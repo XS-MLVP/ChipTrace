@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+build/
+dist/
+var/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.ndjson
+*.jsonl
+node_modules/

@@ -1,0 +1,54 @@
+name: router-v2-trace-collector-canary
+
+services:
+  trace-collector-canary:
+    profiles: ["canary"]
+    build:
+      context: ..
+    image: router-v2-trace-training-pipeline:canary
+    container_name: router-v2-trace-collector-canary
+    restart: unless-stopped
+    user: "1267:1001"
+    command:
+      - serve
+      - --root
+      - /data/capture
+      - --state-root
+      - /data/state
+      - --host
+      - 0.0.0.0
+      - --port
+      - "3010"
+      - --segment-max-mib
+      - "512"
+      - --max-envelope-mib
+      - "1024"
+      - --max-inflight-body-mib
+      - "4096"
+      - --queue-max-items
+      - "2048"
+      - --batch-records
+      - "64"
+      - --batch-wait-ms
+      - "25"
+    ports:
+      - "127.0.0.1:3011:3010"
+    volumes:
+      - /nfs/home/zhangyuxin/router_v2/records/full-trace-capture-v3-canary:/data/capture
+      - /local/zhangyuxin/router_v2-data/trace-training-pipeline-canary:/data/state
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,urllib.request; j=json.load(urllib.request.urlopen('http://127.0.0.1:3010/health',timeout=3)); raise SystemExit(0 if j.get('ok') else 1)"
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - router-v2-net
+
+networks:
+  router-v2-net:
+    external: true

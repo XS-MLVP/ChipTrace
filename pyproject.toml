@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "router-v2-trace-training-pipeline"
+version = "0.1.0"
+description = "Durable, idempotent capture boundary for Router V2 trace training data"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+trace-pipeline = "trace_pipeline.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

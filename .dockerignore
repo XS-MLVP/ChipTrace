@@ -1,0 +1,10 @@
+.git
+__pycache__
+*.pyc
+*.sqlite*
+*.ndjson
+*.jsonl
+var
+tests
+tests-js
+docs
