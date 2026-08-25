@@ -9,14 +9,24 @@ Deliver one immutable directory per dataset version:
   <model>-part-001.sqlite
   <model>-part-002.sqlite
   ...
-  trajectory-catalog.sqlite
+  session-catalog.sqlite
   manifest.json
   SHA256SUMS
 ```
 
-Raw parts should target about 10 GB and stay below the receiver's hard limit.
-Never split one trajectory across parts. Reuse verified SQLite files or hard
-links when repackaging; do not decompress and recompress unchanged BLOBs.
+Raw parts target about 10 GiB. Never split one session across parts; a session
+larger than the target is delivered as one explicitly oversized part. The
+builder copies verified compressed BLOBs directly and does not decompress and
+recompress unchanged payloads.
+
+Build the directory atomically with:
+
+```bash
+trace-pipeline release \
+  --input raw-001.sqlite --input raw-002.sqlite \
+  --output router-v2-gpt-next-YYYYMMDD-v1 \
+  --model gpt-next-sol --target-part-gib 10
+```
 
 ## Manifest
 
@@ -24,23 +34,36 @@ links when repackaging; do not decompress and recompress unchanged BLOBs.
 
 ```json
 {
-  "dataset_id": "router-v2-gpt-next-YYYYMMDD-v1",
-  "schema_version": "trajectory-catalog-v1",
-  "projection_mode": "complete-thread",
-  "requested_window": {"start": "...", "end": "..."},
+  "release_id": "router-v2-gpt-next-YYYYMMDD-v1",
+  "schema_version": "complete-session-release-v1",
+  "selection": {"model": "gpt-next-sol", "mode": "complete-session"},
+  "session_atomic": true,
+  "session_split_count": 0,
   "actual_window": {"start": "...", "end": "..."},
-  "models": ["gpt-next-sol"],
+  "models_present": ["gpt-next-sol", "gpt-helper"],
   "sensitive_raw_data": true,
   "semantic_reward_available": false,
-  "structural_score_policy": "structural-deliverability-v1",
+  "score_semantics": "observed session trace completeness; not task correctness",
+  "session_quality": {
+    "policy_version": "session-trace-completeness-v1",
+    "average": 0,
+    "minimum": 0,
+    "maximum": 0,
+    "grades": {},
+    "incomplete_reasons": {}
+  },
   "records": 0,
-  "trajectories": 0,
-  "turns": 0,
+  "sessions": 0,
   "token_totals": {},
   "parts": [
     {"file": "gpt-next-sol-part-001.sqlite", "bytes": 0, "sha256": "..."}
   ],
-  "catalog": {"file": "trajectory-catalog.sqlite", "bytes": 0, "sha256": "..."},
+  "catalog": {
+    "file": "session-catalog.sqlite",
+    "schema_version": "session-catalog-v2",
+    "bytes": 0,
+    "sha256": "..."
+  },
   "validation_status": "pass"
 }
 ```
@@ -50,27 +73,27 @@ the requested end date when collection stopped earlier.
 
 ## Catalog minimum
 
-The catalog should contain no duplicate raw bodies. It points to raw records by
+The catalog contains no duplicate captures. It points to raw records by
 `(shard_id, record_id)` and includes these normalized tables:
 
-- `trajectories`, `turns`, `steps`;
+- `trajectories` (compatibility name for sessions), `turns`, `steps`;
 - `step_usage`, including input/cache/output/reasoning/total dimensions;
 - `step_item_counts`;
 - `tool_calls`, `tool_results` and linkage status;
-- `trajectory_quality` with policy components;
+- `session_quality` and the compatible `trajectory_quality` table;
 - `validation_results` and dataset metadata.
 
 Identity is versioned:
 
 ```text
-traj_id  = sha256(scope + NUL + stable_thread_id)
-turn_key = sha256(traj_id + NUL + stable_turn_id)
+session_id = sha256(client_metadata.session_id or thread_id)
+turn_key   = sha256(session_id + NUL + stable_turn_id)
 step_id  = captureId
-call_key = sha256(traj_id + NUL + native_call_id)
+call_key = sha256(session_id + NUL + native_call_id)
 ```
 
-Missing native identity stays null and lowers structural quality. Do not invent
-a successful thread, turn, tool result, or reward.
+Missing native identity creates an explicit orphan session and lowers
+completeness. Do not invent a successful task, turn, tool result, or reward.
 
 ## Acceptance gates
 
@@ -78,8 +101,8 @@ Publication fails unless:
 
 - capture IDs are unique and source/export counts match;
 - every payload chunk decompresses, lengths match, and raw hashes reproduce;
-- all selected steps match the declared projection;
-- a trajectory belongs to exactly one raw part;
+- every session containing the selected model includes all its observed steps;
+- a session belongs to exactly one raw part;
 - aggregate turns, usage dimensions, and terminal counts reproduce source
   indices;
 - truncation, left/right censoring, and missing linkage remain explicit;

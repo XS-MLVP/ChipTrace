@@ -45,7 +45,10 @@ Submit fixtures containing:
 
 Required results: failures remain present, retry produces one physical row,
 conflict is 409, byte-budget overload is explicit, `/audit` is healthy, and a
-sealed SQLite export passes all validation rows.
+sealed SQLite export passes all validation rows. A synthetic multi-file
+release must also report `session_split_count=0`, reproduce all selected
+records, and distinguish a closed session from an open tool session in its
+completeness score.
 
 ## 4. Shadow or bounded cohort
 

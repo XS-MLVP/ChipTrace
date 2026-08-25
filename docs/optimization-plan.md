@@ -19,7 +19,9 @@ new design, not a claim that the new collector is already deployed.
 The `gpt-5.6-sol` projection contains 104,759 unique steps and 975 trajectories.
 It has 104,643 completed terminals, 115 failed terminals, one missing terminal,
 100,685 tool calls, and 97,592 paired call/results. Its average structural
-score is 92.951. Semantic reward is absent, so these figures measure delivery
+score under the earlier `structural-deliverability-v1` policy is 92.951. It
+must be recomputed with the session completeness policy when building a new
+release. Semantic reward is absent, so these figures measure delivery
 structure, not answer correctness. API usage is a lower bound of
 16,966,625,642 tokens; it is repeated processing usage, not deduplicated corpus
 tokens.
@@ -53,6 +55,16 @@ offered = durable + conflict + rejected/dropped + queued + in_flight
   backoff, and reports a conservation check;
 - raw SQLite export streams source bytes into independent 4 MiB zlib chunks;
 - export reads a consistent ledger snapshot and publishes only after checks.
+
+### P0: session-atomic release
+
+- stable `session_id/thread_id` is the release identity, independent of model;
+- selecting `gpt-5.6-sol` includes helper/subagent model steps in that session;
+- a two-pass planner keeps every session in exactly one target-size SQLite part;
+- source zlib chunks are copied without recompressing payloads;
+- `session-catalog.sqlite`, manifest, and SHA-256 files publish atomically;
+- session completeness is scored automatically with explicit component and
+  censoring fields; semantic reward remains null.
 
 The synthetic local benchmark with 500 records, 4 KiB payloads, 16 workers,
 and `fsync` enabled measured about 1.25k records/s and 4.9 MiB/s. This is only

@@ -18,10 +18,11 @@ creating a second physical record.
 - one global `capture_id` uniqueness boundary across all segments;
 - explicit `open -> sealed` segment lifecycle rather than mtime-based closure;
 - crash recovery of complete lines and safe truncation of an incomplete tail;
-- SQLite integrity and source/hash/byte accounting suitable for later traj
-  assembly and evaluation.
+- SQLite integrity and source/hash/byte accounting suitable for later session
+  assembly and evaluation;
 - bounded HTTP body memory, writer queue, and Relay retry queue;
-- independently compressed SQLite chunks for bounded-memory training reads.
+- independently compressed SQLite chunks for bounded-memory training reads;
+- complete-session release parts with automatic completeness scoring.
 
 ## Quick start
 
@@ -46,17 +47,23 @@ curl -X POST http://127.0.0.1:3010/capture \
 `/health` is read-only and reports queue, ledger, segment, and recovery state.
 `/audit` runs a bounded read-only audit and does not alter captured bodies.
 
-Build the raw SQLite and normalized trajectory catalog with:
+Export sealed data, then build the preferred complete-session release with:
 
 ```bash
 PYTHONPATH=src python3 -m trace_pipeline export \
   --root /data/capture --ledger /data/state/capture-ledger.sqlite \
   --output /delivery/gpt-next-part-001.sqlite
-PYTHONPATH=src python3 -m trace_pipeline trajectory \
+PYTHONPATH=src python3 -m trace_pipeline release \
   --input /delivery/gpt-next-part-001.sqlite \
-  --output /delivery/trajectory-catalog.sqlite \
-  --model gpt-next-sol --projection-mode complete-thread
+  --output /release/router-v2-gpt-next-YYYYMMDD-v1 \
+  --model gpt-next-sol --target-part-gib 10
 ```
+
+`release` selects every session containing the requested model, includes all
+other-model interactions from those sessions, and never splits one session
+across SQLite parts. It creates `session-catalog.sqlite`, `manifest.json`, and
+`SHA256SUMS`. The automatic score measures observed trace completeness only;
+semantic reward remains null.
 
 Run the full Python, Node, crash-recovery, export, and performance suite with:
 

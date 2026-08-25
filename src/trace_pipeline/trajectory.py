@@ -19,10 +19,14 @@ except ImportError:  # pragma: no cover - optional performance dependency
     orjson = None
 
 
-CATALOG_FORMAT = "router-v2-trajectory-sqlite-delivery-v1"
-CATALOG_SCHEMA_VERSION = "trajectory-catalog-v1"
-QUALITY_POLICY_VERSION = "structural-deliverability-v1"
-TRAJECTORY_DEFINITION = "sha256(api_key_fingerprint + NUL + client_metadata.thread_id)"
+CATALOG_FORMAT = "router-v2-session-sqlite-delivery-v2"
+CATALOG_SCHEMA_VERSION = "session-catalog-v2"
+QUALITY_POLICY_VERSION = "session-trace-completeness-v1"
+SESSION_DEFINITION = (
+    "sha256(client_metadata.session_id or client_metadata.thread_id); "
+    "one orphan session per capture when both are absent"
+)
+TRAJECTORY_DEFINITION = SESSION_DEFINITION
 TURN_DEFINITION = "sha256(traj_id + NUL + client_metadata.turn_id)"
 TERMINAL_TYPES = {
     "response.completed",
@@ -169,6 +173,18 @@ CREATE TABLE trajectory_quality(
   boundary_component REAL NOT NULL,semantic_reward_available INTEGER NOT NULL,
   score_scope TEXT NOT NULL,FOREIGN KEY(traj_id) REFERENCES trajectories(traj_id)
 ) WITHOUT ROWID;
+CREATE VIEW session_quality AS
+SELECT traj_id AS session_id,policy_version,
+       structural_score AS session_completeness_score,
+       quality_grade AS completeness_grade,payload_component,
+       identity_component,terminal_component,usage_component,
+       tool_linkage_component,boundary_component,
+       semantic_reward_available,score_scope,t.steps,t.turns,t.closed,
+       t.left_censored,t.right_censored,t.truncated_steps,
+       t.parse_ok_steps,t.thread_id_present_steps,t.turn_id_present_steps,
+       t.terminal_present_steps,t.usage_present_steps,t.tool_calls,t.tool_results,
+       t.matched_tool_calls,t.orphan_tool_results
+  FROM trajectory_quality q JOIN trajectories t USING(traj_id);
 CREATE TABLE item_type_summary(
   direction TEXT NOT NULL,item_type TEXT NOT NULL,steps INTEGER NOT NULL,
   items INTEGER NOT NULL,PRIMARY KEY(direction,item_type)
@@ -409,7 +425,12 @@ def request_context(request: Any) -> dict[str, Any]:
         "item_counts": counts,
         "prior_history_items": prior,
         "compaction_items": sum(counts.get(kind, 0) for kind in COMPACTION_ITEM_TYPES),
-        "thread_id": nonempty_string(metadata.get("thread_id") or metadata.get("threadId")),
+        "thread_id": nonempty_string(
+            metadata.get("session_id")
+            or metadata.get("sessionId")
+            or metadata.get("thread_id")
+            or metadata.get("threadId")
+        ),
         "turn_id": nonempty_string(metadata.get("turn_id") or metadata.get("turnId")),
         "subagent_present": int(
             metadata.get("x-openai-subagent") not in (None, "", False, "false", "0")
@@ -586,8 +607,8 @@ def record_and_context(raw_record: RawRecord) -> tuple[dict[str, Any], dict[str,
         raise RuntimeError(f"capture identity mismatch: {raw_record.capture_id}")
     context = request_context(body_value(value.get("requestBody")))
     thread_id = context["thread_id"]
-    if thread_id is not None and raw_record.api_key_fingerprint is not None:
-        traj_id = digest_parts(raw_record.api_key_fingerprint, thread_id)
+    if thread_id is not None:
+        traj_id = f"session-{digest_parts(thread_id)}"
     else:
         # The prefix is an explicit quality flag, not a fabricated thread ID.
         traj_id = f"orphan-{digest_parts(raw_record.capture_id)}"
@@ -954,8 +975,14 @@ def aggregate_catalog(conn: sqlite3.Connection, projection_mode: str) -> None:
         """
         UPDATE trajectories SET
           left_censored=(SELECT prior_history_items>0 FROM steps s WHERE s.step_id=trajectories.first_step_id),
-          right_censored=NOT (SELECT terminal_completed=1 AND final_message_present=1
-                                      AND output_tool_calls=0 AND capture_error_present=0
+          right_censored=NOT (SELECT terminal_present=1 AND (
+                                      terminal_event_type IN (
+                                        'response.failed','response.incomplete','response.cancelled'
+                                      ) OR (
+                                        terminal_event_type='response.completed'
+                                        AND final_message_present=1 AND output_tool_calls=0
+                                      )
+                                    )
                                  FROM steps s WHERE s.step_id=trajectories.last_step_id)
         """
     )
@@ -989,21 +1016,21 @@ def aggregate_catalog(conn: sqlite3.Connection, projection_mode: str) -> None:
 
 
 def quality_grade(score: float) -> str:
-    if score >= 90:
-        return "A_ready"
-    if score >= 75:
-        return "B_usable_with_flags"
+    if score >= 99.999:
+        return "A_complete"
+    if score >= 85:
+        return "B_mostly_complete"
     if score >= 60:
-        return "C_review_required"
-    return "D_incomplete"
+        return "C_partial"
+    return "D_fragment"
 
 
 def calculate_quality(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
         """
         SELECT traj_id,steps,parse_ok_steps,truncated_steps,thread_id_present_steps,
-               turn_id_present_steps,terminal_present_steps,terminal_completed_steps,
-               usage_present_steps,tool_calls,tool_results,matched_tool_calls,
+               turn_id_present_steps,terminal_present_steps,usage_present_steps,
+               tool_calls,tool_results,matched_tool_calls,
                left_censored,right_censored FROM trajectories
         """
     )
@@ -1016,7 +1043,6 @@ def calculate_quality(conn: sqlite3.Connection) -> None:
             thread_present,
             turn_present,
             terminal_present,
-            completed,
             usage_present,
             calls,
             results,
@@ -1026,9 +1052,11 @@ def calculate_quality(conn: sqlite3.Connection) -> None:
         ) = row
         steps = max(int(steps), 1)
         payload = 10 * int(parse_ok) / steps + 10 * (steps - int(truncated)) / steps
-        identity = 7.5 * int(thread_present) / steps + 7.5 * int(turn_present) / steps
-        terminal = 10 * int(terminal_present) / steps + 10 * int(completed) / steps
-        usage = 10 * int(usage_present) / steps
+        identity = 10 * int(thread_present) / steps + 10 * int(turn_present) / steps
+        # A captured failure/cancellation is a complete trace outcome. Task
+        # success belongs in semantic reward, not session completeness.
+        terminal = 20 * int(terminal_present) / steps
+        usage = 5 * int(usage_present) / steps
         denominator = max(int(calls), int(results))
         linkage = 20.0 if denominator == 0 else 20 * int(matched) / denominator
         boundary = 5 * (not bool(left_censored)) + 10 * (not bool(right_censored))
@@ -1047,7 +1075,7 @@ def calculate_quality(conn: sqlite3.Connection) -> None:
                 round(linkage, 3),
                 round(boundary, 3),
                 0,
-                "structural delivery quality only; not task correctness or reward",
+                "observed session trace completeness only; not task correctness or semantic reward",
             ),
         )
 
@@ -1142,6 +1170,21 @@ def validate_catalog(
             "semantic_rewards_are_null",
             conn.execute("SELECT count(*) FROM trajectories WHERE reward IS NULL AND reward_source IS NULL").fetchone()[0],
             conn.execute("SELECT count(*) FROM trajectories").fetchone()[0],
+        ),
+        validation_row(
+            conn,
+            "session_quality_rows",
+            conn.execute("SELECT count(*) FROM session_quality").fetchone()[0],
+            conn.execute("SELECT count(*) FROM trajectories").fetchone()[0],
+        ),
+        validation_row(
+            conn,
+            "session_completeness_score_bounds",
+            conn.execute(
+                "SELECT count(*) FROM session_quality "
+                "WHERE session_completeness_score < 0 OR session_completeness_score > 100"
+            ).fetchone()[0],
+            0,
         ),
         validation_row(
             conn,
@@ -1387,6 +1430,7 @@ def build_trajectory_catalog(
         put_meta(conn, "projection_mode", projection_mode)
         put_meta(conn, "model_exact", model_exact)
         put_meta(conn, "trajectory_id_definition", TRAJECTORY_DEFINITION)
+        put_meta(conn, "session_id_definition", SESSION_DEFINITION)
         put_meta(conn, "turn_id_definition", TURN_DEFINITION)
         put_meta(conn, "quality_policy_version", QUALITY_POLICY_VERSION)
         put_meta(conn, "semantic_reward_available", False)
@@ -1443,6 +1487,9 @@ def build_trajectory_catalog(
         "projection_mode": projection_mode,
         "model_exact": model_exact,
         "validation_status": validation_status,
+        "session_completeness_score_average": quality[0],
+        "session_completeness_score_minimum": quality[1],
+        "session_completeness_score_maximum": quality[2],
         "structural_score_average": quality[0],
         "structural_score_minimum": quality[1],
         "structural_score_maximum": quality[2],

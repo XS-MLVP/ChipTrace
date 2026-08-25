@@ -105,21 +105,37 @@ The independent chunks bound decompression memory and match the existing
 trajectory reader's `interactions + interaction_chunks` input contract. Raw
 prompt, answer, tool arguments, and tool results stay in this raw database.
 
-## Trajectory and reward boundary
+## Session release and score boundary
 
-The raw export has enough information to calculate trajectory, turn, step,
-usage, terminal status, native tool call/result linkage, and truncation flags.
-It does not synthesize semantic reward. A standardized delivery should keep:
+`trace-pipeline release` treats a session as the delivery atom. Session identity
+comes from `client_metadata.session_id`, falling back to `thread_id`; a missing
+identity becomes a one-capture orphan and is scored accordingly. Selecting a
+model includes every other-model interaction belonging to the same session.
+One session is never split across release parts, even when that session alone
+exceeds the configured target size.
 
-- `structural_score`: deterministic parse/order/linkage/delivery quality;
+The raw export has enough information to calculate session, turn, step, usage,
+terminal status, native tool call/result linkage, and truncation flags. The
+release automatically keeps:
+
+- `session_completeness_score`: deterministic observed trace completeness;
+- component scores for payload, identity, terminal, usage, tool linkage, and
+  session boundaries;
 - `reward`: nullable correctness or preference result;
 - `reward_source`: evaluator, judge version, benchmark, or ground truth.
 
-HTTP success, `response.completed`, final text, and tool closure are not
-semantic reward. Encrypted reasoning may be retained as opaque source data; the
-delivery must not claim plaintext chain-of-thought availability.
+The 100-point completeness policy is payload 20, session/turn identity 20,
+terminal observation 20, usage 5, tool call/result linkage 20, and observed
+session boundaries 15. `A_complete` requires all 100 points. Every component
+and the underlying flags remain queryable in `session_quality`.
 
-For model-only projections, boundary flags must identify context outside the
-selected model/time window. Complete-thread projection is preferred for
-episode training. The repository provides both modes through
-`trace-pipeline trajectory`. See `docs/delivery-template.md`.
+Captured `response.failed`, `response.incomplete`, and `response.cancelled`
+events are complete terminal observations and do not imply incomplete capture.
+Likewise, HTTP success, `response.completed`, final text, and tool closure are
+not semantic reward. Encrypted reasoning may be retained as opaque source data;
+the delivery must not claim plaintext chain-of-thought availability.
+
+`left_censored`, `right_censored`, truncation, missing identity, and unmatched
+tools remain explicit. Completeness is limited to the supplied raw-input
+universe; the builder cannot prove that an omitted source file contains no
+earlier or later session step. See `docs/delivery-template.md`.

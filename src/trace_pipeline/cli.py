@@ -10,6 +10,7 @@ from typing import Iterable
 
 from .audit import audit_root
 from .exporter import export_sealed
+from .release import build_session_release
 from .server import serve
 from .store import CaptureStore, StoreConfig, StoreError
 from .trajectory import build_trajectory_catalog
@@ -90,6 +91,18 @@ def run_trajectory(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_release(args: argparse.Namespace) -> int:
+    result = build_session_release(
+        [Path(value) for value in args.input],
+        Path(args.output),
+        model_exact=args.model,
+        target_part_bytes=int(args.target_part_gib * 1024 * 1024 * 1024),
+        release_id=args.release_id,
+    )
+    print(json.dumps(result, ensure_ascii=True, indent=2, sort_keys=True))
+    return 0
+
+
 def fixture(capture_id: str, *, status: int = 200, pad: int = 0) -> dict:
     return {
         "captureId": capture_id,
@@ -135,6 +148,14 @@ def run_self_test(_args: argparse.Namespace) -> int:
             model_exact="gpt-self-test",
             projection_mode="exact-model-projection",
         )
+        release_output = Path(temporary) / "session-release"
+        release = build_session_release(
+            [output],
+            release_output,
+            model_exact="gpt-self-test",
+            target_part_bytes=10 * 1024 * 1024,
+            release_id="self-test-release",
+        )
         result = {
             "ok": all(
                 [
@@ -147,6 +168,8 @@ def run_self_test(_args: argparse.Namespace) -> int:
                     export["records"] == 2,
                     catalog["records"] == 2,
                     catalog["validation_status"] in {"pass", "warn"},
+                    release["records"] == 2,
+                    release["validation_status"] in {"pass", "warn"},
                 ]
             ),
             "accepted_error_response": failure_sample.state == "accepted",
@@ -155,6 +178,7 @@ def run_self_test(_args: argparse.Namespace) -> int:
             "audit": audit,
             "export": export,
             "trajectory_catalog": catalog,
+            "session_release": release,
         }
         print(json.dumps(result, ensure_ascii=True, indent=2, sort_keys=True))
         return 0 if result["ok"] else 2
@@ -212,6 +236,17 @@ def parser() -> argparse.ArgumentParser:
     trajectory_parser.add_argument("--replace", action="store_true")
     trajectory_parser.set_defaults(func=run_trajectory)
 
+    release_parser = sub.add_parser(
+        "release",
+        help="build an atomic complete-session release directory from raw SQLite inputs",
+    )
+    release_parser.add_argument("--input", action="append", required=True)
+    release_parser.add_argument("--output", required=True)
+    release_parser.add_argument("--model", required=True)
+    release_parser.add_argument("--release-id")
+    release_parser.add_argument("--target-part-gib", type=float, default=10.0)
+    release_parser.set_defaults(func=run_release)
+
     self_test = sub.add_parser("self-test", help="run an isolated durability and delivery smoke test")
     self_test.set_defaults(func=run_self_test)
     return command
@@ -224,6 +259,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         or getattr(args, "max_envelope_mib", 1) <= 0
         or getattr(args, "max_inflight_body_mib", 1) <= 0
         or getattr(args, "raw_chunk_mib", 1) <= 0
+        or getattr(args, "target_part_gib", 1) <= 0
     ):
         raise SystemExit("size limits must be positive")
     return int(args.func(args))
