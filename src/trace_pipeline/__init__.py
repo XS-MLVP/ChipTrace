@@ -1,4 +1,4 @@
-"""Durable Router V2 trace capture and training-data boundary."""
+"""Durable agent trace capture and training-data boundary."""
 
 from .release import build_session_release
 from .sharded_export import build_sharded_export
@@ -11,4 +11,4 @@ __all__ = [
     "build_session_release",
     "build_sharded_export",
 ]
-__version__ = "0.3.0"
+__version__ = "0.4.0a1"

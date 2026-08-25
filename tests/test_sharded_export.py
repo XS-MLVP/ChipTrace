@@ -78,7 +78,7 @@ class ShardedExportTest(unittest.TestCase):
         released = build_session_release(
             raw_parts,
             release,
-            model_exact="gpt-self-test",
+            model_exact="model-self-test",
         )
         self.assertEqual(released["records"], 18)
         self.assertIn(released["validation_status"], {"pass", "warn"})

@@ -1,0 +1,40 @@
+openapi: 3.1.0
+info:
+  title: Trace Capture API
+  version: 0.4.0-alpha.1
+  description: Durable local ingestion boundary for full agent interaction traces.
+paths:
+  /capture:
+    post:
+      summary: Persist one capture envelope
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./capture-envelope-v3.schema.json
+      responses:
+        "202":
+          description: Segment and ledger durability boundary completed
+        "400":
+          description: Invalid capture envelope
+        "409":
+          description: Capture identifier reused with different bytes
+        "413":
+          description: Envelope exceeds configured byte limit
+        "503":
+          description: Collector backpressure or storage failure
+        "504":
+          description: Durability acknowledgement timed out; retry the same bytes and identifier
+  /health:
+    get:
+      summary: Read collector readiness and durable accounting state
+      responses:
+        "200": {description: Collector ready}
+        "503": {description: Collector not ready}
+  /audit:
+    get:
+      summary: Run a bounded structural ledger audit
+      responses:
+        "200": {description: Audit passed}
+        "500": {description: Audit failed}

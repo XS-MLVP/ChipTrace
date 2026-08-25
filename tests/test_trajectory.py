@@ -32,6 +32,14 @@ class TrajectoryCatalogTest(unittest.TestCase):
         output_item: dict,
         usage: tuple[int, int, int, int],
         timestamp: str,
+        source_namespace: str = "fixture-source",
+        session_id: str | None = "session-one",
+        thread_id: str | None = "thread-one",
+        response_id: str | None = None,
+        previous_response_id: str | None = None,
+        tools: list[dict] | None = None,
+        metadata_extra: dict | None = None,
+        observed_lifecycle_events: list[str] | None = None,
     ) -> dict:
         input_tokens, cached_tokens, output_tokens, reasoning_tokens = usage
         event = json.dumps(
@@ -42,6 +50,7 @@ class TrajectoryCatalogTest(unittest.TestCase):
             {
                 "type": "response.completed",
                 "response": {
+                    "id": response_id,
                     "status": "completed",
                     "usage": {
                         "input_tokens": input_tokens,
@@ -54,9 +63,25 @@ class TrajectoryCatalogTest(unittest.TestCase):
             },
             separators=(",", ":"),
         )
+        metadata = {"turn_id": turn_id}
+        if session_id is not None:
+            metadata["session_id"] = session_id
+        if thread_id is not None:
+            metadata["thread_id"] = thread_id
+        metadata.update(metadata_extra or {})
+        request_value = {
+            "model": model,
+            "client_metadata": metadata,
+            "input": request_items,
+        }
+        if previous_response_id is not None:
+            request_value["previous_response_id"] = previous_response_id
+        if tools is not None:
+            request_value["tools"] = tools
         return {
             "version": "full-trace-spool-v3",
             "captureId": capture_id,
+            "sourceNamespace": source_namespace,
             "receivedAt": timestamp,
             "startedAt": timestamp,
             "finishedAt": timestamp,
@@ -66,11 +91,7 @@ class TrajectoryCatalogTest(unittest.TestCase):
             "apiKeyFingerprint": "fixture-key",
             "requestBody": {
                 "kind": "json",
-                "value": {
-                    "model": model,
-                    "client_metadata": {"thread_id": "thread-one", "turn_id": turn_id},
-                    "input": request_items,
-                },
+                "value": request_value,
             },
             "requestTruncated": False,
             "responseStatus": 200,
@@ -78,23 +99,34 @@ class TrajectoryCatalogTest(unittest.TestCase):
             "responseTruncated": False,
             "stream": True,
             "captureError": None,
+            "observedLifecycleEvents": observed_lifecycle_events or [],
         }
 
     def prepare_raw_export(self) -> None:
         call = {"type": "function_call", "call_id": "call-1", "name": "lookup", "arguments": "{}"}
+        tools = [{
+            "type": "function",
+            "name": "lookup",
+            "description": "Look up a value.",
+            "parameters": {"type": "object", "properties": {}},
+            "schema_version": "1",
+        }]
         records = [
             self.record(
                 "cap-traj-1",
-                model="gpt-next-sol",
+                model="target-model-v1",
                 turn_id="turn-one",
                 request_items=[{"type": "message", "role": "user", "content": "question"}],
                 output_item=call,
                 usage=(100, 80, 10, 3),
                 timestamp="2026-08-24T00:00:00Z",
+                response_id="response-one",
+                tools=tools,
+                observed_lifecycle_events=["response.completed"],
             ),
             self.record(
                 "cap-traj-2",
-                model="gpt-next-sol",
+                model="target-model-v1",
                 turn_id="turn-one",
                 request_items=[
                     {"type": "message", "role": "user", "content": "question"},
@@ -109,10 +141,13 @@ class TrajectoryCatalogTest(unittest.TestCase):
                 },
                 usage=(120, 80, 12, 4),
                 timestamp="2026-08-24T00:00:01Z",
+                response_id="response-two",
+                previous_response_id="response-one",
+                tools=tools,
             ),
             self.record(
                 "cap-traj-3",
-                model="gpt-helper",
+                model="helper-model-v1",
                 turn_id="turn-two",
                 request_items=[{"type": "message", "role": "user", "content": "follow up"}],
                 output_item={
@@ -123,6 +158,8 @@ class TrajectoryCatalogTest(unittest.TestCase):
                 },
                 usage=(50, 10, 5, 1),
                 timestamp="2026-08-24T00:00:02Z",
+                response_id="response-three",
+                previous_response_id="response-two",
             ),
         ]
         store = CaptureStore(StoreConfig(root=self.root, batch_wait_ms=1))
@@ -136,7 +173,7 @@ class TrajectoryCatalogTest(unittest.TestCase):
         result = build_trajectory_catalog(
             [self.raw],
             self.catalog,
-            model_exact="gpt-next-sol",
+            model_exact="target-model-v1",
             projection_mode="exact-model-projection",
         )
         self.assertEqual(result["records"], 2)
@@ -151,7 +188,11 @@ class TrajectoryCatalogTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(trajectory, (2, 1, 1, 1, 1, 242, None, 1))
             self.assertEqual(conn.execute("SELECT result_present FROM tool_calls").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT definition_present FROM tool_calls").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT linkage_status FROM tool_calls").fetchone()[0], "executed")
             self.assertEqual(conn.execute("SELECT matched_call FROM tool_results").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT count(*) FROM trajectory_edges").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT event_type FROM lifecycle_events").fetchone()[0], "response.completed")
             self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
             self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
 
@@ -160,7 +201,7 @@ class TrajectoryCatalogTest(unittest.TestCase):
         result = build_trajectory_catalog(
             [self.raw],
             self.catalog,
-            model_exact="gpt-next-sol",
+            model_exact="target-model-v1",
             projection_mode="complete-thread",
         )
         self.assertEqual(result["records"], 3)
@@ -169,7 +210,7 @@ class TrajectoryCatalogTest(unittest.TestCase):
         with sqlite3.connect(self.catalog) as conn:
             models = dict(conn.execute("SELECT model,count(*) FROM steps GROUP BY model"))
             total_tokens = conn.execute("SELECT total_tokens FROM trajectories").fetchone()[0]
-        self.assertEqual(models, {"gpt-helper": 1, "gpt-next-sol": 2})
+        self.assertEqual(models, {"helper-model-v1": 1, "target-model-v1": 2})
         self.assertEqual(total_tokens, 297)
 
     def test_sparse_sse_output_index_is_preserved(self) -> None:
@@ -194,7 +235,7 @@ class TrajectoryCatalogTest(unittest.TestCase):
             build_trajectory_catalog(
                 [self.raw],
                 self.catalog,
-                model_exact="gpt-next-sol",
+                model_exact="target-model-v1",
                 projection_mode="exact-model-projection",
             )
         self.assertIn("chunk coverage failed", str(context.exception))
@@ -205,9 +246,94 @@ class TrajectoryCatalogTest(unittest.TestCase):
             build_trajectory_catalog(
                 [self.raw],
                 self.raw,
-                model_exact="gpt-next-sol",
+                model_exact="target-model-v1",
                 replace=True,
             )
+
+    def test_same_session_id_in_distinct_namespaces_is_not_merged(self) -> None:
+        output_item = {
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": "done"}],
+        }
+        records = [
+            self.record(
+                "cap-namespace-a",
+                model="target-model-v1",
+                turn_id="turn-one",
+                request_items=[{"type": "message", "role": "user", "content": "a"}],
+                output_item=output_item,
+                usage=(10, 0, 2, 0),
+                timestamp="2026-08-24T00:00:00Z",
+                source_namespace="source-a",
+                response_id="response-a",
+            ),
+            self.record(
+                "cap-namespace-b",
+                model="target-model-v1",
+                turn_id="turn-one",
+                request_items=[{"type": "message", "role": "user", "content": "b"}],
+                output_item=output_item,
+                usage=(10, 0, 2, 0),
+                timestamp="2026-08-24T00:00:01Z",
+                source_namespace="source-b",
+                response_id="response-b",
+            ),
+        ]
+        store = CaptureStore(StoreConfig(root=self.root, batch_wait_ms=1))
+        for record in records:
+            store.submit(record)
+        store.close()
+        export_sealed(self.root, self.raw, raw_chunk_bytes=128)
+        result = build_trajectory_catalog(
+            [self.raw], self.catalog, model_exact="target-model-v1", projection_mode="complete-thread"
+        )
+        self.assertEqual(result["trajectories"], 2)
+        with sqlite3.connect(self.catalog) as conn:
+            namespaces = {row[0] for row in conn.execute("SELECT source_namespace FROM trajectories")}
+        self.assertEqual(namespaces, {"source-a", "source-b"})
+
+    def test_parent_session_relation_and_open_tail_are_explicit(self) -> None:
+        call = {"type": "function_call", "call_id": "call-open", "name": "lookup", "arguments": "{}"}
+        tool = {
+            "type": "function",
+            "name": "lookup",
+            "description": "Look up a value.",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        record = self.record(
+            "cap-open-tail",
+            model="target-model-v1",
+            turn_id="turn-open",
+            request_items=[{"type": "message", "role": "user", "content": "lookup"}],
+            output_item=call,
+            usage=(10, 0, 2, 0),
+            timestamp="2026-08-24T00:00:00Z",
+            session_id="child-session",
+            response_id="response-open",
+            tools=[tool],
+            metadata_extra={"root_session_id": "root-session", "parent_session_id": "parent-session"},
+        )
+        store = CaptureStore(StoreConfig(root=self.root, batch_wait_ms=1))
+        store.submit(record)
+        store.close()
+        export_sealed(self.root, self.raw, raw_chunk_bytes=128)
+        result = build_trajectory_catalog(
+            [self.raw], self.catalog, model_exact="target-model-v1", projection_mode="complete-thread"
+        )
+        self.assertEqual(result["validation_status"], "pass")
+        with sqlite3.connect(self.catalog) as conn:
+            self.assertEqual(conn.execute("SELECT linkage_status FROM tool_calls").fetchone()[0], "open_tail")
+            relations = dict(conn.execute("SELECT relation_type,parent_present FROM session_relations"))
+        self.assertEqual(relations, {"parent_session": 0, "root_session": 0})
+
+        self.catalog.unlink()
+        build_trajectory_catalog(
+            [self.raw], self.catalog, model_exact="target-model-v1", projection_mode="exact-model-projection"
+        )
+        with sqlite3.connect(self.catalog) as conn:
+            self.assertEqual(conn.execute("SELECT linkage_status FROM tool_calls").fetchone()[0], "capture_gap")
 
 
 if __name__ == "__main__":

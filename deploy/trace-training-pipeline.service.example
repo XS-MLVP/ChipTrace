@@ -1,12 +1,12 @@
 [Unit]
-Description=Router V2 trace training collector canary
+Description=Trace training collector canary
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=PYTHONPATH=/nfs/home/zhangyuxin/router_v2/trace-training-pipeline/src
-ExecStart=/usr/bin/python3 -m trace_pipeline serve --root /nfs/home/zhangyuxin/router_v2/records/full-trace-capture-v3-canary --state-root /local/zhangyuxin/router_v2-data/trace-training-pipeline-canary --host 127.0.0.1 --port 3011 --segment-max-mib 512 --max-envelope-mib 1024 --max-inflight-body-mib 4096
+Environment=PYTHONPATH=%h/trace-training-pipeline/src
+ExecStart=/usr/bin/python3 -m trace_pipeline serve --root %h/trace-data/capture --state-root %h/trace-data/state --host 127.0.0.1 --port 3011 --segment-max-mib 512 --max-envelope-mib 1024 --max-inflight-body-mib 4096
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=60

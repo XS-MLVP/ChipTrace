@@ -3,9 +3,8 @@
 This repository has not replaced the live collector. The following sequence is
 designed to preserve forwarding availability and existing raw data.
 
-The `18080` direct entrypoint remains independent and is outside this rollout.
-Only clients that deliberately select the `18084` capture entrypoint are in
-scope.
+The direct entrypoint remains independent and is outside this rollout. Only
+clients that deliberately select the capture entrypoint are in scope.
 
 ## 1. Offline gate
 
@@ -25,8 +24,12 @@ The example Compose file has profile `canary` and does nothing until explicitly
 started:
 
 ```bash
-install -d -m 0700 /nfs/home/zhangyuxin/router_v2/records/full-trace-capture-v3-canary
-install -d -m 0700 /local/zhangyuxin/router_v2-data/trace-training-pipeline-canary
+export TRACE_CAPTURE_DATA_ROOT=/srv/trace-data/capture-canary
+export TRACE_CAPTURE_STATE_ROOT=/var/lib/trace-pipeline-canary
+export TRACE_COLLECTOR_NETWORK=trace-pipeline-net
+export TRACE_PIPELINE_UID="$(id -u)"
+export TRACE_PIPELINE_GID="$(id -g)"
+install -d -m 0700 "$TRACE_CAPTURE_DATA_ROOT" "$TRACE_CAPTURE_STATE_ROOT"
 docker compose -f deploy/collector-canary.compose.yml --profile canary up -d --build
 curl -fsS http://127.0.0.1:3011/health
 ```
@@ -56,9 +59,10 @@ completeness score.
 
 ## 4. Shadow or bounded cohort
 
-Integrate `integration/reliable_capture_submitter.js` behind a disabled feature
+Integrate `integration/durable_capture_outbox.js` behind a disabled feature
 flag. Remove status-code filtering only for the canary route. Start with a
-bounded internal cohort and keep the existing spooler unchanged as rollback.
+bounded internal cohort and keep the existing collector path unchanged as
+rollback.
 
 Gate for at least one complete rotation interval:
 
@@ -70,15 +74,15 @@ Gate for at least one complete rotation interval:
 - sealed audit and SQLite export pass;
 - process RSS and NFS write latency stay below agreed host limits.
 
-The included Relay queue is transient. Do not call the path lossless across a
-Relay crash until a disk-backed outbox or equivalent local durable handoff is
-deployed and crash-tested.
+The included outbox is persistent. Before cutover, crash-test restart recovery,
+byte-identical retry, explicit conflict quarantine, and accounting conservation
+on the actual local filesystem.
 
 ## 5. Cutover and rollback
 
-Any production Relay change needs a separate approved window. Recreate only
-`router-v2-relay-shell`; do not restart Sub2API, Postgres, Redis, ClickHouse, or
-Langfuse for a collector-only change.
+Any production relay change needs a separate approved window. Recreate only
+the capture relay; do not restart the direct path, databases, caches, or
+unrelated observability services for a collector-only change.
 
 Before cutover, record the old spooler URL/config and the exact command to
 restore it. Rollback means restoring that URL/config and recreating only Relay.

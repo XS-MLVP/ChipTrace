@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:trace-pipeline:release-manifest:v1",
+  "title": "Complete session release manifest v1",
+  "type": "object",
+  "required": [
+    "format",
+    "schema_version",
+    "release_id",
+    "selection",
+    "session_atomic",
+    "session_split_count",
+    "records",
+    "sessions",
+    "parts",
+    "catalog",
+    "validation_status"
+  ],
+  "properties": {
+    "format": {"type": "string"},
+    "schema_version": {"const": "complete-session-release-v1"},
+    "release_id": {"type": "string", "minLength": 1},
+    "selection": {
+      "type": "object",
+      "required": ["model", "mode"],
+      "properties": {
+        "model": {"type": "string"},
+        "mode": {"const": "complete-session"}
+      },
+      "additionalProperties": true
+    },
+    "session_atomic": {"const": true},
+    "session_split_count": {"const": 0},
+    "records": {"type": "integer", "minimum": 0},
+    "sessions": {"type": "integer", "minimum": 0},
+    "parts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["file", "bytes", "sha256"],
+        "properties": {
+          "file": {"type": "string"},
+          "bytes": {"type": "integer", "minimum": 0},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "catalog": {
+      "type": "object",
+      "required": ["file", "schema_version", "bytes", "sha256", "validation_status"],
+      "additionalProperties": true
+    },
+    "validation_status": {"enum": ["pass", "warn", "fail"]}
+  },
+  "additionalProperties": true
+}

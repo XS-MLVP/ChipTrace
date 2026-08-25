@@ -1,14 +1,14 @@
-name: router-v2-trace-collector-canary
+name: ${TRACE_PIPELINE_PROJECT_NAME:-trace-training-pipeline-canary}
 
 services:
   trace-collector-canary:
     profiles: ["canary"]
     build:
       context: ..
-    image: router-v2-trace-training-pipeline:canary
-    container_name: router-v2-trace-collector-canary
+    image: ${TRACE_PIPELINE_IMAGE:-trace-training-pipeline:canary}
+    container_name: ${TRACE_COLLECTOR_CONTAINER_NAME:-trace-training-pipeline-canary}
     restart: unless-stopped
-    user: "1267:1001"
+    user: "${TRACE_PIPELINE_UID:-1000}:${TRACE_PIPELINE_GID:-1000}"
     command:
       - serve
       - --root
@@ -32,10 +32,10 @@ services:
       - --batch-wait-ms
       - "25"
     ports:
-      - "127.0.0.1:3011:3010"
+      - "${TRACE_COLLECTOR_BIND:-127.0.0.1}:${TRACE_COLLECTOR_PORT:-3011}:3010"
     volumes:
-      - /nfs/home/zhangyuxin/router_v2/records/full-trace-capture-v3-canary:/data/capture
-      - /local/zhangyuxin/router_v2-data/trace-training-pipeline-canary:/data/state
+      - ${TRACE_CAPTURE_DATA_ROOT:?set TRACE_CAPTURE_DATA_ROOT}:/data/capture
+      - ${TRACE_CAPTURE_STATE_ROOT:?set TRACE_CAPTURE_STATE_ROOT}:/data/state
     healthcheck:
       test:
         - CMD
@@ -47,8 +47,9 @@ services:
       retries: 5
       start_period: 10s
     networks:
-      - router-v2-net
+      - capture-net
 
 networks:
-  router-v2-net:
+  capture-net:
+    name: ${TRACE_COLLECTOR_NETWORK:-trace-pipeline-net}
     external: true

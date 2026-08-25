@@ -90,7 +90,7 @@ class HTTPCompatibilityTest(unittest.TestCase):
         self.assertEqual(payload["reason"], "capture_store")
 
     def test_current_relay_shape_is_normalized_for_trajectory_readers(self) -> None:
-        request_body = {"model": "gpt-5.6-sol", "input": [{"role": "user", "content": "question"}]}
+        request_body = {"model": "target-model-v1", "input": [{"role": "user", "content": "question"}]}
         response_text = 'data: {"type":"response.failed","response":{"status":"failed"}}\n\n'
         value = {
             "captureId": "cap-http-relay-shape",
@@ -122,12 +122,12 @@ class HTTPCompatibilityTest(unittest.TestCase):
                 "FROM captures c JOIN segments s USING(segment_id) WHERE c.capture_id=?",
                 (value["captureId"],),
             ).fetchone()
-        self.assertEqual(row[:2], ("gpt-5.6-sol", 503))
+        self.assertEqual(row[:2], ("target-model-v1", 503))
         with (self.root / row[4]).open("rb") as handle:
             handle.seek(row[2])
             record = json.loads(handle.read(row[3]))
         self.assertNotIn("requestBodyText", record)
-        self.assertEqual(record["requestBody"]["value"]["model"], "gpt-5.6-sol")
+        self.assertEqual(record["requestBody"]["value"]["model"], "target-model-v1")
         self.assertEqual(record["responseBody"], {"kind": "text", "value": response_text})
         self.assertEqual(record["receivedAt"], value["finishedAt"])
 

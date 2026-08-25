@@ -137,7 +137,7 @@ def fixture(capture_id: str, *, status: int = 200, pad: int = 0) -> dict:
         "inboundPath": "/v1/responses",
         "proxiedPath": "/v1/responses",
         "apiKeyFingerprint": "self-test-key",
-        "requestBody": {"kind": "json", "value": {"model": "gpt-self-test", "input": "x" * pad}},
+        "requestBody": {"kind": "json", "value": {"model": "model-self-test", "input": "x" * pad}},
         "requestTruncated": False,
         "responseStatus": status,
         "responseBody": {"kind": "json", "value": {"status": "completed" if status < 400 else "failed"}},
@@ -169,14 +169,14 @@ def run_self_test(_args: argparse.Namespace) -> int:
         catalog = build_trajectory_catalog(
             [output],
             catalog_output,
-            model_exact="gpt-self-test",
+            model_exact="model-self-test",
             projection_mode="exact-model-projection",
         )
         release_output = Path(temporary) / "session-release"
         release = build_session_release(
             [output],
             release_output,
-            model_exact="gpt-self-test",
+            model_exact="model-self-test",
             target_part_bytes=10 * 1024 * 1024,
             release_id="self-test-release",
         )
@@ -209,7 +209,7 @@ def run_self_test(_args: argparse.Namespace) -> int:
 
 
 def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(description="Durable Router V2 trace training pipeline")
+    command = argparse.ArgumentParser(description="Durable agent trace training pipeline")
     sub = command.add_subparsers(dest="command", required=True)
 
     serve_parser = sub.add_parser("serve", help="run the compatible POST /capture service")

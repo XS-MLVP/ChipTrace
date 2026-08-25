@@ -1,0 +1,13 @@
+include LICENSE
+include NOTICE
+include CHANGELOG.md
+include CONTRIBUTING.md
+include SECURITY.md
+include Makefile
+include Dockerfile
+recursive-include docs *.md
+recursive-include deploy *.yml *.example
+recursive-include integration *.js
+recursive-include tests-js *.js
+recursive-include scripts *.py *.sh
+recursive-include benchmarks *.json

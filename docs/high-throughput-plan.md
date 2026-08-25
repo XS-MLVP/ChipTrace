@@ -2,15 +2,15 @@
 
 ## Scope and target
 
-Router V2 intentionally keeps two independent entrypoints:
+The deployment intentionally keeps two independent entrypoints:
 
 ```text
-18080 -> direct Sub2API path, no full-trace capture
-18084 -> Relay forwarding plus full-trace capture
+direct entrypoint  -> upstream path without full-trace capture
+capture entrypoint -> relay forwarding plus full-trace capture
 ```
 
 This plan does not merge, redirect, or police the direct path. It optimizes the
-capture and delivery path selected by clients that use `18084`.
+capture and delivery path selected by clients that use the capture entrypoint.
 
 The performance objective is measured as raw, uncompressed bytes consumed by
 the sealed-segment packer:
@@ -25,7 +25,7 @@ result is not an end-to-end packing result.
 
 ## Hardware boundary
 
-The current `open21` host has 16 physical cores, one SATA SSD, and a 1 Gbit/s
+The measured development host has 16 physical cores, one SATA SSD, and a 1 Gbit/s
 NIC. Its network line-rate ceiling is about 125 MB/s before protocol overhead,
 so this host cannot demonstrate the end-to-end target against NFS.
 
@@ -67,7 +67,7 @@ stretch rate as a backlog-drain capability rather than the normal arrival rate.
 client selecting capture entrypoint
               |
               v
-         18084 Relay
+        capture Relay
       streaming bounded tee
               |
               v
@@ -198,7 +198,7 @@ runs prove that the sharded software path can cross the stretch rate when I/O
 is removed. They do not prove cold-storage or 30-minute production throughput.
 The current 1GbE NIC remains a hard end-to-end limit.
 
-The machine-readable evidence is in `benchmarks/open21-20260825.json`.
+The machine-readable evidence is in `benchmarks/development-host-20260825.json`.
 
 ## Implementation status
 

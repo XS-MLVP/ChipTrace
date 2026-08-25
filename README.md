@@ -1,10 +1,11 @@
 # Trace Training Pipeline
 
-This repository is the isolated capture and training-data boundary for the
-Router V2 full interaction path. It is intentionally independent from the
-online relay deployment: the current relay is not modified by this repository.
-The direct `18080` entrypoint and capture-enabled `18084` entrypoint remain
-independent by design.
+> Status: Experimental Alpha. Persistent formats are versioned, but trajectory
+> and scoring fields may still change before the first stable release.
+
+This repository provides an isolated capture and training-data boundary for an
+agent relay. Direct traffic and capture-enabled traffic remain independent by
+design; deploying the collector does not require changing the direct path.
 
 The service accepts the existing Relay `POST /capture` envelope, normalizes it
 to the historical spool shape, keeps every valid response (including errors),
@@ -23,6 +24,7 @@ creating a second physical record.
 - SQLite integrity and source/hash/byte accounting suitable for later session
   assembly and evaluation;
 - bounded HTTP body memory, writer queue, and Relay retry queue;
+- a local disk outbox with restart recovery and byte-identical delivery retry;
 - independently compressed SQLite chunks for bounded-memory training reads;
 - complete-session release parts with automatic completeness scoring.
 
@@ -54,7 +56,7 @@ Export sealed data, then build the preferred complete-session release with:
 ```bash
 PYTHONPATH=src python3 -m trace_pipeline export \
   --root /data/capture --ledger /data/state/capture-ledger.sqlite \
-  --output /delivery/gpt-next-part-001.sqlite \
+  --output /delivery/target-model-part-001.sqlite \
   --compression-codec zstd --compression-level 1 \
   --compression-workers 8 --compression-batch-mib 256
 PYTHONPATH=src python3 -m trace_pipeline export-sharded \
@@ -64,9 +66,9 @@ PYTHONPATH=src python3 -m trace_pipeline export-sharded \
   --compression-codec zstd --compression-level 1 \
   --compression-workers-per-writer 2 --compression-batch-mib 256
 PYTHONPATH=src python3 -m trace_pipeline release \
-  --input /delivery/gpt-next-part-001.sqlite \
-  --output /release/router-v2-gpt-next-YYYYMMDD-v1 \
-  --model gpt-next-sol --target-part-gib 10
+  --input /delivery/target-model-part-001.sqlite \
+  --output /release/target-model-YYYYMMDD-v1 \
+  --model target-model-v1 --target-part-gib 10
 ```
 
 `release` selects every session containing the requested model, includes all
@@ -102,5 +104,5 @@ de-duplication, and evaluation checks.
 
 Read `docs/optimization-plan.md`, `docs/high-throughput-plan.md`,
 `docs/data-contract.md`, and `docs/rollout.md` before connecting the service to
-`18084`. The deployment examples are canary-only and are not enabled by this
-repository.
+a capture-enabled relay. Deployment examples are canary-only and are not
+enabled by this repository.

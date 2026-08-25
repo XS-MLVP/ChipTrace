@@ -42,7 +42,7 @@ def validate_compression(codec: str, level: int) -> tuple[str, int]:
     if not codec_available(normalized):
         raise CompressionError(
             "zstd compression requires the optional 'zstandard' package; "
-            "install router-v2-trace-training-pipeline[performance]"
+            "install agent-trace-training-pipeline[performance]"
         )
     return normalized, int(level)
 

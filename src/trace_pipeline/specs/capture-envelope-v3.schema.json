@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:trace-pipeline:capture-envelope:v3",
+  "title": "Trace capture envelope v3",
+  "type": "object",
+  "required": ["captureId"],
+  "properties": {
+    "captureId": {
+      "type": "string",
+      "pattern": "^cap-[A-Za-z0-9._:-]+$",
+      "maxLength": 256
+    },
+    "version": {
+      "type": "string",
+      "enum": ["capture-envelope-v3", "full-trace-spool-v3"]
+    },
+    "sourceNamespace": {"type": ["string", "null"], "maxLength": 256},
+    "startedAt": {"type": ["string", "null"]},
+    "finishedAt": {"type": ["string", "null"]},
+    "method": {"type": ["string", "null"]},
+    "inboundPath": {"type": ["string", "null"]},
+    "proxiedPath": {"type": ["string", "null"]},
+    "apiKeyFingerprint": {"type": ["string", "null"]},
+    "actor": {"type": ["object", "null"]},
+    "requestHeaders": {"type": "object"},
+    "requestBodyText": {"type": ["string", "null"]},
+    "requestTruncated": {"type": "boolean"},
+    "requestBytesCaptured": {"type": "integer", "minimum": 0},
+    "responseStatus": {
+      "oneOf": [
+        {"type": "integer", "minimum": 100, "maximum": 599},
+        {"type": "string", "pattern": "^[1-5][0-9]{2}$"},
+        {"type": "null"}
+      ]
+    },
+    "responseHeaders": {"type": "object"},
+    "responseBodyText": {"type": ["string", "null"]},
+    "responseTruncated": {"type": "boolean"},
+    "responseBytesCaptured": {"type": "integer", "minimum": 0},
+    "stream": {"type": "boolean"},
+    "captureError": {"type": ["string", "null"]},
+    "captureErrorCode": {"type": ["string", "null"]},
+    "traceContext": {
+      "type": "object",
+      "properties": {
+        "session_id": {"type": "string"},
+        "thread_id": {"type": "string"},
+        "root_session_id": {"type": "string"},
+        "parent_session_id": {"type": "string"},
+        "goal_id": {"type": "string"},
+        "turn_id": {"type": "string"},
+        "agent_id": {"type": "string"},
+        "branch_id": {"type": "string"},
+        "previous_response_id": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "observedLifecycleEvents": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  },
+  "additionalProperties": true
+}

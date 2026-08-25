@@ -19,11 +19,11 @@ except ImportError:  # pragma: no cover - optional performance dependency
     orjson = None
 
 
-CATALOG_FORMAT = "router-v2-session-sqlite-delivery-v2"
-CATALOG_SCHEMA_VERSION = "session-catalog-v2"
+CATALOG_FORMAT = "agent-session-sqlite-delivery-v3"
+CATALOG_SCHEMA_VERSION = "session-catalog-v3"
 QUALITY_POLICY_VERSION = "session-trace-completeness-v1"
 SESSION_DEFINITION = (
-    "sha256(client_metadata.session_id or client_metadata.thread_id); "
+    "sha256(source_namespace + NUL + (client_metadata.session_id or client_metadata.thread_id)); "
     "one orphan session per capture when both are absent"
 )
 TRAJECTORY_DEFINITION = SESSION_DEFINITION
@@ -75,7 +75,8 @@ CREATE TABLE shards(
   total_tokens INTEGER NOT NULL,payload_table TEXT NOT NULL,payload_codec TEXT NOT NULL
 );
 CREATE TABLE trajectories(
-  traj_id TEXT PRIMARY KEY,shard_id INTEGER NOT NULL,turns INTEGER NOT NULL,
+  traj_id TEXT PRIMARY KEY,source_namespace TEXT NOT NULL,
+  shard_id INTEGER NOT NULL,turns INTEGER NOT NULL,
   steps INTEGER NOT NULL,first_event_utc TEXT,last_event_utc TEXT,
   first_step_id TEXT NOT NULL,last_step_id TEXT NOT NULL,raw_bytes INTEGER NOT NULL,
   stored_bytes INTEGER NOT NULL,parse_ok_steps INTEGER NOT NULL,
@@ -117,7 +118,10 @@ CREATE TABLE steps(
   terminal_completed INTEGER NOT NULL,terminal_matches_source_index INTEGER NOT NULL,
   payload_parse_ok INTEGER NOT NULL,sse_parse_errors INTEGER NOT NULL,
   request_truncated INTEGER NOT NULL,response_truncated INTEGER NOT NULL,
-  capture_error_present INTEGER NOT NULL,thread_id_present INTEGER NOT NULL,
+  capture_error_present INTEGER NOT NULL,source_namespace TEXT NOT NULL,
+  response_id TEXT,previous_response_id TEXT,session_id TEXT,thread_id TEXT,
+  root_session_id TEXT,parent_session_id TEXT,goal_id TEXT,agent_id TEXT,branch_id TEXT,
+  thread_id_present INTEGER NOT NULL,
   turn_id_present INTEGER NOT NULL,subagent_present INTEGER NOT NULL,
   request_input_items INTEGER NOT NULL,prior_history_items INTEGER NOT NULL,
   compaction_items INTEGER NOT NULL,output_items INTEGER NOT NULL,
@@ -150,10 +154,22 @@ CREATE TABLE tool_calls(
   call_id_present INTEGER NOT NULL,argument_bytes INTEGER NOT NULL,
   argument_sha256 TEXT,arguments_complete INTEGER NOT NULL,
   result_present INTEGER NOT NULL DEFAULT 0,
+  definition_present INTEGER NOT NULL DEFAULT 0,
+  linkage_status TEXT NOT NULL DEFAULT 'open_tail'
+    CHECK(linkage_status IN ('executed','abandoned_concurrent','abandoned_retry','open_tail','capture_gap')),
   FOREIGN KEY(shard_id) REFERENCES shards(shard_id),
   FOREIGN KEY(traj_id) REFERENCES trajectories(traj_id),
   FOREIGN KEY(turn_key) REFERENCES turns(turn_key),
   FOREIGN KEY(source_step_id) REFERENCES steps(step_id)
+) WITHOUT ROWID;
+CREATE TABLE tool_definitions(
+  definition_key TEXT PRIMARY KEY,traj_id TEXT NOT NULL,tool_name TEXT NOT NULL,
+  tool_type TEXT,schema_version TEXT,description_present INTEGER NOT NULL,
+  parameters_present INTEGER NOT NULL,
+  definition_bytes INTEGER NOT NULL,definition_sha256 TEXT NOT NULL,
+  first_seen_step_id TEXT NOT NULL,
+  FOREIGN KEY(traj_id) REFERENCES trajectories(traj_id),
+  FOREIGN KEY(first_seen_step_id) REFERENCES steps(step_id)
 ) WITHOUT ROWID;
 CREATE TABLE tool_results(
   call_key TEXT PRIMARY KEY,traj_id TEXT NOT NULL,turn_key TEXT,
@@ -164,6 +180,29 @@ CREATE TABLE tool_results(
   FOREIGN KEY(traj_id) REFERENCES trajectories(traj_id),
   FOREIGN KEY(turn_key) REFERENCES turns(turn_key),
   FOREIGN KEY(first_seen_step_id) REFERENCES steps(step_id)
+) WITHOUT ROWID;
+CREATE TABLE trajectory_edges(
+  parent_step_id TEXT NOT NULL,child_step_id TEXT NOT NULL,
+  edge_type TEXT NOT NULL,edge_identity TEXT,
+  PRIMARY KEY(parent_step_id,child_step_id,edge_type),
+  FOREIGN KEY(parent_step_id) REFERENCES steps(step_id),
+  FOREIGN KEY(child_step_id) REFERENCES steps(step_id)
+) WITHOUT ROWID;
+CREATE TABLE session_relations(
+  parent_traj_id TEXT NOT NULL,child_traj_id TEXT NOT NULL,
+  relation_type TEXT NOT NULL CHECK(relation_type IN ('root_session','parent_session')),
+  relation_identity TEXT NOT NULL,observed_step_id TEXT NOT NULL,
+  parent_present INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(parent_traj_id,child_traj_id,relation_type),
+  FOREIGN KEY(child_traj_id) REFERENCES trajectories(traj_id),
+  FOREIGN KEY(observed_step_id) REFERENCES steps(step_id)
+) WITHOUT ROWID;
+CREATE TABLE lifecycle_events(
+  event_key TEXT PRIMARY KEY,traj_id TEXT NOT NULL,step_id TEXT NOT NULL,
+  event_index INTEGER NOT NULL,event_type TEXT NOT NULL,event_source TEXT NOT NULL,
+  UNIQUE(step_id,event_index,event_type),
+  FOREIGN KEY(traj_id) REFERENCES trajectories(traj_id),
+  FOREIGN KEY(step_id) REFERENCES steps(step_id)
 ) WITHOUT ROWID;
 CREATE TABLE trajectory_quality(
   traj_id TEXT PRIMARY KEY,policy_version TEXT NOT NULL,structural_score REAL NOT NULL,
@@ -409,29 +448,87 @@ def parse_response_body(value: Any) -> dict[str, Any]:
     return {"terminal_type": "missing", "response": {}, "output": [], "output_indexes": [], "parse_errors": 0}
 
 
+def tool_definition_summary(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    nested = value.get("function") if isinstance(value.get("function"), dict) else value
+    name = nonempty_string(nested.get("name") or value.get("name"))
+    if name is None:
+        return None
+    description = nonempty_string(nested.get("description") or value.get("description"))
+    parameters = nested.get("parameters") if "parameters" in nested else value.get("parameters")
+    raw = canonical_bytes(value)
+    return {
+        "name": name,
+        "type": nonempty_string(value.get("type")),
+        "schema_version": nonempty_string(
+            value.get("schema_version")
+            or value.get("schemaVersion")
+            or value.get("version")
+            or nested.get("schema_version")
+            or nested.get("schemaVersion")
+            or nested.get("version")
+        ),
+        "description_present": int(description is not None),
+        "parameters_present": int(isinstance(parameters, dict)),
+        "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def request_context(request: Any) -> dict[str, Any]:
     request_obj = as_dict(request)
     metadata = as_dict(request_obj.get("client_metadata"))
     raw_input = request_obj.get("input")
     items = raw_input if isinstance(raw_input, list) else ([raw_input] if raw_input is not None else [])
     counts = Counter(item_type(item) for item in items)
+    raw_tools: list[Any] = []
+    for field in ("tools", "additional_tools"):
+        candidate = request_obj.get(field)
+        if isinstance(candidate, list):
+            raw_tools.extend(candidate)
+    tool_definitions = [
+        definition
+        for item in raw_tools
+        if (definition := tool_definition_summary(item)) is not None
+    ]
     prior = sum(
         count
         for kind, count in counts.items()
         if kind in HISTORY_ITEM_TYPES or is_tool_call_type(kind) or is_tool_result_type(kind)
     )
+    session_id = nonempty_string(metadata.get("session_id") or metadata.get("sessionId"))
+    thread_id = nonempty_string(metadata.get("thread_id") or metadata.get("threadId"))
+
+    def metadata_identity(name: str, camel_name: str) -> str | None:
+        return nonempty_string(
+            metadata.get(name)
+            or metadata.get(camel_name)
+            or request_obj.get(name)
+            or request_obj.get(camel_name)
+        )
+
     return {
         "items": items,
         "item_counts": counts,
         "prior_history_items": prior,
         "compaction_items": sum(counts.get(kind, 0) for kind in COMPACTION_ITEM_TYPES),
-        "thread_id": nonempty_string(
-            metadata.get("session_id")
-            or metadata.get("sessionId")
-            or metadata.get("thread_id")
-            or metadata.get("threadId")
-        ),
+        "session_id": session_id,
+        "thread_id": thread_id,
+        "session_identity": session_id or thread_id,
+        "root_session_id": metadata_identity("root_session_id", "rootSessionId"),
+        "parent_session_id": metadata_identity("parent_session_id", "parentSessionId"),
+        "goal_id": metadata_identity("goal_id", "goalId"),
+        "agent_id": metadata_identity("agent_id", "agentId"),
+        "branch_id": metadata_identity("branch_id", "branchId"),
         "turn_id": nonempty_string(metadata.get("turn_id") or metadata.get("turnId")),
+        "previous_response_id": nonempty_string(
+            request_obj.get("previous_response_id")
+            or request_obj.get("previousResponseId")
+            or metadata.get("previous_response_id")
+            or metadata.get("previousResponseId")
+        ),
+        "tool_definitions": tool_definitions,
         "subagent_present": int(
             metadata.get("x-openai-subagent") not in (None, "", False, "false", "0")
         ),
@@ -612,9 +709,26 @@ def record_and_context(raw_record: RawRecord) -> tuple[dict[str, Any], dict[str,
     if value.get("captureId") != raw_record.capture_id:
         raise RuntimeError(f"capture identity mismatch: {raw_record.capture_id}")
     context = request_context(body_value(value.get("requestBody")))
-    thread_id = context["thread_id"]
-    if thread_id is not None:
-        traj_id = f"session-{digest_parts(thread_id)}"
+    captured_context = as_dict(value.get("traceContext"))
+    for field in (
+        "session_id",
+        "thread_id",
+        "root_session_id",
+        "parent_session_id",
+        "goal_id",
+        "turn_id",
+        "agent_id",
+        "branch_id",
+        "previous_response_id",
+    ):
+        if context.get(field) is None:
+            context[field] = nonempty_string(captured_context.get(field))
+    context["session_identity"] = context.get("session_id") or context.get("thread_id")
+    source_namespace = nonempty_string(value.get("sourceNamespace")) or raw_record.api_key_fingerprint or "default"
+    context["source_namespace"] = source_namespace
+    session_identity = context["session_identity"]
+    if session_identity is not None:
+        traj_id = f"session-{digest_parts(source_namespace, session_identity)}"
     else:
         # The prefix is an explicit quality flag, not a fabricated thread ID.
         traj_id = f"orphan-{digest_parts(raw_record.capture_id)}"
@@ -735,7 +849,10 @@ def _insert_tool_call(
             raise RuntimeError(f"tool call changed for call key {call_key}")
         return
     conn.execute(
-        "INSERT INTO tool_calls VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+        "INSERT INTO tool_calls("
+        "call_key,traj_id,turn_key,source_step_id,shard_id,record_id,output_index,"
+        "call_type,tool_name,call_id_present,argument_bytes,argument_sha256,arguments_complete"
+        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             call_key,
             traj_id,
@@ -751,6 +868,60 @@ def _insert_tool_call(
             argument_sha256,
             int(arguments_complete),
         ),
+    )
+
+
+def _insert_tool_definition(
+    conn: sqlite3.Connection,
+    *,
+    traj_id: str,
+    step_id: str,
+    definition: dict[str, Any],
+) -> None:
+    definition_key = digest_parts(traj_id, definition["name"], definition["sha256"])
+    existing = conn.execute(
+        "SELECT tool_name,tool_type,schema_version,description_present,parameters_present,"
+        "definition_bytes,definition_sha256 FROM tool_definitions WHERE definition_key=?",
+        (definition_key,),
+    ).fetchone()
+    expected = (
+        definition["name"],
+        definition["type"],
+        definition["schema_version"],
+        definition["description_present"],
+        definition["parameters_present"],
+        definition["bytes"],
+        definition["sha256"],
+    )
+    if existing is not None:
+        if tuple(existing) != expected:
+            raise RuntimeError(f"tool definition changed for key {definition_key}")
+        return
+    conn.execute(
+        "INSERT INTO tool_definitions VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (definition_key, traj_id, *expected, step_id),
+    )
+
+
+def _insert_session_relation(
+    conn: sqlite3.Connection,
+    *,
+    source_namespace: str,
+    child_traj_id: str,
+    relation_type: str,
+    relation_identity: str | None,
+    step_id: str,
+) -> None:
+    if relation_identity is None:
+        return
+    parent_traj_id = f"session-{digest_parts(source_namespace, relation_identity)}"
+    if parent_traj_id == child_traj_id:
+        return
+    conn.execute(
+        "INSERT OR IGNORE INTO session_relations("
+        "parent_traj_id,child_traj_id,relation_type,relation_identity,observed_step_id"
+        ") VALUES(?,?,?,?,?)",
+        (parent_traj_id, child_traj_id, relation_type, relation_identity, step_id),
     )
 
 
@@ -772,6 +943,49 @@ def process_record(
     usage = usage_from_response(response)
     terminal_type = str(parsed_response["terminal_type"])
     step_id = raw_record.capture_id
+
+    lifecycle_events = value.get("observedLifecycleEvents")
+    if isinstance(lifecycle_events, list):
+        for event_index, raw_event_type in enumerate(lifecycle_events):
+            event_type = nonempty_string(raw_event_type)
+            if event_type is None:
+                continue
+            conn.execute(
+                "INSERT INTO lifecycle_events VALUES(?,?,?,?,?,?)",
+                (
+                    digest_parts(step_id, str(event_index), event_type),
+                    traj_id,
+                    step_id,
+                    event_index,
+                    event_type,
+                    "capture_envelope_observation",
+                ),
+            )
+
+    _insert_session_relation(
+        conn,
+        source_namespace=context["source_namespace"],
+        child_traj_id=traj_id,
+        relation_type="root_session",
+        relation_identity=context["root_session_id"],
+        step_id=step_id,
+    )
+    _insert_session_relation(
+        conn,
+        source_namespace=context["source_namespace"],
+        child_traj_id=traj_id,
+        relation_type="parent_session",
+        relation_identity=context["parent_session_id"],
+        step_id=step_id,
+    )
+
+    for definition in context["tool_definitions"]:
+        _insert_tool_definition(
+            conn,
+            traj_id=traj_id,
+            step_id=step_id,
+            definition=definition,
+        )
 
     history_results = 0
     new_results = 0
@@ -835,13 +1049,7 @@ def process_record(
             (step_id, "response_output", kind, count),
         )
 
-    conn.execute(
-        """
-        INSERT INTO steps VALUES(
-          ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
-        )
-        """,
-        (
+    step_values = (
             step_id,
             raw_record.shard_id,
             raw_record.record_id,
@@ -869,7 +1077,17 @@ def process_record(
             int(bool(value.get("requestTruncated"))),
             int(bool(value.get("responseTruncated"))),
             int(bool(value.get("captureError"))),
-            int(context["thread_id"] is not None),
+            context["source_namespace"],
+            nonempty_string(response.get("id")),
+            context["previous_response_id"],
+            context["session_id"],
+            context["thread_id"],
+            context["root_session_id"],
+            context["parent_session_id"],
+            context["goal_id"],
+            context["agent_id"],
+            context["branch_id"],
+            int(context["session_identity"] is not None),
             int(context["turn_id"] is not None),
             int(context["subagent_present"]),
             len(context["items"]),
@@ -884,7 +1102,10 @@ def process_record(
             history_results,
             new_results,
             int(bool(value.get("stream"))),
-        ),
+        )
+    conn.execute(
+        f"INSERT INTO steps VALUES({','.join('?' for _ in step_values)})",
+        step_values,
     )
     conn.execute(
         "INSERT INTO step_usage VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -911,6 +1132,71 @@ def aggregate_catalog(conn: sqlite3.Connection, projection_mode: str) -> None:
     )
     conn.execute(
         "UPDATE tool_results SET matched_call=EXISTS(SELECT 1 FROM tool_calls c WHERE c.call_key=tool_results.call_key)"
+    )
+    conn.execute(
+        """
+        UPDATE tool_calls SET definition_present=EXISTS(
+          SELECT 1
+            FROM tool_definitions d
+            JOIN steps definition_step ON definition_step.step_id=d.first_seen_step_id
+            JOIN steps call_step ON call_step.step_id=tool_calls.source_step_id
+           WHERE d.traj_id=tool_calls.traj_id
+             AND d.tool_name=tool_calls.tool_name
+             AND definition_step.step_index<=call_step.step_index
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO trajectory_edges(parent_step_id,child_step_id,edge_type,edge_identity)
+        SELECT parent.step_id,child.step_id,'previous_response',child.previous_response_id
+          FROM steps child
+          JOIN steps parent
+            ON parent.traj_id=child.traj_id
+           AND parent.response_id=child.previous_response_id
+         WHERE child.previous_response_id IS NOT NULL
+        """
+    )
+    if projection_mode == "exact-model-projection":
+        conn.execute(
+            "UPDATE tool_calls SET linkage_status=CASE WHEN result_present=1 "
+            "THEN 'executed' ELSE 'capture_gap' END"
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE tool_calls SET linkage_status=CASE
+              WHEN result_present=1 THEN 'executed'
+              WHEN EXISTS(
+                SELECT 1 FROM steps source
+                JOIN steps child
+                  ON child.traj_id=source.traj_id
+                 AND child.previous_response_id=source.response_id
+                WHERE source.step_id=tool_calls.source_step_id
+                GROUP BY source.step_id HAVING count(*)>1
+              ) THEN 'abandoned_concurrent'
+              WHEN EXISTS(
+                SELECT 1 FROM steps source
+                JOIN steps sibling
+                  ON sibling.traj_id=source.traj_id
+                 AND sibling.previous_response_id=source.previous_response_id
+                 AND sibling.step_index>source.step_index
+                WHERE source.step_id=tool_calls.source_step_id
+                  AND source.previous_response_id IS NOT NULL
+              ) THEN 'abandoned_retry'
+              WHEN (SELECT source.step_index=(SELECT max(last_step.step_index)
+                                               FROM steps last_step
+                                              WHERE last_step.traj_id=source.traj_id)
+                      FROM steps source
+                     WHERE source.step_id=tool_calls.source_step_id)
+              THEN 'open_tail'
+              ELSE 'capture_gap'
+            END
+            """
+        )
+    conn.execute(
+        "UPDATE session_relations SET parent_present=EXISTS("
+        "SELECT 1 FROM steps parent WHERE parent.traj_id=session_relations.parent_traj_id)"
     )
     conn.execute(
         """
@@ -944,7 +1230,7 @@ def aggregate_catalog(conn: sqlite3.Connection, projection_mode: str) -> None:
     conn.execute(
         """
         INSERT INTO trajectories(
-          traj_id,shard_id,turns,steps,first_event_utc,last_event_utc,first_step_id,last_step_id,
+          traj_id,source_namespace,shard_id,turns,steps,first_event_utc,last_event_utc,first_step_id,last_step_id,
           raw_bytes,stored_bytes,parse_ok_steps,truncated_steps,thread_id_present_steps,
           turn_id_present_steps,terminal_present_steps,terminal_completed_steps,terminal_failed_steps,
           usage_present_steps,compaction_steps,subagent_steps,final_message_steps,tool_calls,
@@ -952,7 +1238,7 @@ def aggregate_catalog(conn: sqlite3.Connection, projection_mode: str) -> None:
           cache_write_tokens,uncached_input_tokens,output_tokens,reasoning_tokens,total_tokens,
           left_censored,right_censored,closed,projection_mode,projection_gap_status,reward,reward_source
         )
-        SELECT s.traj_id,min(s.shard_id),count(DISTINCT s.turn_key),count(*),min(s.event_ts),max(s.event_ts),
+        SELECT s.traj_id,min(s.source_namespace),min(s.shard_id),count(DISTINCT s.turn_key),count(*),min(s.event_ts),max(s.event_ts),
                '', '',sum(s.raw_bytes),sum(s.stored_bytes),sum(s.payload_parse_ok),
                sum(s.request_truncated OR s.response_truncated),sum(s.thread_id_present),
                sum(s.turn_id_present),sum(s.terminal_present),sum(s.terminal_completed),
@@ -1096,7 +1382,14 @@ def create_indexes(conn: sqlite3.Connection) -> None:
         CREATE INDEX usage_present_idx ON step_usage(usage_present,step_id);
         CREATE INDEX item_counts_type_idx ON step_item_counts(direction,item_type,step_id);
         CREATE INDEX tool_calls_traj_idx ON tool_calls(traj_id,source_step_id);
+        CREATE INDEX tool_calls_linkage_idx ON tool_calls(linkage_status,traj_id);
+        CREATE INDEX tool_definitions_name_idx ON tool_definitions(traj_id,tool_name);
         CREATE INDEX tool_results_traj_idx ON tool_results(traj_id,first_seen_step_id);
+        CREATE INDEX steps_response_id_idx ON steps(traj_id,response_id);
+        CREATE INDEX steps_previous_response_idx ON steps(traj_id,previous_response_id);
+        CREATE INDEX trajectory_edges_child_idx ON trajectory_edges(child_step_id,edge_type);
+        CREATE INDEX session_relations_child_idx ON session_relations(child_traj_id,relation_type);
+        CREATE INDEX lifecycle_events_type_idx ON lifecycle_events(event_type,traj_id,step_id);
         """
     )
 
@@ -1159,6 +1452,15 @@ def validate_catalog(
         ),
         validation_row(
             conn,
+            "trajectory_source_namespace_consistency",
+            conn.execute(
+                "SELECT count(*) FROM (SELECT traj_id FROM steps GROUP BY traj_id "
+                "HAVING count(DISTINCT source_namespace)>1)"
+            ).fetchone()[0],
+            0,
+        ),
+        validation_row(
+            conn,
             "duplicate_capture_ids",
             conn.execute(
                 "SELECT count(*) FROM (SELECT step_id FROM steps GROUP BY step_id HAVING count(*)>1)"
@@ -1203,6 +1505,31 @@ def validate_catalog(
             "shard_record_aggregate",
             conn.execute("SELECT coalesce(sum(records),0) FROM shards").fetchone()[0],
             selected_records,
+        ),
+        validation_row(
+            conn,
+            "tool_linkage_status_aggregate",
+            conn.execute("SELECT count(*) FROM tool_calls WHERE linkage_status IS NOT NULL").fetchone()[0],
+            conn.execute("SELECT count(*) FROM tool_calls").fetchone()[0],
+        ),
+        validation_row(
+            conn,
+            "trajectory_edges_cross_session",
+            conn.execute(
+                "SELECT count(*) FROM trajectory_edges e "
+                "JOIN steps p ON p.step_id=e.parent_step_id "
+                "JOIN steps c ON c.step_id=e.child_step_id WHERE p.traj_id<>c.traj_id"
+            ).fetchone()[0],
+            0,
+        ),
+        validation_row(
+            conn,
+            "lifecycle_events_step_coverage",
+            conn.execute(
+                "SELECT count(*) FROM lifecycle_events e WHERE NOT EXISTS("
+                "SELECT 1 FROM steps s WHERE s.step_id=e.step_id AND s.traj_id=e.traj_id)"
+            ).fetchone()[0],
+            0,
         ),
     ]
     if projection_mode == "exact-model-projection":
@@ -1258,6 +1585,43 @@ def validate_catalog(
             0,
             warning=True,
             details="synthetic per-step call keys are retained but lower identity quality",
+        )
+    )
+    statuses.append(
+        validation_row(
+            conn,
+            "tool_calls_without_prior_definition",
+            conn.execute("SELECT count(*) FROM tool_calls WHERE definition_present=0").fetchone()[0],
+            0,
+            warning=True,
+            details="the source request did not contain a matching tool schema before the call",
+        )
+    )
+    statuses.append(
+        validation_row(
+            conn,
+            "duplicate_response_ids",
+            conn.execute(
+                "SELECT count(*) FROM (SELECT traj_id,response_id FROM steps "
+                "WHERE response_id IS NOT NULL GROUP BY traj_id,response_id HAVING count(*)>1)"
+            ).fetchone()[0],
+            0,
+            warning=True,
+            details="duplicate response IDs make previous-response DAG linkage ambiguous",
+        )
+    )
+    statuses.append(
+        validation_row(
+            conn,
+            "unresolved_previous_response_ids",
+            conn.execute(
+                "SELECT count(*) FROM steps child WHERE child.previous_response_id IS NOT NULL "
+                "AND NOT EXISTS(SELECT 1 FROM steps parent WHERE parent.traj_id=child.traj_id "
+                "AND parent.response_id=child.previous_response_id)"
+            ).fetchone()[0],
+            0,
+            warning=True,
+            details="the parent response may be outside the selected projection or capture boundary",
         )
     )
     statuses.append(
@@ -1445,6 +1809,11 @@ def build_trajectory_catalog(
         put_meta(conn, "trajectory_id_definition", TRAJECTORY_DEFINITION)
         put_meta(conn, "session_id_definition", SESSION_DEFINITION)
         put_meta(conn, "turn_id_definition", TURN_DEFINITION)
+        put_meta(conn, "source_namespace_definition", "explicit envelope sourceNamespace, then source fingerprint, then default")
+        put_meta(conn, "response_dag_definition", "trajectory_edges links observed previous_response_id to an observed response_id in one session")
+        put_meta(conn, "session_relation_definition", "root/parent session identifiers are namespaced and may reference a session outside the projection")
+        put_meta(conn, "lifecycle_event_definition", "only event types directly observed in captured request or response payloads")
+        put_meta(conn, "tool_linkage_statuses", ["executed", "abandoned_concurrent", "abandoned_retry", "open_tail", "capture_gap"])
         put_meta(conn, "quality_policy_version", QUALITY_POLICY_VERSION)
         put_meta(conn, "semantic_reward_available", False)
         put_meta(conn, "reasoning_plaintext_claimed", False)

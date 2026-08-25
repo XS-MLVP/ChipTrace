@@ -108,7 +108,7 @@ class CompleteSessionReleaseTest(unittest.TestCase):
             "cap-release-session-a-1",
             thread_id="session-a",
             turn_id="turn-a",
-            model="gpt-5.6-sol",
+            model="target-model-v1",
             timestamp="2026-08-25T00:00:00Z",
             request_items=[{"type": "message", "role": "user", "content": "question"}],
             output_item=call,
@@ -117,7 +117,7 @@ class CompleteSessionReleaseTest(unittest.TestCase):
             "cap-release-unrelated",
             thread_id="session-unrelated",
             turn_id="turn-x",
-            model="gpt-helper",
+            model="helper-model-v1",
             timestamp="2026-08-25T00:00:01Z",
             request_items=[{"type": "message", "role": "user", "content": "ignore"}],
             output_item={
@@ -131,7 +131,7 @@ class CompleteSessionReleaseTest(unittest.TestCase):
             "cap-release-session-a-2",
             thread_id="session-a",
             turn_id="turn-a",
-            model="gpt-helper",
+            model="helper-model-v1",
             timestamp="2026-08-25T00:00:02Z",
             request_items=[
                 {"type": "message", "role": "user", "content": "question"},
@@ -153,7 +153,7 @@ class CompleteSessionReleaseTest(unittest.TestCase):
             "cap-release-session-b-1",
             thread_id="session-b",
             turn_id="turn-b",
-            model="gpt-5.6-sol",
+            model="target-model-v1",
             timestamp="2026-08-25T00:00:03Z",
             request_items=[{"type": "message", "role": "user", "content": "fails"}],
             output_item=None,
@@ -167,7 +167,7 @@ class CompleteSessionReleaseTest(unittest.TestCase):
         result = build_session_release(
             [self.raw_a, self.raw_b],
             self.release,
-            model_exact="gpt-5.6-sol",
+            model_exact="target-model-v1",
             target_part_bytes=1,
             release_id="session-release-test-v1",
         )
@@ -181,7 +181,7 @@ class CompleteSessionReleaseTest(unittest.TestCase):
         manifest = json.loads((self.release / "manifest.json").read_text())
         self.assertTrue(manifest["session_atomic"])
         self.assertEqual(manifest["session_split_count"], 0)
-        self.assertEqual(manifest["models_present"], ["gpt-5.6-sol", "gpt-helper"])
+        self.assertEqual(manifest["models_present"], ["helper-model-v1", "target-model-v1"])
         self.assertEqual(manifest["session_quality"]["average"], 100.0)
         self.assertFalse(manifest["semantic_reward_available"])
         self.assertEqual(manifest["source_records_scanned"], 5)
@@ -247,7 +247,7 @@ class CompleteSessionReleaseTest(unittest.TestCase):
             build_session_release(
                 [self.raw_a, self.raw_b],
                 self.release,
-                model_exact="gpt-5.6-sol",
+                model_exact="target-model-v1",
             )
 
     def test_conflicting_capture_across_inputs_aborts_without_release(self) -> None:
@@ -255,7 +255,7 @@ class CompleteSessionReleaseTest(unittest.TestCase):
             "cap-release-conflict",
             thread_id="session-conflict",
             turn_id="turn-conflict",
-            model="gpt-5.6-sol",
+            model="target-model-v1",
             timestamp="2026-08-25T00:00:00Z",
             request_items=[{"type": "message", "role": "user", "content": "question"}],
             output_item={
@@ -274,7 +274,7 @@ class CompleteSessionReleaseTest(unittest.TestCase):
             build_session_release(
                 [self.raw_a, self.raw_b],
                 self.release,
-                model_exact="gpt-5.6-sol",
+                model_exact="target-model-v1",
             )
         self.assertIn("captureId conflict", str(context.exception))
         self.assertFalse(self.release.exists())
@@ -284,7 +284,7 @@ class CompleteSessionReleaseTest(unittest.TestCase):
             "cap-release-open-tool",
             thread_id="session-open-tool",
             turn_id="turn-open-tool",
-            model="gpt-5.6-sol",
+            model="target-model-v1",
             timestamp="2026-08-25T00:00:00Z",
             request_items=[{"type": "message", "role": "user", "content": "question"}],
             output_item={
@@ -298,7 +298,7 @@ class CompleteSessionReleaseTest(unittest.TestCase):
         result = build_session_release(
             [self.raw_a],
             self.release,
-            model_exact="gpt-5.6-sol",
+            model_exact="target-model-v1",
         )
 
         self.assertEqual(result["records"], 1)
@@ -317,7 +317,7 @@ class CompleteSessionReleaseTest(unittest.TestCase):
             "cap-release-model-fallback",
             thread_id="session-model-fallback",
             turn_id="turn-model-fallback",
-            model="gpt-5.6-sol",
+            model="target-model-v1",
             timestamp="2026-08-25T00:00:00Z",
             request_items=[{"type": "message", "role": "user", "content": "question"}],
             output_item={
@@ -335,12 +335,12 @@ class CompleteSessionReleaseTest(unittest.TestCase):
         result = build_session_release(
             [self.raw_a],
             self.release,
-            model_exact="gpt-5.6-sol",
+            model_exact="target-model-v1",
         )
         self.assertEqual(result["records"], 1)
         part = json.loads((self.release / "manifest.json").read_text())["parts"][0]["file"]
         with sqlite3.connect(self.release / part) as conn:
-            self.assertEqual(conn.execute("SELECT model FROM interactions").fetchone()[0], "gpt-5.6-sol")
+            self.assertEqual(conn.execute("SELECT model FROM interactions").fetchone()[0], "target-model-v1")
 
 
 if __name__ == "__main__":

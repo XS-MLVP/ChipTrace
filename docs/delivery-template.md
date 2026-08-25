@@ -24,8 +24,8 @@ Build the directory atomically with:
 ```bash
 trace-pipeline release \
   --input raw-001.sqlite --input raw-002.sqlite \
-  --output router-v2-gpt-next-YYYYMMDD-v1 \
-  --model gpt-next-sol --target-part-gib 10
+  --output target-model-YYYYMMDD-v1 \
+  --model target-model-v1 --target-part-gib 10
 ```
 
 ## Manifest
@@ -34,13 +34,13 @@ trace-pipeline release \
 
 ```json
 {
-  "release_id": "router-v2-gpt-next-YYYYMMDD-v1",
+  "release_id": "target-model-YYYYMMDD-v1",
   "schema_version": "complete-session-release-v1",
-  "selection": {"model": "gpt-next-sol", "mode": "complete-session"},
+  "selection": {"model": "target-model-v1", "mode": "complete-session"},
   "session_atomic": true,
   "session_split_count": 0,
   "actual_window": {"start": "...", "end": "..."},
-  "models_present": ["gpt-next-sol", "gpt-helper"],
+  "models_present": ["target-model-v1", "helper-model-v1"],
   "sensitive_raw_data": true,
   "semantic_reward_available": false,
   "score_semantics": "observed session trace completeness; not task correctness",
@@ -56,11 +56,11 @@ trace-pipeline release \
   "sessions": 0,
   "token_totals": {},
   "parts": [
-    {"file": "gpt-next-sol-part-001.sqlite", "bytes": 0, "sha256": "..."}
+    {"file": "target-model-v1-part-001.sqlite", "bytes": 0, "sha256": "..."}
   ],
   "catalog": {
     "file": "session-catalog.sqlite",
-    "schema_version": "session-catalog-v2",
+    "schema_version": "session-catalog-v3",
     "bytes": 0,
     "sha256": "..."
   },
@@ -86,7 +86,7 @@ The catalog contains no duplicate captures. It points to raw records by
 Identity is versioned:
 
 ```text
-session_id = sha256(client_metadata.session_id or thread_id)
+session_id = sha256(source_namespace + NUL + (client_metadata.session_id or thread_id))
 turn_key   = sha256(session_id + NUL + stable_turn_id)
 step_id  = captureId
 call_key = sha256(session_id + NUL + native_call_id)

@@ -275,6 +275,34 @@ os._exit(0)
         recovered.close()
         self.assertTrue(audit_root(self.root)["ok"])
 
+    def test_unknown_ledger_schema_is_rejected_without_overwrite(self) -> None:
+        state = self.root / "state"
+        state.mkdir(parents=True)
+        ledger = state / "capture-ledger.sqlite"
+        with sqlite3.connect(ledger) as conn:
+            conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID")
+            conn.execute("INSERT INTO meta VALUES('ledger_schema_version','future-ledger-v99')")
+        with self.assertRaises(StoreError):
+            self.store()
+        with sqlite3.connect(ledger) as conn:
+            value = conn.execute("SELECT value FROM meta WHERE key='ledger_schema_version'").fetchone()[0]
+        self.assertEqual(value, "future-ledger-v99")
+
+    def test_known_legacy_ledger_metadata_is_migrated(self) -> None:
+        state = self.root / "state"
+        state.mkdir(parents=True)
+        ledger = state / "capture-ledger.sqlite"
+        with sqlite3.connect(ledger) as conn:
+            conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID")
+            conn.execute("INSERT INTO meta VALUES('schema_version','router-v2-capture-envelope-v3')")
+        store = self.store()
+        health = store.health()
+        store.close()
+        self.assertEqual(health["ledger_schema_version"], "capture-ledger-v1")
+        with sqlite3.connect(ledger) as conn:
+            migrations = conn.execute("SELECT version FROM schema_migrations").fetchall()
+        self.assertEqual(migrations, [("capture-ledger-v1",)])
+
 
 if __name__ == "__main__":
     unittest.main()

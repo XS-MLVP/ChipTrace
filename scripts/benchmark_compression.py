@@ -23,7 +23,7 @@ MIB = 1024 * 1024
 
 def trace_json_chunk(size: int, index: int) -> bytes:
     prefix = (
-        f'{{"captureId":"cap-benchmark-{index:04d}","model":"gpt-next-sol",'
+        f'{{"captureId":"cap-benchmark-{index:04d}","model":"target-model-v1",'
         '"requestBody":{"kind":"json","value":{"input":"'
     ).encode()
     middle = b'","opaque":"'

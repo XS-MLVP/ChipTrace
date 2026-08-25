@@ -11,7 +11,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .model import SCHEMA_VERSION, canonical_envelope, envelope_metadata, utc_now, validate_envelope
+from .model import (
+    CAPTURE_ENVELOPE_SCHEMA_VERSION,
+    SUPPORTED_RECORD_VERSIONS,
+    canonical_envelope,
+    envelope_metadata,
+    utc_now,
+    validate_envelope,
+)
+
+
+LEDGER_SCHEMA_VERSION = "capture-ledger-v1"
 
 
 class StoreError(RuntimeError):
@@ -62,6 +72,10 @@ PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version TEXT PRIMARY KEY,
+  applied_at TEXT NOT NULL
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS segments (
   segment_id INTEGER PRIMARY KEY,
@@ -182,11 +196,33 @@ class CaptureStore:
         self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA temp_store=MEMORY")
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID"
+        )
+        current_ledger = self._meta_value("ledger_schema_version")
+        legacy_version = self._meta_value("schema_version")
+        if current_ledger is not None and current_ledger != LEDGER_SCHEMA_VERSION:
+            self._conn.close()
+            raise StoreError(
+                f"unsupported ledger schema {current_ledger!r}; expected {LEDGER_SCHEMA_VERSION!r}"
+            )
+        if current_ledger is None and legacy_version is not None and legacy_version not in SUPPORTED_RECORD_VERSIONS:
+            self._conn.close()
+            raise StoreError(f"cannot migrate unknown legacy ledger schema {legacy_version!r}")
         self._conn.executescript(SCHEMA)
         self._conn.execute(
-            "INSERT INTO meta(key,value) VALUES('schema_version',?) "
+            "INSERT INTO meta(key,value) VALUES('ledger_schema_version',?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (SCHEMA_VERSION,),
+            (LEDGER_SCHEMA_VERSION,),
+        )
+        self._conn.execute(
+            "INSERT INTO meta(key,value) VALUES('capture_envelope_schema_version',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (CAPTURE_ENVELOPE_SCHEMA_VERSION,),
+        )
+        self._conn.execute(
+            "INSERT INTO schema_migrations(version,applied_at) VALUES(?,?) ON CONFLICT(version) DO NOTHING",
+            (LEDGER_SCHEMA_VERSION, utc_now()),
         )
         self._conn.execute(
             "INSERT INTO meta(key,value) VALUES('created_at',?) ON CONFLICT(key) DO NOTHING",
@@ -204,6 +240,10 @@ class CaptureStore:
             raise
         self._thread = threading.Thread(target=self._writer_loop, name="trace-capture-writer", daemon=True)
         self._thread.start()
+
+    def _meta_value(self, key: str) -> str | None:
+        row = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return str(row[0]) if row is not None else None
 
     @property
     def ready(self) -> bool:
@@ -310,7 +350,9 @@ class CaptureStore:
             return {
                 "ok": self.ready,
                 "ready": self.ready,
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": LEDGER_SCHEMA_VERSION,
+                "ledger_schema_version": LEDGER_SCHEMA_VERSION,
+                "capture_envelope_schema_version": CAPTURE_ENVELOPE_SCHEMA_VERSION,
                 "db": str(self.db_path),
                 "data_root": str(self.root),
                 "state_root": str(self.state_dir),

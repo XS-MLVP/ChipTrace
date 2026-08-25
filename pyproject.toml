@@ -1,13 +1,30 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "router-v2-trace-training-pipeline"
-version = "0.3.0"
-description = "Durable capture and complete-session release pipeline for Router V2 trace data"
+name = "agent-trace-training-pipeline"
+dynamic = ["version"]
+description = "Durable capture and complete-session release pipeline for agent trace data"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{name = "Trace Pipeline Authors"}]
 requires-python = ">=3.10"
 dependencies = []
+keywords = ["agent", "trace", "trajectory", "dataset", "sqlite"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Database",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
 
 [project.optional-dependencies]
 performance = ["orjson>=3.10", "zstandard>=0.22"]
@@ -17,3 +34,10 @@ trace-pipeline = "trace_pipeline.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "trace_pipeline.__version__"}
+
+[tool.setuptools.package-data]
+trace_pipeline = ["py.typed"]
+"trace_pipeline.specs" = ["*.json", "*.yaml", "*.sql"]

@@ -2,7 +2,7 @@
   "schema": "trace-pipeline-development-benchmark-v1",
   "measured_at": "2026-08-25",
   "host": {
-    "name": "open21",
+    "name": "development-host",
     "cpu": "AMD Ryzen 9 5950X",
     "physical_cores": 16,
     "logical_cpus": 32,

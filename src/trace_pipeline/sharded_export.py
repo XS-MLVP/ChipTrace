@@ -14,7 +14,7 @@ from .exporter import COMPRESSION_BATCH_BYTES, RAW_CHUNK_BYTES, export_sealed
 from .model import utc_now
 
 
-SHARDED_EXPORT_FORMAT = "router-v2-training-raw-sharded-sqlite-v1"
+SHARDED_EXPORT_FORMAT = "agent-training-raw-sharded-sqlite-v2"
 
 
 def _ledger_path(root: Path, ledger_path: Path | None) -> Path:

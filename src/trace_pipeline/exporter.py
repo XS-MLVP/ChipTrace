@@ -13,7 +13,7 @@ from .compression import ChunkCompressor, validate_compression
 from .model import utc_now
 
 
-EXPORT_FORMAT = "router-v2-training-raw-sqlite-v1"
+EXPORT_FORMAT = "agent-training-raw-sqlite-v2"
 RAW_CHUNK_BYTES = 4 * 1024 * 1024
 COMPRESSION_BATCH_BYTES = 64 * 1024 * 1024
 EXPORT_SCHEMA = """

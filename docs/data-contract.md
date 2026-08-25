@@ -15,20 +15,26 @@ even when the expected traffic contains no sensitive text.
 ## Relay input
 
 `POST /capture` accepts `application/json` and requires a `captureId` matching
-`cap-[A-Za-z0-9._:-]+`. The current Router V2 relay shape is supported:
+`cap-[A-Za-z0-9._:-]+`. The compatible relay shape is:
 
 ```json
 {
   "captureId": "cap-...",
   "startedAt": "2026-08-24T00:00:00Z",
   "finishedAt": "2026-08-24T00:00:01Z",
-  "requestBodyText": "{\"model\":\"gpt-5.6-sol\",\"input\":[]}",
+  "requestBodyText": "{\"model\":\"target-model-v1\",\"input\":[]}",
   "responseStatus": 503,
   "responseBodyText": "data: {...}\n\n",
   "requestTruncated": false,
   "responseTruncated": false,
   "stream": true,
-  "captureError": null
+  "captureError": null,
+  "traceContext": {
+    "session_id": "session-1",
+    "turn_id": "turn-1",
+    "previous_response_id": "response-0"
+  },
+  "observedLifecycleEvents": ["response.completed"]
 }
 ```
 
@@ -117,11 +123,12 @@ delivery.
 ## Session release and score boundary
 
 `trace-pipeline release` treats a session as the delivery atom. Session identity
-comes from `client_metadata.session_id`, falling back to `thread_id`; a missing
-identity becomes a one-capture orphan and is scored accordingly. Selecting a
-model includes every other-model interaction belonging to the same session.
-One session is never split across release parts, even when that session alone
-exceeds the configured target size.
+comes from `client_metadata.session_id`, falling back to `thread_id`, and is
+hashed together with `sourceNamespace`; a missing identity becomes a
+one-capture orphan and is scored accordingly. Selecting a model includes every
+other-model interaction belonging to the same session. One session is never
+split across release parts, even when that session alone exceeds the configured
+target size.
 
 The raw export has enough information to calculate session, turn, step, usage,
 terminal status, native tool call/result linkage, and truncation flags. The
@@ -132,6 +139,11 @@ release automatically keeps:
   session boundaries;
 - `reward`: nullable correctness or preference result;
 - `reward_source`: evaluator, judge version, benchmark, or ground truth.
+
+The catalog also indexes root/parent/goal/agent/branch identifiers, observed
+lifecycle events, response-chain DAG edges, full tool-definition hashes, and
+tool linkage states. These fields remain observations; the builder does not
+invent a missing parent, result, lifecycle event, or reward.
 
 The 100-point completeness policy is payload 20, session/turn identity 20,
 terminal observation 20, usage 5, tool call/result linkage 20, and observed

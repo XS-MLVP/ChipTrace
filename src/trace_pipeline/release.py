@@ -23,7 +23,7 @@ from .trajectory import (
 )
 
 
-RELEASE_FORMAT = "router-v2-complete-session-release-v1"
+RELEASE_FORMAT = "agent-complete-session-release-v2"
 RELEASE_SCHEMA_VERSION = "complete-session-release-v1"
 DEFAULT_TARGET_PART_BYTES = 10 * 1024 * 1024 * 1024
 PLANNER_SCHEMA = """
