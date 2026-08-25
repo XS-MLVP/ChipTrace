@@ -12,6 +12,7 @@ from pathlib import Path
 
 from trace_pipeline.audit import audit_root
 from trace_pipeline.cli import fixture
+from trace_pipeline.compression import codec_available, decompress_chunk
 from trace_pipeline.exporter import export_sealed
 from trace_pipeline.store import (
     CaptureStore,
@@ -20,6 +21,7 @@ from trace_pipeline.store import (
     StoreError,
     _filesystem_type,
 )
+from trace_pipeline.trajectory import iter_raw_records
 
 
 class CaptureStoreTest(unittest.TestCase):
@@ -83,7 +85,13 @@ class CaptureStoreTest(unittest.TestCase):
         store.close()
         audit = audit_root(self.root)
         output = Path(self.temporary.name) / "delivery.sqlite"
-        result = export_sealed(self.root, output, raw_chunk_bytes=128)
+        result = export_sealed(
+            self.root,
+            output,
+            raw_chunk_bytes=128,
+            compression_workers=4,
+            compression_batch_bytes=512,
+        )
 
         self.assertTrue(audit["ok"], audit)
         self.assertGreater(audit["segments"], 1)
@@ -94,10 +102,41 @@ class CaptureStoreTest(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT count(*) FROM validation_results WHERE status!='pass'").fetchone()[0], 0)
             self.assertGreater(conn.execute("SELECT count(*) FROM interaction_chunks").fetchone()[0], 12)
             chunks = conn.execute(
-                "SELECT payload FROM interaction_chunks WHERE record_id=1 ORDER BY chunk_index"
+                "SELECT codec,raw_bytes,payload FROM interaction_chunks "
+                "WHERE record_id=1 ORDER BY chunk_index"
             ).fetchall()
-            rebuilt = b"".join(__import__("zlib").decompress(row[0]) for row in chunks)
+            rebuilt = b"".join(
+                decompress_chunk(row[2], row[0], expected_raw_bytes=row[1])
+                for row in chunks
+            )
             self.assertEqual(json.loads(rebuilt)["captureId"], "cap-rotate-000")
+
+    @unittest.skipUnless(codec_available("zstd"), "optional zstandard package is unavailable")
+    def test_parallel_zstd_export_is_readable_by_trajectory_pipeline(self) -> None:
+        store = self.store(segment_max_bytes=1300, batch_records=8)
+        for index in range(12):
+            store.submit(fixture(f"cap-zstd-{index:03d}", pad=250))
+        store.close()
+        output = Path(self.temporary.name) / "zstd-delivery.sqlite"
+        result = export_sealed(
+            self.root,
+            output,
+            compression_codec="zstd",
+            compression_level=1,
+            compression_workers=4,
+            compression_batch_bytes=512,
+            raw_chunk_bytes=128,
+        )
+
+        records = list(iter_raw_records(output, 1))
+        self.assertEqual(result["compression"], "zstd-1")
+        self.assertEqual(result["records"], 12)
+        self.assertEqual(len(records), 12)
+        with sqlite3.connect(output) as conn:
+            self.assertEqual(
+                {row[0] for row in conn.execute("SELECT DISTINCT codec FROM interaction_chunks")},
+                {"zstd-1"},
+            )
 
     def test_export_cannot_replace_ledger_or_source_segment(self) -> None:
         store = self.store()

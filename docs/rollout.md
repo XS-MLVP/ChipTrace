@@ -3,6 +3,10 @@
 This repository has not replaced the live collector. The following sequence is
 designed to preserve forwarding availability and existing raw data.
 
+The `18080` direct entrypoint remains independent and is outside this rollout.
+Only clients that deliberately select the `18084` capture entrypoint are in
+scope.
+
 ## 1. Offline gate
 
 ```bash

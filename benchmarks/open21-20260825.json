@@ -1,0 +1,81 @@
+{
+  "schema": "trace-pipeline-development-benchmark-v1",
+  "measured_at": "2026-08-25",
+  "host": {
+    "name": "open21",
+    "cpu": "AMD Ryzen 9 5950X",
+    "physical_cores": 16,
+    "logical_cpus": 32,
+    "memory_gib": 125,
+    "primary_nic_mbit_per_second": 1000,
+    "local_storage": "single Intel SATA SSD"
+  },
+  "sample": {
+    "source": "pack-20260731-001 interaction_chunks",
+    "records": 2244,
+    "raw_bytes": 1982693345,
+    "body_text_printed": false
+  },
+  "results": [
+    {
+      "name": "zstd-1-one-worker-codec-only",
+      "workers": 1,
+      "raw_bytes": 2152281184,
+      "stored_bytes": 665101936,
+      "elapsed_seconds": 3.130744,
+      "raw_mib_per_second": 655.619,
+      "compression_ratio": 3.236017,
+      "scope": "compression_cpu_only_no_sqlite_no_storage_io"
+    },
+    {
+      "name": "zstd-1-eight-workers-codec-only",
+      "workers": 8,
+      "raw_bytes": 2162531848,
+      "stored_bytes": 668576060,
+      "elapsed_seconds": 0.557787,
+      "raw_mib_per_second": 3697.383,
+      "compression_ratio": 3.234534,
+      "scope": "compression_cpu_only_no_sqlite_no_storage_io"
+    },
+    {
+      "name": "zlib-1-eight-workers-codec-only",
+      "workers": 8,
+      "raw_bytes": 2162531848,
+      "stored_bytes": 814341128,
+      "elapsed_seconds": 3.119133,
+      "raw_mib_per_second": 661.194,
+      "compression_ratio": 2.65556,
+      "scope": "compression_cpu_only_no_sqlite_no_storage_io"
+    },
+    {
+      "name": "zstd-1-one-sqlite-writer-tmpfs",
+      "writers": 1,
+      "compression_workers_per_writer": 8,
+      "raw_bytes": 537025782,
+      "stored_bytes": 168994461,
+      "elapsed_seconds": 1.123517,
+      "raw_mib_per_second": 455.843,
+      "scope": "segment_read_hash_compress_sqlite_integrity_fsync_sha256"
+    },
+    {
+      "name": "zstd-1-four-sqlite-writers-tmpfs",
+      "writers": 4,
+      "compression_workers_per_writer": 2,
+      "raw_bytes": 1982693345,
+      "stored_bytes": 594583544,
+      "elapsed_seconds": 1.469859,
+      "raw_mib_per_second": 1286.411,
+      "target_mib_per_second": 954,
+      "target_pass": true,
+      "validation_status": "pass",
+      "scope": "segment_read_hash_compress_sqlite_integrity_fsync_sha256_manifest_publish"
+    }
+  ],
+  "limitations": [
+    "Short development runs, not a 30-minute soak.",
+    "The fastest SQLite runs used tmpfs and do not prove persistent-storage throughput.",
+    "Input cache state was uncontrolled.",
+    "The 1 Gbit/s host NIC cannot validate 500 MB/s or 1 GB/s against NFS.",
+    "Production acceptance still requires 25GbE and multi-NVMe evidence."
+  ]
+}

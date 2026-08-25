@@ -3,6 +3,8 @@
 This repository is the isolated capture and training-data boundary for the
 Router V2 full interaction path. It is intentionally independent from the
 online relay deployment: the current relay is not modified by this repository.
+The direct `18080` entrypoint and capture-enabled `18084` entrypoint remain
+independent by design.
 
 The service accepts the existing Relay `POST /capture` envelope, normalizes it
 to the historical spool shape, keeps every valid response (including errors),
@@ -52,7 +54,15 @@ Export sealed data, then build the preferred complete-session release with:
 ```bash
 PYTHONPATH=src python3 -m trace_pipeline export \
   --root /data/capture --ledger /data/state/capture-ledger.sqlite \
-  --output /delivery/gpt-next-part-001.sqlite
+  --output /delivery/gpt-next-part-001.sqlite \
+  --compression-codec zstd --compression-level 1 \
+  --compression-workers 8 --compression-batch-mib 256
+PYTHONPATH=src python3 -m trace_pipeline export-sharded \
+  --root /data/capture --ledger /data/state/capture-ledger.sqlite \
+  --output /delivery/raw-shards \
+  --shards 8 --max-writers 4 \
+  --compression-codec zstd --compression-level 1 \
+  --compression-workers-per-writer 2 --compression-batch-mib 256
 PYTHONPATH=src python3 -m trace_pipeline release \
   --input /delivery/gpt-next-part-001.sqlite \
   --output /release/router-v2-gpt-next-YYYYMMDD-v1 \
@@ -65,10 +75,21 @@ across SQLite parts. It creates `session-catalog.sqlite`, `manifest.json`, and
 `SHA256SUMS`. The automatic score measures observed trace completeness only;
 semantic reward remains null.
 
+`export-sharded` partitions immutable source segments across independent SQLite
+writers. Its raw parts are deliberately not session-atomic; pass every raw part
+to `release` to produce the final complete-session directory.
+
 Run the full Python, Node, crash-recovery, export, and performance suite with:
 
 ```bash
 make self-test
+make benchmark-pack
+```
+
+Install the optional native codecs before using zstd:
+
+```bash
+python3 -m pip install -e '.[performance]'
 ```
 
 ## Repository boundary
@@ -79,6 +100,7 @@ production spool. Use separate data/state roots for tests and deployment.
 Training exports must come from sealed segments after policy, consent,
 de-duplication, and evaluation checks.
 
-Read `docs/optimization-plan.md`, `docs/data-contract.md`, and
-`docs/rollout.md` before connecting the service to `18084`. The deployment
-examples are canary-only and are not enabled by this repository.
+Read `docs/optimization-plan.md`, `docs/high-throughput-plan.md`,
+`docs/data-contract.md`, and `docs/rollout.md` before connecting the service to
+`18084`. The deployment examples are canary-only and are not enabled by this
+repository.

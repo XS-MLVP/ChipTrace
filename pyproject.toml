@@ -4,10 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "router-v2-trace-training-pipeline"
-version = "0.2.0"
+version = "0.3.0"
 description = "Durable capture and complete-session release pipeline for Router V2 trace data"
 requires-python = ">=3.10"
 dependencies = []
+
+[project.optional-dependencies]
+performance = ["orjson>=3.10", "zstandard>=0.22"]
 
 [project.scripts]
 trace-pipeline = "trace_pipeline.cli:main"

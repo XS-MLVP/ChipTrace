@@ -53,7 +53,10 @@ offered = durable + conflict + rejected/dropped + queued + in_flight
 - HTTP connections, writer queue items, and in-flight body bytes are bounded;
 - the Relay adapter serializes once, retries the exact body with exponential
   backoff, and reports a conservation check;
-- raw SQLite export streams source bytes into independent 4 MiB zlib chunks;
+- raw SQLite export streams source bytes into independent 4 MiB zlib or zstd
+  chunks through a bounded parallel compression window;
+- sharded raw export balances immutable segments across independent SQLite
+  writer processes and validates aggregate segment/record/byte conservation;
 - export reads a consistent ledger snapshot and publishes only after checks.
 
 ### P0: session-atomic release
@@ -61,7 +64,7 @@ offered = durable + conflict + rejected/dropped + queued + in_flight
 - stable `session_id/thread_id` is the release identity, independent of model;
 - selecting `gpt-5.6-sol` includes helper/subagent model steps in that session;
 - a two-pass planner keeps every session in exactly one target-size SQLite part;
-- source zlib chunks are copied without recompressing payloads;
+- source compressed chunks are copied without recompressing payloads;
 - `session-catalog.sqlite`, manifest, and SHA-256 files publish atomically;
 - session completeness is scored automatically with explicit component and
   censoring fields; semantic reward remains null.
@@ -70,6 +73,11 @@ The synthetic local benchmark with 500 records, 4 KiB payloads, 16 workers,
 and `fsync` enabled measured about 1.25k records/s and 4.9 MiB/s. This is only
 a regression baseline. Large-body and NFS throughput must be measured on the
 canary storage path before sizing production.
+
+The separate packing target is 500 MB/s sustained with a 1 GB/s stretch goal.
+It requires sharded readers and SQLite part writers on 25GbE and multi-NVMe
+storage. The current 1GbE host cannot demonstrate that end-to-end rate. See
+`docs/high-throughput-plan.md` for metric definitions and acceptance gates.
 
 ### P0: NFS boundary
 

@@ -5,12 +5,12 @@ import json
 import os
 import sqlite3
 import urllib.parse
-import zlib
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from .compression import CompressionError, decompress_chunk
 from .model import utc_now
 
 try:
@@ -527,14 +527,20 @@ def iter_raw_records(
             chunk_raw_bytes = int(row[14])
             chunk_stored_bytes = int(row[15])
             payload = bytes(row[16])
-            if chunk_index != expected_chunk or not codec.startswith("zlib-"):
+            if chunk_index != expected_chunk:
                 raise RuntimeError(f"invalid chunk sequence or codec in {path}: record {metadata[0]}")
             if len(payload) != chunk_stored_bytes:
                 raise RuntimeError(f"compressed chunk length mismatch in {path}: record {metadata[0]}")
             try:
-                decoded = zlib.decompress(payload)
-            except zlib.error as exc:
-                raise RuntimeError(f"invalid zlib payload in {path}: record {metadata[0]}") from exc
+                decoded = decompress_chunk(
+                    payload,
+                    codec,
+                    expected_raw_bytes=chunk_raw_bytes,
+                )
+            except CompressionError as exc:
+                raise RuntimeError(
+                    f"invalid compressed payload in {path}: record {metadata[0]}"
+                ) from exc
             if len(decoded) != chunk_raw_bytes:
                 raise RuntimeError(f"raw chunk length mismatch in {path}: record {metadata[0]}")
             raw.extend(decoded)
@@ -1362,7 +1368,14 @@ def build_trajectory_catalog(
             )
             conn.execute(
                 "INSERT INTO shards VALUES(?,?,?,?,0,0,0,0,0,NULL,NULL,0,0,0,0,0,0,0,?,?)",
-                (shard_id, path.name, stat.st_size, "pending", "interactions + interaction_chunks", "zlib-independent-chunks"),
+                (
+                    shard_id,
+                    path.name,
+                    stat.st_size,
+                    "pending",
+                    "interactions + interaction_chunks",
+                    "codec-tagged-independent-chunks",
+                ),
             )
 
         for shard_id, path in enumerate(paths, start=1):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import tempfile
 import threading
@@ -12,6 +13,7 @@ from .audit import audit_root
 from .exporter import export_sealed
 from .release import build_session_release
 from .server import serve
+from .sharded_export import build_sharded_export
 from .store import CaptureStore, StoreConfig, StoreError
 from .trajectory import build_trajectory_catalog
 
@@ -71,8 +73,12 @@ def run_export(args: argparse.Namespace) -> int:
         Path(args.root),
         Path(args.output),
         ledger_path=Path(args.ledger) if args.ledger else None,
+        compression_codec=args.compression_codec,
         compression_level=args.compression_level,
+        compression_workers=args.compression_workers,
+        compression_batch_bytes=int(args.compression_batch_mib * 1024 * 1024),
         raw_chunk_bytes=int(args.raw_chunk_mib * 1024 * 1024),
+        staging_sync=args.staging_sync,
         replace=args.replace,
     )
     print(json.dumps(result, ensure_ascii=True, indent=2, sort_keys=True))
@@ -86,6 +92,24 @@ def run_trajectory(args: argparse.Namespace) -> int:
         model_exact=args.model,
         projection_mode=args.projection_mode,
         replace=args.replace,
+    )
+    print(json.dumps(result, ensure_ascii=True, indent=2, sort_keys=True))
+    return 0
+
+
+def run_export_sharded(args: argparse.Namespace) -> int:
+    result = build_sharded_export(
+        Path(args.root),
+        Path(args.output),
+        ledger_path=Path(args.ledger) if args.ledger else None,
+        shard_count=args.shards,
+        max_writers=args.max_writers,
+        compression_codec=args.compression_codec,
+        compression_level=args.compression_level,
+        compression_workers_per_writer=args.compression_workers_per_writer,
+        compression_batch_bytes=int(args.compression_batch_mib * 1024 * 1024),
+        raw_chunk_bytes=int(args.raw_chunk_mib * 1024 * 1024),
+        staging_sync=args.staging_sync,
     )
     print(json.dumps(result, ensure_ascii=True, indent=2, sort_keys=True))
     return 0
@@ -216,10 +240,52 @@ def parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--root", required=True)
     export_parser.add_argument("--ledger")
     export_parser.add_argument("--output", required=True)
-    export_parser.add_argument("--compression-level", type=int, choices=range(0, 10), default=1)
+    export_parser.add_argument(
+        "--compression-codec",
+        choices=("zstd", "zlib"),
+        default="zlib",
+    )
+    export_parser.add_argument("--compression-level", type=int, default=1)
+    export_parser.add_argument(
+        "--compression-workers",
+        type=int,
+        default=min(8, os.cpu_count() or 1),
+    )
+    export_parser.add_argument("--compression-batch-mib", type=float, default=64)
     export_parser.add_argument("--raw-chunk-mib", type=float, default=4)
+    export_parser.add_argument(
+        "--staging-sync",
+        choices=("fast", "full"),
+        default="fast",
+        help="fast is safe for unpublished rebuildable staging; final output is fsynced",
+    )
     export_parser.add_argument("--replace", action="store_true")
     export_parser.set_defaults(func=run_export)
+
+    sharded_export_parser = sub.add_parser(
+        "export-sharded",
+        help="export sealed captures into parallel validated raw SQLite shards",
+    )
+    sharded_export_parser.add_argument("--root", required=True)
+    sharded_export_parser.add_argument("--ledger")
+    sharded_export_parser.add_argument("--output", required=True)
+    sharded_export_parser.add_argument("--shards", type=int, default=4)
+    sharded_export_parser.add_argument("--max-writers", type=int, default=4)
+    sharded_export_parser.add_argument(
+        "--compression-codec",
+        choices=("zstd", "zlib"),
+        default="zlib",
+    )
+    sharded_export_parser.add_argument("--compression-level", type=int, default=1)
+    sharded_export_parser.add_argument("--compression-workers-per-writer", type=int, default=2)
+    sharded_export_parser.add_argument("--compression-batch-mib", type=float, default=256)
+    sharded_export_parser.add_argument("--raw-chunk-mib", type=float, default=4)
+    sharded_export_parser.add_argument(
+        "--staging-sync",
+        choices=("fast", "full"),
+        default="fast",
+    )
+    sharded_export_parser.set_defaults(func=run_export_sharded)
 
     trajectory_parser = sub.add_parser(
         "trajectory",
@@ -259,6 +325,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         or getattr(args, "max_envelope_mib", 1) <= 0
         or getattr(args, "max_inflight_body_mib", 1) <= 0
         or getattr(args, "raw_chunk_mib", 1) <= 0
+        or getattr(args, "compression_batch_mib", 1) <= 0
+        or getattr(args, "compression_workers", 1) <= 0
+        or getattr(args, "compression_workers_per_writer", 1) <= 0
+        or getattr(args, "shards", 1) <= 0
+        or getattr(args, "max_writers", 1) <= 0
         or getattr(args, "target_part_gib", 1) <= 0
     ):
         raise SystemExit("size limits must be positive")

@@ -98,12 +98,21 @@ while `--replace` uses an atomic rename. The schema is:
 - `dataset_meta`: format, creation time, compression, sensitivity claims;
 - `source_segments`: segment path, byte/record count, and SHA-256;
 - `interactions`: one unique capture and its metadata/source locator;
-- `interaction_chunks`: ordered independent zlib chunks, 4 MiB raw by default;
+- `interaction_chunks`: ordered independent zlib or zstd chunks, 4 MiB raw by
+  default;
 - `validation_results`: record, chunk, foreign-key, and integrity checks.
 
 The independent chunks bound decompression memory and match the existing
 trajectory reader's `interactions + interaction_chunks` input contract. Raw
 prompt, answer, tool arguments, and tool results stay in this raw database.
+The codec and level are recorded on every chunk. Readers must reject unknown
+codecs, length mismatches, decompression failures, and raw hash mismatches.
+
+`export-sharded` takes one explicit snapshot of all sealed segment IDs, assigns
+each segment to exactly one raw SQLite writer, and publishes a directory with
+`manifest.json` and `SHA256SUMS`. Raw shards are a throughput boundary and may
+split a session. Only the downstream `release` command may claim session-atomic
+delivery.
 
 ## Session release and score boundary
 
