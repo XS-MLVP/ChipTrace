@@ -19,8 +19,8 @@ except ImportError:  # pragma: no cover - optional performance dependency
     orjson = None
 
 
-CATALOG_FORMAT = "agent-session-sqlite-delivery-v3"
-CATALOG_SCHEMA_VERSION = "session-catalog-v3"
+CATALOG_FORMAT = "agent-session-sqlite-delivery-v4"
+CATALOG_SCHEMA_VERSION = "session-catalog-v4"
 QUALITY_POLICY_VERSION = "session-trace-completeness-v1"
 SESSION_DEFINITION = (
     "sha256(source_namespace + NUL + (client_metadata.session_id or client_metadata.thread_id)); "
@@ -151,8 +151,9 @@ CREATE TABLE tool_calls(
   call_key TEXT PRIMARY KEY,traj_id TEXT NOT NULL,turn_key TEXT,
   source_step_id TEXT NOT NULL,shard_id INTEGER NOT NULL,record_id INTEGER NOT NULL,
   output_index INTEGER NOT NULL,call_type TEXT NOT NULL,tool_name TEXT,
-  call_id_present INTEGER NOT NULL,argument_bytes INTEGER NOT NULL,
-  argument_sha256 TEXT,arguments_complete INTEGER NOT NULL,
+  call_id_present INTEGER NOT NULL,call_status TEXT,
+  argument_bytes INTEGER NOT NULL,argument_sha256 TEXT,
+  argument_json TEXT,arguments_complete INTEGER NOT NULL,
   result_present INTEGER NOT NULL DEFAULT 0,
   definition_present INTEGER NOT NULL DEFAULT 0,
   linkage_status TEXT NOT NULL DEFAULT 'open_tail'
@@ -167,6 +168,7 @@ CREATE TABLE tool_definitions(
   tool_type TEXT,schema_version TEXT,description_present INTEGER NOT NULL,
   parameters_present INTEGER NOT NULL,
   definition_bytes INTEGER NOT NULL,definition_sha256 TEXT NOT NULL,
+  schema_json TEXT NOT NULL,
   first_seen_step_id TEXT NOT NULL,
   FOREIGN KEY(traj_id) REFERENCES trajectories(traj_id),
   FOREIGN KEY(first_seen_step_id) REFERENCES steps(step_id)
@@ -175,7 +177,9 @@ CREATE TABLE tool_results(
   call_key TEXT PRIMARY KEY,traj_id TEXT NOT NULL,turn_key TEXT,
   first_seen_step_id TEXT NOT NULL,shard_id INTEGER NOT NULL,record_id INTEGER NOT NULL,
   result_type TEXT NOT NULL,call_id_present INTEGER NOT NULL,
-  result_bytes INTEGER NOT NULL,result_sha256 TEXT,matched_call INTEGER NOT NULL DEFAULT 0,
+  result_status TEXT,result_error INTEGER NOT NULL DEFAULT 0,
+  result_bytes INTEGER NOT NULL,result_sha256 TEXT,result_json TEXT,
+  matched_call INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY(shard_id) REFERENCES shards(shard_id),
   FOREIGN KEY(traj_id) REFERENCES trajectories(traj_id),
   FOREIGN KEY(turn_key) REFERENCES turns(turn_key),
@@ -277,6 +281,11 @@ def canonical_bytes(value: Any) -> bytes:
     if orjson is not None:
         return orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+
+
+def canonical_text(value: Any) -> str:
+    """Return a stable UTF-8 JSON/text representation for catalog evidence."""
+    return canonical_bytes(value).decode("utf-8", errors="replace")
 
 
 def digest_parts(*values: str) -> str:
@@ -473,6 +482,7 @@ def tool_definition_summary(value: Any) -> dict[str, Any] | None:
         "parameters_present": int(isinstance(parameters, dict)),
         "bytes": len(raw),
         "sha256": hashlib.sha256(raw).hexdigest(),
+        "schema_json": raw.decode("utf-8", errors="replace"),
     }
 
 
@@ -793,19 +803,34 @@ def _insert_tool_result(
     raw_record: RawRecord,
     result_type: str,
     call_id_present: bool,
+    result_status: str | None,
+    result_error: bool,
     result_bytes: int,
     result_sha256: str | None,
+    result_json: str,
 ) -> bool:
     existing = conn.execute(
-        "SELECT result_type,result_bytes,result_sha256 FROM tool_results WHERE call_key=?",
+        "SELECT result_type,result_status,result_error,result_bytes,result_sha256,result_json "
+        "FROM tool_results WHERE call_key=?",
         (call_key,),
     ).fetchone()
+    expected = (
+        result_type,
+        result_status,
+        int(result_error),
+        result_bytes,
+        result_sha256,
+        result_json,
+    )
     if existing is not None:
-        if tuple(existing) != (result_type, result_bytes, result_sha256):
+        if tuple(existing) != expected:
             raise RuntimeError(f"tool result changed for call key {call_key}")
         return False
     conn.execute(
-        "INSERT INTO tool_results VALUES(?,?,?,?,?,?,?,?,?,?,0)",
+        "INSERT INTO tool_results("
+        "call_key,traj_id,turn_key,first_seen_step_id,shard_id,record_id,result_type,"
+        "call_id_present,result_status,result_error,result_bytes,result_sha256,result_json,matched_call"
+        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
         (
             call_key,
             traj_id,
@@ -815,8 +840,11 @@ def _insert_tool_result(
             raw_record.record_id,
             result_type,
             int(call_id_present),
+            result_status,
+            int(result_error),
             result_bytes,
             result_sha256,
+            result_json,
         ),
     )
     return True
@@ -834,16 +862,26 @@ def _insert_tool_call(
     call_type: str,
     tool_name: str | None,
     call_id_present: bool,
+    call_status: str | None,
     argument_bytes: int,
     argument_sha256: str | None,
+    argument_json: str,
     arguments_complete: bool,
 ) -> None:
     existing = conn.execute(
-        "SELECT call_type,tool_name,argument_bytes,argument_sha256,arguments_complete "
+        "SELECT call_type,tool_name,call_status,argument_bytes,argument_sha256,argument_json,arguments_complete "
         "FROM tool_calls WHERE call_key=?",
         (call_key,),
     ).fetchone()
-    expected = (call_type, tool_name, argument_bytes, argument_sha256, int(arguments_complete))
+    expected = (
+        call_type,
+        tool_name,
+        call_status,
+        argument_bytes,
+        argument_sha256,
+        argument_json,
+        int(arguments_complete),
+    )
     if existing is not None:
         if tuple(existing) != expected:
             raise RuntimeError(f"tool call changed for call key {call_key}")
@@ -851,8 +889,9 @@ def _insert_tool_call(
     conn.execute(
         "INSERT INTO tool_calls("
         "call_key,traj_id,turn_key,source_step_id,shard_id,record_id,output_index,"
-        "call_type,tool_name,call_id_present,argument_bytes,argument_sha256,arguments_complete"
-        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "call_type,tool_name,call_id_present,call_status,argument_bytes,argument_sha256,"
+        "argument_json,arguments_complete"
+        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             call_key,
             traj_id,
@@ -864,8 +903,10 @@ def _insert_tool_call(
             call_type,
             tool_name,
             int(call_id_present),
+            call_status,
             argument_bytes,
             argument_sha256,
+            argument_json,
             int(arguments_complete),
         ),
     )
@@ -881,7 +922,7 @@ def _insert_tool_definition(
     definition_key = digest_parts(traj_id, definition["name"], definition["sha256"])
     existing = conn.execute(
         "SELECT tool_name,tool_type,schema_version,description_present,parameters_present,"
-        "definition_bytes,definition_sha256 FROM tool_definitions WHERE definition_key=?",
+        "definition_bytes,definition_sha256,schema_json FROM tool_definitions WHERE definition_key=?",
         (definition_key,),
     ).fetchone()
     expected = (
@@ -892,13 +933,14 @@ def _insert_tool_definition(
         definition["parameters_present"],
         definition["bytes"],
         definition["sha256"],
+        definition["schema_json"],
     )
     if existing is not None:
         if tuple(existing) != expected:
             raise RuntimeError(f"tool definition changed for key {definition_key}")
         return
     conn.execute(
-        "INSERT INTO tool_definitions VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO tool_definitions VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         (definition_key, traj_id, *expected, step_id),
     )
 
@@ -999,7 +1041,8 @@ def process_record(
         call_id = nonempty_string(item.get("call_id") or item.get("tool_call_id") or item.get("id"))
         identity = call_id or f"missing-result:{step_id}:{history_results}"
         call_key = digest_parts(traj_id, identity)
-        result_bytes, result_sha256 = value_fingerprint(tool_result_payload(item))
+        result_payload = tool_result_payload(item)
+        result_bytes, result_sha256 = value_fingerprint(result_payload)
         new_results += int(
             _insert_tool_result(
                 conn,
@@ -1010,8 +1053,11 @@ def process_record(
                 raw_record=raw_record,
                 result_type=kind,
                 call_id_present=call_id is not None,
+                result_status=nonempty_string(item.get("status")),
+                result_error=bool(item.get("is_error") or item.get("isError")),
                 result_bytes=result_bytes,
                 result_sha256=result_sha256,
+                result_json=canonical_text(result_payload),
             )
         )
 
@@ -1033,8 +1079,10 @@ def process_record(
             call_type=kind,
             tool_name=nonempty_string(item.get("name") or item.get("tool_name")),
             call_id_present=call_id is not None,
+            call_status=nonempty_string(item.get("status")),
             argument_bytes=argument_bytes,
             argument_sha256=argument_sha256,
+            argument_json=canonical_text(argument),
             arguments_complete=complete,
         )
 
@@ -1600,6 +1648,40 @@ def validate_catalog(
     statuses.append(
         validation_row(
             conn,
+            "tool_definitions_without_full_schema",
+            conn.execute(
+                "SELECT count(*) FROM tool_definitions WHERE schema_json IS NULL OR schema_json=''"
+            ).fetchone()[0],
+            0,
+        )
+    )
+    statuses.append(
+        validation_row(
+            conn,
+            "tool_calls_without_argument_evidence",
+            conn.execute(
+                "SELECT count(*) FROM tool_calls WHERE arguments_complete=1 "
+                "AND (argument_json IS NULL OR argument_json='')"
+            ).fetchone()[0],
+            0,
+            warning=True,
+        )
+    )
+    statuses.append(
+        validation_row(
+            conn,
+            "tool_results_without_result_evidence",
+            conn.execute(
+                "SELECT count(*) FROM tool_results WHERE result_bytes>0 "
+                "AND (result_json IS NULL OR result_json='')"
+            ).fetchone()[0],
+            0,
+            warning=True,
+        )
+    )
+    statuses.append(
+        validation_row(
+            conn,
             "duplicate_response_ids",
             conn.execute(
                 "SELECT count(*) FROM (SELECT traj_id,response_id FROM steps "
@@ -1814,6 +1896,12 @@ def build_trajectory_catalog(
         put_meta(conn, "session_relation_definition", "root/parent session identifiers are namespaced and may reference a session outside the projection")
         put_meta(conn, "lifecycle_event_definition", "only event types directly observed in captured request or response payloads")
         put_meta(conn, "tool_linkage_statuses", ["executed", "abandoned_concurrent", "abandoned_retry", "open_tail", "capture_gap"])
+        put_meta(
+            conn,
+            "tool_evidence_storage",
+            "tool_definitions.schema_json, tool_calls.argument_json and tool_results.result_json "
+            "store canonical observed payloads; hashes remain available for integrity checks",
+        )
         put_meta(conn, "quality_policy_version", QUALITY_POLICY_VERSION)
         put_meta(conn, "semantic_reward_available", False)
         put_meta(conn, "reasoning_plaintext_claimed", False)

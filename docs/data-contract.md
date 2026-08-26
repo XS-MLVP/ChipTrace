@@ -64,6 +64,12 @@ HTTP 400、411、413、415、在途字节超限、duplicate、conflict、accepte
 
 请求超时不代表写入失败。发送端必须重试完全相同的序列化字节和 ID，ledger 将结果归并为 accepted 或 duplicate。
 
+## Open 段封存
+
+离线 `export` 只读取 `sealed`/`archived` 段。在线服务继续运行时，先调用
+受信任的本地 `POST /flush`；该接口按写入顺序等待队列完成、封存当前段并
+创建新的 `open` 段。也可以先优雅停止 Collector，`close()` 会封存最后一段。
+
 ## 原始存储
 
 每条原始记录占一行 JSON：
@@ -163,7 +169,7 @@ Release 保存以下质量字段：
 | --- | --- |
 | Capture envelope | `capture-envelope-v3` |
 | Raw spool | `full-trace-spool-v3` |
-| Session catalog | `session-catalog-v3` |
+| Session catalog | `session-catalog-v4` |
 | Release manifest | `complete-session-release-v1` |
 | Completeness policy | `session-trace-completeness-v1` |
 

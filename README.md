@@ -36,7 +36,8 @@ flowchart LR
 
 ## 安装
 
-要求 Python 3.10+、Node.js 20+ 和本地持久化文件系统。
+要求 Python 3.10+ 和本地持久化文件系统。使用 Durable Outbox 集成时再要求
+Node.js 20+。
 
 ```bash
 python3 -m venv .venv
@@ -44,6 +45,32 @@ source .venv/bin/activate
 python3 -m pip install -e '.[performance]'
 make self-test
 ```
+
+Node.js 集成组件不依赖第三方包：
+
+```bash
+npm test
+```
+
+业务 Relay 可以直接复用本地持久化 outbox：
+
+```javascript
+const { DurableCaptureOutbox } = require('chiptrace-governance/outbox');
+
+const outbox = new DurableCaptureOutbox({
+  directory: '/var/lib/chiptrace/outbox',
+  url: 'http://127.0.0.1:3010',
+  concurrency: 8,
+});
+
+(async () => {
+  await outbox.enqueue(captureEnvelope);
+})();
+```
+
+`enqueue` 返回本地落盘确认；进程重启后 pending 文件会自动恢复。业务 Relay
+负责构造 capture envelope 和转发上游请求，Collector 不替换上游响应。
+仓库提供的是可嵌入的 outbox，不会自行占用或接管现有业务端口。
 
 ## 运行 Collector
 
@@ -66,6 +93,15 @@ curl --fail http://127.0.0.1:3010/capture \
 curl --fail http://127.0.0.1:3010/health | python3 -m json.tool
 ```
 
+离线导出前先封存当前 open 段。服务保持运行时执行：
+
+```bash
+curl --fail -X POST http://127.0.0.1:3010/flush | python3 -m json.tool
+```
+
+也可以先停止 Collector；`flush` 是受信任的本地运维接口，默认服务只监听
+loopback。导出只读取 sealed/archived 段，未封存的 open 段不会被静默纳入。
+
 ## 处理与交付
 
 ```bash
@@ -81,6 +117,13 @@ chiptrace release \
   --output "$CHIPTRACE_ROOT/release" \
   --model target-model-v1 \
   --target-part-gib 10
+
+chiptrace verify-release \
+  --release "$CHIPTRACE_ROOT/release"
+
+chiptrace archive-release \
+  --release "$CHIPTRACE_ROOT/release" \
+  --output "$CHIPTRACE_ROOT/release.tar.gz"
 ```
 
 大规模数据先使用 `export-sharded` 生成 raw shards，再将多个 shard
@@ -113,8 +156,9 @@ chiptrace/
 ├── docs/                    # 架构、契约、交付、运维和图片资源
 ├── integration/             # Relay outbox 与 Trace 上下文
 ├── scripts/                 # 自测、导出和性能脚本
-├── src/trace_pipeline/      # Collector 与离线处理实现
+├── src/trace_pipeline/      # Collector 与离线处理实现（历史兼容包名）
 ├── tests/                   # Python 与 JavaScript 测试
+├── package.json             # Node.js 集成测试与导出入口
 ├── README.md
 ├── LICENSE
 ├── Dockerfile

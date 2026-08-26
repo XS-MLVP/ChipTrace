@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import tarfile
 import json
 import sqlite3
 import tempfile
@@ -8,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from trace_pipeline.exporter import export_sealed
-from trace_pipeline.release import build_session_release
+from trace_pipeline.release import archive_session_release, build_session_release, verify_session_release
 from trace_pipeline.store import CaptureStore, StoreConfig
 
 
@@ -186,6 +187,22 @@ class CompleteSessionReleaseTest(unittest.TestCase):
         self.assertFalse(manifest["semantic_reward_available"])
         self.assertEqual(manifest["source_records_scanned"], 5)
         self.assertEqual(manifest["duplicate_records_omitted"], 1)
+
+        verification = verify_session_release(self.release)
+        self.assertTrue(verification["ok"])
+        self.assertEqual(verification["records"], 3)
+        self.assertEqual(verification["sessions"], 2)
+        self.assertEqual(verification["parts"], 2)
+        with self.assertRaises(RuntimeError):
+            verify_session_release(self.release, require_pass=True)
+
+        archive = self.base / "release-v1.tar.gz"
+        archive_result = archive_session_release(self.release, archive)
+        self.assertTrue(archive_result["ok"])
+        with tarfile.open(archive, "r:gz") as handle:
+            names = sorted(member.name for member in handle.getmembers())
+        self.assertIn("release-v1/manifest.json", names)
+        self.assertIn("release-v1/SHA256SUMS", names)
 
         catalog = self.release / "session-catalog.sqlite"
         with sqlite3.connect(catalog) as conn:

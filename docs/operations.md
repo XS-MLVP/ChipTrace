@@ -121,6 +121,15 @@ curl --fail http://127.0.0.1:3010/health | python3 -m json.tool
 curl --fail http://127.0.0.1:3010/audit | python3 -m json.tool
 ```
 
+离线导出前封存当前 open 段，服务可以继续运行：
+
+```bash
+curl --fail -X POST http://127.0.0.1:3010/flush | python3 -m json.tool
+```
+
+`/flush` 按写入顺序等待队列完成，封存当前段后立即创建新的 open 段。
+它是受信任的本地运维接口；对外绑定端口时必须由网络策略限制访问。
+
 定时告警覆盖以下状态：
 
 - `health.ok != true` 或 writer fatal error
@@ -136,6 +145,7 @@ curl --fail http://127.0.0.1:3010/audit | python3 -m json.tool
 - export 或 release validation 失败
 
 sealed segment 的 payload audit 在业务低峰期执行。导出只读取 sealed segment。
+在线服务继续写入时先调用 `/flush`；停机导出时先执行优雅停止，再运行导出命令。
 
 ## 备份与恢复
 

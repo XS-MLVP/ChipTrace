@@ -11,7 +11,7 @@ from typing import Iterable
 
 from .audit import audit_root
 from .exporter import export_sealed
-from .release import build_session_release
+from .release import archive_session_release, build_session_release, verify_session_release
 from .server import serve
 from .sharded_export import build_sharded_export
 from .store import CaptureStore, StoreConfig, StoreError
@@ -127,6 +127,23 @@ def run_release(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_verify_release(args: argparse.Namespace) -> int:
+    result = verify_session_release(Path(args.release), require_pass=args.require_pass)
+    print(json.dumps(result, ensure_ascii=True, indent=2, sort_keys=True))
+    return 0
+
+
+def run_archive_release(args: argparse.Namespace) -> int:
+    result = archive_session_release(
+        Path(args.release),
+        Path(args.output),
+        require_pass=args.require_pass,
+        replace=args.replace,
+    )
+    print(json.dumps(result, ensure_ascii=True, indent=2, sort_keys=True))
+    return 0
+
+
 def fixture(capture_id: str, *, status: int = 200, pad: int = 0) -> dict:
     return {
         "captureId": capture_id,
@@ -180,6 +197,9 @@ def run_self_test(_args: argparse.Namespace) -> int:
             target_part_bytes=10 * 1024 * 1024,
             release_id="self-test-release",
         )
+        release_verification = verify_session_release(release_output)
+        archive_output = Path(temporary) / "session-release.tar.gz"
+        archive = archive_session_release(release_output, archive_output)
         result = {
             "ok": all(
                 [
@@ -194,6 +214,8 @@ def run_self_test(_args: argparse.Namespace) -> int:
                     catalog["validation_status"] in {"pass", "warn"},
                     release["records"] == 2,
                     release["validation_status"] in {"pass", "warn"},
+                    release_verification["ok"],
+                    archive["ok"],
                 ]
             ),
             "accepted_error_response": failure_sample.state == "accepted",
@@ -203,6 +225,8 @@ def run_self_test(_args: argparse.Namespace) -> int:
             "export": export,
             "trajectory_catalog": catalog,
             "session_release": release,
+            "release_verification": release_verification,
+            "release_archive": archive,
         }
         print(json.dumps(result, ensure_ascii=True, indent=2, sort_keys=True))
         return 0 if result["ok"] else 2
@@ -312,6 +336,28 @@ def parser() -> argparse.ArgumentParser:
     release_parser.add_argument("--release-id")
     release_parser.add_argument("--target-part-gib", type=float, default=10.0)
     release_parser.set_defaults(func=run_release)
+
+    verify_parser = sub.add_parser(
+        "verify-release",
+        help="verify a published complete-session release without modifying it",
+    )
+    verify_parser.add_argument("--release", required=True)
+    verify_parser.add_argument(
+        "--require-pass",
+        action="store_true",
+        help="fail unless manifest validation_status is exactly pass",
+    )
+    verify_parser.set_defaults(func=run_verify_release)
+
+    archive_parser = sub.add_parser(
+        "archive-release",
+        help="create a deterministic tar.gz from a verified release directory",
+    )
+    archive_parser.add_argument("--release", required=True)
+    archive_parser.add_argument("--output", required=True)
+    archive_parser.add_argument("--require-pass", action="store_true")
+    archive_parser.add_argument("--replace", action="store_true")
+    archive_parser.set_defaults(func=run_archive_release)
 
     self_test = sub.add_parser("self-test", help="run an isolated durability and delivery smoke test")
     self_test.set_defaults(func=run_self_test)

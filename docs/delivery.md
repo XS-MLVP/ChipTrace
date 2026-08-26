@@ -81,7 +81,7 @@ chiptrace release \
   ],
   "catalog": {
     "file": "session-catalog.sqlite",
-    "schema_version": "session-catalog-v3",
+    "schema_version": "session-catalog-v4",
     "bytes": 0,
     "sha256": "..."
   },
@@ -99,8 +99,9 @@ chiptrace release \
 - `turns` 和 `steps`：Turn 与交互步骤。
 - `step_usage`：input、cache、output、reasoning 和 total Token。
 - `step_item_counts`：消息和响应 item 计数。
-- `tool_definitions`：工具 schema、hash 和版本。
-- `tool_calls` 与 `tool_results`：工具调用、真实结果和关联状态。
+- `tool_definitions`：完整工具 schema、hash 和版本。
+- `tool_calls` 与 `tool_results`：规范化参数/结果、真实状态和关联状态；
+  `call_status`、`result_status` 和 `result_error` 只记录源中实际观测到的字段。
 - `session_quality` 与 `trajectory_quality`：完整性分项、总分和原因。
 - `validation_results`：构建和验收校验。
 
@@ -136,7 +137,7 @@ API usage 表示实际调用成本，包含同一上下文被重复处理的 Tok
 
 ## 验收门槛
 
-发布必须通过以下校验：
+发布必须通过以下结构校验：
 
 - Capture ID 唯一，源段、导出和发布记录数守恒。
 - 每个 payload chunk 可以解压，长度与原始哈希一致。
@@ -147,8 +148,20 @@ API usage 表示实际调用成本，包含同一上下文被重复处理的 Tok
 - 每个 SQLite 的 `PRAGMA foreign_key_check` 返回空结果。
 - 每个 SQLite 的 `PRAGMA integrity_check` 返回 `ok`。
 - Manifest 与 `SHA256SUMS` 包含全部交付文件的 SHA-256。
-- `validation_status` 为 `pass`。
+- `validation_status` 为 `pass`；若源数据存在边界告警则保留为 `warn`，不得伪装为
+  `pass`。采购准入使用 `verify-release --require-pass` 强制 `pass`。
 
+上传前使用仓库命令生成可复现归档：
+
+```bash
+chiptrace verify-release --release target-model-YYYYMMDD-v1 --require-pass
+chiptrace archive-release \
+  --release target-model-YYYYMMDD-v1 \
+  --output target-model-YYYYMMDD-v1.tar.gz \
+  --require-pass
+```
+
+归档命令先执行只读验收，再以 UTF-8 文件名、固定归档元数据生成 `tar.gz`。
 上传完成后，使用远端文件大小和 SHA-256 复核传输完整性。
 
 ## 压缩交付

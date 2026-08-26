@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
 import shutil
 import sqlite3
+import tarfile
 import tempfile
 import urllib.parse
 from pathlib import Path
@@ -247,6 +249,148 @@ def build_session_release(
         planner.close()
         if not published:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+def verify_session_release(root: Path, *, require_pass: bool = False) -> dict[str, Any]:
+    """Verify an already published complete-session release read-only.
+
+    This is the recipient-side counterpart to ``build_session_release``. It
+    checks the manifest, SHA256SUMS, every SQLite file's integrity/foreign-key
+    state, and the catalog/part conservation counts without modifying files.
+    """
+    root = Path(root).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"release directory does not exist: {root}")
+    manifest_path = root / "manifest.json"
+    sums_path = root / "SHA256SUMS"
+    if not manifest_path.is_file() or not sums_path.is_file():
+        raise RuntimeError("release must contain manifest.json and SHA256SUMS")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"invalid release manifest: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError("release manifest must be a JSON object")
+    if manifest.get("schema_version") != RELEASE_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"unsupported release schema {manifest.get('schema_version')!r}; "
+            f"expected {RELEASE_SCHEMA_VERSION!r}"
+        )
+    if manifest.get("session_atomic") is not True or manifest.get("session_split_count") != 0:
+        raise RuntimeError("release is not marked as session-atomic")
+    parts = manifest.get("parts")
+    catalog = manifest.get("catalog")
+    if not isinstance(parts, list) or not isinstance(catalog, dict):
+        raise RuntimeError("release manifest has invalid parts or catalog entries")
+    part_names = []
+    for part in parts:
+        if not isinstance(part, dict) or not isinstance(part.get("file"), str):
+            raise RuntimeError("release manifest contains an invalid part entry")
+        part_names.append(part["file"])
+    if len(set(part_names)) != len(part_names):
+        raise RuntimeError("release manifest contains duplicate part files")
+    catalog_name = catalog.get("file")
+    if not isinstance(catalog_name, str):
+        raise RuntimeError("release manifest has no catalog file")
+    if catalog_name in {"manifest.json", "SHA256SUMS"} or catalog_name in part_names:
+        raise RuntimeError("release manifest file names overlap")
+    expected_names = {"manifest.json", catalog_name, *part_names}
+    actual_files = {path.name for path in root.iterdir() if path.is_file()}
+    expected_files = expected_names | {"SHA256SUMS"}
+    if actual_files != expected_files:
+        missing = sorted(expected_files - actual_files)
+        unexpected = sorted(actual_files - expected_files)
+        raise RuntimeError(f"release file set mismatch: missing={missing}, unexpected={unexpected}")
+    _verify_sha256s(root, sums_path, expected_names=expected_names)
+    _verify_release(root, manifest)
+    validation_status = str(manifest.get("validation_status", ""))
+    if require_pass and validation_status != "pass":
+        raise RuntimeError(f"release validation status is {validation_status!r}, not 'pass'")
+    with sqlite3.connect(f"file:{root / catalog_name}?mode=ro", uri=True) as conn:
+        integrity = str(conn.execute("PRAGMA integrity_check").fetchone()[0])
+        foreign = len(conn.execute("PRAGMA foreign_key_check").fetchall())
+        catalog_status = conn.execute(
+            "SELECT value FROM dataset_meta WHERE key='validation_status'"
+        ).fetchone()
+    catalog_validation_status = None
+    if catalog_status is not None:
+        try:
+            catalog_validation_status = json.loads(str(catalog_status[0]))
+        except (TypeError, ValueError):
+            catalog_validation_status = str(catalog_status[0])
+    if catalog_validation_status != validation_status:
+        raise RuntimeError("manifest and catalog validation statuses differ")
+    return {
+        "ok": True,
+        "release": str(root),
+        "release_id": manifest.get("release_id"),
+        "schema_version": manifest["schema_version"],
+        "validation_status": validation_status,
+        "catalog_validation_status": catalog_validation_status,
+        "records": int(manifest.get("records", 0)),
+        "sessions": int(manifest.get("sessions", 0)),
+        "parts": len(parts),
+        "integrity_check": integrity,
+        "foreign_key_rows": foreign,
+        "sha256_entries": len(expected_names),
+    }
+
+
+def archive_session_release(
+    release: Path,
+    output: Path,
+    *,
+    require_pass: bool = False,
+    replace: bool = False,
+) -> dict[str, Any]:
+    """Create a deterministic UTF-8 ``tar.gz`` from a verified release."""
+    release = Path(release).resolve()
+    output = Path(output).resolve()
+    verification = verify_session_release(release, require_pass=require_pass)
+    if output.parent == release or release in output.parents:
+        raise ValueError("archive output cannot be inside the release directory")
+    if output.exists() and not replace:
+        raise FileExistsError(f"archive exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    staging.unlink(missing_ok=True)
+    root_name = release.name
+    try:
+        with staging.open("wb") as raw_handle:
+            with gzip.GzipFile(fileobj=raw_handle, mode="wb", mtime=0) as gzip_handle:
+                with tarfile.open(fileobj=gzip_handle, mode="w", format=tarfile.PAX_FORMAT) as archive:
+                    for path in sorted(release.rglob("*")):
+                        if path.is_dir():
+                            continue
+                        if path.is_symlink() or not path.is_file():
+                            raise RuntimeError(f"release contains a non-regular file: {path}")
+                        relative = Path(root_name) / path.relative_to(release)
+                        info = archive.gettarinfo(str(path), arcname=relative.as_posix())
+                        info.uid = 0
+                        info.gid = 0
+                        info.uname = ""
+                        info.gname = ""
+                        info.mtime = 0
+                        with path.open("rb") as handle:
+                            archive.addfile(info, handle)
+            raw_handle.flush()
+            os.fsync(raw_handle.fileno())
+        if replace:
+            os.replace(staging, output)
+        else:
+            os.link(staging, output)
+            staging.unlink()
+        os.chmod(output, 0o600)
+        _fsync_directory(output.parent)
+    finally:
+        staging.unlink(missing_ok=True)
+    return {
+        "ok": True,
+        "archive": str(output),
+        "bytes": output.stat().st_size,
+        "sha256": _file_sha256(output),
+        "release": verification,
+    }
 
 
 def _assign_parts(conn: sqlite3.Connection, target_bytes: int) -> tuple[int, list[str]]:
@@ -573,17 +717,42 @@ def _build_manifest(
     }
 
 
+def _release_child(root: Path, name: str) -> Path:
+    if Path(name).name != name or not name or name in {".", ".."}:
+        raise RuntimeError(f"release entry is not a plain file name: {name!r}")
+    path = (root / name).resolve()
+    if path.parent != root:
+        raise RuntimeError(f"release entry escapes its directory: {name!r}")
+    return path
+
+
 def _verify_release(root: Path, manifest: dict[str, Any]) -> None:
-    part_files = [root / part["file"] for part in manifest["parts"]]
-    catalog_path = root / manifest["catalog"]["file"]
+    part_files = [_release_child(root, str(part["file"])) for part in manifest["parts"]]
+    catalog_path = _release_child(root, str(manifest["catalog"]["file"]))
+    if manifest.get("validation_status") not in {"pass", "warn"}:
+        raise RuntimeError(f"invalid release validation status: {manifest.get('validation_status')!r}")
+    part_records = 0
     for part, path in zip(manifest["parts"], part_files):
         if not path.is_file() or path.stat().st_size != int(part["bytes"]):
             raise RuntimeError(f"release part size mismatch: {path}")
         if _file_sha256(path) != part["sha256"]:
             raise RuntimeError(f"release part checksum mismatch: {path}")
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as conn:
+            integrity = str(conn.execute("PRAGMA integrity_check").fetchone()[0])
+            foreign = len(conn.execute("PRAGMA foreign_key_check").fetchall())
+            records_in_part = int(conn.execute("SELECT count(*) FROM interactions").fetchone()[0])
+            if integrity != "ok" or foreign:
+                raise RuntimeError(f"release part SQLite validation failed: {path}")
+            if "records" in part and records_in_part != int(part["records"]):
+                raise RuntimeError(f"release part record count mismatch: {path}")
+            part_records += records_in_part
     if _file_sha256(catalog_path) != manifest["catalog"]["sha256"]:
         raise RuntimeError("session catalog checksum mismatch")
     with sqlite3.connect(f"file:{catalog_path}?mode=ro", uri=True) as conn:
+        integrity = str(conn.execute("PRAGMA integrity_check").fetchone()[0])
+        foreign = len(conn.execute("PRAGMA foreign_key_check").fetchall())
+        if integrity != "ok" or foreign:
+            raise RuntimeError("session catalog SQLite validation failed")
         split_sessions = int(
             conn.execute(
                 "SELECT count(*) FROM (SELECT traj_id FROM steps GROUP BY traj_id "
@@ -596,16 +765,31 @@ def _verify_release(root: Path, manifest: dict[str, Any]) -> None:
         raise RuntimeError(f"release split {split_sessions} sessions across parts")
     if records != int(manifest["records"]) or sessions != int(manifest["sessions"]):
         raise RuntimeError("release manifest counts do not match session catalog")
+    if part_records != records:
+        raise RuntimeError("release part records do not match session catalog")
 
 
-def _verify_sha256s(root: Path, sums_path: Path) -> None:
+def _verify_sha256s(
+    root: Path,
+    sums_path: Path,
+    *,
+    expected_names: set[str] | None = None,
+) -> None:
+    seen: set[str] = set()
     for line in sums_path.read_text(encoding="ascii").splitlines():
         expected, separator, name = line.partition("  ")
         if not separator or not name or Path(name).name != name:
             raise RuntimeError("invalid SHA256SUMS entry")
-        path = root / name
+        if name in seen:
+            raise RuntimeError(f"duplicate SHA256SUMS entry: {name}")
+        seen.add(name)
+        path = _release_child(root, name)
         if not path.is_file() or _file_sha256(path) != expected:
             raise RuntimeError(f"SHA256SUMS mismatch: {name}")
+    if expected_names is not None and seen != set(expected_names):
+        missing = sorted(set(expected_names) - seen)
+        unexpected = sorted(seen - set(expected_names))
+        raise RuntimeError(f"SHA256SUMS file set mismatch: missing={missing}, unexpected={unexpected}")
 
 
 def _safe_name(value: str) -> str:

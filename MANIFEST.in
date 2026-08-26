@@ -3,6 +3,7 @@ include README.md
 include Dockerfile
 include Makefile
 include pyproject.toml
+include package.json
 recursive-include docs *.md *.png
 recursive-include deploy *.yml *.service
 recursive-include integration *.js

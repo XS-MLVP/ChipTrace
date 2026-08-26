@@ -103,7 +103,13 @@ class TrajectoryCatalogTest(unittest.TestCase):
         }
 
     def prepare_raw_export(self) -> None:
-        call = {"type": "function_call", "call_id": "call-1", "name": "lookup", "arguments": "{}"}
+        call = {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "lookup",
+            "arguments": "{}",
+            "status": "completed",
+        }
         tools = [{
             "type": "function",
             "name": "lookup",
@@ -131,7 +137,12 @@ class TrajectoryCatalogTest(unittest.TestCase):
                 request_items=[
                     {"type": "message", "role": "user", "content": "question"},
                     call,
-                    {"type": "function_call_output", "call_id": "call-1", "output": "result"},
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call-1",
+                        "output": "result",
+                        "status": "completed",
+                    },
                 ],
                 output_item={
                     "type": "message",
@@ -191,6 +202,14 @@ class TrajectoryCatalogTest(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT definition_present FROM tool_calls").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT linkage_status FROM tool_calls").fetchone()[0], "executed")
             self.assertEqual(conn.execute("SELECT matched_call FROM tool_results").fetchone()[0], 1)
+            schema_json = conn.execute("SELECT schema_json FROM tool_definitions").fetchone()[0]
+            argument_json = conn.execute("SELECT argument_json FROM tool_calls").fetchone()[0]
+            result_json = conn.execute("SELECT result_json FROM tool_results").fetchone()[0]
+            self.assertEqual(json.loads(schema_json)["name"], "lookup")
+            self.assertEqual(argument_json, "{}")
+            self.assertEqual(result_json, "result")
+            self.assertEqual(conn.execute("SELECT call_status FROM tool_calls").fetchone()[0], "completed")
+            self.assertEqual(conn.execute("SELECT result_status FROM tool_results").fetchone()[0], "completed")
             self.assertEqual(conn.execute("SELECT count(*) FROM trajectory_edges").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT event_type FROM lifecycle_events").fetchone()[0], "response.completed")
             self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")

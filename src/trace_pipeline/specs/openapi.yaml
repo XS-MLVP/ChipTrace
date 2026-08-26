@@ -18,6 +18,10 @@ paths:
           description: 段文件和 ledger 已完成持久化
         "400":
           description: 采集记录格式无效
+        "411":
+          description: 请求缺少 Content-Length
+        "415":
+          description: 仅接受 application/json
         "409":
           description: 采集标识被用于不同字节内容
         "413":
@@ -32,6 +36,14 @@ paths:
       responses:
         "200": {description: Collector 已就绪}
         "503": {description: Collector 未就绪}
+  /flush:
+    post:
+      summary: 按写入顺序持久化并封存当前段
+      description: 仅供受信任的本地运维调用；封存后会立即创建新的 open 段。
+      responses:
+        "200": {description: 当前队列已持久化且段已封存}
+        "503": {description: Collector 不可用或队列已满}
+        "504": {description: 在途记录未能在超时内完成持久化}
   /audit:
     get:
       summary: 执行有界的 ledger 结构审计

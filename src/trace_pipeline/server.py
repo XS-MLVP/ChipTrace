@@ -68,7 +68,28 @@ class CaptureHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.NOT_FOUND, {"ok": False, "reason": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
-        if urlsplit(self.path).path != "/capture":
+        path = urlsplit(self.path).path
+        if path == "/flush":
+            # This is deliberately a local administration primitive. The
+            # default listener is loopback; deployments exposing the port
+            # should restrict it at the network boundary.
+            try:
+                result = self.server.store.flush(timeout=30.0, seal=True)
+            except TimeoutError as exc:
+                self._json(
+                    HTTPStatus.GATEWAY_TIMEOUT,
+                    {"ok": False, "reason": "flush_timeout", "detail": str(exc)[:300]},
+                )
+                return
+            except StoreError as exc:
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"ok": False, "reason": "flush_failed", "detail": str(exc)[:300]},
+                )
+                return
+            self._json(HTTPStatus.OK, {"ok": True, "sealed": True, **result})
+            return
+        if path != "/capture":
             self._json(HTTPStatus.NOT_FOUND, {"ok": False, "reason": "not_found"})
             return
         content_type = self.headers.get("content-type", "").split(";", 1)[0].strip().lower()

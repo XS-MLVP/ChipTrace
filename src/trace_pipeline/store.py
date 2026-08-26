@@ -67,6 +67,15 @@ class _Task:
     error: BaseException | None = None
 
 
+@dataclass
+class _FlushTask:
+    """A writer-ordered barrier used to seal the active segment safely."""
+
+    seal: bool
+    done: threading.Event
+    error: BaseException | None = None
+
+
 SCHEMA = """
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS meta (
@@ -163,7 +172,7 @@ class CaptureStore:
             )
         self._lock = threading.RLock()
         self._stats_lock = threading.Lock()
-        self._queue: queue.Queue[_Task | None] = queue.Queue(maxsize=config.queue_max_items)
+        self._queue: queue.Queue[_Task | _FlushTask | None] = queue.Queue(maxsize=config.queue_max_items)
         self._stop = threading.Event()
         self._ready = False
         self._fatal: BaseException | None = None
@@ -296,8 +305,19 @@ class CaptureStore:
         except queue.Full as exc:
             with self._stats_lock:
                 self._stats["failed"] += 1
+            self.record_rejection(
+                "queue_full",
+                capture_id=str(value.get("captureId")),
+                raw_sha256=digest,
+            )
             raise StoreError("capture queue is full") from exc
         if not task.done.wait(timeout):
+            self.record_rejection(
+                "durability_ack_timeout",
+                capture_id=str(value.get("captureId")),
+                raw_sha256=digest,
+                state="timeout",
+            )
             raise TimeoutError("capture durability acknowledgement timed out")
         if task.error is not None:
             raise task.error
@@ -319,18 +339,40 @@ class CaptureStore:
             self._conn.commit()
             self._conn.close()
 
+    def flush(self, timeout: float | None = 30.0, *, seal: bool = True) -> dict[str, Any]:
+        """Wait for queued captures, optionally seal, and return health data.
+
+        The barrier is handled by the single writer, so every capture queued
+        before this call is durable before the response is returned. When
+        ``seal`` is true a fresh open segment is created for subsequent writes.
+        """
+        if not self.ready:
+            raise StoreError(f"capture store is not ready: {self._last_error or 'starting'}")
+        task = _FlushTask(seal=bool(seal), done=threading.Event())
+        try:
+            self._queue.put(task, timeout=timeout)
+        except queue.Full as exc:
+            self.record_rejection("flush_queue_full", state="flush_rejected")
+            raise StoreError("capture queue is full") from exc
+        if not task.done.wait(timeout):
+            raise TimeoutError("capture flush acknowledgement timed out")
+        if task.error is not None:
+            raise task.error
+        return self.health()
+
     def record_rejection(
         self,
         reason: str,
         *,
         capture_id: str | None = None,
         raw_sha256: str | None = None,
+        state: str = "rejected",
     ) -> None:
         with self._lock:
             self._conn.execute(
                 "INSERT INTO capture_attempts(capture_id,raw_sha256,state,reason,received_at) "
                 "VALUES(?,?,?,?,?)",
-                (capture_id, raw_sha256, "rejected", reason[:300], utc_now()),
+                (capture_id, raw_sha256, state[:64], reason[:300], utc_now()),
             )
             with self._stats_lock:
                 self._stats["rejected"] += 1
@@ -414,6 +456,7 @@ class CaptureStore:
     def _writer_loop(self) -> None:
         while True:
             batch: list[_Task] = []
+            control: _FlushTask | None = None
             try:
                 try:
                     first = self._queue.get(timeout=1.0)
@@ -422,6 +465,10 @@ class CaptureStore:
                     continue
                 if first is None:
                     break
+                if isinstance(first, _FlushTask):
+                    control = first
+                    self._handle_flush(control)
+                    continue
                 batch = [first]
                 deadline = time.monotonic() + self.config.batch_wait_ms / 1000
                 while len(batch) < self.config.batch_records:
@@ -435,6 +482,9 @@ class CaptureStore:
                     if item is None:
                         self._queue.put(None)
                         break
+                    if isinstance(item, _FlushTask):
+                        self._queue.put(item)
+                        break
                     batch.append(item)
                 self._commit_batch(batch)
             except BaseException as exc:
@@ -447,16 +497,59 @@ class CaptureStore:
                 # remains visible in capture_attempts.
                 for task in batch:
                     task.error = StoreError(str(exc))
+                    self.record_rejection(
+                        "writer_failure",
+                        capture_id=str(task.value.get("captureId")),
+                        raw_sha256=task.digest,
+                        state="failed",
+                    )
                     task.done.set()
+                if control is not None:
+                    control.error = StoreError(str(exc))
+                    control.done.set()
                 while True:
                     try:
                         queued = self._queue.get_nowait()
                     except queue.Empty:
                         break
-                    if queued is not None:
+                    if isinstance(queued, _Task):
+                        queued.error = StoreError(str(exc))
+                        self.record_rejection(
+                            "writer_failure",
+                            capture_id=str(queued.value.get("captureId")),
+                            raw_sha256=queued.digest,
+                            state="failed",
+                        )
+                        queued.done.set()
+                    elif isinstance(queued, _FlushTask):
                         queued.error = StoreError(str(exc))
                         queued.done.set()
                 break
+
+    def _handle_flush(self, task: _FlushTask) -> None:
+        try:
+            with self._lock:
+                if task.seal:
+                    self._seal_active()
+                    self._open_active_segment()
+                elif self._active_handle is not None:
+                    self._active_handle.flush()
+                    os.fsync(self._active_handle.fileno())
+                    self._conn.execute(
+                        "UPDATE segments SET bytes=?,records=?,last_offset=? WHERE segment_id=?",
+                        (
+                            self._active_bytes,
+                            self._active_records,
+                            self._active_bytes,
+                            self._active_segment_id,
+                        ),
+                    )
+                    self._conn.commit()
+            task.done.set()
+        except BaseException as exc:
+            task.error = StoreError(str(exc))
+            task.done.set()
+            raise
 
     def _commit_batch(self, batch: list[_Task]) -> None:
         with self._lock:

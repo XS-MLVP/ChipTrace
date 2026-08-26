@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from trace_pipeline.cli import fixture
+from trace_pipeline.exporter import export_sealed
 from trace_pipeline.server import CaptureHTTPServer
 from trace_pipeline.store import CaptureStore, StoreConfig
 
@@ -56,6 +57,25 @@ class HTTPCompatibilityTest(unittest.TestCase):
         self.assertEqual(health["captures"], 1)
         self.assertEqual(audit_status, 200)
         self.assertTrue(audit["ok"])
+
+    def test_flush_seals_queued_records_without_stopping_collector(self) -> None:
+        value = fixture("cap-http-flush", status=200, pad=100)
+        raw = json.dumps(value, separators=(",", ":")).encode()
+        self.assertEqual(self.request("POST", "/capture", raw)[0], 202)
+
+        status, payload = self.request("POST", "/flush")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["sealed"])
+        self.assertEqual(payload["captures"], 1)
+        health = self.store.health()
+        self.assertEqual(health["captures"], 1)
+        self.assertGreaterEqual(health["segments"].get("sealed", {}).get("count", 0), 1)
+        self.assertGreaterEqual(health["segments"].get("open", {}).get("count", 0), 1)
+        raw_output = self.root.parent / "flushed-export.sqlite"
+        exported = export_sealed(self.root, raw_output, raw_chunk_bytes=128)
+        self.assertEqual(exported["records"], 1)
 
     def test_invalid_attempt_is_counted(self) -> None:
         status, payload = self.request("POST", "/capture", b'{"missing":"capture-id"}')

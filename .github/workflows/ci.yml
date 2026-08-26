@@ -25,6 +25,7 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[performance]'
       - run: make test
+      - run: npm test
       - run: python -m trace_pipeline self-test
 
   package:
