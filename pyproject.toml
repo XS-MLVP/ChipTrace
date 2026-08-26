@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-trace-training-pipeline"
 dynamic = ["version"]
-description = "Durable capture and complete-session release pipeline for agent trace data"
+description = "面向 Agent 交互轨迹的可靠采集、完整 Session 整理与训练数据标准化交付流水线"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
