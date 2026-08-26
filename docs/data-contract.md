@@ -1,27 +1,23 @@
-# Data contract
+# 数据契约
 
-## Boundary
+## 采集边界
 
-The collector is a raw, durable boundary. It does not decide whether an
-interaction is useful, correct, or eligible for training. In particular, it
-does not discard HTTP 408, 429, or 5xx responses, upstream errors, incomplete
-responses, or records without usage. Policy and quality decisions happen in a
-versioned downstream projection.
+Collector 是原始数据的持久化边界，不判断交互是否有效、正确或符合
+训练准入条件。HTTP 408、429、5xx、上游错误、不完整响应和缺少 usage
+的记录均进入原始存储。质量策略在版本化的下游投影中执行。
 
-The operator must authorize the source before enabling capture. The service
-does no body redaction and treats every stored envelope as sensitive raw data,
-even when the expected traffic contains no sensitive text.
+部署方必须在启用采集前取得数据源授权。服务不对正文执行脱敏，每个 envelope 均按敏感原始数据处理。
 
-## Relay input
+## Relay 输入
 
-`POST /capture` accepts `application/json` and requires a `captureId` matching
-`cap-[A-Za-z0-9._:-]+`. The compatible relay shape is:
+`POST /capture` 接受 `application/json`，并要求 `captureId` 匹配 `cap-[A-Za-z0-9._:-]+`。兼容格式如下：
 
 ```json
 {
-  "captureId": "cap-...",
-  "startedAt": "2026-08-24T00:00:00Z",
-  "finishedAt": "2026-08-24T00:00:01Z",
+  "captureId": "cap-example-001",
+  "sourceNamespace": "relay-a",
+  "startedAt": "2026-08-26T00:00:00Z",
+  "finishedAt": "2026-08-26T00:00:01Z",
   "requestBodyText": "{\"model\":\"target-model-v1\",\"input\":[]}",
   "responseStatus": 503,
   "responseBodyText": "data: {...}\n\n",
@@ -34,129 +30,141 @@ even when the expected traffic contains no sensitive text.
     "turn_id": "turn-1",
     "previous_response_id": "response-0"
   },
-  "observedLifecycleEvents": ["response.completed"]
+  "observedLifecycleEvents": ["response.failed"]
 }
 ```
 
-The collector normalizes the two text bodies to the historical
-`full-trace-spool-v3` shape:
+Collector 将两个文本正文规范化为 `full-trace-spool-v3`：
 
-- valid JSON text becomes `{ "kind": "json", "value": ... }`;
-- SSE, plain text, and invalid JSON become `{ "kind": "text", "value": ... }`;
-- `requestBodySha256` and `responseBodySha256` cover the original UTF-8 text;
-- all response statuses and `captureError` fields are retained;
-- the persisted `receivedAt` is derived only from stable event timestamps;
-- the collector's actual arrival time is stored separately as `imported_at`.
+- 合法 JSON 文本保存为 `{"kind": "json", "value": ...}`。
+- SSE、纯文本和非法 JSON 保存为 `{"kind": "text", "value": ...}`。
+- `requestBodySha256` 和 `responseBodySha256` 覆盖原始 UTF-8 字节。
+- 所有响应状态和 `captureError` 字段完整保留。
+- `receivedAt` 只由稳定事件时间生成。
+- Collector 实际接收时间单独保存在 `imported_at`。
 
-The stable timestamp rule makes a byte-identical retry with the same
-`captureId` idempotent, including compatibility clients that omit timestamps.
-Already-normalized spool records are accepted without rewriting their body
-shape.
+稳定时间规则确保兼容客户端省略时间戳时，同一 `captureId` 和相同字节仍可幂等重试。已经规范化的 spool 记录保持正文结构不变。
 
-## ACK and identity
+完整字段由
+[Capture Envelope JSON Schema](../src/trace_pipeline/specs/capture-envelope-v3.schema.json)
+定义。
 
-The collector returns HTTP 202 only after the segment bytes have crossed the
-configured `fsync` boundary and the SQLite ledger transaction has committed.
-The response includes `durable: true` and one of these states:
+## 持久化确认与身份
 
-- `accepted`: the ID and payload were committed for the first time;
-- `duplicate`: the same ID and payload hash were already committed;
-- HTTP 409 `conflict`: the ID was reused with different payload bytes.
+Collector 在段文件跨过配置的 `fsync` 边界并提交 SQLite ledger 事务后
+返回 HTTP 202。响应包含 `durable: true` 和以下状态之一：
 
-HTTP 400/411/413/415, body-budget overload, duplicate, conflict, accepted, and
-startup-recovered attempts are recorded in `capture_attempts`. The durable
-ledger, rather than process-lifetime counters, is the accounting authority.
-Timeout is ambiguous by design: the sender retries the exact serialized body
-and ID; the ledger resolves it to accepted or duplicate.
+- `accepted`：ID 和 payload 首次提交。
+- `duplicate`：相同 ID 和 payload hash 已提交。
+- HTTP 409 `conflict`：相同 ID 对应不同 payload 字节。
 
-## Storage
+HTTP 400、411、413、415、在途字节超限、duplicate、conflict、accepted
+和启动恢复状态均记录到 `capture_attempts`。ledger 是 attempt 记账
+依据，进程内计数只用于运行监控。
 
-Raw records are one JSON object per line in:
+请求超时不代表写入失败。发送端必须重试完全相同的序列化字节和 ID，ledger 将结果归并为 accepted 或 duplicate。
+
+## 原始存储
+
+每条原始记录占一行 JSON：
 
 ```text
 <data-root>/segments/segment-NNNNNNNN.open.ndjson
 <data-root>/segments/segment-NNNNNNNN.sealed.ndjson
 ```
 
-Only the writer appends to the one open segment. Rotation atomically renames it
-to `sealed`; sealed files have a SHA-256 in the ledger. Startup truncates only
-an incomplete tail of an open segment. Missing segments, conflicting IDs, or a
-second physical copy of an ID fail startup rather than being hidden.
+只有当前写者追加 open 段。轮转通过原子重命名生成 sealed 段，并将
+SHA-256 写入 ledger。启动恢复只截断 open 段末尾的不完整行；
+段文件缺失、ID 冲突或同一 ID 存在第二份物理记录会阻止服务进入
+ready 状态。
 
-SQLite state defaults to `<data-root>/state/capture-ledger.sqlite`, but WAL is
-rejected on NFS/CIFS. The production layout must use separate roots:
+SQLite 状态默认位于 `<data-root>/state/capture-ledger.sqlite`。生产部署使用独立目录：
 
 ```text
-NFS or data volume:  --root /data/capture
-local persistent FS: --state-root /data/state
+数据卷或 NFS:   --root /data/capture
+本地持久化磁盘: --state-root /var/lib/trace-pipeline/state
 ```
 
-The local state directory must be backed up. If it is lost, it can be rebuilt
-by scanning all retained segments, but startup will take proportional time.
+live ledger 不在 NFS/CIFS 上使用 WAL。状态目录纳入备份；从 retained segments 重建 ledger 的耗时与原始数据规模成正比。
 
-## Raw SQLite export
+## Raw SQLite 导出
 
-`trace-pipeline export` takes a read-only SQLite snapshot and selects sealed or
-archived segments only. It builds a private staging database, validates it,
-then publishes it atomically: the default no-overwrite path uses a hard link,
-while `--replace` uses an atomic rename. The schema is:
+`trace-pipeline export` 固定一个只读 SQLite 快照，只选择 sealed 或
+archived 段。命令在私有 staging 数据库中构建并校验结果，再原子发布。
+默认无覆盖路径使用 hard link，`--replace` 使用原子 rename。
 
-- `dataset_meta`: format, creation time, compression, sensitivity claims;
-- `source_segments`: segment path, byte/record count, and SHA-256;
-- `interactions`: one unique capture and its metadata/source locator;
-- `interaction_chunks`: ordered independent zlib or zstd chunks, 4 MiB raw by
-  default;
-- `validation_results`: record, chunk, foreign-key, and integrity checks.
+Raw SQLite 包含以下表：
 
-The independent chunks bound decompression memory and match the existing
-trajectory reader's `interactions + interaction_chunks` input contract. Raw
-prompt, answer, tool arguments, and tool results stay in this raw database.
-The codec and level are recorded on every chunk. Readers must reject unknown
-codecs, length mismatches, decompression failures, and raw hash mismatches.
+- `dataset_meta`：格式、创建时间、压缩方式和敏感数据声明。
+- `source_segments`：段路径、字节数、记录数和 SHA-256。
+- `interactions`：唯一 capture、元数据和源定位信息。
+- `interaction_chunks`：有序、独立的 zlib 或 zstd 压缩块，默认原始块大小为 4 MiB。
+- `validation_results`：记录、压缩块、外键和完整性校验结果。
 
-`export-sharded` takes one explicit snapshot of all sealed segment IDs, assigns
-each segment to exactly one raw SQLite writer, and publishes a directory with
-`manifest.json` and `SHA256SUMS`. Raw shards are a throughput boundary and may
-split a session. Only the downstream `release` command may claim session-atomic
-delivery.
+独立压缩块限制解压内存，并与 trajectory reader 的
+`interactions + interaction_chunks` 输入契约一致。原始 Prompt、
+回答、工具参数和工具结果保留在 raw 数据库中。读取端必须拒绝未知
+codec、长度不符、解压失败和原始哈希不符。
 
-## Session release and score boundary
+`export-sharded` 固定所有 sealed segment ID 的同一快照，将每个段
+分配给唯一 raw SQLite writer，并发布包含 `manifest.json` 和
+`SHA256SUMS` 的目录。Raw shard 可以拆分 Session，只有下游
+`release` 可以声明 Session 原子交付。
 
-`trace-pipeline release` treats a session as the delivery atom. Session identity
-comes from `client_metadata.session_id`, falling back to `thread_id`, and is
-hashed together with `sourceNamespace`; a missing identity becomes a
-one-capture orphan and is scored accordingly. Selecting a model includes every
-other-model interaction belonging to the same session. One session is never
-split across release parts, even when that session alone exceeds the configured
-target size.
+## Session 交付与评分边界
 
-The raw export has enough information to calculate session, turn, step, usage,
-terminal status, native tool call/result linkage, and truncation flags. The
-release automatically keeps:
+`trace-pipeline release` 将 Session 作为最小交付单元。Session 身份
+优先取 `client_metadata.session_id`，其次取 `thread_id`，并与
+`sourceNamespace` 一起计算哈希。缺少身份的记录生成单 capture
+orphan Session，并在完整性评分中体现。
 
-- `session_completeness_score`: deterministic observed trace completeness;
-- component scores for payload, identity, terminal, usage, tool linkage, and
-  session boundaries;
-- `reward`: nullable correctness or preference result;
-- `reward_source`: evaluator, judge version, benchmark, or ground truth.
+选择目标模型时，同一 Session 中其他模型的交互也会保留。一个 Session
+不跨 release part；单个 Session 超过目标大小时，独立生成超限 part。
 
-The catalog also indexes root/parent/goal/agent/branch identifiers, observed
-lifecycle events, response-chain DAG edges, full tool-definition hashes, and
-tool linkage states. These fields remain observations; the builder does not
-invent a missing parent, result, lifecycle event, or reward.
+Raw export 支持计算以下字段：
 
-The 100-point completeness policy is payload 20, session/turn identity 20,
-terminal observation 20, usage 5, tool call/result linkage 20, and observed
-session boundaries 15. `A_complete` requires all 100 points. Every component
-and the underlying flags remain queryable in `session_quality`.
+- Session、Turn 和 Step 身份。
+- input、cache、output、reasoning 和 total Token 用量。
+- Terminal 状态和生命周期事件。
+- 工具 schema、调用、结果和关联状态。
+- payload 截断和 Session 左右边界。
+- root、parent、goal、agent、branch 和 Response DAG 关系。
 
-Captured `response.failed`, `response.incomplete`, and `response.cancelled`
-events are complete terminal observations and do not imply incomplete capture.
-Likewise, HTTP success, `response.completed`, final text, and tool closure are
-not semantic reward. Encrypted reasoning may be retained as opaque source data;
-the delivery must not claim plaintext chain-of-thought availability.
+Release 保存以下质量字段：
 
-`left_censored`, `right_censored`, truncation, missing identity, and unmatched
-tools remain explicit. Completeness is limited to the supplied raw-input
-universe; the builder cannot prove that an omitted source file contains no
-earlier or later session step. See `docs/delivery-template.md`.
+- `session_completeness_score`：确定性的已观测 Trace 完整性。
+- Payload、Identity、Terminal、Usage、Tool Linkage 和 Boundary 分项得分。
+- `reward`：可空的正确性或偏好结果。
+- `reward_source`：evaluator、judge 版本、benchmark 或 ground truth。
+
+100 分完整性策略如下：
+
+| 分项 | 分值 |
+| --- | ---: |
+| Payload | 20 |
+| Session / Turn Identity | 20 |
+| Terminal | 20 |
+| Usage | 5 |
+| Tool Linkage | 20 |
+| Boundary | 15 |
+
+`A_complete` 要求 100 分。所有分项和底层 flags 保存在 `session_quality` 中。
+
+`response.failed`、`response.incomplete` 和 `response.cancelled`
+是完整的终态观测，不代表采集不完整。HTTP 成功、
+`response.completed`、最终文本和工具闭合也不代表语义奖励。
+加密 reasoning 作为不透明原始数据保存，交付结果不声明具备明文思维链。
+
+`left_censored`、`right_censored`、正文截断、身份缺失和工具未配对均保持显式。完整性结论仅覆盖本次输入的原始数据集合。交付约束见[交付规范](delivery.md)。
+
+## 版本
+
+| 对象 | 当前格式 |
+| --- | --- |
+| Capture envelope | `capture-envelope-v3` |
+| Raw spool | `full-trace-spool-v3` |
+| Session catalog | `session-catalog-v3` |
+| Release manifest | `complete-session-release-v1` |
+| Completeness policy | `session-trace-completeness-v1` |
+
+持久化格式变更必须新增版本和迁移测试，不覆盖既有格式语义。

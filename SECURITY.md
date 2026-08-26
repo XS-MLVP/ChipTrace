@@ -1,22 +1,24 @@
-# Security policy
+# 安全策略
 
-## Supported versions
+## 支持范围
 
-Only the latest tagged release receives security fixes while the project is in
-alpha.
+最新发布版本接收安全修复。持久化格式的安全修复同时覆盖读取端校验和迁移路径。
 
-## Reporting
+## 漏洞报告
 
-Do not open a public issue containing credentials, captured content, private
-network details, or an exploitable trace. Contact the repository maintainers
-through the private security-reporting channel configured by the hosting
-organization.
+不要在公开 Issue 中提交凭据、真实采集正文、私有网络信息或可直接利用的 Trace。通过代码托管平台配置的私有安全报告通道联系维护者。
 
-## Deployment boundary
+报告包含以下信息：
 
-The collector has no application-level authentication or TLS termination. It
-binds to loopback by default and must remain behind a trusted local network or
-an authenticated ingress. It stores request and response bodies as sensitive
-raw evidence. Common credential-bearing headers are removed during compatible
-envelope normalization, but operators remain responsible for source consent,
-field policy, encryption at rest, access control, retention, and deletion.
+- 受影响版本和组件
+- 复现条件和最小复现步骤
+- 数据机密性、完整性或可用性影响
+- 已验证的缓解措施
+
+## 部署边界
+
+Collector 不提供应用层认证和 TLS 终止。默认监听 loopback，生产环境部署在可信内网或受认证的入口之后。
+
+请求正文、响应正文、工具参数和工具结果均按敏感原始数据处理。兼容 envelope 规范化会移除常见凭据 Header；部署方负责数据源授权、字段策略、静态加密、访问控制、保留期限和删除流程。
+
+live SQLite ledger 和 Relay outbox 使用本地持久化文件系统及服务专属权限。备份、导出和交付文件采用相同的数据分级和访问控制策略。

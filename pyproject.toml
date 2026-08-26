@@ -14,7 +14,6 @@ requires-python = ">=3.10"
 dependencies = []
 keywords = ["agent", "trace", "trajectory", "dataset", "sqlite"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
   "Environment :: Console",
   "Intended Audience :: Developers",
   "Operating System :: POSIX :: Linux",

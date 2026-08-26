@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { extractTraceMetadata } = require('../integration/trace_context');
+const { extractTraceMetadata } = require('../../integration/trace_context');
 
 test('extracts explicit session DAG identifiers without inference', () => {
   const request = JSON.stringify({

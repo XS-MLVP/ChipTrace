@@ -1,12 +1,12 @@
 openapi: 3.1.0
 info:
-  title: Trace Capture API
-  version: 0.4.0-alpha.1
-  description: Durable local ingestion boundary for full agent interaction traces.
+  title: Agent Trace 采集 API
+  version: 0.4.0
+  description: 完整 Agent 交互 Trace 的本地持久化采集接口。
 paths:
   /capture:
     post:
-      summary: Persist one capture envelope
+      summary: 持久化一条采集记录
       requestBody:
         required: true
         content:
@@ -15,26 +15,26 @@ paths:
               $ref: ./capture-envelope-v3.schema.json
       responses:
         "202":
-          description: Segment and ledger durability boundary completed
+          description: 段文件和 ledger 已完成持久化
         "400":
-          description: Invalid capture envelope
+          description: 采集记录格式无效
         "409":
-          description: Capture identifier reused with different bytes
+          description: 采集标识被用于不同字节内容
         "413":
-          description: Envelope exceeds configured byte limit
+          description: 采集记录超过配置的字节上限
         "503":
-          description: Collector backpressure or storage failure
+          description: Collector 背压或存储失败
         "504":
-          description: Durability acknowledgement timed out; retry the same bytes and identifier
+          description: 持久化确认超时，使用相同标识和字节重试
   /health:
     get:
-      summary: Read collector readiness and durable accounting state
+      summary: 读取 Collector 就绪状态和持久化记账状态
       responses:
-        "200": {description: Collector ready}
-        "503": {description: Collector not ready}
+        "200": {description: Collector 已就绪}
+        "503": {description: Collector 未就绪}
   /audit:
     get:
-      summary: Run a bounded structural ledger audit
+      summary: 执行有界的 ledger 结构审计
       responses:
-        "200": {description: Audit passed}
-        "500": {description: Audit failed}
+        "200": {description: 审计通过}
+        "500": {description: 审计失败}

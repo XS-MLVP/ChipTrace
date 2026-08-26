@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:trace-pipeline:release-manifest:v1",
-  "title": "Complete session release manifest v1",
+  "title": "完整 Session 交付清单 v1",
   "type": "object",
   "required": [
     "format",

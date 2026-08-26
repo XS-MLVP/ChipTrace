@@ -2,7 +2,7 @@
 
 test:
 	PYTHONPATH=src python3 -m unittest discover -s tests -v
-	node --test tests-js/*.test.js
+	node --test tests/js/*.test.js
 
 self-test:
 	PYTHONPATH=src ./scripts/self-test.sh

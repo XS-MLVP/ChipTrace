@@ -9,7 +9,7 @@ const {
   CaptureConflictError,
   DurableCaptureOutbox,
   OutboxFullError,
-} = require('../integration/durable_capture_outbox');
+} = require('../../integration/durable_capture_outbox');
 
 function response(status, payload = {}) {
   return {

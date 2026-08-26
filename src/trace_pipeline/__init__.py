@@ -1,4 +1,4 @@
-"""Durable agent trace capture and training-data boundary."""
+"""Agent Trace 可靠采集与训练数据边界。"""
 
 from .release import build_session_release
 from .sharded_export import build_sharded_export
@@ -11,4 +11,4 @@ __all__ = [
     "build_session_release",
     "build_sharded_export",
 ]
-__version__ = "0.4.0a1"
+__version__ = "0.4.0"
