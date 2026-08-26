@@ -6,5 +6,5 @@ COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 RUN python -m pip install --no-cache-dir --no-build-isolation .
 
-ENTRYPOINT ["trace-pipeline"]
+ENTRYPOINT ["chiptrace"]
 CMD ["--help"]

@@ -1,4 +1,4 @@
-# 数据契约
+# 芯迹数据契约
 
 ## 采集边界
 
@@ -82,14 +82,14 @@ SQLite 状态默认位于 `<data-root>/state/capture-ledger.sqlite`。生产部�
 
 ```text
 数据卷或 NFS:   --root /data/capture
-本地持久化磁盘: --state-root /var/lib/trace-pipeline/state
+本地持久化磁盘: --state-root /var/lib/chiptrace/state
 ```
 
 live ledger 不在 NFS/CIFS 上使用 WAL。状态目录纳入备份；从 retained segments 重建 ledger 的耗时与原始数据规模成正比。
 
 ## Raw SQLite 导出
 
-`trace-pipeline export` 固定一个只读 SQLite 快照，只选择 sealed 或
+`chiptrace export` 固定一个只读 SQLite 快照，只选择 sealed 或
 archived 段。命令在私有 staging 数据库中构建并校验结果，再原子发布。
 默认无覆盖路径使用 hard link，`--replace` 使用原子 rename。
 
@@ -113,7 +113,7 @@ codec、长度不符、解压失败和原始哈希不符。
 
 ## Session 交付与评分边界
 
-`trace-pipeline release` 将 Session 作为最小交付单元。Session 身份
+`chiptrace release` 将 Session 作为最小交付单元。Session 身份
 优先取 `client_metadata.session_id`，其次取 `thread_id`，并与
 `sourceNamespace` 一起计算哈希。缺少身份的记录生成单 capture
 orphan Session，并在完整性评分中体现。

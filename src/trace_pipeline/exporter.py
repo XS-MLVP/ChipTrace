@@ -249,7 +249,7 @@ def export_sealed(
                     raise RuntimeError(f"invalid source length for {row['capture_id']}")
                 cursor = out.execute(
                     "INSERT INTO interactions(capture_id,event_ts,received_at,started_at,finished_at,model,api_key_fingerprint,response_status,raw_bytes,stored_bytes,raw_sha256,segment_id,source_offset,source_length,metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (row["capture_id"], row["started_at"] or row["received_at"], row["received_at"], row["started_at"], row["finished_at"], row["model"], row["api_key_fingerprint"], row["response_status"], raw_bytes, 0, row["raw_sha256"], segment_id, row["offset"], row["length"], json.dumps({"source":"trace-training-pipeline","inbound_path":row["inbound_path"],"proxied_path":row["proxied_path"]}, separators=(",", ":"), sort_keys=True)),
+                    (row["capture_id"], row["started_at"] or row["received_at"], row["received_at"], row["started_at"], row["finished_at"], row["model"], row["api_key_fingerprint"], row["response_status"], raw_bytes, 0, row["raw_sha256"], segment_id, row["offset"], row["length"], json.dumps({"source":"chiptrace","inbound_path":row["inbound_path"],"proxied_path":row["proxied_path"]}, separators=(",", ":"), sort_keys=True)),
                 )
                 record_id = int(cursor.lastrowid)
                 digest = hashlib.sha256()

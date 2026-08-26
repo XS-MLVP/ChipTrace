@@ -6,7 +6,7 @@
 
 ```text
 /srv/trace-data/capture/             # sealed 与 open NDJSON 段
-/var/lib/trace-pipeline/state/       # live SQLite ledger
+/var/lib/chiptrace/state/            # live SQLite ledger
 /var/lib/trace-relay/outbox/         # Relay 待投递文件
 ```
 
@@ -19,20 +19,21 @@ Capture 数据目录可以位于 NFS 或数据卷。Collector 使用 Capture 和
 创建目录并启动服务：
 
 ```bash
-export TRACE_CAPTURE_DATA_ROOT=/srv/trace-data/capture
-export TRACE_CAPTURE_STATE_ROOT=/var/lib/trace-pipeline/state
-export TRACE_PIPELINE_UID="$(id -u)"
-export TRACE_PIPELINE_GID="$(id -g)"
+export CHIPTRACE_CAPTURE_DATA_ROOT=/srv/trace-data/capture
+export CHIPTRACE_CAPTURE_STATE_ROOT=/var/lib/chiptrace/state
+export CHIPTRACE_UID="$(id -u)"
+export CHIPTRACE_GID="$(id -g)"
 
 install -d -m 0700 \
-  "$TRACE_CAPTURE_DATA_ROOT" \
-  "$TRACE_CAPTURE_STATE_ROOT"
+  "$CHIPTRACE_CAPTURE_DATA_ROOT" \
+  "$CHIPTRACE_CAPTURE_STATE_ROOT"
 
 docker compose -f deploy/docker-compose.yml up -d --build
 curl --fail http://127.0.0.1:3010/health
 ```
 
-默认只监听宿主机 `127.0.0.1:3010`。通过 `TRACE_COLLECTOR_BIND` 和 `TRACE_COLLECTOR_PORT` 调整绑定地址与端口。
+默认只监听宿主机 `127.0.0.1:3010`。通过 `CHIPTRACE_COLLECTOR_BIND` 和
+`CHIPTRACE_COLLECTOR_PORT` 调整绑定地址与端口。
 
 停止服务：
 
@@ -44,25 +45,28 @@ docker compose -f deploy/docker-compose.yml down
 
 ## systemd 用户服务
 
-仓库放置于 `$HOME/trace-training-pipeline` 并完成虚拟环境安装后，启用用户服务：
+仓库放置于 `$HOME/chiptrace` 并完成虚拟环境安装后，启用用户服务：
 
 ```bash
 install -d "$HOME/.config/systemd/user"
 install -d -m 0700 \
-  "$HOME/.local/share/trace-pipeline/capture" \
-  "$HOME/.local/state/trace-pipeline"
+  "$HOME/.local/share/chiptrace/capture" \
+  "$HOME/.local/state/chiptrace"
 
-cp deploy/trace-pipeline.service "$HOME/.config/systemd/user/"
+cp deploy/chiptrace.service "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
-systemctl --user enable --now trace-pipeline.service
-systemctl --user status trace-pipeline.service
+systemctl --user enable --now chiptrace.service
+systemctl --user status chiptrace.service
 ```
 
 服务日志通过以下命令查看：
 
 ```bash
-journalctl --user -u trace-pipeline.service -f
+journalctl --user -u chiptrace.service -f
 ```
+
+服务单元提供 `trace-pipeline.service` 兼容别名；已有调用方可平滑迁移到
+`chiptrace.service`。
 
 ## Relay 配置
 

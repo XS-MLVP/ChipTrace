@@ -1,4 +1,4 @@
-name: ci
+name: chiptrace-ci
 
 on:
   push:
@@ -37,4 +37,4 @@ jobs:
       - run: python -m pip install --upgrade build
       - run: python -m build
       - run: python -m pip install --no-deps dist/*.whl
-      - run: trace-pipeline --help
+      - run: chiptrace --help

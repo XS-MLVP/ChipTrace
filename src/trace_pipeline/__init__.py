@@ -1,4 +1,4 @@
-"""Agent Trace 可靠采集与训练数据边界。"""
+"""芯迹（ChipTrace）可靠采集与 Trace 治理边界。"""
 
 from .release import build_session_release
 from .sharded_export import build_sharded_export

@@ -3,13 +3,13 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-trace-training-pipeline"
+name = "chiptrace-governance"
 dynamic = ["version"]
-description = "面向 Agent 交互轨迹的可靠采集、完整 Session 整理与训练数据标准化交付流水线"
+description = "万总一芯团队的芯片行业 Trace 治理框架"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-authors = [{name = "Trace Pipeline Authors"}]
+authors = [{name = "万总一芯团队"}]
 requires-python = ">=3.10"
 dependencies = []
 keywords = ["agent", "trace", "trajectory", "dataset", "sqlite"]
@@ -29,6 +29,7 @@ classifiers = [
 performance = ["orjson>=3.10", "zstandard>=0.22"]
 
 [project.scripts]
+chiptrace = "trace_pipeline.cli:main"
 trace-pipeline = "trace_pipeline.cli:main"
 
 [tool.setuptools.packages.find]

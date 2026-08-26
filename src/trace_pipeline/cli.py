@@ -148,7 +148,7 @@ def fixture(capture_id: str, *, status: int = 200, pad: int = 0) -> dict:
 
 
 def run_self_test(_args: argparse.Namespace) -> int:
-    with tempfile.TemporaryDirectory(prefix="trace-pipeline-self-test-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="chiptrace-self-test-") as temporary:
         root = Path(temporary) / "capture"
         store = CaptureStore(StoreConfig(root=root, segment_max_bytes=1400, batch_records=8, batch_wait_ms=5))
         first = store.submit(fixture("cap-self-test-1", status=200, pad=300))
@@ -209,7 +209,7 @@ def run_self_test(_args: argparse.Namespace) -> int:
 
 
 def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(description="Durable agent trace training pipeline")
+    command = argparse.ArgumentParser(description="芯迹（ChipTrace）芯片行业 Trace 治理框架")
     sub = command.add_subparsers(dest="command", required=True)
 
     serve_parser = sub.add_parser("serve", help="run the compatible POST /capture service")

@@ -1,8 +1,10 @@
-# Agent 轨迹训练数据流水线
+# 芯迹（ChipTrace）
 
-面向 Agent 交互轨迹的可靠采集、Session 组装、质量评分与标准化交付。
+万总一芯团队的芯片行业 Trace 治理框架。
 
-Relay 负责旁路复制和本地 outbox，Collector 持久化原始证据，离线命令负责轨迹组装、校验和分包。采集入口保留真实成功、失败、取消和重试记录，质量筛选在离线投影中执行。
+Relay 负责旁路复制和本地 outbox，Collector 持久化原始证据，
+离线命令负责轨迹组装、校验和分包。采集入口保留真实成功、失败、
+取消和重试记录，质量筛选在离线投影中执行。
 
 ## 核心能力
 
@@ -28,7 +30,7 @@ flowchart LR
     I --> J[Session 原子 Release]
 ```
 
-![实时数据流与数据包状态](docs/assets/realtime-pipeline.png)
+![芯迹实时数据流与数据包状态](docs/assets/chiptrace-realtime.png)
 
 实时采集、入库、轮转和交付状态示例。
 
@@ -46,11 +48,11 @@ make self-test
 ## 运行 Collector
 
 ```bash
-export TRACE_ROOT=/var/tmp/trace-pipeline
-mkdir -p "$TRACE_ROOT/capture" "$TRACE_ROOT/state"
-trace-pipeline serve \
-  --root "$TRACE_ROOT/capture" \
-  --state-root "$TRACE_ROOT/state" \
+export CHIPTRACE_ROOT=/var/tmp/chiptrace
+mkdir -p "$CHIPTRACE_ROOT/capture" "$CHIPTRACE_ROOT/state"
+chiptrace serve \
+  --root "$CHIPTRACE_ROOT/capture" \
+  --state-root "$CHIPTRACE_ROOT/state" \
   --host 127.0.0.1 \
   --port 3010
 ```
@@ -67,16 +69,16 @@ curl --fail http://127.0.0.1:3010/health | python3 -m json.tool
 ## 处理与交付
 
 ```bash
-trace-pipeline export \
-  --root "$TRACE_ROOT/capture" \
-  --ledger "$TRACE_ROOT/state/capture-ledger.sqlite" \
-  --output "$TRACE_ROOT/raw.sqlite" \
+chiptrace export \
+  --root "$CHIPTRACE_ROOT/capture" \
+  --ledger "$CHIPTRACE_ROOT/state/capture-ledger.sqlite" \
+  --output "$CHIPTRACE_ROOT/raw.sqlite" \
   --compression-codec zstd \
   --compression-level 1
 
-trace-pipeline release \
-  --input "$TRACE_ROOT/raw.sqlite" \
-  --output "$TRACE_ROOT/release" \
+chiptrace release \
+  --input "$CHIPTRACE_ROOT/raw.sqlite" \
+  --output "$CHIPTRACE_ROOT/release" \
   --model target-model-v1 \
   --target-part-gib 10
 ```
@@ -106,7 +108,7 @@ release/
 ## 项目结构
 
 ```text
-trace-training-pipeline/
+chiptrace/
 ├── deploy/                  # Docker Compose 与 systemd
 ├── docs/                    # 架构、契约、交付、运维和图片资源
 ├── integration/             # Relay outbox 与 Trace 上下文
@@ -129,7 +131,7 @@ trace-training-pipeline/
 - [部署与运维](docs/operations.md)
 - [OpenAPI 规范](src/trace_pipeline/specs/openapi.yaml)
 
-使用 `trace-pipeline <command> --help` 查看完整参数。
+使用 `chiptrace <command> --help` 查看完整参数。`trace-pipeline` 仍作为兼容别名提供。
 
 ## 许可证
 

@@ -1,13 +1,13 @@
-name: ${TRACE_PIPELINE_PROJECT_NAME:-trace-training-pipeline}
+name: ${CHIPTRACE_PROJECT_NAME:-chiptrace}
 
 services:
   collector:
     build:
       context: ..
-    image: ${TRACE_PIPELINE_IMAGE:-agent-trace-training-pipeline:0.4.0}
+    image: ${CHIPTRACE_IMAGE:-chiptrace-governance:0.4.0}
     restart: unless-stopped
     init: true
-    user: "${TRACE_PIPELINE_UID:-1000}:${TRACE_PIPELINE_GID:-1000}"
+    user: "${CHIPTRACE_UID:-1000}:${CHIPTRACE_GID:-1000}"
     command:
       - serve
       - --root
@@ -31,10 +31,10 @@ services:
       - --batch-wait-ms
       - "25"
     ports:
-      - "${TRACE_COLLECTOR_BIND:-127.0.0.1}:${TRACE_COLLECTOR_PORT:-3010}:3010"
+      - "${CHIPTRACE_COLLECTOR_BIND:-127.0.0.1}:${CHIPTRACE_COLLECTOR_PORT:-3010}:3010"
     volumes:
-      - "${TRACE_CAPTURE_DATA_ROOT:?请设置 TRACE_CAPTURE_DATA_ROOT}:/data/capture"
-      - "${TRACE_CAPTURE_STATE_ROOT:?请设置 TRACE_CAPTURE_STATE_ROOT}:/data/state"
+      - "${CHIPTRACE_CAPTURE_DATA_ROOT:?请设置 CHIPTRACE_CAPTURE_DATA_ROOT}:/data/capture"
+      - "${CHIPTRACE_CAPTURE_STATE_ROOT:?请设置 CHIPTRACE_CAPTURE_STATE_ROOT}:/data/state"
     healthcheck:
       test:
         - CMD

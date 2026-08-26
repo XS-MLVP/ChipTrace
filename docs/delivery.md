@@ -1,4 +1,4 @@
-# 交付规范
+# 芯迹交付规范
 
 ## 目录结构
 
@@ -21,7 +21,7 @@ Part 目标大小为 10 GiB。一个 Session 不跨 Part；单个 Session 大于
 生成交付目录：
 
 ```bash
-trace-pipeline release \
+chiptrace release \
   --input raw-001.sqlite \
   --input raw-002.sqlite \
   --output target-model-YYYYMMDD-v1 \
