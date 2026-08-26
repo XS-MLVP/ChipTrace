@@ -1,12 +1,10 @@
 include LICENSE
-include NOTICE
-include CHANGELOG.md
-include CONTRIBUTING.md
-include SECURITY.md
-include Makefile
+include README.md
 include Dockerfile
+include Makefile
+include pyproject.toml
 recursive-include docs *.md
 recursive-include deploy *.yml *.service
 recursive-include integration *.js
-recursive-include tests *.py *.js
 recursive-include scripts *.py *.sh
+recursive-include tests *.py *.js

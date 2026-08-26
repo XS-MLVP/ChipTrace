@@ -238,9 +238,8 @@ trace-training-pipeline/
 ├── scripts/                 # 自测、导出和性能脚本
 ├── src/trace_pipeline/      # Collector、存储、导出和轨迹实现
 ├── tests/                   # Python 与 JavaScript 测试
-├── CHANGELOG.md             # 版本变更记录
-├── CONTRIBUTING.md          # 贡献指南
-├── SECURITY.md              # 安全策略
+├── README.md                # 项目入口说明
+├── LICENSE                  # Apache License 2.0
 ├── Dockerfile
 ├── Makefile
 └── pyproject.toml
@@ -256,13 +255,12 @@ make benchmark-pack
 
 `benchmark-pack` 只验证编解码吞吐。端到端性能报告同时记录硬件、文件系统、缓存状态、输入分布、持续时间和完整性校验结果。性能边界和验收方法见[架构与性能](docs/architecture.md)。
 
-## 安全
+## 数据边界
 
-原始请求、响应、工具参数和工具结果均按敏感数据处理。兼容入口会移除常见凭据 Header，但不对正文执行内容级脱敏。部署方负责数据授权、访问控制、静态加密、保留期限和删除策略。
-
-Collector 默认不提供应用层认证或 TLS，必须绑定 loopback、可信内网
-或受认证的入口。安全问题按[安全策略](SECURITY.md)报告，不要在公开
-Issue 中提交凭据、私有地址或真实交互正文。
+采集的请求、响应、工具参数和工具结果均属于敏感原始数据。兼容入口会移除常见凭据
+Header，但不对正文执行内容级脱敏。部署方负责数据授权、访问控制、静态加密、
+保留期限和删除策略。Collector 默认不提供应用层认证或 TLS，必须绑定 loopback、
+可信内网或受认证的入口。
 
 ## 文档
 
@@ -271,8 +269,6 @@ Issue 中提交凭据、私有地址或真实交互正文。
 - [交付规范](docs/delivery.md)
 - [部署与运维](docs/operations.md)
 - [OpenAPI 规范](src/trace_pipeline/specs/openapi.yaml)
-- [变更记录](CHANGELOG.md)
-- [贡献指南](CONTRIBUTING.md)
 
 ## 许可证
 
