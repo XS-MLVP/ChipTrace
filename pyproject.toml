@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "chiptrace-governance"
 dynamic = ["version"]
-description = "万总一芯团队的芯片行业 Trace 治理框架"
+description = "万众一芯开放验证团队的芯片行业 Trace 治理框架"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-authors = [{name = "万总一芯团队"}]
+authors = [{name = "万众一芯开放验证团队"}]
 requires-python = ">=3.10"
 dependencies = []
 keywords = ["agent", "trace", "trajectory", "dataset", "sqlite"]

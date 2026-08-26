@@ -1,6 +1,18 @@
 # 芯迹（ChipTrace）
 
-万总一芯团队的芯片行业 Trace 治理框架。
+<p align="center">
+  <a href="https://github.com/XS-MLVP">
+    <img src="docs/assets/xs-mlvp-avatar.png" alt="万众一芯开放验证（UnityChip Verification）" width="96">
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/XS-MLVP"><strong>万众一芯开放验证（UnityChip Verification）</strong></a>
+  ·
+  <a href="https://open-verify.cc/">官方网站</a>
+</p>
+
+万众一芯开放验证团队的芯片行业 Trace 治理框架。
 
 Relay 负责旁路复制和本地 outbox，Collector 持久化原始证据，
 离线命令负责轨迹组装、校验和分包。采集入口保留真实成功、失败、
