@@ -18,7 +18,7 @@ def audit_root(
     root = Path(root).resolve()
     database = Path(ledger_path).resolve() if ledger_path else root / "state" / "capture-ledger.sqlite"
     if not database.exists() and ledger_path is None:
-        # Compatibility with the repository's initial layout.
+        # Some deployments keep the ledger directly under the capture root.
         database = root / "capture-ledger.sqlite"
     conn = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row

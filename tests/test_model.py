@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from trace_pipeline.model import (
+from chiptrace.model import (
     PERSISTED_RECORD_VERSION,
     ValidationError,
     canonical_envelope,

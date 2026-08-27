@@ -10,7 +10,7 @@ Collector 是原始数据的持久化边界，不判断交互是否有效、正�
 
 ## Relay 输入
 
-`POST /capture` 接受 `application/json`，并要求 `captureId` 匹配 `cap-[A-Za-z0-9._:-]+`。兼容格式如下：
+`POST /capture` 接受 `application/json`，并要求 `captureId` 匹配 `cap-[A-Za-z0-9._:-]+`。请求格式如下：
 
 ```json
 {
@@ -43,10 +43,10 @@ Collector 将两个文本正文规范化为 `full-trace-spool-v3`：
 - `receivedAt` 只由稳定事件时间生成。
 - Collector 实际接收时间单独保存在 `imported_at`。
 
-稳定时间规则确保兼容客户端省略时间戳时，同一 `captureId` 和相同字节仍可幂等重试。已经规范化的 spool 记录保持正文结构不变。
+稳定时间规则确保客户端省略时间戳时，同一 `captureId` 和相同字节仍可幂等重试。已经规范化的 spool 记录保持正文结构不变。
 
 完整字段由
-[Capture Envelope JSON Schema](../src/trace_pipeline/specs/capture-envelope-v3.schema.json)
+[Capture Envelope JSON Schema](../src/chiptrace/specs/capture-envelope-v3.schema.json)
 定义。
 
 ## 持久化确认与身份

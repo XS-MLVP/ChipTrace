@@ -161,7 +161,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: Any) -> None:
         # Production supervisors already add timestamps and service identity.
-        print(f"capture-http {self.client_address[0]} {fmt % args}", flush=True)
+        print(f"chiptrace-http {self.client_address[0]} {fmt % args}", flush=True)
 
     def _discard_body(self, count: int) -> None:
         if count > 0:

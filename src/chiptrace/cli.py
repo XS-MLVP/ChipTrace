@@ -236,7 +236,7 @@ def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(description="芯迹（ChipTrace）芯片行业 Trace 治理框架")
     sub = command.add_subparsers(dest="command", required=True)
 
-    serve_parser = sub.add_parser("serve", help="run the compatible POST /capture service")
+    serve_parser = sub.add_parser("serve", help="run the ChipTrace POST /capture service")
     serve_parser.add_argument("--root", required=True)
     serve_parser.add_argument("--state-root")
     serve_parser.add_argument("--host", default="127.0.0.1")

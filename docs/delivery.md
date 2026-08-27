@@ -95,7 +95,7 @@ chiptrace release \
 
 `session-catalog.sqlite` 不包含重复 capture，并通过 `(shard_id, record_id)` 定位原始记录。核心表如下：
 
-- `trajectories`：Session 主表，保留兼容命名。
+- `trajectories`：Session 主表。
 - `turns` 和 `steps`：Turn 与交互步骤。
 - `step_usage`：input、cache、output、reasoning 和 total Token。
 - `step_item_counts`：消息和响应 item 计数。

@@ -42,7 +42,7 @@ def validate_compression(codec: str, level: int) -> tuple[str, int]:
     if not codec_available(normalized):
         raise CompressionError(
             "zstd compression requires the optional 'zstandard' package; "
-            "install chiptrace-governance[performance]"
+            "install chiptrace[performance]"
         )
     return normalized, int(level)
 
@@ -102,7 +102,7 @@ class ChunkCompressor:
         self._executor = (
             concurrent.futures.ThreadPoolExecutor(
                 max_workers=self.workers,
-                thread_name_prefix="trace-compress",
+                thread_name_prefix="chiptrace-compress",
             )
             if self.workers > 1
             else None

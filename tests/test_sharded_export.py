@@ -7,16 +7,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from trace_pipeline.cli import fixture
-from trace_pipeline.compression import codec_available
-from trace_pipeline.release import build_session_release
-from trace_pipeline.sharded_export import build_sharded_export
-from trace_pipeline.store import CaptureStore, StoreConfig
+from chiptrace.cli import fixture
+from chiptrace.compression import codec_available
+from chiptrace.release import build_session_release
+from chiptrace.sharded_export import build_sharded_export
+from chiptrace.store import CaptureStore, StoreConfig
 
 
 class ShardedExportTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="trace-sharded-export-test-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="chiptrace-sharded-export-test-")
         self.base = Path(self.temporary.name)
         self.root = self.base / "capture"
         self.output = self.base / "raw-shards"

@@ -70,7 +70,7 @@ loopback，`/flush` 供本地运维调用。
 ### 接入 Relay Outbox
 
 ```javascript
-const { DurableCaptureOutbox } = require('chiptrace-governance/outbox');
+const { DurableCaptureOutbox } = require('chiptrace/outbox');
 
 const outbox = new DurableCaptureOutbox({
   directory: '/var/lib/chiptrace/outbox',
@@ -180,7 +180,7 @@ chiptrace/
 ├── docs/                    # 架构、契约、交付、运维和图片资源
 ├── integration/             # Relay outbox 与 Trace 上下文
 ├── scripts/                 # 自测、导出和性能脚本
-├── src/trace_pipeline/      # Collector 与离线处理实现（兼容包名）
+├── src/chiptrace/           # Collector 与离线处理实现
 ├── tests/                   # Python 与 JavaScript 测试
 ├── package.json             # Node.js 集成入口
 ├── README.md
@@ -197,9 +197,9 @@ chiptrace/
 - [数据契约](docs/data-contract.md)
 - [交付规范](docs/delivery.md)
 - [部署与运维](docs/operations.md)
-- [OpenAPI 规范](src/trace_pipeline/specs/openapi.yaml)
+- [OpenAPI 规范](src/chiptrace/specs/openapi.yaml)
 
-使用 `chiptrace <command> --help` 查看完整参数。`trace-pipeline` 仍作为兼容别名提供。
+使用 `chiptrace <command> --help` 查看完整参数。
 
 ## 许可证
 

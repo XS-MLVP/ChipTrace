@@ -20,7 +20,7 @@ function response(status, payload = {}) {
 }
 
 function temporaryDirectory(t) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'trace-outbox-test-'));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'chiptrace-outbox-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   return directory;
 }

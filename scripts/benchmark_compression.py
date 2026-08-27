@@ -11,7 +11,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from trace_pipeline.compression import (
+from chiptrace.compression import (
     ChunkCompressor,
     CompressionError,
     decompress_chunk,
@@ -44,7 +44,7 @@ def make_chunk(profile: str, size: int, index: int) -> bytes:
     if profile == "trace-json":
         return trace_json_chunk(size, index)
     if profile == "incompressible":
-        return hashlib.shake_256(f"trace-benchmark-{index}".encode()).digest(size)
+        return hashlib.shake_256(f"chiptrace-benchmark-{index}".encode()).digest(size)
     return bytes(size)
 
 

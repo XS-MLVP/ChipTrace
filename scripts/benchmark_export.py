@@ -8,10 +8,10 @@ import tempfile
 import time
 from pathlib import Path
 
-from trace_pipeline.compression import CompressionError, decompress_chunk
-from trace_pipeline.exporter import export_sealed
-from trace_pipeline.sharded_export import build_sharded_export
-from trace_pipeline.store import CaptureStore, StoreConfig
+from chiptrace.compression import CompressionError, decompress_chunk
+from chiptrace.exporter import export_sealed
+from chiptrace.sharded_export import build_sharded_export
+from chiptrace.store import CaptureStore, StoreConfig
 
 
 MIB = 1024 * 1024
@@ -98,7 +98,7 @@ def main() -> int:
 
     try:
         with tempfile.TemporaryDirectory(
-            prefix="trace-export-benchmark-",
+            prefix="chiptrace-export-benchmark-",
             dir=args.work_root,
         ) as temporary:
             base = Path(temporary)

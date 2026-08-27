@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from trace_pipeline.compression import (
+from chiptrace.compression import (
     ChunkCompressor,
     CompressionError,
     codec_available,

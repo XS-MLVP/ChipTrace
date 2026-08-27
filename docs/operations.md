@@ -5,9 +5,9 @@
 数据链路使用三个独立持久化目录：
 
 ```text
-/srv/trace-data/capture/             # sealed 与 open NDJSON 段
+/srv/chiptrace/capture/              # sealed 与 open NDJSON 段
 /var/lib/chiptrace/state/            # live SQLite ledger
-/var/lib/trace-relay/outbox/         # Relay 待投递文件
+/var/lib/chiptrace/outbox/           # Relay 待投递文件
 ```
 
 Capture 数据目录可以位于 NFS 或数据卷。Collector 使用 Capture 和 State
@@ -19,7 +19,7 @@ Capture 数据目录可以位于 NFS 或数据卷。Collector 使用 Capture 和
 创建目录并启动服务：
 
 ```bash
-export CHIPTRACE_CAPTURE_DATA_ROOT=/srv/trace-data/capture
+export CHIPTRACE_CAPTURE_DATA_ROOT=/srv/chiptrace/capture
 export CHIPTRACE_CAPTURE_STATE_ROOT=/var/lib/chiptrace/state
 export CHIPTRACE_UID="$(id -u)"
 export CHIPTRACE_GID="$(id -g)"
@@ -65,9 +65,6 @@ systemctl --user status chiptrace.service
 journalctl --user -u chiptrace.service -f
 ```
 
-服务单元提供 `trace-pipeline.service` 兼容别名；已有调用方可平滑迁移到
-`chiptrace.service`。
-
 ## Relay 配置
 
 Relay 初始化一个长期存活的 `DurableCaptureOutbox`：
@@ -76,7 +73,7 @@ Relay 初始化一个长期存活的 `DurableCaptureOutbox`：
 const { DurableCaptureOutbox } = require('./integration/durable_capture_outbox');
 
 const outbox = new DurableCaptureOutbox({
-  directory: '/var/lib/trace-relay/outbox',
+  directory: '/var/lib/chiptrace/outbox',
   url: 'http://127.0.0.1:3010',
   concurrency: 8,
   maxBytes: 64 * 1024 * 1024 * 1024,
@@ -164,4 +161,4 @@ sealed segment 的 payload audit 在业务低峰期执行。导出只读取 seal
 
 升级过程只替换 Collector 进程或容器，不修改已有段和 ledger。新版本启动后依次检查 `/health`、`/audit`、重复提交幂等性和新段轮转。
 
-回滚时恢复上一版本镜像或可执行文件，并继续使用同一数据契约兼容的目录。涉及持久化 schema 变更的版本必须提供迁移和回滚测试；不直接改写历史 sealed 段。
+回滚时恢复上一版本镜像或可执行文件，并继续使用符合同一数据契约的目录。涉及持久化 schema 变更的版本必须提供迁移和回滚测试；不直接改写历史 sealed 段。

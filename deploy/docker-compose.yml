@@ -4,7 +4,7 @@ services:
   collector:
     build:
       context: ..
-    image: ${CHIPTRACE_IMAGE:-chiptrace-governance:0.4.0}
+    image: ${CHIPTRACE_IMAGE:-chiptrace:0.4.0}
     restart: unless-stopped
     init: true
     user: "${CHIPTRACE_UID:-1000}:${CHIPTRACE_GID:-1000}"

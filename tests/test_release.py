@@ -8,14 +8,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from trace_pipeline.exporter import export_sealed
-from trace_pipeline.release import archive_session_release, build_session_release, verify_session_release
-from trace_pipeline.store import CaptureStore, StoreConfig
+from chiptrace.exporter import export_sealed
+from chiptrace.release import archive_session_release, build_session_release, verify_session_release
+from chiptrace.store import CaptureStore, StoreConfig
 
 
 class CompleteSessionReleaseTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="trace-release-test-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="chiptrace-release-test-")
         self.base = Path(self.temporary.name)
         self.raw_a = self.base / "source-a.sqlite"
         self.raw_b = self.base / "source-b.sqlite"

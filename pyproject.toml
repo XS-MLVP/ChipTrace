@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "chiptrace-governance"
+name = "chiptrace"
 dynamic = ["version"]
 description = "万众一芯开放验证团队的芯片行业 Trace 治理框架"
 readme = "README.md"
@@ -29,15 +29,14 @@ classifiers = [
 performance = ["orjson>=3.10", "zstandard>=0.22"]
 
 [project.scripts]
-chiptrace = "trace_pipeline.cli:main"
-trace-pipeline = "trace_pipeline.cli:main"
+chiptrace = "chiptrace.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.dynamic]
-version = {attr = "trace_pipeline.__version__"}
+version = {attr = "chiptrace.__version__"}
 
 [tool.setuptools.package-data]
-trace_pipeline = ["py.typed"]
-"trace_pipeline.specs" = ["*.json", "*.yaml", "*.sql"]
+chiptrace = ["py.typed"]
+"chiptrace.specs" = ["*.json", "*.yaml", "*.sql"]

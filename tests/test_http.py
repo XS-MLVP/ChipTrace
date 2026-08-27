@@ -8,15 +8,15 @@ import threading
 import unittest
 from pathlib import Path
 
-from trace_pipeline.cli import fixture
-from trace_pipeline.exporter import export_sealed
-from trace_pipeline.server import CaptureHTTPServer
-from trace_pipeline.store import CaptureStore, StoreConfig
+from chiptrace.cli import fixture
+from chiptrace.exporter import export_sealed
+from chiptrace.server import CaptureHTTPServer
+from chiptrace.store import CaptureStore, StoreConfig
 
 
-class HTTPCompatibilityTest(unittest.TestCase):
+class HTTPCaptureTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="trace-http-test-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="chiptrace-http-test-")
         self.root = Path(self.temporary.name) / "capture"
         self.store = CaptureStore(StoreConfig(root=self.root, batch_wait_ms=2))
         self.server = CaptureHTTPServer(("127.0.0.1", 0), self.store, max_connections=16)

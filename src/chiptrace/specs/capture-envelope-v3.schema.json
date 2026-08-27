@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:trace-pipeline:capture-envelope:v3",
+  "$id": "urn:chiptrace:capture-envelope:v3",
   "title": "Trace 采集记录 v3",
   "type": "object",
   "required": ["captureId"],

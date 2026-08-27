@@ -6,14 +6,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from trace_pipeline.exporter import export_sealed
-from trace_pipeline.store import CaptureStore, StoreConfig
-from trace_pipeline.trajectory import build_trajectory_catalog, parse_sse_response
+from chiptrace.exporter import export_sealed
+from chiptrace.store import CaptureStore, StoreConfig
+from chiptrace.trajectory import build_trajectory_catalog, parse_sse_response
 
 
 class TrajectoryCatalogTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="trace-trajectory-test-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="chiptrace-trajectory-test-")
         self.base = Path(self.temporary.name)
         self.root = self.base / "capture"
         self.raw = self.base / "raw-part-001.sqlite"

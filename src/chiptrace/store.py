@@ -209,15 +209,22 @@ class CaptureStore:
             "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID"
         )
         current_ledger = self._meta_value("ledger_schema_version")
-        legacy_version = self._meta_value("schema_version")
+        existing_record_version = self._meta_value("schema_version")
         if current_ledger is not None and current_ledger != LEDGER_SCHEMA_VERSION:
             self._conn.close()
             raise StoreError(
                 f"unsupported ledger schema {current_ledger!r}; expected {LEDGER_SCHEMA_VERSION!r}"
             )
-        if current_ledger is None and legacy_version is not None and legacy_version not in SUPPORTED_RECORD_VERSIONS:
+        if (
+            current_ledger is None
+            and existing_record_version is not None
+            and existing_record_version not in SUPPORTED_RECORD_VERSIONS
+        ):
             self._conn.close()
-            raise StoreError(f"cannot migrate unknown legacy ledger schema {legacy_version!r}")
+            raise StoreError(
+                f"cannot initialize ledger from unsupported record schema "
+                f"{existing_record_version!r}"
+            )
         self._conn.executescript(SCHEMA)
         self._conn.execute(
             "INSERT INTO meta(key,value) VALUES('ledger_schema_version',?) "
@@ -247,7 +254,11 @@ class CaptureStore:
             self._last_error = str(exc)
             self._conn.close()
             raise
-        self._thread = threading.Thread(target=self._writer_loop, name="trace-capture-writer", daemon=True)
+        self._thread = threading.Thread(
+            target=self._writer_loop,
+            name="chiptrace-capture-writer",
+            daemon=True,
+        )
         self._thread.start()
 
     def _meta_value(self, key: str) -> str | None:
@@ -282,8 +293,7 @@ class CaptureStore:
             value = json.loads(raw)
         validate_envelope(value)
         normalized = raw.strip()
-        # The spool format is NDJSON. The current relay emits one compact JSON
-        # object; pretty-printed compatibility clients are canonicalized once.
+        # The spool format is NDJSON. Pretty-printed input is canonicalized once.
         if b"\n" in normalized or b"\r" in normalized:
             normalized, digest = canonical_envelope(value)
         else:
@@ -665,9 +675,8 @@ class CaptureStore:
                         validate_envelope(value)
                     except (ValueError, TypeError, json.JSONDecodeError) as exc:
                         raise RecoveryError(f"invalid record at {path}:{offset}: {exc}") from exc
-                    # A line written by this store is canonical. Older or
-                    # compatible clients may differ in key order; index the
-                    # actual bytes hash so replay remains lossless.
+                    # Index the stored bytes so replay remains lossless even when
+                    # object key order differs from the current canonical encoder.
                     actual_digest = hashlib.sha256(line[:-1]).hexdigest()
                     self._reconcile_record(value, actual_digest, segment_id, offset, len(line), "recovered")
                     valid_end = offset + len(line)

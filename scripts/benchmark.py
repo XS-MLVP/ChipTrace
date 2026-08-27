@@ -8,9 +8,9 @@ import tempfile
 import time
 from pathlib import Path
 
-from trace_pipeline.audit import audit_root
-from trace_pipeline.cli import fixture
-from trace_pipeline.store import CaptureStore, StoreConfig
+from chiptrace.audit import audit_root
+from chiptrace.cli import fixture
+from chiptrace.store import CaptureStore, StoreConfig
 
 
 def main() -> int:
@@ -21,7 +21,7 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--no-fsync", action="store_true")
     args = parser.parse_args()
-    temporary = tempfile.TemporaryDirectory(prefix="trace-benchmark-") if not args.root else None
+    temporary = tempfile.TemporaryDirectory(prefix="chiptrace-benchmark-") if not args.root else None
     root = Path(args.root) if args.root else Path(temporary.name) / "capture"
     store = CaptureStore(
         StoreConfig(

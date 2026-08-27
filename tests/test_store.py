@@ -10,23 +10,23 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from trace_pipeline.audit import audit_root
-from trace_pipeline.cli import fixture
-from trace_pipeline.compression import codec_available, decompress_chunk
-from trace_pipeline.exporter import export_sealed
-from trace_pipeline.store import (
+from chiptrace.audit import audit_root
+from chiptrace.cli import fixture
+from chiptrace.compression import codec_available, decompress_chunk
+from chiptrace.exporter import export_sealed
+from chiptrace.store import (
     CaptureStore,
     RecoveryError,
     StoreConfig,
     StoreError,
     _filesystem_type,
 )
-from trace_pipeline.trajectory import iter_raw_records
+from chiptrace.trajectory import iter_raw_records
 
 
 class CaptureStoreTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="trace-store-test-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="chiptrace-store-test-")
         self.root = Path(self.temporary.name) / "capture"
 
     def tearDown(self) -> None:
@@ -112,7 +112,7 @@ class CaptureStoreTest(unittest.TestCase):
             self.assertEqual(json.loads(rebuilt)["captureId"], "cap-rotate-000")
 
     @unittest.skipUnless(codec_available("zstd"), "optional zstandard package is unavailable")
-    def test_parallel_zstd_export_is_readable_by_trajectory_pipeline(self) -> None:
+    def test_parallel_zstd_export_is_readable_by_trajectory_reader(self) -> None:
         store = self.store(segment_max_bytes=1300, batch_records=8)
         for index in range(12):
             store.submit(fixture(f"cap-zstd-{index:03d}", pad=250))
@@ -163,8 +163,8 @@ class CaptureStoreTest(unittest.TestCase):
         code = """
 import os,sys
 from pathlib import Path
-from trace_pipeline.cli import fixture
-from trace_pipeline.store import CaptureStore,StoreConfig
+from chiptrace.cli import fixture
+from chiptrace.store import CaptureStore,StoreConfig
 store=CaptureStore(StoreConfig(root=Path(sys.argv[1]),batch_wait_ms=1))
 store.submit(fixture('cap-crash-recovery',status=502,pad=400))
 os._exit(0)
@@ -192,8 +192,8 @@ os._exit(0)
         code = """
 import os,sys
 from pathlib import Path
-from trace_pipeline.cli import fixture
-from trace_pipeline.store import CaptureStore,StoreConfig
+from chiptrace.cli import fixture
+from chiptrace.store import CaptureStore,StoreConfig
 store=CaptureStore(StoreConfig(root=Path(sys.argv[1]),batch_wait_ms=1))
 store.submit(fixture('cap-before-invalid-line',pad=100))
 os._exit(0)
@@ -238,7 +238,7 @@ os._exit(0)
     )
     def test_wal_state_on_nfs_is_rejected(self) -> None:
         repository = Path(__file__).resolve().parents[1]
-        with tempfile.TemporaryDirectory(prefix="trace-nfs-guard-", dir=repository) as temporary:
+        with tempfile.TemporaryDirectory(prefix="chiptrace-nfs-guard-", dir=repository) as temporary:
             with self.assertRaises(StoreError) as context:
                 CaptureStore(StoreConfig(root=Path(temporary)))
         self.assertIn("SQLite WAL state cannot be placed", str(context.exception))
@@ -249,8 +249,8 @@ os._exit(0)
     )
     def test_nfs_segments_with_local_state_are_supported(self) -> None:
         repository = Path(__file__).resolve().parents[1]
-        with tempfile.TemporaryDirectory(prefix="trace-nfs-data-", dir=repository) as data_directory:
-            with tempfile.TemporaryDirectory(prefix="trace-local-state-") as state_directory:
+        with tempfile.TemporaryDirectory(prefix="chiptrace-nfs-data-", dir=repository) as data_directory:
+            with tempfile.TemporaryDirectory(prefix="chiptrace-local-state-") as state_directory:
                 store = CaptureStore(
                     StoreConfig(root=Path(data_directory), state_root=Path(state_directory), batch_wait_ms=1)
                 )
@@ -288,7 +288,7 @@ os._exit(0)
             value = conn.execute("SELECT value FROM meta WHERE key='ledger_schema_version'").fetchone()[0]
         self.assertEqual(value, "future-ledger-v99")
 
-    def test_known_legacy_ledger_metadata_is_migrated(self) -> None:
+    def test_record_schema_metadata_initializes_ledger_schema(self) -> None:
         state = self.root / "state"
         state.mkdir(parents=True)
         ledger = state / "capture-ledger.sqlite"

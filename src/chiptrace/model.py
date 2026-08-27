@@ -10,13 +10,15 @@ from typing import Any
 CAPTURE_ID_RE = re.compile(r"^cap-[A-Za-z0-9._:-]+$")
 CAPTURE_ENVELOPE_SCHEMA_VERSION = "capture-envelope-v3"
 PERSISTED_RECORD_VERSION = "full-trace-spool-v3"
-# Backward-compatible import name. Persistent stores use their own ledger
-# version and must never infer it from the envelope version.
+# Public name retained for callers that inspect the current envelope format.
 SCHEMA_VERSION = CAPTURE_ENVELOPE_SCHEMA_VERSION
+# This value is a persisted data-format identifier from an earlier collector
+# release; it is intentionally accepted for ledger migration only.
+HISTORICAL_RECORD_SCHEMA_VERSION = "router-v2-capture-envelope-v3"
 SUPPORTED_RECORD_VERSIONS = {
     CAPTURE_ENVELOPE_SCHEMA_VERSION,
     PERSISTED_RECORD_VERSION,
-    "router-v2-capture-envelope-v3",
+    HISTORICAL_RECORD_SCHEMA_VERSION,
 }
 SENSITIVE_HEADER_NAMES = {
     "api-key",
