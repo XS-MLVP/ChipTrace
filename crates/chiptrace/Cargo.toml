@@ -1,0 +1,49 @@
+[package]
+name = "chiptrace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "面向芯片行业 Agent 的 Trace 采集、验收与对象存储交付引擎"
+
+[[bin]]
+name = "chiptrace"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.8.9"
+bytes = "1.10"
+clap = { version = "4.5", features = ["derive"] }
+flume = "0.12"
+futures-util = "0.3"
+hex = "0.4"
+http-body-util = "0.1"
+opendal = { version = "0.58.2", default-features = false, features = [
+  "auto-register-services",
+  "executors-tokio",
+  "http-transport-reqwest-rustls-no-provider",
+  "layers-retry",
+  "services-fs",
+  "services-oss",
+  "services-s3",
+] }
+rayon = "1.11"
+redb = "4.2"
+regex = "1.11"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.21"
+tiktoken-rs = "0.12"
+time = { version = "0.3", features = ["formatting", "macros"] }
+tokio = { version = "1.47", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.7", features = ["catch-panic", "limit", "timeout", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+walkdir = "2.5"
+zstd = { version = "0.13", features = ["zstdmt"] }

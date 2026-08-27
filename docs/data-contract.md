@@ -1,176 +1,130 @@
-# 芯迹数据契约
+# 数据与评分契约
 
-## 采集边界
+## Capture
 
-Collector 是原始数据的持久化边界，不判断交互是否有效、正确或符合
-训练准入条件。HTTP 408、429、5xx、上游错误、不完整响应和缺少 usage
-的记录均进入原始存储。质量策略在版本化的下游投影中执行。
+Collector 接收 `schemas/capture-v1.schema.json`。必需字段为稳定
+`captureId`；完整采集应同时提供：
 
-部署方必须在启用采集前取得数据源授权。服务不对正文执行脱敏，每个 envelope 均按敏感原始数据处理。
+- 原始 request/response body、HTTP 状态、错误与截断标志；
+- `sourceNamespace` 和实际 provider/model；
+- `session_id`、`root_session_id`、`parent_session_id`、`goal_id`、
+  `turn_id`、`agent_id`、`branch_id`、`previous_response_id`；
+- Session start/end、cancel、retry、compaction、subagent spawn/join 等事件；
+- 流式 SSE 原文或完整聚合响应；
+- 原生 usage 与缓存 Token；
+- 测试、构建、搜索、用户修正、最终验收和 evaluator 的真实证据。
 
-## Relay 输入
+Collector 保存所有响应状态。认证头、Cookie 和 API Key 在进入 WAL 前删除；
+正文按敏感原始数据管理，不自动改写。
 
-`POST /capture` 接受 `application/json`，并要求 `captureId` 匹配 `cap-[A-Za-z0-9._:-]+`。请求格式如下：
+## Canonical Session
 
-```json
-{
-  "captureId": "cap-example-001",
-  "sourceNamespace": "relay-a",
-  "startedAt": "2026-08-26T00:00:00Z",
-  "finishedAt": "2026-08-26T00:00:01Z",
-  "requestBodyText": "{\"model\":\"target-model-v1\",\"input\":[]}",
-  "responseStatus": 503,
-  "responseBodyText": "data: {...}\n\n",
-  "requestTruncated": false,
-  "responseTruncated": false,
-  "stream": true,
-  "captureError": null,
-  "traceContext": {
-    "session_id": "session-1",
-    "turn_id": "turn-1",
-    "previous_response_id": "response-0"
-  },
-  "observedLifecycleEvents": ["response.failed"]
-}
-```
+Assembly 输出 `schemas/session-v1.schema.json`，一行一个完整 Session。主要
+字段如下：
 
-Collector 将两个文本正文规范化为 `full-trace-spool-v3`：
-
-- 合法 JSON 文本保存为 `{"kind": "json", "value": ...}`。
-- SSE、纯文本和非法 JSON 保存为 `{"kind": "text", "value": ...}`。
-- `requestBodySha256` 和 `responseBodySha256` 覆盖原始 UTF-8 字节。
-- 所有响应状态和 `captureError` 字段完整保留。
-- `receivedAt` 只由稳定事件时间生成。
-- Collector 实际接收时间单独保存在 `imported_at`。
-
-稳定时间规则确保客户端省略时间戳时，同一 `captureId` 和相同字节仍可幂等重试。已经规范化的 spool 记录保持正文结构不变。
-
-完整字段由
-[Capture Envelope JSON Schema](../src/chiptrace/specs/capture-envelope-v3.schema.json)
-定义。
-
-## 持久化确认与身份
-
-Collector 在段文件跨过配置的 `fsync` 边界并提交 SQLite ledger 事务后
-返回 HTTP 202。响应包含 `durable: true` 和以下状态之一：
-
-- `accepted`：ID 和 payload 首次提交。
-- `duplicate`：相同 ID 和 payload hash 已提交。
-- HTTP 409 `conflict`：相同 ID 对应不同 payload 字节。
-
-HTTP 400、411、413、415、在途字节超限、duplicate、conflict、accepted
-和启动恢复状态均记录到 `capture_attempts`。ledger 是 attempt 记账
-依据，进程内计数只用于运行监控。
-
-请求超时不代表写入失败。发送端必须重试完全相同的序列化字节和 ID，ledger 将结果归并为 accepted 或 duplicate。
-
-## Open 段封存
-
-离线 `export` 只读取 `sealed`/`archived` 段。在线服务继续运行时，先调用
-受信任的本地 `POST /flush`；该接口按写入顺序等待队列完成、封存当前段并
-创建新的 `open` 段。也可以先优雅停止 Collector，`close()` 会封存最后一段。
-
-## 原始存储
-
-每条原始记录占一行 JSON：
-
-```text
-<data-root>/segments/segment-NNNNNNNN.open.ndjson
-<data-root>/segments/segment-NNNNNNNN.sealed.ndjson
-```
-
-只有当前写者追加 open 段。轮转通过原子重命名生成 sealed 段，并将
-SHA-256 写入 ledger。启动恢复只截断 open 段末尾的不完整行；
-段文件缺失、ID 冲突或同一 ID 存在第二份物理记录会阻止服务进入
-ready 状态。
-
-SQLite 状态默认位于 `<data-root>/state/capture-ledger.sqlite`。生产部署使用独立目录：
-
-```text
-数据卷或 NFS:   --root /data/capture
-本地持久化磁盘: --state-root /var/lib/chiptrace/state
-```
-
-live ledger 不在 NFS/CIFS 上使用 WAL。状态目录纳入备份；从 retained segments 重建 ledger 的耗时与原始数据规模成正比。
-
-## Raw SQLite 导出
-
-`chiptrace export` 固定一个只读 SQLite 快照，只选择 sealed 或
-archived 段。命令在私有 staging 数据库中构建并校验结果，再原子发布。
-默认无覆盖路径使用 hard link，`--replace` 使用原子 rename。
-
-Raw SQLite 包含以下表：
-
-- `dataset_meta`：格式、创建时间、压缩方式和敏感数据声明。
-- `source_segments`：段路径、字节数、记录数和 SHA-256。
-- `interactions`：唯一 capture、元数据和源定位信息。
-- `interaction_chunks`：有序、独立的 zlib 或 zstd 压缩块，默认原始块大小为 4 MiB。
-- `validation_results`：记录、压缩块、外键和完整性校验结果。
-
-独立压缩块限制解压内存，并与 trajectory reader 的
-`interactions + interaction_chunks` 输入契约一致。原始 Prompt、
-回答、工具参数和工具结果保留在 raw 数据库中。读取端必须拒绝未知
-codec、长度不符、解压失败和原始哈希不符。
-
-`export-sharded` 固定所有 sealed segment ID 的同一快照，将每个段
-分配给唯一 raw SQLite writer，并发布包含 `manifest.json` 和
-`SHA256SUMS` 的目录。Raw shard 可以拆分 Session，只有下游
-`release` 可以声明 Session 原子交付。
-
-## Session 交付与评分边界
-
-`chiptrace release` 将 Session 作为最小交付单元。Session 身份
-优先取 `client_metadata.session_id`，其次取 `thread_id`，并与
-`sourceNamespace` 一起计算哈希。缺少身份的记录生成单 capture
-orphan Session，并在完整性评分中体现。
-
-选择目标模型时，同一 Session 中其他模型的交互也会保留。一个 Session
-不跨 release part；单个 Session 超过目标大小时，独立生成超限 part。
-
-Raw export 支持计算以下字段：
-
-- Session、Turn 和 Step 身份。
-- input、cache、output、reasoning 和 total Token 用量。
-- Terminal 状态和生命周期事件。
-- 工具 schema、调用、结果和关联状态。
-- payload 截断和 Session 左右边界。
-- root、parent、goal、agent、branch 和 Response DAG 关系。
-
-Release 保存以下质量字段：
-
-- `session_completeness_score`：确定性的已观测 Trace 完整性。
-- Payload、Identity、Terminal、Usage、Tool Linkage 和 Boundary 分项得分。
-- `reward`：可空的正确性或偏好结果。
-- `reward_source`：evaluator、judge 版本、benchmark 或 ground truth。
-
-100 分完整性策略如下：
-
-| 分项 | 分值 |
-| --- | ---: |
-| Payload | 20 |
-| Session / Turn Identity | 20 |
-| Terminal | 20 |
-| Usage | 5 |
-| Tool Linkage | 20 |
-| Boundary | 15 |
-
-`A_complete` 要求 100 分。所有分项和底层 flags 保存在 `session_quality` 中。
-
-`response.failed`、`response.incomplete` 和 `response.cancelled`
-是完整的终态观测，不代表采集不完整。HTTP 成功、
-`response.completed`、最终文本和工具闭合也不代表语义奖励。
-加密 reasoning 作为不透明原始数据保存，交付结果不声明具备明文思维链。
-
-`left_censored`、`right_censored`、正文截断、身份缺失和工具未配对均保持显式。完整性结论仅覆盖本次输入的原始数据集合。交付约束见[交付规范](delivery.md)。
-
-## 版本
-
-| 对象 | 当前格式 |
+| 字段 | 说明 |
 | --- | --- |
-| Capture envelope | `capture-envelope-v3` |
-| Raw spool | `full-trace-spool-v3` |
-| Session catalog | `session-catalog-v4` |
-| Release manifest | `complete-session-release-v1` |
-| Completeness policy | `session-trace-completeness-v1` |
+| `trajectory_id` / `session_id` | 稳定轨迹与任务 Session 标识 |
+| `provider` / `model` | 捕获到的模型字段及推断 provider |
+| `system_prompt` | Agent 角色与行为约束 |
+| `tools` | name、description、parameters、schema hash/version |
+| `messages` | system/user/assistant/tool 的真实时序 |
+| `usage` | 实际 API Token 与缓存 Token 聚合 |
+| `meta.capture_dag` | response 链、状态、根、尾、环和缺失父节点 |
+| `meta.task_dag` | root/subagent 关系和可拆分子轨迹 |
+| `meta.trace` | root/parent/goal/turn/agent/branch 标识 |
+| `meta.model_evidence` | 请求与响应模型一致性及证明范围 |
+| `meta.evaluation_evidence` | 测试、构建、搜索、验收和 evaluator 证据 |
 
-持久化格式变更必须新增版本和迁移测试，不覆盖既有格式语义。
+每个工具定义包含 `schema_hash` 和 `schema_version`。来源没有版本时，Assembly
+使用 `sha256:<schema_hash>` 作为内容寻址版本。每次工具调用包含
+`execution_status`，工具返回保留 `status`、`is_error` 与原始内容。
+
+模型字段一致性不等于供应商身份认证。若采集入口不能提供可信 provider
+证明，评分会输出 `model_attestation_missing`，不得宣称已证明模型来源。
+
+## 三类质量结果
+
+每条 Session 同时保留三类独立结果：
+
+1. `capture_completeness`：身份、时间、usage、层级和闭环是否被采到。
+2. `buyer_acceptance`：采购标准的确定性硬门槛、分数和失败原因。
+3. `semantic_quality`：测试、搜索证据、用户修正和 evaluator reward。
+
+采集完整性不能替代采购验收，结构分不能替代任务正确性。
+`semantic_quality` 只接受带来源的 0–1 reward，或对已采集证据中的明确
+pass/fail、0–1 score 求平均；未知状态不参与计算。
+
+## 版本化验收
+
+| 规则 | buyer-v6 | buyer-v7 |
+| --- | ---: | ---: |
+| 有效轮次 | ≥2 | ≥10 |
+| 结构化工具调用 | ≥1 | ≥5 |
+| 不同工具名 | ≥1 | ≥5 |
+| 有效工具返回 | ≥1 | ≥2 |
+| 去尾配对率 | 100% | 100% |
+| 机器轮 / user 轮 | <25% | <25% |
+| System Prompt | 必需 | 必需 |
+| 完整 Tool Schema | 必需 | 必需 |
+| 首消息 role | system/user | system/user |
+
+`buyer-v6` 对应仓库外采购文档 v6.0。`buyer-v7` 对应用户提供的 v7.0：
+GPT-5.5+、合格 Claude、DeepSeek v4+、GLM 5.2+、K3+，排除 Gemini 和 Haiku。
+规则以 profile 固化，不能用同一个硬编码版本覆盖不同采购合同。
+
+有效轮次由实质 user→assistant 交互与已配对 assistant→tool→result 相加。
+`heartbeat`、`cron`、`no_reply` 优先读取显式 `meta.turn_kind`，缺失时使用
+确定性文本规则。最终 assistant 消息中的未返回调用可标记 open tail，但完整
+Release 仍要求 Session 有明确终态且不悬停在工具调用。
+
+## 分数与准入
+
+100 分结构权重：
+
+| 项目 | 分值 |
+| --- | ---: |
+| 必填字段、role、首 role、System Prompt | 20 |
+| 有效轮次 | 15 |
+| 结构化工具调用与有效返回 | 15 |
+| 完整 Tool Schema | 15 |
+| 工具配对 | 15 |
+| 机器轮比例 | 10 |
+| 模型范围 | 5 |
+| Session 闭环 | 5 |
+
+`eligible = all_required_gates_pass && score >= minimum_score`。分数不能补偿任何
+硬门槛失败；默认准入阈值为 90。消息合并分歧、工具 Schema 冲突、Trace
+冲突、response DAG 环/缺失父节点以及 task DAG 不完整统一进入
+`assembly_integrity` hard gate。
+
+`chiptrace score` 的输出文件和 Release 的 `reports/assessments-part-*.jsonl.zst` 使用
+`schemas/assessment-v1.schema.json`，逐条给出 Gate、观测值、期望值、失败原因、
+三类质量结果和 Token。`release_decision=eligible` 仅在全部 hard gate 通过且
+分数达到阈值时产生。
+
+## 去重
+
+- 精确去重指纹覆盖 System Prompt、Tool Definitions 和全部 Messages。
+- 同一 trajectory_id 的连续消息子序列只保留最长版本。
+- 同一 trajectory_id 出现无法互为连续子序列的候选时整组拒绝，并写入
+  `reports/divergent-sessions.jsonl.zst`。
+- Manifest 记录输入、解析失败、精确重复、子集、冲突、已评分和准入数量，
+  并校验守恒。
+
+## Token
+
+Manifest 同时报告：
+
+- `api_input_tokens`；
+- `api_cached_input_tokens`；
+- `api_cache_write_tokens`；
+- `api_output_tokens` 与 `api_reasoning_tokens`；
+- `api_total_tokens`；
+- `normalized_corpus_tokens`；
+- `supervised_output_tokens`。
+
+规范化语料 Token 使用 `o200k_base`，范围为实际调用工具的 Definition 与全部
+Messages。显式 base64 字段和 `data:*;base64,...` 载荷替换为占位符并记录
+排除字节数。API Token 表示真实调用消耗；规范化语料 Token 表示去重后数据量，
+两者不可互换。

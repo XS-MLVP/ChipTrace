@@ -1,0 +1,65 @@
+openapi: 3.1.0
+info:
+  title: 芯迹 Collector API
+  version: 0.5.0
+  description: Rust Collector 的单条和批量持久化采集接口。
+paths:
+  /capture:
+    post:
+      summary: 持久化一条 Capture
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./capture-v1.schema.json
+      responses:
+        "202": {description: WAL 与 ledger 已完成持久化}
+        "200": {description: 相同 captureId 与字节已持久化}
+        "400": {description: Capture 无效}
+        "409": {description: captureId 对应不同字节}
+        "413": {description: Capture 超过大小上限}
+        "415": {description: Content-Type 不是 application/json}
+        "503": {description: 背压或存储不可用}
+  /captures:
+    post:
+      summary: 批量持久化 Capture NDJSON
+      description: >-
+        每行一个 Capture。响应逐条返回 durable、duplicate、conflict 或
+        unavailable；所有条目 durable 时返回 200/202，部分失败时返回 207。
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            schema:
+              type: string
+          application/ndjson:
+            schema:
+              type: string
+      responses:
+        "202": {description: 全部条目已持久化，至少一条为首次提交}
+        "200": {description: 全部条目均为幂等重复}
+        "207": {description: 部分条目失败，读取 results 获取逐条结果}
+        "400": {description: NDJSON 或 Capture 无效}
+        "413": {description: 批次超过字节或记录数上限}
+        "415": {description: Content-Type 不是 NDJSON}
+        "503": {description: 背压或存储不可用}
+  /health:
+    get:
+      summary: Collector 健康与守恒指标
+      responses:
+        "200": {description: 就绪}
+        "503": {description: 未就绪}
+  /audit:
+    get:
+      summary: O(1) 运行时计数守恒检查
+      description: 完整 WAL、locator、哈希审计由离线 chiptrace audit 命令执行。
+      responses:
+        "200": {description: 审计通过}
+        "500": {description: 审计失败}
+  /flush:
+    post:
+      summary: 封存当前 WAL 段并创建新段
+      responses:
+        "200": {description: 所有分片已执行持久化屏障并封存非空段}
+        "503": {description: 封存失败}

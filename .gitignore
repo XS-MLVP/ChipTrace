@@ -1,15 +1,11 @@
-__pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
-.coverage
-build/
-dist/
-var/
-*.db
-*.db-*
-*.sqlite
-*.sqlite-*
+/target/
+*.redb
+*.redb.*
 *.ndjson
 *.jsonl
-node_modules/
+*.jsonl.zst
+*.tar.gz
+/var/
+.DS_Store
+Agent数据交付格式说明(1)(1).docx
+Trajectory 验收标准(1)(1).pdf

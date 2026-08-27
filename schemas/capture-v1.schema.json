@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/capture-v1.schema.json",
+  "title": "ChipTrace Capture v1",
+  "type": "object",
+  "required": ["captureId"],
+  "properties": {
+    "version": {"type": "string"},
+    "captureId": {
+      "type": "string",
+      "pattern": "^cap-[A-Za-z0-9._:-]+$",
+      "maxLength": 256
+    },
+    "sourceNamespace": {"type": ["string", "null"], "maxLength": 256},
+    "provider": {"type": ["string", "null"]},
+    "actualProvider": {"type": ["string", "null"]},
+    "receivedAt": {"type": ["string", "null"]},
+    "startedAt": {"type": ["string", "null"]},
+    "finishedAt": {"type": ["string", "null"]},
+    "method": {"type": ["string", "null"]},
+    "inboundPath": {"type": ["string", "null"]},
+    "proxiedPath": {"type": ["string", "null"]},
+    "requestHeaders": {"type": ["object", "null"]},
+    "responseHeaders": {"type": ["object", "null"]},
+    "requestBodyText": {"type": ["string", "null"]},
+    "responseBodyText": {"type": ["string", "null"]},
+    "requestBody": {"$ref": "#/$defs/capturedBody"},
+    "responseBody": {"$ref": "#/$defs/capturedBody"},
+    "requestBytesCaptured": {"type": "integer", "minimum": 0},
+    "responseBytesCaptured": {"type": "integer", "minimum": 0},
+    "requestBodySha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "responseBodySha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "requestTruncated": {"type": "boolean"},
+    "responseTruncated": {"type": "boolean"},
+    "responseStatus": {
+      "oneOf": [
+        {"type": "integer", "minimum": 100, "maximum": 599},
+        {"type": "string", "pattern": "^[1-5][0-9]{2}$"},
+        {"type": "null"}
+      ]
+    },
+    "stream": {"type": "boolean"},
+    "captureError": {"type": ["string", "null"]},
+    "captureErrorCode": {"type": ["string", "null"]},
+    "isFinalSnapshot": {"type": "boolean"},
+    "traceContext": {
+      "type": "object",
+      "properties": {
+        "session_id": {"type": ["string", "null"]},
+        "thread_id": {"type": ["string", "null"]},
+        "conversation_id": {"type": ["string", "null"]},
+        "trace_id": {"type": ["string", "null"]},
+        "task_id": {"type": ["string", "null"]},
+        "root_session_id": {"type": ["string", "null"]},
+        "parent_session_id": {"type": ["string", "null"]},
+        "goal_id": {"type": ["string", "null"]},
+        "turn_id": {"type": ["string", "null"]},
+        "agent_id": {"type": ["string", "null"]},
+        "branch_id": {"type": ["string", "null"]},
+        "previous_response_id": {"type": ["string", "null"]},
+        "session_final": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "observedLifecycleEvents": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "evaluationEvidence": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/evaluationEvidence"}
+    },
+    "evaluation_evidence": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/evaluationEvidence"}
+    }
+  },
+  "$defs": {
+    "capturedBody": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string"},
+        {
+          "type": "object",
+          "properties": {
+            "kind": {"enum": ["json", "text", "binary", "sse"]},
+            "value": {}
+          },
+          "additionalProperties": true
+        },
+        {"type": "array"},
+        {"type": "number"},
+        {"type": "boolean"}
+      ]
+    },
+    "evaluationEvidence": {
+      "type": "object",
+      "required": ["kind", "source"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "test",
+            "build",
+            "search",
+            "user_correction",
+            "final_acceptance",
+            "evaluator"
+          ]
+        },
+        "source": {"type": "string", "minLength": 1},
+        "status": {"type": "string"},
+        "passed": {"type": "boolean"},
+        "reward": {"type": "number", "minimum": 0, "maximum": 1},
+        "score": {"type": "number", "minimum": 0, "maximum": 1},
+        "artifact": {},
+        "observed_at": {"type": "string"}
+      },
+      "anyOf": [
+        {"required": ["status"]},
+        {"required": ["passed"]},
+        {"required": ["reward"]},
+        {"required": ["score"]}
+      ],
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

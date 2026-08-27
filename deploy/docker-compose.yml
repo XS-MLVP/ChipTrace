@@ -1,15 +1,15 @@
-name: ${CHIPTRACE_PROJECT_NAME:-chiptrace}
+name: chiptrace
 
 services:
   collector:
     build:
       context: ..
-    image: ${CHIPTRACE_IMAGE:-chiptrace:0.4.0}
+    image: ${CHIPTRACE_IMAGE:-chiptrace:0.5.0}
     restart: unless-stopped
     init: true
-    user: "${CHIPTRACE_UID:-1000}:${CHIPTRACE_GID:-1000}"
+    user: "${CHIPTRACE_UID:-10001}:${CHIPTRACE_GID:-10001}"
     command:
-      - serve
+      - collector
       - --root
       - /data/capture
       - --state-root
@@ -24,23 +24,23 @@ services:
       - "1024"
       - --max-inflight-body-mib
       - "4096"
-      - --queue-max-items
-      - "2048"
+      - --queue-items
+      - "8192"
       - --batch-records
+      - "256"
+      - --batch-mib
       - "64"
-      - --batch-wait-ms
-      - "25"
+      - --store-shards
+      - "${CHIPTRACE_STORE_SHARDS:-1}"
+      - --max-batch-records
+      - "4096"
     ports:
       - "${CHIPTRACE_COLLECTOR_BIND:-127.0.0.1}:${CHIPTRACE_COLLECTOR_PORT:-3010}:3010"
     volumes:
       - "${CHIPTRACE_CAPTURE_DATA_ROOT:?请设置 CHIPTRACE_CAPTURE_DATA_ROOT}:/data/capture"
       - "${CHIPTRACE_CAPTURE_STATE_ROOT:?请设置 CHIPTRACE_CAPTURE_STATE_ROOT}:/data/state"
     healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import json,urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:3010/health',timeout=3)); raise SystemExit(0 if data.get('ok') else 1)"
+      test: ["CMD", "chiptrace", "probe"]
       interval: 20s
       timeout: 5s
       retries: 5

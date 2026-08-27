@@ -1,14 +1,20 @@
 [Unit]
-Description=芯迹（ChipTrace）芯片行业 Trace 治理服务
+Description=芯迹（ChipTrace）Trace Collector
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/chiptrace
-Environment=PYTHONUNBUFFERED=1
-Environment=PATH=%h/chiptrace/.venv/bin:/usr/local/bin:/usr/bin
-ExecStart=/usr/bin/env chiptrace serve --root %h/.local/share/chiptrace/capture --state-root %h/.local/state/chiptrace --host 127.0.0.1 --port 3010 --segment-max-mib 512 --max-envelope-mib 1024 --max-inflight-body-mib 4096
+ExecStart=%h/.local/bin/chiptrace collector \
+  --root %h/.local/share/chiptrace/capture \
+  --state-root %h/.local/state/chiptrace \
+  --host 127.0.0.1 \
+  --port 3010 \
+  --segment-max-mib 512 \
+  --max-envelope-mib 1024 \
+  --max-inflight-body-mib 4096 \
+  --store-shards 1 \
+  --max-batch-records 4096
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=60

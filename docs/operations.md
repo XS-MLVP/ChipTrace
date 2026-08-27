@@ -1,22 +1,34 @@
 # 部署与运维
 
-## 存储布局
+## 目录
 
-数据链路使用三个独立持久化目录：
+Collector：
 
 ```text
-/srv/chiptrace/capture/              # sealed 与 open NDJSON 段
-/var/lib/chiptrace/state/            # live SQLite ledger
-/var/lib/chiptrace/outbox/           # Relay 待投递文件
+/srv/chiptrace/capture/segments/       # open/sealed NDJSON WAL
+/var/lib/chiptrace/state/              # capture-ledger.redb
 ```
 
-Capture 数据目录可以位于 NFS 或数据卷。Collector 使用 Capture 和 State
-目录，Relay 使用 outbox 目录。State 和 outbox 位于本地持久化 ext4/XFS。
-三个目录均使用服务专属账号和 `0700` 权限。
+`--store-shards N` 大于 1 时，两个根目录下均创建 `shard-00000` 等固定子目录，
+`state/sharding.json` 保存拓扑。分片数不能直接变更；扩容时建立新 Collector
+实例并切换流量。需要跨设备并行时，将各 shard 子目录分别挂载到独立磁盘。
 
-## Docker Compose
+Relay：
 
-创建目录并启动服务：
+```text
+/var/lib/chiptrace/outbox/segments/    # 本地 outbox WAL
+/var/lib/chiptrace/outbox-state/       # 本地 capture ledger
+/var/lib/chiptrace/delivery/           # delivery-ledger.redb
+```
+
+Relay 的 `--max-delivery-inflight-mib` 是跨全部投递 Worker 的 Payload 内存上限，
+必须不小于单条 Capture 上限。默认 4096 MiB；内存较小的机器应同时下调
+`--max-envelope-mib` 与该值。
+
+State、Capture 与 outbox 使用本地持久化 ext4/XFS；生产数据目录使用服务专属账号和
+`0700` 权限。对象存储凭据通过环境或运行时密钥服务注入。
+
+## Docker
 
 ```bash
 export CHIPTRACE_CAPTURE_DATA_ROOT=/srv/chiptrace/capture
@@ -32,133 +44,86 @@ docker compose -f deploy/docker-compose.yml up -d --build
 curl --fail http://127.0.0.1:3010/health
 ```
 
-默认只监听宿主机 `127.0.0.1:3010`。通过 `CHIPTRACE_COLLECTOR_BIND` 和
-`CHIPTRACE_COLLECTOR_PORT` 调整绑定地址与端口。
+Compose 可通过 `CHIPTRACE_STORE_SHARDS` 设置分片数。默认值为 1，适用于单盘和
+既有数据目录。
 
-停止服务：
-
-```bash
-docker compose -f deploy/docker-compose.yml down
-```
-
-`down` 不删除宿主机数据目录。
-
-## systemd 用户服务
-
-仓库放置于 `$HOME/chiptrace` 并完成虚拟环境安装后，启用用户服务：
+## systemd
 
 ```bash
+cargo build --release --locked
+install -m 0755 target/release/chiptrace "$HOME/.local/bin/chiptrace"
 install -d "$HOME/.config/systemd/user"
-install -d -m 0700 \
-  "$HOME/.local/share/chiptrace/capture" \
-  "$HOME/.local/state/chiptrace"
-
 cp deploy/chiptrace.service "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
 systemctl --user enable --now chiptrace.service
 systemctl --user status chiptrace.service
 ```
 
-服务日志通过以下命令查看：
+服务默认监听 loopback，采集接口不实现应用层认证。跨主机部署时放在受控内网
+或服务网格中，并由网络策略限制 `/flush` 与 `/audit`。认证头在写入 WAL 前
+移除，Trace 正文不做内容改写。
+
+## 上线验收
+
+在独立临时目录和非业务端口执行：
 
 ```bash
-journalctl --user -u chiptrace.service -f
+cargo test --workspace --all-targets --locked
+chiptrace self-test
+
+chiptrace benchmark-store \
+  --records 5000 \
+  --payload-kib 256 \
+  --concurrency 256 \
+  --store-shards 4 \
+  --work-root /mnt/local-nvme/chiptrace-benchmark
+
+chiptrace benchmark-http \
+  --records 5000 \
+  --payload-kib 256 \
+  --batch-records 16 \
+  --concurrency 16 \
+  --store-shards 4
+
+chiptrace benchmark-compression \
+  --records 10000 \
+  --payload-kib 64 \
+  --level 1 \
+  --streams 16 \
+  --workers-per-stream 1
 ```
 
-## Relay 配置
+验收样本覆盖 200、408、429、503、取消、CaptureError、SSE、重复、冲突、
+截断、Session 生命周期、并发工具和 subagent。必须验证：
 
-Relay 初始化一个长期存活的 `DurableCaptureOutbox`：
+- 已 ACK Capture 在 kill -9 后仍可恢复；
+- Relay 在 Collector 停止期间积压，重启后回落；
+- accepted + duplicate + conflict + rejected attempt 守恒；
+- WAL locator 覆盖连续且 SHA-256 一致；
+- Session 不跨 Release Part；
+- 去重与评分数量守恒；
+- OSS/S3 在 COMMIT 出现前不可见为完整 Release。
 
-```javascript
-const { DurableCaptureOutbox } = require('./integration/durable_capture_outbox');
+## 监控
 
-const outbox = new DurableCaptureOutbox({
-  directory: '/var/lib/chiptrace/outbox',
-  url: 'http://127.0.0.1:3010',
-  concurrency: 8,
-  maxBytes: 64 * 1024 * 1024 * 1024,
-});
-```
+告警至少覆盖：
 
-每条真实请求生成一个稳定 `captureId`。请求、响应、错误、取消和重试
-状态全部写入 envelope，不按 HTTP 状态过滤。Relay 退出前调用
-`close()`；尚未送达的文件保留在 outbox，下次启动自动恢复。
+- 业务请求增长但 Capture 不增长；
+- Relay pending/inflight 持续增长；
+- Collector queue 或在途字节预算耗尽；
+- attempt 或 Release 计数不守恒；
+- open WAL 超过大小或时间阈值；
+- `/audit` 失败、磁盘空间不足、fsync 延迟升高；
+- Assembly orphan、merge divergence、模型证明缺失增加；
+- buyer hard-gate 通过率或有效 Token 异常下降；
+- multipart 重试、staging 残留和 COMMIT 冲突。
 
-## 上线校验
-
-新部署使用独立 data root 和 state root 执行校验，不复用现有采集目录。校验样本覆盖：
-
-- HTTP 200 JSON 响应
-- SSE 响应
-- HTTP 408、429 和 503
-- 只有 `captureError`、没有 Terminal 事件的上游错误
-- 同 ID 同正文重试
-- 同 ID 不同正文字节冲突
-- 接近配置上限的正文
-- Collector 超时后的同字节重试
-- Session start/end、cancel、retry、compaction 和 subagent 生命周期事件
-
-验收结果必须满足：
-
-- 失败和取消记录存在于原始段。
-- 同字节重试只产生一条物理记录。
-- 不同字节复用 ID 返回 HTTP 409。
-- 字节预算和队列拒绝状态进入 attempt ledger。
-- `/audit` 返回 `ok: true`。
-- sealed SQLite export 的全部 validation rows 通过。
-- 多文件 release 的 `session_split_count` 为 0。
-- 完整 Session 与 open-tail Session 获得不同的完整性结果。
-
-## 运行检查
-
-健康检查：
+在线 `/audit` 只检查持久化增量计数的守恒关系，不扫描历史 WAL。完整 locator、
+段哈希和 Payload 校验使用离线命令，避免审计流量阻塞采集写线程：
 
 ```bash
-curl --fail http://127.0.0.1:3010/health | python3 -m json.tool
-curl --fail http://127.0.0.1:3010/audit | python3 -m json.tool
+chiptrace audit \
+  --root /srv/chiptrace/capture \
+  --state-root /var/lib/chiptrace/state \
+  --verify-payloads
 ```
-
-离线导出前封存当前 open 段，服务可以继续运行：
-
-```bash
-curl --fail -X POST http://127.0.0.1:3010/flush | python3 -m json.tool
-```
-
-`/flush` 按写入顺序等待队列完成，封存当前段后立即创建新的 open 段。
-它是受信任的本地运维接口；对外绑定端口时必须由网络策略限制访问。
-
-定时告警覆盖以下状态：
-
-- `health.ok != true` 或 writer fatal error
-- Capture ID conflict 非零
-- body budget 或 queue rejection 非零
-- attempt accounting 不守恒
-- Relay 存在符合采集条件的业务流量，但 accepted 记录不增长
-- open segment 超过配置的大小或时间阈值
-- sealed checksum 或 payload locator 校验失败
-- 本地 state 文件系统空间低于阈值
-- NFS 延迟或剩余空间超过阈值
-- outbox 积压持续增长
-- export 或 release validation 失败
-
-sealed segment 的 payload audit 在业务低峰期执行。导出只读取 sealed segment。
-在线服务继续写入时先调用 `/flush`；停机导出时先执行优雅停止，再运行导出命令。
-
-## 备份与恢复
-
-备份对象包括：
-
-- Capture data root 中的全部 open 和 sealed 段
-- State root 中的 ledger 及其 SQLite 辅助文件
-- Relay outbox 的 pending、failed 和 conflicts 目录
-- 已发布目录中的 Manifest、Catalog、Part 和 SHA256SUMS
-
-每季度执行一次 ledger 恢复验证。恢复后先运行只读 `audit`，通过后再启动写入服务。
-
-## 升级与回滚
-
-升级前记录镜像版本、命令行参数、数据目录、状态目录和 Relay Collector URL。停止 Collector 会完成当前批次提交并封存 open 段。
-
-升级过程只替换 Collector 进程或容器，不修改已有段和 ledger。新版本启动后依次检查 `/health`、`/audit`、重复提交幂等性和新段轮转。
-
-回滚时恢复上一版本镜像或可执行文件，并继续使用符合同一数据契约的目录。涉及持久化 schema 变更的版本必须提供迁移和回滚测试；不直接改写历史 sealed 段。

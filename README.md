@@ -2,204 +2,118 @@
 
 <p align="center">
   <a href="https://github.com/XS-MLVP">
-    <img src="docs/assets/xs-mlvp-avatar.png" alt="万众一芯开放验证（UnityChip Verification）" width="96">
+    <img src="docs/assets/xs-mlvp-avatar.png" alt="万众一芯团队" width="96">
   </a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/XS-MLVP"><strong>万众一芯开放验证（UnityChip Verification）</strong></a>
+  <a href="https://github.com/XS-MLVP"><strong>万众一芯团队</strong></a>
   ·
   <a href="https://open-verify.cc/">官方网站</a>
 </p>
 
-面向芯片行业 Agent Trace 的采集、轨迹组装、质量校验和数据交付工具。
+面向芯片行业 Agent 的 Trace 采集与训练数据治理框架。项目由单一 Rust
+二进制提供可靠采集、Session DAG 组装、版本化验收、JSONL 分包和 OSS/S3
+发布能力。
 
 ## 功能
 
-- 在线采集：持久化请求、响应、工具调用和生命周期状态。
-- 离线处理：导出原始数据，组装 Session / Trajectory，执行校验和评分。
-- 数据交付：按 Session 原子分包，生成 Manifest、SHA-256 和 `tar.gz` 归档。
-- 集成组件：提供 Node.js Durable Outbox 和 Trace 上下文提取器。
+- Collector：JSON/NDJSON 接收、分片 WAL、redb ledger、幂等与崩溃恢复。
+- Relay：本地 durable outbox、批量续投、背压、取消/失败/重试完整保留。
+- Trajectory：Session 边界、response DAG、root/subagent DAG 和工具执行状态。
+- Quality：`buyer-v6` / `buyer-v7` 硬门槛、90 分准入、语义证据与 Token 分类。
+- Delivery：Session 原子 `JSONL.zst`、去重、Manifest、SHA-256 和 OSS/S3 提交。
 
-## 安装
+## 构建
 
-要求 Python 3.10+；使用 Node.js 集成组件时要求 Node.js 20+。
+要求 Rust 1.91+。
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -e '.[performance]'
+cargo build --release --locked
+cargo test --workspace --all-targets --locked
+target/release/chiptrace self-test
 ```
 
-运行自测：
+## 采集
+
+启动 Collector：
 
 ```bash
-make self-test
-npm test
-```
-
-## 快速开始
-
-### 启动 Collector
-
-```bash
-export CHIPTRACE_ROOT=/var/tmp/chiptrace
-mkdir -p "$CHIPTRACE_ROOT/capture" "$CHIPTRACE_ROOT/state"
-
-chiptrace serve \
-  --root "$CHIPTRACE_ROOT/capture" \
-  --state-root "$CHIPTRACE_ROOT/state" \
+target/release/chiptrace collector \
+  --root /srv/chiptrace/capture \
+  --state-root /var/lib/chiptrace/state \
   --host 127.0.0.1 \
   --port 3010
 ```
 
-### 提交采集记录
+单条入口为 `POST /capture`；高吞吐入口为 `POST /captures`，请求体使用
+`application/x-ndjson`，每行一个 Capture：
 
 ```bash
-curl --fail http://127.0.0.1:3010/capture \
-  -H 'content-type: application/json' \
-  --data '{"captureId":"cap-demo-001","responseStatus":200,"requestBodyText":"{}","responseBodyText":"{}"}'
-
-curl --fail http://127.0.0.1:3010/health | python3 -m json.tool
-curl --fail -X POST http://127.0.0.1:3010/flush | python3 -m json.tool
+curl --fail-with-body http://127.0.0.1:3010/captures \
+  -H 'content-type: application/x-ndjson' \
+  --data-binary @captures.jsonl
 ```
 
-`/flush` 会封存当前 open 段；导出只读取已封存的段。服务默认只监听
-loopback，`/flush` 供本地运维调用。
-
-### 接入 Relay Outbox
-
-```javascript
-const { DurableCaptureOutbox } = require('chiptrace/outbox');
-
-const outbox = new DurableCaptureOutbox({
-  directory: '/var/lib/chiptrace/outbox',
-  url: 'http://127.0.0.1:3010',
-  concurrency: 8,
-});
-
-(async () => {
-  await outbox.enqueue(captureEnvelope);
-})();
-```
-
-`enqueue` 在本地文件落盘后确认；进程重启会恢复 pending 文件，并使用同一
-`captureId` 进行幂等投递。Relay 负责构造 capture envelope 和转发上游请求，
-Collector 不替换上游响应，也不接管业务端口。
-
-## 离线处理
-
-封存后导出原始 SQLite：
+需要跨进程可靠投递时启动 Relay：
 
 ```bash
-chiptrace export \
-  --root "$CHIPTRACE_ROOT/capture" \
-  --ledger "$CHIPTRACE_ROOT/state/capture-ledger.sqlite" \
-  --output "$CHIPTRACE_ROOT/raw.sqlite" \
-  --compression-codec zstd \
-  --compression-level 1
+target/release/chiptrace relay \
+  --root /var/lib/chiptrace/outbox \
+  --state-root /var/lib/chiptrace/outbox-state \
+  --delivery-state-root /var/lib/chiptrace/delivery \
+  --collector-url http://127.0.0.1:3010 \
+  --host 127.0.0.1 \
+  --port 3011
 ```
 
-组装轨迹并生成交付目录：
+## 交付
 
 ```bash
-chiptrace trajectory \
-  --input "$CHIPTRACE_ROOT/raw.sqlite" \
-  --output "$CHIPTRACE_ROOT/trajectory-catalog.sqlite" \
-  --model target-model-v1
+target/release/chiptrace assemble \
+  --input /srv/chiptrace/capture \
+  --output /srv/chiptrace/assembly
 
-chiptrace release \
-  --input "$CHIPTRACE_ROOT/raw.sqlite" \
-  --output "$CHIPTRACE_ROOT/release" \
-  --model target-model-v1 \
-  --target-part-gib 10
+target/release/chiptrace release \
+  --input /srv/chiptrace/assembly \
+  --output /srv/chiptrace/release-v1 \
+  --release-id chiptrace-20260827-v1 \
+  --profile buyer-v7 \
+  --minimum-score 90 \
+  --target-part-gib 10 \
+  --workers 16
 
-chiptrace verify-release --release "$CHIPTRACE_ROOT/release"
-chiptrace archive-release \
-  --release "$CHIPTRACE_ROOT/release" \
-  --output "$CHIPTRACE_ROOT/release.tar.gz"
+target/release/chiptrace verify-release \
+  --release /srv/chiptrace/release-v1 \
+  --require-pass
+
+target/release/chiptrace publish \
+  --release /srv/chiptrace/release-v1 \
+  --backend oss \
+  --endpoint https://oss-cn-hangzhou.aliyuncs.com \
+  --bucket example-bucket \
+  --prefix datasets/chiptrace
 ```
 
-大规模数据可先使用 `export-sharded` 生成多个 raw shard，再将多个 shard
-传给 `trajectory` 或 `release`。
-
-交付目录示例：
+OSS 凭据从 `ALIBABA_CLOUD_ACCESS_KEY_ID`、
+`ALIBABA_CLOUD_ACCESS_KEY_SECRET` 和可选的
+`ALIBABA_CLOUD_SECURITY_TOKEN` 读取。
 
 ```text
-release/
+release-v1/
+├── data/sessions-part-*.jsonl.zst
+├── reports/assessments-part-*.jsonl.zst
 ├── manifest.json
-├── SHA256SUMS
-├── session-catalog.sqlite
-└── target-model-v1-part-*.sqlite
-```
-
-## 工作流
-
-Relay 旁路复制并写入本地 outbox，Collector 持久化原始证据，离线命令负责
-轨迹组装、校验和分包。采集入口保留成功、失败、取消和重试记录，质量筛选
-在离线投影中执行。
-
-```mermaid
-flowchart LR
-    A[Agent 请求] --> B[Relay]
-    B --> C[本地 Outbox]
-    C --> D[Collector]
-    D --> E[Sealed 段]
-    D --> F[SQLite Ledger]
-    E --> G[Raw Export]
-    F --> G
-    G --> H[Session / Trajectory]
-    H --> I[评分与验收]
-    I --> J[Release]
-```
-
-![芯迹实时数据流与数据包状态](docs/assets/chiptrace-realtime.png)
-
-## 能力说明
-
-- Outbox：原子落盘、重启恢复、同一 `captureId` 幂等重试。
-- Collector：段文件与 SQLite ledger 双重持久化确认，保留完整响应状态。
-- Trace 上下文：记录 Session、Turn、Goal、Agent、Branch 和 Response 链标识。
-- Trajectory：组装 Session DAG，保存工具 schema、调用、结果和生命周期事件。
-- Release：并行压缩、Session 原子分包、完整性评分、Manifest 和 SHA-256 校验。
-
-## 质量与边界
-
-- 完整性分数范围为 0-100，覆盖 Payload、Identity、Terminal、Usage、Tool Linkage 和 Boundary。
-- Session 身份使用 `sourceNamespace + session_id/thread_id`；缺失身份、截断和未配对工具保持显式。
-- `reward` 在接入 evaluator 或 ground truth 后写入；结构分数不代表任务正确性。
-- 请求、响应和工具数据按敏感原始数据处理；Collector 默认监听 loopback，不执行正文脱敏。
-
-字段、状态和评分规则见[数据契约](docs/data-contract.md)；交付验收见[交付规范](docs/delivery.md)。
-
-## 项目结构
-
-```text
-chiptrace/
-├── deploy/                  # Docker Compose 与 systemd
-├── docs/                    # 架构、契约、交付、运维和图片资源
-├── integration/             # Relay outbox 与 Trace 上下文
-├── scripts/                 # 自测、导出和性能脚本
-├── src/chiptrace/           # Collector 与离线处理实现
-├── tests/                   # Python 与 JavaScript 测试
-├── package.json             # Node.js 集成入口
-├── README.md
-├── LICENSE
-├── Dockerfile
-├── Makefile
-├── MANIFEST.in
-└── pyproject.toml
+└── SHA256SUMS
 ```
 
 ## 文档
 
 - [架构与性能](docs/architecture.md)
-- [数据契约](docs/data-contract.md)
-- [交付规范](docs/delivery.md)
+- [数据与评分契约](docs/data-contract.md)
+- [JSONL 与对象存储交付](docs/delivery.md)
 - [部署与运维](docs/operations.md)
-- [OpenAPI 规范](src/chiptrace/specs/openapi.yaml)
-
-使用 `chiptrace <command> --help` 查看完整参数。
+- [OpenAPI](schemas/openapi.yaml)
 
 ## 许可证
 

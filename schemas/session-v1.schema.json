@@ -1,0 +1,247 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/session-v1.schema.json",
+  "title": "ChipTrace canonical Session v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "trajectory_id",
+    "session_id",
+    "provider",
+    "model",
+    "created_at",
+    "status",
+    "is_final_snapshot",
+    "source_request_count",
+    "system_prompt",
+    "tools",
+    "messages",
+    "usage",
+    "meta"
+  ],
+  "properties": {
+    "schema_version": {"const": "chiptrace.session.v1"},
+    "trajectory_id": {"type": "string", "minLength": 1},
+    "session_id": {"type": "string", "minLength": 1},
+    "dataset": {"type": "string", "minLength": 1},
+    "provider": {"type": "string", "minLength": 1},
+    "model": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string"},
+    "ended_at": {"type": ["string", "null"]},
+    "status": {
+      "enum": [
+        "completed",
+        "terminated",
+        "failed",
+        "cancelled",
+        "canceled",
+        "incomplete"
+      ]
+    },
+    "is_final_snapshot": {"type": "boolean"},
+    "source_request_count": {"type": "integer", "minimum": 1},
+    "system_prompt": {"type": "string"},
+    "tools": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/toolDefinition"}
+    },
+    "messages": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/message"}
+    },
+    "usage": {
+      "type": ["object", "null"],
+      "properties": {
+        "input_tokens": {"type": "integer", "minimum": 0},
+        "cached_input_tokens": {"type": "integer", "minimum": 0},
+        "cache_creation_input_tokens": {"type": "integer", "minimum": 0},
+        "output_tokens": {"type": "integer", "minimum": 0},
+        "reasoning_tokens": {"type": "integer", "minimum": 0},
+        "total_tokens": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    },
+    "meta": {"$ref": "#/$defs/sessionMeta"},
+    "quality": {"type": "object"}
+  },
+  "$defs": {
+    "toolDefinition": {
+      "type": "object",
+      "required": [
+        "name",
+        "description",
+        "parameters",
+        "schema_hash",
+        "schema_version"
+      ],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "description": {"type": "string"},
+        "parameters": {"type": "object"},
+        "type": {"type": "string"},
+        "schema_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "schema_version": {"type": ["string", "integer"]}
+      },
+      "additionalProperties": true
+    },
+    "toolCall": {
+      "type": "object",
+      "required": ["id", "type", "function", "execution_status"],
+      "properties": {
+        "id": {"type": ["string", "null"]},
+        "type": {"type": "string"},
+        "function": {
+          "type": "object",
+          "required": ["name", "arguments"],
+          "properties": {
+            "name": {"type": ["string", "null"]},
+            "arguments": {"type": "string"}
+          },
+          "additionalProperties": true
+        },
+        "execution_status": {
+          "enum": ["executed", "failed", "open_tail", "unpaired"]
+        },
+        "result_status": {"type": "string"},
+        "result_message_index": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    },
+    "message": {
+      "type": "object",
+      "required": ["role", "content"],
+      "properties": {
+        "role": {"enum": ["system", "user", "assistant", "tool"]},
+        "content": {},
+        "tool_calls": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/toolCall"}
+        },
+        "tool_call_id": {"type": ["string", "null"]},
+        "status": {"type": "string"},
+        "is_error": {"type": "boolean"},
+        "reasoning": {},
+        "thinking": {},
+        "meta": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "captureDag": {
+      "type": "object",
+      "required": [
+        "nodes",
+        "edges",
+        "roots",
+        "tips",
+        "open_tail_call_ids",
+        "unresolved_parent_response_ids",
+        "has_cycle",
+        "disposition_counts"
+      ],
+      "properties": {
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["node_id", "capture_id", "disposition", "lifecycle_events", "trace"],
+            "properties": {
+              "node_id": {"type": "string"},
+              "capture_id": {"type": "string"},
+              "response_id": {"type": ["string", "null"]},
+              "previous_response_id": {"type": ["string", "null"]},
+              "timestamp": {"type": "string"},
+              "terminal_status": {"type": ["string", "null"]},
+              "http_status": {"type": ["integer", "null"]},
+              "disposition": {"enum": ["executed", "retry", "abandoned", "open_tail"]},
+              "lifecycle_events": {"type": "array", "items": {"type": "string"}},
+              "trace": {"type": "object"}
+            },
+            "additionalProperties": true
+          }
+        },
+        "edges": {"type": "array"},
+        "roots": {"type": "array", "items": {"type": "string"}},
+        "tips": {"type": "array", "items": {"type": "string"}},
+        "open_tail_call_ids": {"type": "array", "items": {"type": "string"}},
+        "unresolved_parent_response_ids": {"type": "array", "items": {"type": "string"}},
+        "has_cycle": {"type": "boolean"},
+        "disposition_counts": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "taskDag": {
+      "type": "object",
+      "required": [
+        "root_session_id",
+        "nodes",
+        "edges",
+        "unresolved_parent_session_ids",
+        "complete"
+      ],
+      "properties": {
+        "root_session_id": {"type": "string"},
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["session_id", "role", "detachable"],
+            "properties": {
+              "session_id": {"type": "string"},
+              "trajectory_id": {"type": ["string", "null"]},
+              "parent_session_id": {"type": ["string", "null"]},
+              "agent_id": {"type": ["string", "null"]},
+              "branch_id": {"type": ["string", "null"]},
+              "role": {"enum": ["root", "subagent"]},
+              "detachable": {"type": "boolean"}
+            },
+            "additionalProperties": true
+          }
+        },
+        "edges": {"type": "array"},
+        "unresolved_parent_session_ids": {"type": "array", "items": {"type": "string"}},
+        "complete": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "sessionMeta": {
+      "type": "object",
+      "required": [
+        "source_request_ids",
+        "response_ids",
+        "session_identity_source",
+        "source_namespace",
+        "capture_dag",
+        "task_dag",
+        "task_role",
+        "lifecycle_events",
+        "evaluation_evidence",
+        "schema_conflicts",
+        "trace_conflicts",
+        "merge_divergences",
+        "model_evidence",
+        "trace"
+      ],
+      "properties": {
+        "source_request_ids": {"type": "array", "items": {"type": "string"}},
+        "response_ids": {"type": "array", "items": {"type": "string"}},
+        "session_identity_source": {"type": "string"},
+        "source_namespace": {"type": "string"},
+        "capture_dag": {"$ref": "#/$defs/captureDag"},
+        "task_dag": {"$ref": "#/$defs/taskDag"},
+        "task_role": {"enum": ["root", "subagent"]},
+        "lifecycle_events": {"type": "array", "items": {"type": "string"}},
+        "evaluation_evidence": {"type": "array", "items": {"type": "object"}},
+        "schema_conflicts": {"type": "array", "items": {"type": "string"}},
+        "trace_conflicts": {"type": "array", "items": {"type": "string"}},
+        "merge_divergences": {"type": "integer", "minimum": 0},
+        "model_evidence": {
+          "type": "object",
+          "required": ["request_models", "response_models", "providers", "attested", "scope"]
+        },
+        "trace": {"type": "object"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

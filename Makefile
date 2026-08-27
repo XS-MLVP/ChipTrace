@@ -1,18 +1,28 @@
-.PHONY: test self-test benchmark benchmark-pack benchmark-export
+.PHONY: check test self-test build benchmark benchmark-store benchmark-http benchmark-compression
+
+check:
+	cargo fmt --all -- --check
+	cargo clippy --workspace --all-targets --locked -- -D warnings
 
 test:
-	PYTHONPATH=src python3 -m unittest discover -s tests -v
-	node --test tests/js/*.test.js
+	cargo test --workspace --all-targets --locked
 
 self-test:
-	PYTHONPATH=src ./scripts/self-test.sh
+	cargo run --locked --bin chiptrace -- self-test
+
+build:
+	cargo build --release --locked --bin chiptrace
 
 benchmark:
-	PYTHONPATH=src python3 scripts/benchmark.py
+	$(MAKE) benchmark-store
+	$(MAKE) benchmark-http
+	$(MAKE) benchmark-compression
 
-benchmark-pack:
-	PYTHONPATH=src python3 scripts/benchmark_compression.py
+benchmark-store:
+	cargo run --release --locked --bin chiptrace -- benchmark-store
 
-benchmark-export:
-	test -n "$(INPUT_SQLITE)"
-	PYTHONPATH=src python3 scripts/benchmark_export.py --input-sqlite "$(INPUT_SQLITE)"
+benchmark-http:
+	cargo run --release --locked --bin chiptrace -- benchmark-http
+
+benchmark-compression:
+	cargo run --release --locked --bin chiptrace -- benchmark-compression

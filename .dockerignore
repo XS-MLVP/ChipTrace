@@ -1,19 +1,11 @@
 .git
-.venv
-__pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
-.coverage
-build/
-dist/
-var/
-*.db
-*.db-*
-*.sqlite
-*.sqlite-*
+.github
+target
+var
+*.redb
 *.ndjson
 *.jsonl
-node_modules/
-tests/
-docs/
+*.jsonl.zst
+*.tar.gz
+Agent数据交付格式说明(1)(1).docx
+Trajectory 验收标准(1)(1).pdf

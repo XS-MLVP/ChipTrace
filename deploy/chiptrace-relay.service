@@ -1,0 +1,28 @@
+[Unit]
+Description=芯迹（ChipTrace）Durable Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/chiptrace relay \
+  --root %h/.local/share/chiptrace/outbox \
+  --state-root %h/.local/state/chiptrace/outbox \
+  --delivery-state-root %h/.local/state/chiptrace/delivery \
+  --collector-url http://127.0.0.1:3010 \
+  --host 127.0.0.1 \
+  --port 3011 \
+  --store-shards 1 \
+  --max-batch-records 4096 \
+  --delivery-batch-records 128 \
+  --delivery-batch-mib 16 \
+  --max-delivery-inflight-mib 4096
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=60
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

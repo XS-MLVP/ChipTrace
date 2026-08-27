@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/release-manifest-v1.schema.json",
+  "title": "ChipTrace JSONL Release Manifest v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "release_id",
+    "created_at_utc",
+    "format",
+    "session_atomic",
+    "session_split_count",
+    "buyer_profile",
+    "minimum_score",
+    "tokenizer",
+    "compression",
+    "processing_workers",
+    "target_part_bytes",
+    "counts",
+    "eligible_tokens",
+    "assessed_tokens",
+    "failure_reason_counts",
+    "parts",
+    "reports",
+    "validation_status"
+  ],
+  "properties": {
+    "schema_version": {"const": "chiptrace.jsonl-release.v1"},
+    "release_id": {"type": "string", "minLength": 1},
+    "created_at_utc": {"type": "string"},
+    "format": {"type": "string"},
+    "session_atomic": {"const": true},
+    "session_split_count": {"const": 0},
+    "buyer_profile": {"enum": ["buyer-v6", "buyer-v7"]},
+    "minimum_score": {"type": "number", "minimum": 0, "maximum": 100},
+    "tokenizer": {"type": "string"},
+    "compression": {"type": "string", "pattern": "^zstd-"},
+    "processing_workers": {"type": "integer", "minimum": 1},
+    "target_part_bytes": {"type": "integer", "minimum": 1},
+    "counts": {
+      "type": "object",
+      "required": [
+        "input_records",
+        "parse_failures",
+        "exact_duplicates_removed",
+        "subset_snapshots_removed",
+        "divergent_session_conflicts",
+        "divergent_session_records",
+        "assessed_sessions",
+        "eligible_sessions",
+        "rejected_sessions"
+      ],
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "eligible_tokens": {"$ref": "#/$defs/tokenCounts"},
+    "assessed_tokens": {"$ref": "#/$defs/tokenCounts"},
+    "failure_reason_counts": {
+      "type": "object",
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "parts": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/file"}
+    },
+    "reports": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/file"}
+    },
+    "validation_status": {"enum": ["pass", "fail"]}
+  },
+  "$defs": {
+    "file": {
+      "type": "object",
+      "required": ["file", "sha256", "bytes"],
+      "properties": {
+        "file": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "bytes": {"type": "integer", "minimum": 0},
+        "records": {"type": "integer", "minimum": 0},
+        "uncompressed_bytes": {"type": "integer", "minimum": 0},
+        "oversized_session": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "tokenCounts": {
+      "type": "object",
+      "required": [
+        "api_input_tokens",
+        "api_cached_input_tokens",
+        "api_cache_write_tokens",
+        "api_output_tokens",
+        "api_reasoning_tokens",
+        "api_total_tokens",
+        "normalized_corpus_tokens",
+        "supervised_output_tokens",
+        "excluded_base64_bytes",
+        "tokenizer"
+      ],
+      "properties": {
+        "tokenizer": {"type": "string"}
+      },
+      "additionalProperties": {
+        "oneOf": [
+          {"type": "integer", "minimum": 0},
+          {"type": "string"}
+        ]
+      }
+    }
+  },
+  "additionalProperties": true
+}
