@@ -77,6 +77,10 @@ Relay 先完成本地 WAL 确认，再异步投递。delivery ledger 使用独�
 索引；重启后 `inflight` 回到 `pending`。Worker 将多个 Capture 合并为 NDJSON
 请求，Collector 不支持批量入口时自动回退到单条投递。
 
+18084 到 Relay 的旁路提交使用有界异步重试（生产为 25 次尝试、24 次重连），
+采用指数退避、5 秒上限和抖动；它不等待采集结果再返回业务响应。只有 Relay
+返回 `durable=true` 后，Capture 才进入可恢复的本地 outbox。
+
 投递 Payload 使用跨全部 Worker 的全局字节预算，避免大响应与高并发叠加造成
 内存失控。每次 claim 同时写入持久化 lease；进程异常、任务取消或网络请求
 卡死后，过期 `inflight` 会返回 `pending`，并沿用同一 `captureId` 幂等续投。

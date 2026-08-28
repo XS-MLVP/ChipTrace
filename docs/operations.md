@@ -54,6 +54,26 @@ curl --fail http://127.0.0.1:3011/health
 Compose 可通过 `CHIPTRACE_STORE_SHARDS` 设置分片数。默认值为 1，适用于单盘和
 既有数据目录。
 
+## 18084 入口适配器
+
+机房 `18084` 只负责业务请求/响应的有界旁路复制，并在业务响应结束后异步提交
+到 Rust Relay。当前生产配置为：
+
+```text
+FULL_TRACE_CAPTURE_SUBMIT_ATTEMPTS=25   # 1 次初始提交 + 24 次重连
+FULL_TRACE_CAPTURE_RETRY_BASE_MS=250
+FULL_TRACE_CAPTURE_RETRY_MAX_MS=5000
+FULL_TRACE_CAPTURE_RETRY_JITTER_PERCENT=20
+FULL_TRACE_CAPTURE_RELAY_TIMEOUT_MS=30000
+FULL_TRACE_CAPTURE_SUBMIT_CONCURRENCY=8
+FULL_TRACE_CAPTURE_SUBMIT_MAX_INFLIGHT_BYTES=1073741824
+```
+
+重试采用指数退避、上限和抖动；失败、取消、重试及非成功 HTTP 响应均会进入
+Capture，不按状态码过滤。18084 不写 Trace 磁盘，Rust Relay 返回 `durable=true`
+才是持久化交接点；交接后由 Relay outbox 持续续投 Collector。若 18084 进程在
+取得 durable ACK 前重启，当前 Capture 仍可能丢失，这是旁路适配器的明确边界。
+
 ## open21 复现环境
 
 `open21` 是由独立 Docker Compose 管理的复现 fixture，不是 ChipTrace 生产
