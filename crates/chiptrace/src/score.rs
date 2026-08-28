@@ -389,19 +389,20 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
     let first_role = messages
         .first()
         .and_then(|message| string_field(message, "role"));
-    let first_role_valid = matches!(first_role, Some("system" | "user"));
+    let first_role_valid = matches!(first_role, Some("system" | "user" | "developer"));
     push_gate(
         &mut gates,
         "first_message_role",
         first_role_valid,
         true,
         json!(first_role),
-        "system or user",
+        "system, user, or developer",
         None,
     );
     let system_prompt_present = string_field(session, "system_prompt").is_some()
         || messages.iter().any(|message| {
-            string_field(message, "role") == Some("system") && content_nonempty(message)
+            matches!(string_field(message, "role"), Some("system" | "developer"))
+                && content_nonempty(message)
         });
     push_gate(
         &mut gates,
@@ -409,7 +410,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         system_prompt_present,
         true,
         json!(system_prompt_present),
-        "non-empty system_prompt or system message",
+        "non-empty system_prompt, system message, or developer instruction",
         None,
     );
     push_gate(
@@ -1550,6 +1551,34 @@ mod tests {
         assert_eq!(
             count_tokens(&session, &BTreeSet::new()).excluded_base64_bytes,
             4
+        );
+    }
+
+    #[test]
+    fn developer_instruction_counts_as_system_prompt_evidence() {
+        let session = json!({
+            "trajectory_id":"t", "session_id":"s", "provider":"OpenAI", "model":"gpt-5.6-sol",
+            "created_at":"2026-08-28T00:00:00Z", "status":"completed", "is_final_snapshot":true,
+            "source_request_count":1, "system_prompt":"", "tools":[], "usage":{},
+            "messages":[
+                {"role":"developer","content":"You are a coding agent."},
+                {"role":"user","content":"hello"}
+            ]
+        });
+        let assessment = assess_session(&session, Profile::BuyerV6, 90.0);
+        assert!(
+            assessment
+                .buyer_acceptance
+                .gates
+                .iter()
+                .any(|gate| gate.name == "system_prompt" && gate.pass)
+        );
+        assert!(
+            assessment
+                .buyer_acceptance
+                .gates
+                .iter()
+                .any(|gate| gate.name == "first_message_role" && gate.pass)
         );
     }
 

@@ -26,19 +26,28 @@ Assembly 输出 `schemas/session-v1.schema.json`，一行一个完整 Session。
 | --- | --- |
 | `trajectory_id` / `session_id` | 稳定轨迹与任务 Session 标识 |
 | `provider` / `model` | 捕获到的模型字段及推断 provider |
-| `system_prompt` | Agent 角色与行为约束 |
-| `tools` | name、description、parameters、schema hash/version |
-| `messages` | system/user/assistant/tool 的真实时序 |
+| `system_prompt` | Agent 角色与行为约束；`instructions`、`system` 或 `developer` 指令映射为 system |
+| `tools` | 实际可调用工具的 name、description、parameters、schema hash/version；展开 `additional_tools` / `functions` / namespace 包装，不把 `functions/collaboration` 当成工具名 |
+| `messages` | system/user/assistant/tool 的真实时序；`developer` 记为 system；按稳定消息 ID / call_id 合并 |
 | `usage` | 实际 API Token 与缓存 Token 聚合 |
-| `meta.capture_dag` | response 链、状态、根、尾、环和缺失父节点 |
+| `meta.capture_dag` | response 链、状态、根、尾、环和缺失父节点；节点上保留该 Capture 的 turn 级字段 |
 | `meta.task_dag` | root/subagent 关系和可拆分子轨迹 |
-| `meta.trace` | root/parent/goal/turn/agent/branch 标识 |
+| `meta.trace` | 会话级稳定标识：root/parent/goal/agent/branch；`turn_id` 不进入会话级冲突 |
+| `meta.turn_ids` | 按出现顺序去重后的 turn 级标识 |
 | `meta.model_evidence` | 请求与响应模型一致性及证明范围 |
 | `meta.evaluation_evidence` | 测试、构建、搜索、验收和 evaluator 证据 |
 
 每个工具定义包含 `schema_hash` 和 `schema_version`。来源没有版本时，Assembly
 使用 `sha256:<schema_hash>` 作为内容寻址版本。每次工具调用包含
-`execution_status`，工具返回保留 `status`、`is_error` 与原始内容。
+`execution_status`。工具返回只在原始对象或嵌套 `output`/`content` 中出现
+`status`、`is_error`、`isError` 时写入这些字段；没有证据时保持缺失，不默认
+`success`。
+
+`turn_id`、`previous_response_id` 和 `session_final` 属于单次 Capture / 轮次，
+写入 `meta.capture_dag.nodes[].trace` 与 `meta.turn_ids`。它们随轮次变化不是
+`assembly_integrity` 冲突。Session 终态仍只接受显式 `isFinalSnapshot`、
+`session_final`、`session_end` / cancel / terminate；`response.completed` 不能
+代替 Session 结束，需要 18084 补采该事件。
 
 模型字段一致性不等于供应商身份认证。若采集入口不能提供可信 provider
 证明，评分会输出 `model_attestation_missing`，不得宣称已证明模型来源。

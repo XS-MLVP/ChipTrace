@@ -238,7 +238,8 @@
           "type": "object",
           "required": ["request_models", "response_models", "providers", "attested", "scope"]
         },
-        "trace": {"type": "object"}
+        "trace": {"type": "object"},
+        "turn_ids": {"type": "array", "items": {"type": "string"}}
       },
       "additionalProperties": true
     }

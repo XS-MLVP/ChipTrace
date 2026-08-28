@@ -417,12 +417,13 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
             response_ids.push(response_id.clone());
         }
         for (key, value) in &capture.trace_context {
-            if !value.is_null() {
-                if trace.get(key).is_some_and(|existing| existing != value) {
-                    trace_conflicts.insert(key.clone());
-                } else {
-                    trace.entry(key.clone()).or_insert_with(|| value.clone());
-                }
+            if value.is_null() || is_turn_scoped_trace_field(key) {
+                continue;
+            }
+            if trace.get(key).is_some_and(|existing| existing != value) {
+                trace_conflicts.insert(key.clone());
+            } else {
+                trace.entry(key.clone()).or_insert_with(|| value.clone());
             }
         }
         if capture.system_prompt.is_some() {
@@ -505,6 +506,7 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     meta.insert("schema_conflicts".to_owned(), json!(schema_conflicts));
     meta.insert("trace_conflicts".to_owned(), json!(trace_conflicts));
     meta.insert("merge_divergences".to_owned(), json!(divergences));
+    meta.insert("turn_ids".to_owned(), json!(collect_turn_ids(&parsed)));
     meta.insert(
         "model_evidence".to_owned(),
         json!({
@@ -859,19 +861,22 @@ fn parse_request(
 ) -> (Vec<Value>, Vec<Value>, Option<String>) {
     let mut messages = Vec::new();
     let mut tools = Vec::new();
-    let system_prompt = request
+    let mut system_prompt = request
         .get("instructions")
         .or_else(|| request.get("system"))
-        .and_then(|value| content_text(Some(value)));
+        .and_then(|value| content_text(Some(value)))
+        .filter(|text| !text.trim().is_empty());
     if let Some(system) = &system_prompt {
-        messages.push(json!({"role": "system", "content": system}));
+        messages.push(json!({
+            "id": "system:instructions",
+            "role": "system",
+            "content": system
+        }));
     }
     for field in ["tools", "additional_tools"] {
         if let Some(values) = request.get(field).and_then(Value::as_array) {
             for value in values {
-                if let Some(tool) = normalize_tool_definition(value) {
-                    tools.push(tool);
-                }
+                tools.extend(expand_tool_definitions(value));
             }
         }
     }
@@ -891,6 +896,15 @@ fn parse_request(
         }
         _ => {}
     }
+    if system_prompt.is_none() {
+        system_prompt = messages.iter().find_map(|message| {
+            if string_field(message, "role") == Some("system") {
+                content_text(message.get("content")).filter(|text| !text.trim().is_empty())
+            } else {
+                None
+            }
+        });
+    }
     (messages, tools, system_prompt)
 }
 
@@ -900,15 +914,7 @@ fn parse_input_item(item: &Value, messages: &mut Vec<Value>, tools: &mut Vec<Val
     };
     let kind = object.get("type").and_then(Value::as_str).unwrap_or("");
     if kind == "additional_tools" {
-        for field in ["tools", "additional_tools", "definitions"] {
-            if let Some(definitions) = object.get(field).and_then(Value::as_array) {
-                for definition in definitions {
-                    if let Some(tool) = normalize_tool_definition(definition) {
-                        tools.push(tool);
-                    }
-                }
-            }
-        }
+        tools.extend(expand_tool_definitions(item));
         return;
     }
     if matches!(kind, "function_call" | "custom_tool_call" | "tool_use") {
@@ -922,7 +928,7 @@ fn parse_input_item(item: &Value, messages: &mut Vec<Value>, tools: &mut Vec<Val
             .or_else(|| object.get("input"))
             .cloned()
             .unwrap_or_else(|| json!({}));
-        messages.push(json!({
+        let mut message = json!({
             "role": "assistant",
             "content": "",
             "tool_calls": [{
@@ -930,7 +936,11 @@ fn parse_input_item(item: &Value, messages: &mut Vec<Value>, tools: &mut Vec<Val
                 "type": "function",
                 "function": {"name": name, "arguments": argument_string(&arguments)}
             }]
-        }));
+        });
+        if let Some(item_id) = object.get("id") {
+            message["id"] = item_id.clone();
+        }
+        messages.push(message);
         return;
     }
     if matches!(
@@ -947,37 +957,46 @@ fn parse_input_item(item: &Value, messages: &mut Vec<Value>, tools: &mut Vec<Val
             .or_else(|| object.get("content"))
             .cloned()
             .unwrap_or(Value::Null);
-        let source_status = object.get("status").and_then(Value::as_str);
-        let failed = object
-            .get("is_error")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || source_status.is_some_and(|status| {
-                matches!(
-                    status.to_ascii_lowercase().as_str(),
-                    "error" | "failed" | "cancelled" | "canceled"
-                )
-            });
-        messages.push(json!({
-            "role": "tool",
-            "tool_call_id": call_id,
-            "content": content,
-            "status": source_status.unwrap_or(if failed {"error"} else {"success"}),
-            "is_error": failed,
-        }));
+        messages.push(tool_result_message(call_id, content, object));
         return;
     }
-    let role = object
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or(if kind == "message" { "user" } else { "" });
+    let role = object.get("role").and_then(Value::as_str).unwrap_or(
+        if matches!(kind, "message" | "developer") {
+            if kind == "developer" {
+                "developer"
+            } else {
+                "user"
+            }
+        } else {
+            ""
+        },
+    );
+    let role = if role == "developer" || kind == "developer" {
+        "system"
+    } else {
+        role
+    };
     if matches!(role, "system" | "user" | "assistant" | "tool") {
+        if role == "system"
+            && let Some(text) = object
+                .get("content")
+                .and_then(|content| content_text(Some(content)))
+            && messages.iter().any(|message| {
+                string_field(message, "role") == Some("system")
+                    && content_text(message.get("content")).as_deref() == Some(text.as_str())
+            })
+        {
+            return;
+        }
         if let Some(content) = object.get("content") {
             parse_role_content(role, content, object, messages);
         } else {
             let mut normalized = Map::new();
             normalized.insert("role".to_owned(), Value::String(role.to_owned()));
             normalized.insert("content".to_owned(), Value::String(String::new()));
+            if let Some(id) = object.get("id") {
+                normalized.insert("id".to_owned(), id.clone());
+            }
             if let Some(calls) = object.get("tool_calls") {
                 normalized.insert("tool_calls".to_owned(), calls.clone());
             }
@@ -994,17 +1013,30 @@ fn parse_role_content(
 ) {
     let Some(blocks) = content.as_array() else {
         let mut message = json!({"role": role, "content": content});
+        if let Some(id) = source.get("id") {
+            message["id"] = id.clone();
+        }
         if let Some(calls) = source.get("tool_calls") {
             message["tool_calls"] = calls.clone();
         }
         if let Some(call_id) = source.get("tool_call_id") {
             message["tool_call_id"] = call_id.clone();
         }
-        if let Some(status) = source.get("status") {
-            message["status"] = status.clone();
-        }
-        if let Some(is_error) = source.get("is_error") {
-            message["is_error"] = is_error.clone();
+        if role == "tool" {
+            let (status, is_error) = tool_result_status(source, content);
+            if let Some(status) = status {
+                message["status"] = json!(status);
+            }
+            if let Some(is_error) = is_error {
+                message["is_error"] = json!(is_error);
+            }
+        } else {
+            if let Some(status) = source.get("status") {
+                message["status"] = status.clone();
+            }
+            if let Some(is_error) = source.get("is_error") {
+                message["is_error"] = is_error.clone();
+            }
         }
         messages.push(message);
         return;
@@ -1026,13 +1058,14 @@ fn parse_role_content(
             }
             "tool_result" => {
                 flush_role_blocks(role, &mut text, &mut calls, messages);
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": block.get("tool_use_id"),
-                    "content": block.get("content").cloned().unwrap_or(Value::Null),
-                    "status": if block.get("is_error").and_then(Value::as_bool).unwrap_or(false) {"error"} else {"success"},
-                    "is_error": block.get("is_error").and_then(Value::as_bool).unwrap_or(false),
-                }));
+                let content = block.get("content").cloned().unwrap_or(Value::Null);
+                let object = block.as_object().cloned().unwrap_or_default();
+                let call_id = block
+                    .get("tool_use_id")
+                    .or_else(|| block.get("tool_call_id"))
+                    .or_else(|| block.get("call_id"))
+                    .and_then(Value::as_str);
+                messages.push(tool_result_message(call_id, content, &object));
             }
             _ => {
                 if let Some(value) = content_text(Some(block))
@@ -1183,9 +1216,70 @@ fn parse_response_messages(response: &Value, provider: &str) -> Vec<Value> {
     output
 }
 
+fn expand_tool_definitions(value: &Value) -> Vec<Value> {
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    let mut nested = Vec::new();
+    for field in ["functions", "tools", "additional_tools", "definitions"] {
+        match object.get(field) {
+            Some(Value::Array(items)) => {
+                for item in items {
+                    nested.extend(expand_tool_definitions(item));
+                }
+            }
+            Some(Value::Object(_)) => {
+                nested.extend(expand_tool_definitions(object.get(field).unwrap()));
+            }
+            _ => {}
+        }
+    }
+    if let Some(tool_set) = object.get("tool_set") {
+        nested.extend(expand_tool_definitions(tool_set));
+    }
+    if !nested.is_empty() {
+        return nested;
+    }
+    let type_name = object.get("type").and_then(Value::as_str).unwrap_or("");
+    let name = string_field(value, "name")
+        .or_else(|| {
+            value
+                .get("function")
+                .and_then(|function| string_field(function, "name"))
+        })
+        .unwrap_or("");
+    if is_tool_namespace_wrapper(name, type_name) && !looks_like_callable_tool(value) {
+        return Vec::new();
+    }
+    normalize_tool_definition(value).into_iter().collect()
+}
+
+fn is_tool_namespace_wrapper(name: &str, type_name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "functions" | "collaboration" | "additional_tools" | "namespace" | "tool_set"
+    ) || matches!(
+        type_name,
+        "additional_tools" | "namespace" | "tool_group" | "functions"
+    )
+}
+
+fn looks_like_callable_tool(value: &Value) -> bool {
+    let nested = value.get("function").unwrap_or(value);
+    let name = string_field(nested, "name").unwrap_or("");
+    if name.is_empty() || is_tool_namespace_wrapper(name, "") {
+        return false;
+    }
+    nested.get("parameters").is_some() || nested.get("input_schema").is_some()
+}
+
 fn normalize_tool_definition(value: &Value) -> Option<Value> {
     let nested = value.get("function").unwrap_or(value);
     let name = string_field(nested, "name")?;
+    if is_tool_namespace_wrapper(name, "") && !looks_like_callable_tool(value) {
+        return None;
+    }
     let description = nested
         .get("description")
         .and_then(Value::as_str)
@@ -1215,6 +1309,96 @@ fn normalize_tool_definition(value: &Value) -> Option<Value> {
         "schema_hash": hash,
         "schema_version": schema_version,
     }))
+}
+
+fn tool_result_message(
+    call_id: Option<&str>,
+    content: Value,
+    source: &Map<String, Value>,
+) -> Value {
+    let (status, is_error) = tool_result_status(source, &content);
+    let mut message = json!({
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": content,
+    });
+    if let Some(id) = source.get("id") {
+        message["id"] = id.clone();
+    }
+    if let Some(status) = status {
+        message["status"] = json!(status);
+    }
+    if let Some(is_error) = is_error {
+        message["is_error"] = json!(is_error);
+    }
+    message
+}
+
+fn tool_result_status(
+    source: &Map<String, Value>,
+    content: &Value,
+) -> (Option<String>, Option<bool>) {
+    let explicit_status = source
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| !status.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| extract_status(content));
+    let is_error = source
+        .get("is_error")
+        .or_else(|| source.get("isError"))
+        .and_then(Value::as_bool)
+        .or_else(|| extract_is_error(content));
+    let status = match (&explicit_status, is_error) {
+        (Some(status), _) => Some(status.clone()),
+        (None, Some(true)) => Some("error".to_owned()),
+        (None, Some(false)) => Some("success".to_owned()),
+        (None, None) => None,
+    };
+    (status, is_error)
+}
+
+fn extract_is_error(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(flag) => Some(*flag),
+        Value::Object(object) => {
+            if let Some(flag) = object
+                .get("isError")
+                .or_else(|| object.get("is_error"))
+                .and_then(Value::as_bool)
+            {
+                return Some(flag);
+            }
+            ["output", "content", "result", "metadata"]
+                .into_iter()
+                .find_map(|field| object.get(field).and_then(extract_is_error))
+        }
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|parsed| extract_is_error(&parsed)),
+        Value::Array(items) => items.iter().find_map(extract_is_error),
+        _ => None,
+    }
+}
+
+fn extract_status(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(object) => object
+            .get("status")
+            .and_then(Value::as_str)
+            .filter(|status| !status.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                ["output", "content", "result", "metadata"]
+                    .into_iter()
+                    .find_map(|field| object.get(field).and_then(extract_status))
+            }),
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|parsed| extract_status(&parsed)),
+        Value::Array(items) => items.iter().find_map(extract_status),
+        _ => None,
+    }
 }
 
 fn annotate_tool_call_statuses(messages: &mut [Value]) {
@@ -1522,6 +1706,12 @@ fn merge_messages(current: &mut Vec<Value>, candidate: &[Value]) -> u64 {
         current.extend(candidate.iter().cloned());
         return 0;
     }
+    if candidate.is_empty() {
+        return 0;
+    }
+    if let Some(divergences) = merge_messages_by_stable_id(current, candidate) {
+        return divergences;
+    }
     let current_fingerprints: Vec<Vec<u8>> = current
         .iter()
         .map(|message| serde_json::to_vec(message).unwrap_or_default())
@@ -1545,6 +1735,90 @@ fn merge_messages(current: &mut Vec<Value>, candidate: &[Value]) -> u64 {
         .unwrap_or(0);
     current.extend(candidate[overlap..].iter().cloned());
     1
+}
+
+fn merge_messages_by_stable_id(current: &mut Vec<Value>, candidate: &[Value]) -> Option<u64> {
+    let current_ids: Vec<Option<String>> = current.iter().map(message_stable_id).collect();
+    let candidate_ids: Vec<Option<String>> = candidate.iter().map(message_stable_id).collect();
+    let current_known: Vec<&str> = current_ids.iter().filter_map(|id| id.as_deref()).collect();
+    let candidate_known: Vec<&str> = candidate_ids
+        .iter()
+        .filter_map(|id| id.as_deref())
+        .collect();
+    if current_known.len() * 2 < current.len() || candidate_known.len() * 2 < candidate.len() {
+        return None;
+    }
+    let current_by_id: HashMap<&str, &Value> = current
+        .iter()
+        .zip(current_ids.iter())
+        .filter_map(|(message, id)| id.as_deref().map(|id| (id, message)))
+        .collect();
+    let candidate_by_id: HashMap<&str, &Value> = candidate
+        .iter()
+        .zip(candidate_ids.iter())
+        .filter_map(|(message, id)| id.as_deref().map(|id| (id, message)))
+        .collect();
+    let divergences = current_by_id
+        .iter()
+        .filter(|(id, current_message)| {
+            candidate_by_id.get(*id).is_some_and(|candidate_message| {
+                message_identity_conflicts(current_message, candidate_message)
+            })
+        })
+        .count() as u64;
+    if is_subsequence(&current_known, &candidate_known) {
+        *current = candidate.to_vec();
+        return Some(divergences);
+    }
+    if is_subsequence(&candidate_known, &current_known) {
+        return Some(divergences);
+    }
+    None
+}
+
+fn message_stable_id(message: &Value) -> Option<String> {
+    if let Some(id) = string_field(message, "id").filter(|id| !id.is_empty()) {
+        return Some(id.to_owned());
+    }
+    if string_field(message, "role") == Some("tool")
+        && let Some(id) = string_field(message, "tool_call_id").filter(|id| !id.is_empty())
+    {
+        return Some(format!("tool:{id}"));
+    }
+    message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .and_then(|calls| calls.first())
+        .and_then(|call| string_field(call, "id"))
+        .filter(|id| !id.is_empty())
+        .map(|id| format!("call:{id}"))
+}
+
+fn message_identity_conflicts(left: &Value, right: &Value) -> bool {
+    string_field(left, "role") != string_field(right, "role")
+        || (string_field(left, "role") == Some("tool")
+            && string_field(left, "tool_call_id") != string_field(right, "tool_call_id"))
+}
+
+fn is_turn_scoped_trace_field(field: &str) -> bool {
+    matches!(field, "turn_id" | "previous_response_id" | "session_final")
+}
+
+fn collect_turn_ids(captures: &[ParsedCapture]) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut seen = BTreeSet::new();
+    for capture in captures {
+        if let Some(turn_id) = capture
+            .trace_context
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            && seen.insert(turn_id.to_owned())
+        {
+            output.push(turn_id.to_owned());
+        }
+    }
+    output
 }
 
 fn is_subsequence<T: PartialEq>(needle: &[T], haystack: &[T]) -> bool {
@@ -1950,6 +2224,288 @@ mod tests {
             sessions[0].pointer("/meta/task_dag/complete"),
             Some(&json!(true))
         );
+    }
+
+    #[test]
+    fn developer_instruction_maps_to_system_prompt() {
+        let capture = json!({
+            "captureId": "cap-developer",
+            "sourceNamespace": "fixture",
+            "startedAt": "2026-08-28T00:00:00Z",
+            "traceContext": {"session_id": "session-developer"},
+            "requestBody": {"kind": "json", "value": {
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {"id": "msg-dev", "type": "message", "role": "developer", "content": [
+                        {"type": "input_text", "text": "You are a coding agent. Preserve real tool evidence."}
+                    ]},
+                    {"id": "msg-user", "type": "message", "role": "user", "content": "run tests"}
+                ]
+            }},
+            "responseBody": {"kind": "json", "value": {
+                "id": "resp-dev",
+                "status": "completed",
+                "output": [{"type": "message", "role": "assistant", "content": "ok"}]
+            }}
+        });
+        let (session, _, _) = assemble_group(vec![capture]).unwrap();
+        assert_eq!(
+            session["system_prompt"],
+            "You are a coding agent. Preserve real tool evidence."
+        );
+        assert_eq!(session["messages"][0]["role"], "system");
+        assert_eq!(
+            session["messages"][0]["content"],
+            "You are a coding agent. Preserve real tool evidence."
+        );
+    }
+
+    #[test]
+    fn nested_functions_collaboration_expands_to_exec_and_wait() {
+        let capture = json!({
+            "captureId": "cap-nested-tools",
+            "sourceNamespace": "fixture",
+            "startedAt": "2026-08-28T00:00:00Z",
+            "traceContext": {"session_id": "session-tools"},
+            "requestBody": {"kind": "json", "value": {
+                "model": "gpt-5.6-sol",
+                "additional_tools": [{
+                    "type": "functions",
+                    "name": "functions",
+                    "namespace": "collaboration",
+                    "functions": [
+                        {
+                            "name": "exec",
+                            "description": "Run a command.",
+                            "parameters": {"type": "object", "properties": {
+                                "cmd": {"type": "string", "description": "Command to run."}
+                            }}
+                        },
+                        {
+                            "name": "wait",
+                            "description": "Wait for a process.",
+                            "parameters": {"type": "object", "properties": {
+                                "id": {"type": "string", "description": "Process id."}
+                            }}
+                        }
+                    ]
+                }],
+                "input": [
+                    {"id": "msg-user", "type": "message", "role": "user", "content": "inspect"},
+                    {"id": "fc-exec", "type": "function_call", "call_id": "call-exec", "name": "exec", "arguments": "{\"cmd\":\"pwd\"}"},
+                    {
+                        "id": "out-exec",
+                        "type": "function_call_output",
+                        "call_id": "call-exec",
+                        "output": {"content": "ok", "isError": false}
+                    }
+                ]
+            }},
+            "responseStatus": 200,
+            "responseBody": {"kind": "json", "value": {
+                "id": "resp-tools",
+                "status": "completed",
+                "output": [{"type": "function_call", "call_id": "call-wait", "name": "wait", "arguments": "{}"}]
+            }}
+        });
+        let (session, _, _) = assemble_group(vec![capture]).unwrap();
+        let names: Vec<&str> = session["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(names, vec!["exec", "wait"]);
+        assert!(
+            !names
+                .iter()
+                .any(|name| *name == "functions" || *name == "collaboration")
+        );
+        let result = session["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message.get("tool_call_id") == Some(&json!("call-exec")))
+            .unwrap();
+        assert_eq!(result["status"], "success");
+        assert_eq!(result["is_error"], false);
+    }
+
+    #[test]
+    fn missing_tool_status_is_not_defaulted_to_success() {
+        let mut messages = Vec::new();
+        parse_input_item(
+            &json!({
+                "type": "function_call_output",
+                "call_id": "call-plain",
+                "output": "stdout without status"
+            }),
+            &mut messages,
+            &mut Vec::new(),
+        );
+        assert_eq!(messages[0]["role"], "tool");
+        assert!(messages[0].get("status").is_none());
+        assert!(messages[0].get("is_error").is_none());
+    }
+
+    #[test]
+    fn changing_turn_id_is_not_a_session_trace_conflict() {
+        let first = json!({
+            "captureId": "cap-turn-1",
+            "sourceNamespace": "fixture",
+            "startedAt": "2026-08-28T00:00:00Z",
+            "traceContext": {
+                "session_id": "session-turns",
+                "goal_id": "goal-1",
+                "turn_id": "turn-1"
+            },
+            "requestBody": {"kind": "json", "value": {
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {"id": "msg-1", "type": "message", "role": "user", "content": "first"}
+                ]
+            }},
+            "responseBody": {"kind": "json", "value": {
+                "id": "resp-1",
+                "status": "completed",
+                "output": [{"type": "message", "id": "asst-1", "role": "assistant", "content": "ok"}]
+            }}
+        });
+        let second = json!({
+            "captureId": "cap-turn-2",
+            "sourceNamespace": "fixture",
+            "startedAt": "2026-08-28T00:00:01Z",
+            "traceContext": {
+                "session_id": "session-turns",
+                "goal_id": "goal-1",
+                "turn_id": "turn-2",
+                "previous_response_id": "resp-1"
+            },
+            "requestBody": {"kind": "json", "value": {
+                "model": "gpt-5.6-sol",
+                "previous_response_id": "resp-1",
+                "input": [
+                    {"id": "msg-1", "type": "message", "role": "user", "content": "first"},
+                    {"id": "asst-1", "type": "message", "role": "assistant", "content": "ok"},
+                    {"id": "msg-2", "type": "message", "role": "user", "content": "second"}
+                ]
+            }},
+            "responseBody": {"kind": "json", "value": {
+                "id": "resp-2",
+                "status": "completed",
+                "output": [{"type": "message", "id": "asst-2", "role": "assistant", "content": "done"}]
+            }}
+        });
+        let (session, _, divergences) = assemble_group(vec![first, second]).unwrap();
+        assert_eq!(divergences, 0);
+        assert_eq!(session["meta"]["trace_conflicts"], json!([]));
+        assert_eq!(session["meta"]["turn_ids"], json!(["turn-1", "turn-2"]));
+        assert!(session["meta"]["trace"].get("turn_id").is_none());
+        assert_eq!(session["meta"]["trace"]["goal_id"], "goal-1");
+        assert_eq!(session["messages"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn assembled_codex_snapshot_has_v6_structure_except_session_end() {
+        let capture = json!({
+            "captureId": "cap-v6-structure",
+            "sourceNamespace": "fixture",
+            "startedAt": "2026-08-28T00:00:00Z",
+            "finishedAt": "2026-08-28T00:00:03Z",
+            "proxiedPath": "/v1/responses",
+            "traceContext": {
+                "session_id": "session-v6",
+                "goal_id": "goal-v6",
+                "turn_id": "turn-2",
+                "agent_id": "agent-root"
+            },
+            "requestBody": {"kind": "json", "value": {
+                "model": "gpt-5.6-sol",
+                "additional_tools": [{
+                    "type": "functions",
+                    "name": "functions",
+                    "namespace": "collaboration",
+                    "functions": [{
+                        "name": "exec",
+                        "description": "Run a command.",
+                        "parameters": {"type": "object", "properties": {
+                            "cmd": {"type": "string", "description": "Command."}
+                        }}
+                    }]
+                }],
+                "input": [
+                    {"id": "msg-dev", "type": "message", "role": "developer", "content": "You are a coding agent."},
+                    {"id": "msg-user-1", "type": "message", "role": "user", "content": "Inspect /workspace/chip."},
+                    {"id": "fc-1", "type": "function_call", "call_id": "call-1", "name": "exec", "arguments": "{\"cmd\":\"ls\"}"},
+                    {"id": "out-1", "type": "function_call_output", "call_id": "call-1", "output": {"isError": false, "content": "ok"}},
+                    {"id": "msg-user-2", "type": "message", "role": "user", "content": "Continue with the next check."}
+                ]
+            }},
+            "responseStatus": 200,
+            "responseBody": {"kind": "json", "value": {
+                "id": "resp-v6",
+                "model": "gpt-5.6-sol",
+                "status": "completed",
+                "output": [{"type": "message", "role": "assistant", "content": "Next check passed."}],
+                "usage": {"input_tokens": 80, "output_tokens": 20, "total_tokens": 100}
+            }}
+        });
+        let (session, _, _) = assemble_group(vec![capture]).unwrap();
+        let mut sessions = vec![session];
+        attach_task_dags(&mut sessions).unwrap();
+        let quality =
+            crate::score::assess_session(&sessions[0], crate::score::Profile::BuyerV6, 90.0);
+        let failed: Vec<&str> = quality
+            .buyer_acceptance
+            .gates
+            .iter()
+            .filter(|gate| !gate.pass)
+            .map(|gate| gate.name.as_str())
+            .collect();
+        assert!(
+            quality
+                .buyer_acceptance
+                .gates
+                .iter()
+                .any(|gate| gate.name == "system_prompt" && gate.pass)
+        );
+        assert!(
+            quality
+                .buyer_acceptance
+                .gates
+                .iter()
+                .any(|gate| gate.name == "tool_definitions" && gate.pass)
+        );
+        assert!(
+            quality
+                .buyer_acceptance
+                .gates
+                .iter()
+                .any(|gate| gate.name == "assembly_integrity" && gate.pass)
+        );
+        assert_eq!(failed, vec!["session_closed"]);
+    }
+
+    #[test]
+    fn response_completion_still_does_not_close_session_without_session_end() {
+        let capture = json!({
+            "captureId": "cap-still-open",
+            "sourceNamespace": "fixture",
+            "startedAt": "2026-08-28T00:00:00Z",
+            "traceContext": {"session_id": "session-open", "turn_id": "turn-9"},
+            "requestBody": {"kind": "json", "value": {
+                "model": "gpt-5.6-sol",
+                "input": [{"role": "user", "content": "continue"}]
+            }},
+            "responseBody": {"kind": "json", "value": {
+                "id": "resp-open",
+                "status": "completed",
+                "output": [{"type": "message", "role": "assistant", "content": "partial"}]
+            }}
+        });
+        let (session, _, _) = assemble_group(vec![capture]).unwrap();
+        assert_eq!(session["is_final_snapshot"], false);
+        assert_eq!(session["status"], "incomplete");
     }
 
     #[test]
