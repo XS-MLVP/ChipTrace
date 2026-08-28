@@ -20,6 +20,28 @@ flowchart LR
 任务。在线阶段保存全部成功、失败、取消和重试证据；Session 边界、去重和
 质量筛选只在离线阶段执行。
 
+## 唯一生产架构
+
+ChipTrace 的生产 Trace 数据平面只有一套 Rust 实现：
+
+```mermaid
+flowchart LR
+    A[18084 业务入口适配器] --> B[ChipTrace Rust Relay]
+    B --> C[ChipTrace Rust Collector]
+    C --> D[Rust Assembly]
+    D --> E[Rust Score]
+    E --> F[Rust Release / Publish]
+    G[open21 Docker 复现环境] -. 仅生成验收场景 .-> A
+```
+
+18084 是既有业务入口，只负责受限旁路复制和向 Rust Relay 投递；它不执行
+Trace 落盘或语义组装。`open21` 的 Compose 网络与 `router-v2-net` 隔离，属于
+Docker 复现/验收环境，不写入生产 Trace 存储。
+
+`collector`、`relay`、`assemble`、`score`、`release` 和 `publish` 均由同一个
+`chiptrace` Rust 二进制提供。Relay 独立启动；Collector 暂停或冷启动失败时，
+Capture 仍先进入 durable outbox，并在 Collector 恢复后自动续投。
+
 对象存储适合不可变大对象，不适合为每次请求提供低延迟追加确认。ChipTrace
 先在本地 WAL 完成 durable ACK，再将 Session JSONL 分片发布到 OSS/S3。这样
 Collector 暂停、对象存储限流或网络中断不会改变 Agent 的业务响应，也不会

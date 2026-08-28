@@ -12,9 +12,19 @@
   <a href="https://open-verify.cc/">官方网站</a>
 </p>
 
-面向芯片行业 Agent 的 Trace 采集与训练数据治理框架。项目由单一 Rust
-二进制提供可靠采集、Session DAG 组装、版本化验收、JSONL 分包和 OSS/S3
-发布能力。
+面向芯片行业 Agent 的 Trace 采集与训练数据治理框架。核心数据平面由单一
+Rust 二进制提供可靠采集、Session DAG 组装、版本化验收、JSONL 分包和
+OSS/S3 发布能力。
+
+## 架构边界
+
+生产 Trace 链路只有一套：`18084` 业务入口适配器将 Capture 投递到
+ChipTrace Rust Relay，Relay 的 durable outbox 异步续投 Rust Collector，
+随后由同一 Rust 二进制的 Assembly、Score 和 Release 命令完成组装、验收
+与交付。18084 只负责有界旁路复制，不定义第二份数据格式或持久化存储。
+
+`open21`（`open21-agor`、`open21-gitlab`）是独立的 Docker 复现与验收环境，
+只用于生成可重复的业务场景；它不属于生产采集链路，也不承担 Trace 存储。
 
 ## 功能
 

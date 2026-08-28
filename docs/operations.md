@@ -33,19 +33,32 @@ State、Capture 与 outbox 使用本地持久化 ext4/XFS；生产数据目录�
 ```bash
 export CHIPTRACE_CAPTURE_DATA_ROOT=/srv/chiptrace/capture
 export CHIPTRACE_CAPTURE_STATE_ROOT=/var/lib/chiptrace/state
+export CHIPTRACE_RELAY_DATA_ROOT=/var/lib/chiptrace/relay/outbox
+export CHIPTRACE_RELAY_STATE_ROOT=/var/lib/chiptrace/relay/outbox-state
+export CHIPTRACE_RELAY_DELIVERY_ROOT=/var/lib/chiptrace/relay/delivery
 export CHIPTRACE_UID="$(id -u)"
 export CHIPTRACE_GID="$(id -g)"
 
 install -d -m 0700 \
   "$CHIPTRACE_CAPTURE_DATA_ROOT" \
-  "$CHIPTRACE_CAPTURE_STATE_ROOT"
+  "$CHIPTRACE_CAPTURE_STATE_ROOT" \
+  "$CHIPTRACE_RELAY_DATA_ROOT" \
+  "$CHIPTRACE_RELAY_STATE_ROOT" \
+  "$CHIPTRACE_RELAY_DELIVERY_ROOT"
 
 docker compose -f deploy/docker-compose.yml up -d --build
 curl --fail http://127.0.0.1:3010/health
+curl --fail http://127.0.0.1:3011/health
 ```
 
 Compose 可通过 `CHIPTRACE_STORE_SHARDS` 设置分片数。默认值为 1，适用于单盘和
 既有数据目录。
+
+## open21 复现环境
+
+`open21` 是由独立 Docker Compose 管理的复现 fixture，不是 ChipTrace 生产
+服务。其容器网络与生产数据平面隔离；复现场景通过业务入口进入唯一的 Rust
+Trace 链路。open21 的容器、数据库和目录均不作为 Collector/Relay 实现。
 
 ## systemd
 

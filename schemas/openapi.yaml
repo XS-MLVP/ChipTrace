@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: 芯迹 Collector API
-  version: 0.5.0
+  version: 0.5.1
   description: Rust Collector 的单条和批量持久化采集接口。
 paths:
   /capture:

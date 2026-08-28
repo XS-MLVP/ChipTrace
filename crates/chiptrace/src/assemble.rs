@@ -798,7 +798,7 @@ fn parse_capture(value: Value) -> Result<ParsedCapture> {
             .as_u64()
             .or_else(|| status.as_str().and_then(|text| text.parse().ok()))
     });
-    let lifecycle_events = value
+    let mut lifecycle_events = value
         .get("observedLifecycleEvents")
         .and_then(Value::as_array)
         .into_iter()
@@ -806,6 +806,9 @@ fn parse_capture(value: Value) -> Result<ParsedCapture> {
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    lifecycle_events.extend(infer_lifecycle_events(&request_object, &raw_response));
+    lifecycle_events.sort();
+    lifecycle_events.dedup();
     let evaluation_evidence = value
         .get("evaluationEvidence")
         .or_else(|| value.get("evaluation_evidence"))
@@ -1289,30 +1292,102 @@ fn collect_trace_context(capture: &Value, request: &Map<String, Value>) -> Map<S
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    for field in [
-        "session_id",
-        "thread_id",
-        "conversation_id",
-        "trace_id",
-        "task_id",
-        "root_session_id",
-        "parent_session_id",
-        "goal_id",
-        "turn_id",
-        "agent_id",
-        "branch_id",
-        "previous_response_id",
-        "session_final",
+    for (field, aliases) in [
+        ("session_id", &["session_id", "sessionId"][..]),
+        ("thread_id", &["thread_id", "threadId"]),
+        ("conversation_id", &["conversation_id", "conversationId"]),
+        ("trace_id", &["trace_id", "traceId"]),
+        ("task_id", &["task_id", "taskId"]),
+        ("root_session_id", &["root_session_id", "rootSessionId"]),
+        (
+            "parent_session_id",
+            &["parent_session_id", "parentSessionId"],
+        ),
+        ("goal_id", &["goal_id", "goalId"]),
+        ("turn_id", &["turn_id", "turnId"]),
+        ("agent_id", &["agent_id", "agentId"]),
+        ("branch_id", &["branch_id", "branchId"]),
+        (
+            "previous_response_id",
+            &["previous_response_id", "previousResponseId"],
+        ),
+        ("session_final", &["session_final", "sessionFinal"]),
     ] {
-        if let Some(value) = captured
-            .get(field)
-            .or_else(|| metadata.get(field))
-            .or_else(|| request.get(field))
+        if let Some(value) = [&captured, &metadata, request]
+            .into_iter()
+            .find_map(|source| aliases.iter().find_map(|alias| source.get(*alias)))
         {
             output.insert(field.to_owned(), value.clone());
         }
     }
     output
+}
+
+fn infer_lifecycle_events(request: &Map<String, Value>, response: &Value) -> Vec<String> {
+    fn add_event(events: &mut BTreeSet<String>, value: Option<&Value>) {
+        let Some(event) = value.and_then(Value::as_str) else {
+            return;
+        };
+        if lifecycle_event_type(event) {
+            events.insert(event.to_owned());
+        }
+    }
+
+    fn add_response(events: &mut BTreeSet<String>, response: &Value) {
+        add_event(events, response.get("type"));
+        if let Some(status) = response.get("status").and_then(Value::as_str) {
+            add_event(events, Some(&Value::String(format!("response.{status}"))));
+        }
+    }
+
+    let mut events = BTreeSet::new();
+    if let Some(input) = request.get("input").and_then(Value::as_array) {
+        for item in input {
+            add_event(&mut events, item.get("type"));
+        }
+    }
+    match response {
+        Value::Object(_) => add_response(&mut events, response),
+        Value::String(text) => {
+            if let Ok(value) = serde_json::from_str::<Value>(text) {
+                add_response(&mut events, &value);
+            }
+            for line in text.lines() {
+                let Some(payload) = line.trim().strip_prefix("data:") else {
+                    continue;
+                };
+                let payload = payload.trim();
+                if payload.is_empty() || payload == "[DONE]" {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(payload) {
+                    add_response(&mut events, &value);
+                }
+            }
+        }
+        _ => {}
+    }
+    events.into_iter().collect()
+}
+
+fn lifecycle_event_type(event: &str) -> bool {
+    matches!(
+        normalize_event(event).as_str(),
+        "cancel"
+            | "compaction"
+            | "compaction_trigger"
+            | "retry"
+            | "session_end"
+            | "session_start"
+            | "subagent_join"
+            | "subagent_spawn"
+            | "response_cancelled"
+            | "response_completed"
+            | "response_created"
+            | "response_failed"
+            | "response_incomplete"
+            | "response_in_progress"
+    )
 }
 
 fn session_identity(
@@ -1746,6 +1821,48 @@ mod tests {
         });
         assert_eq!(session_group_key(&capture), "fixture\0codex-session");
         assert_eq!(task_partition_key(&capture), "fixture\0codex-session");
+    }
+
+    #[test]
+    fn raw_capture_infers_trace_aliases_and_lifecycle_events_in_rust() {
+        let capture = json!({
+            "captureId": "cap-raw-metadata",
+            "sourceNamespace": "fixture",
+            "startedAt": "2026-08-28T00:00:00Z",
+            "requestBody": {"kind": "json", "value": {
+                "model": "gpt-5.6-sol",
+                "client_metadata": {
+                    "sessionId": "session-camel",
+                    "rootSessionId": "root-camel",
+                    "previousResponseId": "response-parent"
+                },
+                "input": [
+                    {"type": "session_start"},
+                    {"type": "compaction"},
+                    {"role": "user", "content": "continue"}
+                ]
+            }},
+            "responseBody": {"kind": "text", "value":
+                "data: {\"type\":\"response.in_progress\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"response-current\",\"status\":\"completed\"}}\n\n"
+            }
+        });
+        assert_eq!(session_group_key(&capture), "fixture\0session-camel");
+        let parsed = parse_capture(capture).unwrap();
+        assert_eq!(parsed.trace_context["root_session_id"], "root-camel");
+        assert_eq!(
+            parsed.previous_response_id.as_deref(),
+            Some("response-parent")
+        );
+        assert_eq!(
+            parsed.lifecycle_events,
+            vec![
+                "compaction",
+                "response.completed",
+                "response.in_progress",
+                "session_start"
+            ]
+        );
+        assert!(!parsed.final_snapshot);
     }
 
     #[test]

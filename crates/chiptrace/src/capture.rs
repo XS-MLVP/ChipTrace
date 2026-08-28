@@ -218,10 +218,9 @@ pub fn validate_stored_capture(raw: &[u8]) -> Result<CaptureRecord> {
 
 pub fn extract_body(value: Option<&Value>) -> Option<&Value> {
     let value = value?;
-    if value.get("kind").and_then(Value::as_str) == Some("json") {
-        value.get("value")
-    } else {
-        Some(value)
+    match value.get("kind").and_then(Value::as_str) {
+        Some("json" | "text" | "binary" | "sse") => value.get("value"),
+        _ => Some(value),
     }
 }
 
@@ -361,5 +360,15 @@ mod tests {
         let record = validate_stored_capture(raw).unwrap();
         assert_eq!(record.canonical, raw);
         assert_eq!(record.sha256, hex::encode(Sha256::digest(raw)));
+    }
+
+    #[test]
+    fn captured_body_wrappers_are_unwrapped_for_assembly() {
+        for kind in ["json", "text", "binary", "sse"] {
+            let value = json!({"kind": kind, "value": "payload"});
+            assert_eq!(extract_body(Some(&value)), Some(&json!("payload")));
+        }
+        let native = json!({"model": "gpt-5.6-sol"});
+        assert_eq!(extract_body(Some(&native)), Some(&native));
     }
 }
