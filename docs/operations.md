@@ -182,7 +182,7 @@ checkpoint；退出时完成严格 bundle 扫描和 spool flush。
 export CHIPTRACE_MODEL_BASE_URL=http://gateway.internal:18084/
 
 chiptrace codex-run \
-  --codex-bin /usr/local/bin/codex \
+  --codex-bin /opt/chiptrace/codex-producer/codex \
   --working-directory /workspace/project \
   --state-root /var/lib/chiptrace/tasks/task-001 \
   --source-namespace router-v2-18084 \
@@ -196,7 +196,7 @@ chiptrace codex-run \
 为每个进程分配新的空 `trace-root`：
 
 ```bash
-chiptrace codex-run --codex-bin /usr/local/bin/codex \
+chiptrace codex-run --codex-bin /opt/chiptrace/codex-producer/codex \
   --working-directory /workspace/project \
   --state-root /var/lib/chiptrace/tasks/task-001 \
   --trace-root /var/lib/chiptrace/tasks/task-001/trace-01 \
@@ -204,7 +204,7 @@ chiptrace codex-run --codex-bin /usr/local/bin/codex \
   --model-base-url "$CHIPTRACE_MODEL_BASE_URL" --task-phase begin \
   --task-session-id task-001 -- exec --json "执行第一阶段"
 
-chiptrace codex-run --codex-bin /usr/local/bin/codex \
+chiptrace codex-run --codex-bin /opt/chiptrace/codex-producer/codex \
   --working-directory /workspace/project \
   --state-root /var/lib/chiptrace/tasks/task-001 \
   --trace-root /var/lib/chiptrace/tasks/task-001/trace-02 \
@@ -212,7 +212,7 @@ chiptrace codex-run --codex-bin /usr/local/bin/codex \
   --model-base-url "$CHIPTRACE_MODEL_BASE_URL" --task-phase continue \
   -- exec --json "依据上一阶段继续修正"
 
-chiptrace codex-run --codex-bin /usr/local/bin/codex \
+chiptrace codex-run --codex-bin /opt/chiptrace/codex-producer/codex \
   --working-directory /workspace/project \
   --state-root /var/lib/chiptrace/tasks/task-001 \
   --trace-root /var/lib/chiptrace/tasks/task-001/trace-03 \
@@ -228,6 +228,10 @@ open；不同 sink、已关闭任务、复用非空 trace 目录或通过 Codex 
 和 Runtime Tool Registry 设置都会失败。每阶段摘要必须满足 `ok=true`、
 `capture_complete=true`、`pending_records=0`；`finish` 还必须满足
 `task_terminal_emitted=true` 和 `task_status=closed`。
+
+`--codex-bin` 必须直接指向按 `integrations/codex/` 构建的 producer ELF。
+`codex-run` 在创建任务前验证 producer capability；通用 launcher 或未打补丁的上游
+二进制会立即失败，不会留下 open Session。
 
 入口部署必须包含业务进程的持久 `/capture-outbox` 挂载。只升级 `codex-run` 而入口仍
 运行旧的 direct-to-Relay 代码，会出现原生 `inference_completed` 多于 API Capture；

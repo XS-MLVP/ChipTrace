@@ -682,7 +682,7 @@ struct ExportCodexTraceBundleArgs {
 
 #[derive(Debug, Args)]
 struct CodexRunArgs {
-    /// 启用了 Runtime Tool Registry producer 补丁的 Codex 二进制。
+    /// 启用了 Runtime Tool Registry producer 补丁的 Codex ELF；不能传通用 launcher。
     #[arg(long)]
     codex_bin: PathBuf,
     /// Codex 任务工作目录。

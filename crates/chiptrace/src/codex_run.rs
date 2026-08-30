@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
@@ -28,6 +29,8 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 const CODEX_ROLLOUT_TRACE_ROOT_ENV: &str = "CODEX_ROLLOUT_TRACE_ROOT";
 const CODE_MODE_HOST_CONFIG: &str = "features.code_mode_host=true";
+const RUNTIME_TOOL_REGISTRY_PRODUCER_MARKER: &[u8] = b"codex.runtime-tool-registry.v1";
+const PRODUCER_SCAN_CHUNK_BYTES: usize = 64 * 1024;
 const MIN_RETRY_ATTEMPTS: usize = 20;
 const MAX_PROVIDER_RETRY_ATTEMPTS: u64 = 100;
 
@@ -377,6 +380,7 @@ pub async fn run_codex(config: CodexRunConfig) -> Result<CodexRunSummary> {
         .codex_bin
         .canonicalize()
         .with_context(|| format!("resolve Codex binary {}", config.codex_bin.display()))?;
+    validate_codex_producer_binary(&codex_bin)?;
     let working_directory = config.working_directory.canonicalize().with_context(|| {
         format!(
             "resolve Codex working directory {}",
@@ -529,6 +533,43 @@ pub async fn run_codex(config: CodexRunConfig) -> Result<CodexRunSummary> {
         final_flush,
         harness: inspection,
     })
+}
+
+fn validate_codex_producer_binary(path: &Path) -> Result<()> {
+    if !path.is_file() {
+        bail!(
+            "Codex producer path is not a regular file: {}",
+            path.display()
+        );
+    }
+    let mut input = fs::File::open(path)
+        .with_context(|| format!("open Codex producer binary {}", path.display()))?;
+    let overlap = RUNTIME_TOOL_REGISTRY_PRODUCER_MARKER
+        .len()
+        .saturating_sub(1);
+    let mut buffer = vec![0_u8; PRODUCER_SCAN_CHUNK_BYTES + overlap];
+    let mut retained = 0;
+    loop {
+        let read = input
+            .read(&mut buffer[retained..])
+            .with_context(|| format!("scan Codex producer binary {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        let available = retained + read;
+        if buffer[..available]
+            .windows(RUNTIME_TOOL_REGISTRY_PRODUCER_MARKER.len())
+            .any(|window| window == RUNTIME_TOOL_REGISTRY_PRODUCER_MARKER)
+        {
+            return Ok(());
+        }
+        retained = overlap.min(available);
+        buffer.copy_within(available - retained..available, 0);
+    }
+    bail!(
+        "Codex binary does not contain the Runtime Tool Registry producer; pass the patched producer ELF directly instead of a launcher or upstream binary: {}",
+        path.display()
+    )
 }
 
 async fn supervise_child(
@@ -1046,5 +1087,24 @@ mod tests {
                 .to_string()
                 .contains("Runtime Tool Registry producer")
         );
+    }
+
+    #[test]
+    fn producer_capability_marker_may_cross_a_scan_chunk() {
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("codex-producer");
+        let mut bytes = vec![b'x'; PRODUCER_SCAN_CHUNK_BYTES - 7];
+        bytes.extend_from_slice(RUNTIME_TOOL_REGISTRY_PRODUCER_MARKER);
+        fs::write(&binary, bytes).unwrap();
+        validate_codex_producer_binary(&binary).unwrap();
+    }
+
+    #[test]
+    fn upstream_or_launcher_without_producer_capability_is_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("codex");
+        fs::write(&binary, b"#!/bin/sh\nexec upstream-codex \"$@\"\n").unwrap();
+        let error = validate_codex_producer_binary(&binary).unwrap_err();
+        assert!(error.to_string().contains("patched producer ELF directly"));
     }
 }
