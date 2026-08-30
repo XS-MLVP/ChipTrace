@@ -1,3 +1,329 @@
+diff --git a/codex-rs/core/src/tools/handlers/apply_patch.rs b/codex-rs/core/src/tools/handlers/apply_patch.rs
+index 484e201..1563cff 100644
+--- a/codex-rs/core/src/tools/handlers/apply_patch.rs
++++ b/codex-rs/core/src/tools/handlers/apply_patch.rs
+@@ -23,7 +23,8 @@ use crate::tools::context::boxed_tool_output;
+ use crate::tools::events::ToolEmitter;
+ use crate::tools::events::ToolEventCtx;
+ use crate::tools::handlers::apply_granted_turn_permissions;
+-use crate::tools::handlers::apply_patch_spec::create_apply_patch_freeform_tool;
++use crate::tools::handlers::apply_patch_spec::create_apply_patch_function_tool;
++use crate::tools::handlers::parse_arguments;
+ use crate::tools::handlers::resolve_tool_environment;
+ use crate::tools::handlers::updated_hook_command;
+ use crate::tools::hook_names::HookToolName;
+@@ -55,6 +56,8 @@ use codex_tools::ToolName;
+ use codex_tools::ToolSpec;
+ use codex_utils_absolute_path::AbsolutePathBuf;
+ use codex_utils_path_uri::PathUri;
++use serde::Deserialize;
++use serde::Serialize;
+ 
+ const APPLY_PATCH_ARGUMENT_DIFF_BUFFER_INTERVAL: Duration = Duration::from_millis(500);
+ 
+@@ -271,9 +274,21 @@ fn write_permissions_for_paths(
+ }
+ 
+ /// Extracts the raw patch text used as the command-shaped hook input for apply_patch.
++#[derive(Debug, Deserialize, Serialize)]
++struct ApplyPatchFunctionArgs {
++    input: String,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    environment_id: Option<String>,
++}
++
+ fn apply_patch_payload_command(payload: &ToolPayload) -> Option<String> {
+     match payload {
+         ToolPayload::Custom { input } => Some(input.clone()),
++        ToolPayload::Function { arguments } => {
++            serde_json::from_str::<ApplyPatchFunctionArgs>(arguments)
++                .ok()
++                .map(|args| args.input)
++        }
+         _ => None,
+     }
+ }
+@@ -354,7 +369,7 @@ impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
+     }
+ 
+     fn spec(&self) -> ToolSpec {
+-        create_apply_patch_freeform_tool(self.multi_environment)
++        create_apply_patch_function_tool(self.multi_environment)
+     }
+ 
+     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+@@ -379,12 +394,19 @@ impl ApplyPatchHandler {
+             ..
+         } = invocation;
+ 
+-        let ToolPayload::Custom { input: patch_input } = payload else {
+-            return Err(FunctionCallError::RespondToModel(
+-                "apply_patch handler received unsupported payload".to_string(),
+-            ));
++        let (patch_input, function_environment_id) = match payload {
++            ToolPayload::Custom { input } => (input, None),
++            ToolPayload::Function { arguments } => {
++                let args: ApplyPatchFunctionArgs = parse_arguments(&arguments)?;
++                (args.input, args.environment_id)
++            }
++            _ => {
++                return Err(FunctionCallError::RespondToModel(
++                    "apply_patch handler received unsupported payload".to_string(),
++                ));
++            }
+         };
+-        let args = match codex_apply_patch::parse_patch(&patch_input) {
++        let mut args = match codex_apply_patch::parse_patch(&patch_input) {
+             Ok(args) => args,
+             Err(parse_error) => {
+                 return Err(FunctionCallError::RespondToModel(format!(
+@@ -392,6 +414,18 @@ impl ApplyPatchHandler {
+                 )));
+             }
+         };
++        if let Some(environment_id) = function_environment_id {
++            if args
++                .environment_id
++                .as_deref()
++                .is_some_and(|embedded| embedded != environment_id)
++            {
++                return Err(FunctionCallError::RespondToModel(
++                    "apply_patch environment_id conflicts with the patch header".to_string(),
++                ));
++            }
++            args.environment_id = Some(environment_id);
++        }
+         let selected_environment_id =
+             require_environment_id(args.environment_id.as_deref(), self.multi_environment)?;
+ 
+@@ -456,7 +490,10 @@ impl ApplyPatchHandler {
+ 
+ impl CoreToolRuntime for ApplyPatchHandler {
+     fn matches_kind(&self, payload: &ToolPayload) -> bool {
+-        matches!(payload, ToolPayload::Custom { .. })
++        matches!(
++            payload,
++            ToolPayload::Custom { .. } | ToolPayload::Function { .. }
++        )
+     }
+ 
+     fn create_diff_consumer(&self) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
+@@ -480,6 +517,16 @@ impl CoreToolRuntime for ApplyPatchHandler {
+             ToolPayload::Custom { .. } => ToolPayload::Custom {
+                 input: patch.to_string(),
+             },
++            ToolPayload::Function { arguments } => {
++                let mut args: ApplyPatchFunctionArgs = parse_arguments(&arguments)?;
++                args.input = patch.to_string();
++                let arguments = serde_json::to_string(&args).map_err(|error| {
++                    FunctionCallError::RespondToModel(format!(
++                        "failed to serialize updated apply_patch input: {error}"
++                    ))
++                })?;
++                ToolPayload::Function { arguments }
++            }
+             payload => payload,
+         };
+         Ok(invocation)
+diff --git a/codex-rs/core/src/tools/handlers/apply_patch_spec.rs b/codex-rs/core/src/tools/handlers/apply_patch_spec.rs
+index 39956d2..49a1d41 100644
+--- a/codex-rs/core/src/tools/handlers/apply_patch_spec.rs
++++ b/codex-rs/core/src/tools/handlers/apply_patch_spec.rs
+@@ -1,29 +1,38 @@
+-use codex_tools::FreeformTool;
+-use codex_tools::FreeformToolFormat;
++use std::collections::BTreeMap;
++
++use codex_tools::JsonSchema;
++use codex_tools::ResponsesApiTool;
+ use codex_tools::ToolSpec;
+ 
+-const APPLY_PATCH_LARK_GRAMMAR: &str = include_str!("apply_patch.lark");
++/// Returns a JSON function tool backed by the same verified apply_patch runtime.
++pub fn create_apply_patch_function_tool(include_environment_id: bool) -> ToolSpec {
++    let mut properties = BTreeMap::from([(
++        "input".to_string(),
++        JsonSchema::string(Some(
++            "Complete patch text from `*** Begin Patch` through `*** End Patch`.".to_string(),
++        )),
++    )]);
++    if include_environment_id {
++        properties.insert(
++            "environment_id".to_string(),
++            JsonSchema::string(Some(
++                "Target environment identifier when an explicit environment is required."
++                    .to_string(),
++            )),
++        );
++    }
+ 
+-/// Returns a custom tool that can be used to edit files. Well-suited for GPT-5 models
+-/// https://platform.openai.com/docs/guides/function-calling#custom-tools
+-pub fn create_apply_patch_freeform_tool(include_environment_id: bool) -> ToolSpec {
+-    let definition = if include_environment_id {
+-        APPLY_PATCH_LARK_GRAMMAR.replace(
+-            "start: begin_patch hunk+ end_patch",
+-            "start: begin_patch environment_id? hunk+ end_patch\nenvironment_id: \"*** Environment ID: \" filename LF",
+-        )
+-    } else {
+-        APPLY_PATCH_LARK_GRAMMAR.to_string()
+-    };
+-    ToolSpec::Freeform(FreeformTool {
++    ToolSpec::Function(ResponsesApiTool {
+         name: "apply_patch".to_string(),
+-        description: "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.".to_string(),
++        description: "Apply a patch to files. Pass the complete patch text in `input`.".to_string(),
++        strict: false,
+         defer_loading: None,
+-        format: FreeformToolFormat {
+-            r#type: "grammar".to_string(),
+-            syntax: "lark".to_string(),
+-            definition,
+-        },
++        parameters: JsonSchema::object(
++            properties,
++            Some(vec!["input".to_string()]),
++            Some(false.into()),
++        ),
++        output_schema: None,
+     })
+ }
+ 
+diff --git a/codex-rs/core/src/tools/handlers/apply_patch_spec_tests.rs b/codex-rs/core/src/tools/handlers/apply_patch_spec_tests.rs
+index 6ea5ec7..8a71528 100644
+--- a/codex-rs/core/src/tools/handlers/apply_patch_spec_tests.rs
++++ b/codex-rs/core/src/tools/handlers/apply_patch_spec_tests.rs
+@@ -1,37 +1,39 @@
+ use super::*;
+-use pretty_assertions::assert_eq;
+-
+ #[test]
+-fn create_apply_patch_freeform_tool_matches_expected_spec() {
++fn create_apply_patch_function_tool_has_complete_json_schema() {
++    let ToolSpec::Function(tool) =
++        create_apply_patch_function_tool(/*include_environment_id*/ false)
++    else {
++        panic!("expected function tool");
++    };
++
++    assert_eq!(tool.name, "apply_patch");
++    assert!(!tool.description.is_empty());
+     assert_eq!(
+-        create_apply_patch_freeform_tool(/*include_environment_id*/ false),
+-        ToolSpec::Freeform(FreeformTool {
+-            name: "apply_patch".to_string(),
+-            description:
+-                "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON."
+-                    .to_string(),
+-            defer_loading: None,
+-            format: FreeformToolFormat {
+-                r#type: "grammar".to_string(),
+-                syntax: "lark".to_string(),
+-                definition: APPLY_PATCH_LARK_GRAMMAR.to_string(),
++        serde_json::to_value(tool.parameters).unwrap(),
++        serde_json::json!({
++            "type":"object",
++            "properties":{
++                "input":{
++                    "type":"string",
++                    "description":"Complete patch text from `*** Begin Patch` through `*** End Patch`."
++                }
+             },
++            "required":["input"],
++            "additionalProperties":false
+         })
+     );
+ }
+ 
+ #[test]
+-fn create_apply_patch_freeform_tool_includes_environment_id_when_requested() {
+-    let ToolSpec::Freeform(tool) =
+-        create_apply_patch_freeform_tool(/*include_environment_id*/ true)
++fn create_apply_patch_function_tool_exposes_optional_environment_id() {
++    let ToolSpec::Function(tool) =
++        create_apply_patch_function_tool(/*include_environment_id*/ true)
+     else {
+-        panic!("expected freeform tool");
++        panic!("expected function tool");
+     };
++    let schema = serde_json::to_value(tool.parameters).unwrap();
+ 
+-    assert!(tool.format.definition.contains("environment_id?"));
+-    assert!(
+-        tool.format
+-            .definition
+-            .contains("\"*** Environment ID: \" filename LF")
+-    );
++    assert_eq!(schema["required"], serde_json::json!(["input"]));
++    assert_eq!(schema["properties"]["environment_id"]["type"], "string");
+ }
+diff --git a/codex-rs/core/src/tools/handlers/apply_patch_tests.rs b/codex-rs/core/src/tools/handlers/apply_patch_tests.rs
+index b78e62e..d3364fb 100644
+--- a/codex-rs/core/src/tools/handlers/apply_patch_tests.rs
++++ b/codex-rs/core/src/tools/handlers/apply_patch_tests.rs
+@@ -65,7 +65,7 @@ async fn file_update_mode_follows_preserve_line_endings_feature() {
+ }
+ 
+ #[tokio::test]
+-async fn pre_tool_use_payload_uses_freeform_patch_input() {
++async fn pre_tool_use_payload_uses_custom_patch_input() {
+     let patch = sample_patch();
+     let payload = ToolPayload::Custom {
+         input: patch.to_string(),
+@@ -82,6 +82,24 @@ async fn pre_tool_use_payload_uses_freeform_patch_input() {
+     );
+ }
+ 
++#[tokio::test]
++async fn pre_tool_use_payload_uses_function_patch_input() {
++    let patch = sample_patch();
++    let payload = ToolPayload::Function {
++        arguments: json!({"input":patch}).to_string(),
++    };
++    let invocation = invocation_for_payload(payload).await;
++    let handler = ApplyPatchHandler::default();
++
++    assert_eq!(
++        handler.pre_tool_use_payload(&invocation),
++        Some(PreToolUsePayload {
++            tool_name: HookToolName::apply_patch(),
++            tool_input: json!({ "command": patch }),
++        })
++    );
++}
++
+ #[tokio::test]
+ async fn post_tool_use_payload_uses_patch_input_and_tool_output() {
+     let patch = sample_patch();
+@@ -103,6 +121,28 @@ async fn post_tool_use_payload_uses_patch_input_and_tool_output() {
+     );
+ }
+ 
++#[tokio::test]
++async fn function_hook_rewrite_preserves_environment_id() {
++    let original = sample_patch();
++    let replacement = original.replace("hello", "updated");
++    let payload = ToolPayload::Function {
++        arguments: json!({"input":original,"environment_id":"remote"}).to_string(),
++    };
++    let invocation = invocation_for_payload(payload).await;
++    let handler = ApplyPatchHandler::default();
++
++    let updated = handler
++        .with_updated_hook_input(invocation, json!({"command":replacement}))
++        .expect("rewrite function input");
++    let ToolPayload::Function { arguments } = updated.payload else {
++        panic!("expected function payload");
++    };
++    assert_eq!(
++        serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
++        json!({"input":replacement,"environment_id":"remote"})
++    );
++}
++
+ #[test]
+ fn diff_consumer_streams_apply_patch_changes() {
+     let mut consumer = ApplyPatchArgumentDiffConsumer::default();
 diff --git a/codex-rs/core/src/tools/mod.rs b/codex-rs/core/src/tools/mod.rs
 index df6b596..d38e1fe 100644
 --- a/codex-rs/core/src/tools/mod.rs
@@ -7,9 +333,9 @@ index df6b596..d38e1fe 100644
  pub(crate) mod tool_dispatch_trace;
  mod tool_namespaces_info;
 +mod tool_registry_trace;
-
+ 
  use std::borrow::Cow;
-
+ 
 diff --git a/codex-rs/core/src/tools/router.rs b/codex-rs/core/src/tools/router.rs
 index e5e6124..8b7f87c 100644
 --- a/codex-rs/core/src/tools/router.rs
@@ -17,7 +343,7 @@ index e5e6124..8b7f87c 100644
 @@ -110,6 +110,12 @@ impl ToolRouter {
          Arc::clone(&self.model_visible_specs)
      }
-
+ 
 +    pub(crate) fn runtime_tool_registry_snapshot(
 +        &self,
 +    ) -> anyhow::Result<codex_rollout_trace::RuntimeToolRegistrySnapshot> {
@@ -34,7 +360,7 @@ index b317ca2..47077bc 100644
 @@ -162,12 +162,24 @@ pub(crate) fn build_tool_router(
          hosted_model_tool_specs(turn_context, standalone_web_search_tool.as_slice())
      };
-
+ 
 -    finalize_tool_router(
 +    let router = finalize_tool_router(
          turn_context,
@@ -56,7 +382,7 @@ index b317ca2..47077bc 100644
 +    }
 +    Ok(router)
  }
-
+ 
  fn apply_mcp_tool_exposure_policy(
 diff --git a/codex-rs/core/src/tools/tool_registry_trace.rs b/codex-rs/core/src/tools/tool_registry_trace.rs
 new file mode 100644
@@ -190,21 +516,13 @@ index 0000000..1a196a6
 +mod tests;
 diff --git a/codex-rs/core/src/tools/tool_registry_trace_tests.rs b/codex-rs/core/src/tools/tool_registry_trace_tests.rs
 new file mode 100644
-index 0000000..8d0c8c1
+index 0000000..12a25b2
 --- /dev/null
 +++ b/codex-rs/core/src/tools/tool_registry_trace_tests.rs
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,183 @@
 +use std::collections::BTreeMap;
-+use std::fs;
-+use std::path::PathBuf;
 +use std::sync::Arc;
 +
-+use codex_protocol::protocol::SessionSource;
-+use codex_rollout_trace::RawTraceEvent;
-+use codex_rollout_trace::RawTraceEventPayload;
-+use codex_rollout_trace::ThreadStartedTraceMetadata;
-+use codex_tools::FreeformTool;
-+use codex_tools::FreeformToolFormat;
 +use codex_tools::JsonSchema;
 +use codex_tools::ResponsesApiNamespace;
 +use codex_tools::ResponsesApiNamespaceTool;
@@ -213,11 +531,8 @@ index 0000000..8d0c8c1
 +use codex_tools::ToolSpec;
 +use pretty_assertions::assert_eq;
 +use serde_json::json;
-+use tempfile::TempDir;
 +
 +use super::*;
-+use crate::session::step_context::StepContext;
-+use crate::session::tests::make_session_and_context;
 +use crate::tools::context::FunctionToolOutput;
 +use crate::tools::context::ToolInvocation;
 +use crate::tools::context::ToolOutput;
@@ -251,7 +566,7 @@ index 0000000..8d0c8c1
 +impl CoreToolRuntime for TestRuntime {}
 +
 +#[test]
-+fn snapshot_preserves_function_freeform_and_namespace_contracts() -> anyhow::Result<()> {
++fn snapshot_preserves_function_and_namespace_contracts() -> anyhow::Result<()> {
 +    let command_schema = JsonSchema::object(
 +        BTreeMap::from([(
 +            "cmd".to_string(),
@@ -268,21 +583,26 @@ index 0000000..8d0c8c1
 +                description: "Execute a command.".to_string(),
 +                strict: false,
 +                defer_loading: None,
-+                parameters: command_schema,
++                parameters: command_schema.clone(),
 +                output_schema: None,
 +            }),
 +        }) as Arc<dyn CoreToolRuntime>,
 +        Arc::new(TestRuntime {
 +            name: ToolName::plain("apply_patch"),
-+            spec: ToolSpec::Freeform(FreeformTool {
++            spec: ToolSpec::Function(ResponsesApiTool {
 +                name: "apply_patch".to_string(),
 +                description: "Apply a patch.".to_string(),
++                strict: false,
 +                defer_loading: None,
-+                format: FreeformToolFormat {
-+                    r#type: "grammar".to_string(),
-+                    syntax: "lark".to_string(),
-+                    definition: "start: /.+/".to_string(),
-+                },
++                parameters: JsonSchema::object(
++                    BTreeMap::from([(
++                        "input".to_string(),
++                        JsonSchema::string(Some("Complete patch text.".to_string())),
++                    )]),
++                    Some(vec!["input".to_string()]),
++                    Some(false.into()),
++                ),
++                output_schema: None,
 +            }),
 +        }),
 +        Arc::new(TestRuntime {
@@ -339,14 +659,22 @@ index 0000000..8d0c8c1
 +                    }
 +                },
 +                {
-+                    "runtime_item_type":"custom",
++                    "runtime_item_type":"function",
 +                    "runtime_tool":"apply_patch",
 +                    "runtime_namespace":"functions",
 +                    "tool":{
-+                        "type":"custom",
++                        "type":"function",
 +                        "name":"apply_patch",
 +                        "description":"Apply a patch.",
-+                        "format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"},
++                        "strict":false,
++                        "parameters":{
++                            "type":"object",
++                            "properties":{"input":{
++                                "type":"string","description":"Complete patch text."
++                            }},
++                            "required":["input"],
++                            "additionalProperties":false
++                        },
 +                        "runtime_name":{"name":"apply_patch","namespace":"functions"}
 +                    }
 +                },
@@ -375,76 +703,28 @@ index 0000000..8d0c8c1
 +    );
 +    Ok(())
 +}
-+
-+#[tokio::test]
-+async fn active_tool_router_writes_its_registry_to_the_turn_bundle() -> anyhow::Result<()> {
-+    let temp = TempDir::new()?;
-+    let (mut session, turn) = make_session_and_context().await;
-+    let thread_id = session.thread_id;
-+    let trace = codex_rollout_trace::ThreadTraceContext::start_root_in_root_for_test(
-+        temp.path(),
-+        ThreadStartedTraceMetadata {
-+            thread_id: thread_id.to_string(),
-+            agent_path: "/root".to_string(),
-+            task_name: None,
-+            nickname: None,
-+            agent_role: None,
-+            session_source: SessionSource::Exec,
-+            cwd: PathBuf::from("/workspace"),
-+            rollout_path: None,
-+            model: "gpt-test".to_string(),
-+            provider_name: "test-provider".to_string(),
-+            approval_policy: "never".to_string(),
-+            sandbox_policy: "danger-full-access".to_string(),
-+        },
-+    )?;
-+    trace.record_codex_turn_started(turn.sub_id.as_str());
-+    session.services.rollout_thread_trace = trace;
-+    let turn = Arc::new(turn);
-+    let step_context = StepContext::for_test(Arc::clone(&turn));
-+
-+    let router = crate::tools::spec_plan::build_tool_router(
-+        &session,
-+        step_context.turn.as_ref(),
-+        &step_context.environments,
-+        &step_context.mcp,
-+        /*apps_enabled*/ false,
-+        &turn.extension_data,
-+        /*tool_suggest_candidates*/ None,
-+    )?;
-+    let expected = serde_json::to_value(router.runtime_tool_registry_snapshot()?)?;
-+
-+    let mut bundles = fs::read_dir(temp.path())?
-+        .map(|entry| entry.map(|entry| entry.path()))
-+        .collect::<Result<Vec<_>, _>>()?;
-+    assert_eq!(bundles.len(), 1);
-+    let bundle = bundles.remove(0);
-+    let events = fs::read_to_string(bundle.join("trace.jsonl"))?
-+        .lines()
-+        .map(serde_json::from_str::<RawTraceEvent>)
-+        .collect::<Result<Vec<_>, _>>()?;
-+    let snapshots = events
-+        .iter()
-+        .filter_map(|event| match &event.payload {
-+            RawTraceEventPayload::Other { kind, payloads, .. }
-+                if kind == "tool_registry_snapshot" =>
-+            {
-+                Some((event, payloads))
-+            }
-+            _ => None,
-+        })
-+        .collect::<Vec<_>>();
-+    assert_eq!(snapshots.len(), 1);
-+    let (event, payloads) = snapshots[0];
-+    assert_eq!(event.thread_id, Some(thread_id.to_string()));
-+    assert_eq!(event.codex_turn_id.as_deref(), Some(turn.sub_id.as_str()));
-+    assert_eq!(payloads.len(), 1);
-+    let observed =
-+        serde_json::from_slice::<serde_json::Value>(&fs::read(bundle.join(&payloads[0].path))?)?;
-+    assert_eq!(observed, expected);
-+
-+    Ok(())
-+}
+diff --git a/codex-rs/core/tests/suite/code_mode.rs b/codex-rs/core/tests/suite/code_mode.rs
+index 29be9a8..901e1a3 100644
+--- a/codex-rs/core/tests/suite/code_mode.rs
++++ b/codex-rs/core/tests/suite/code_mode.rs
+@@ -4081,7 +4081,7 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
+     let patch = format!(
+         "*** Begin Patch\n*** Add File: {file_name}\n+hello from code_mode\n*** End Patch\n"
+     );
+-    let code = format!("text(await tools.apply_patch({patch:?}));\n");
++    let code = format!("text(await tools.apply_patch({{ input: {patch:?} }}));\n");
+ 
+     let (test, second_mock) =
+         run_code_mode_turn(&server, "use exec to run apply_patch", &code).await?;
+@@ -4096,7 +4096,7 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
+         Some(false),
+         "exec apply_patch call failed unexpectedly: {items:?}"
+     );
+-    assert_eq!(items.len(), 2);
++    assert_eq!(items.len(), 2, "unexpected exec output: {items:?}");
+     assert_regex_match(
+         concat!(
+             r"(?s)\A",
 diff --git a/codex-rs/rollout-trace/src/lib.rs b/codex-rs/rollout-trace/src/lib.rs
 index 54094f0..04e8599 100644
 --- a/codex-rs/rollout-trace/src/lib.rs
@@ -455,7 +735,7 @@ index 54094f0..04e8599 100644
  mod tool_dispatch;
 +mod tool_registry;
  mod writer;
-
+ 
  /// Conventional reduced-state cache name written next to a raw trace bundle.
 @@ -74,5 +75,11 @@ pub use tool_dispatch::ToolDispatchRequester;
  pub use tool_dispatch::ToolDispatchResult;
@@ -484,7 +764,7 @@ index 514b8d3..0e9af9d 100644
 @@ -301,6 +302,27 @@ impl ThreadTraceContext {
          );
      }
-
+ 
 +    /// Records the exact dispatcher registry active before a turn can execute tools.
 +    pub fn record_tool_registry_snapshot(
 +        &self,
@@ -520,12 +800,12 @@ index e0a5547..0791230 100644
 +use crate::RuntimeToolRegistryEntry;
 +use crate::RuntimeToolRegistrySnapshot;
  use crate::replay_bundle;
-
+ 
  #[test]
 @@ -225,6 +227,81 @@ fn protocol_wrapper_records_selected_events_as_raw_payloads() -> anyhow::Result<
      Ok(())
  }
-
+ 
 +#[test]
 +fn runtime_tool_registry_is_ordered_before_dispatch_and_deduplicated() -> anyhow::Result<()> {
 +    let temp = TempDir::new()?;
@@ -672,7 +952,7 @@ index 925f7ba..4939af5 100644
  use crate::raw_event::RawTraceEventContext;
  use crate::raw_event::RawTraceEventPayload;
 +use crate::tool_registry::RuntimeToolRegistrySnapshot;
-
+ 
  /// Local trace bundle writer.
  ///
 @@ -44,6 +45,7 @@ struct TraceWriterInner {
@@ -681,7 +961,7 @@ index 925f7ba..4939af5 100644
      next_payload_ordinal: u64,
 +    active_tool_registry_snapshot: Option<Vec<u8>>,
  }
-
+ 
  impl TraceWriter {
 @@ -78,6 +80,7 @@ impl TraceWriter {
                  event_log: BufWriter::new(event_log),
@@ -712,7 +992,7 @@ index 925f7ba..4939af5 100644
 -        })
 +        write_json_payload_locked(&mut self.lock_inner(), kind, value)
      }
-
+ 
      /// Appends one raw event with no extra envelope context.
 @@ -116,21 +105,36 @@ impl TraceWriter {
          context: RawTraceEventContext,
@@ -763,12 +1043,12 @@ index 925f7ba..4939af5 100644
 +        inner.active_tool_registry_snapshot = Some(canonical);
 +        Ok(true)
      }
-
+ 
      fn lock_inner(&self) -> MutexGuard<'_, TraceWriterInner> {
 @@ -141,6 +145,48 @@ impl TraceWriter {
      }
  }
-
+ 
 +fn write_json_payload_locked(
 +    inner: &mut TraceWriterInner,
 +    kind: RawPayloadKind,
@@ -814,3 +1094,4 @@ index 925f7ba..4939af5 100644
  fn write_json_file(path: &Path, value: &impl Serialize) -> Result<()> {
      let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
      serde_json::to_writer_pretty(file, value)
+
