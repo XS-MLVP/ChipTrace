@@ -1,0 +1,134 @@
+name: ${CHIPTRACE_PROJECT_NAME:-chiptrace}
+
+x-chiptrace-runtime: &chiptrace-runtime
+  image: ${CHIPTRACE_IMAGE:?set CHIPTRACE_IMAGE to an immutable ChipTrace image}
+  init: true
+  restart: unless-stopped
+  user: ${CHIPTRACE_RUN_AS:-10001:10001}
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  stop_grace_period: 30s
+  networks:
+    - data-plane
+
+services:
+  collector:
+    <<: *chiptrace-runtime
+    container_name: ${CHIPTRACE_COLLECTOR_CONTAINER:-chiptrace-collector}
+    command:
+      - collector
+      - --root
+      - /data/capture
+      - --state-root
+      - /data/state
+      - --host
+      - 0.0.0.0
+      - --port
+      - "3010"
+      - --segment-max-mib
+      - "512"
+      - --max-envelope-mib
+      - "1024"
+      - --max-inflight-body-mib
+      - "4096"
+      - --queue-items
+      - "8192"
+      - --batch-records
+      - "256"
+      - --batch-mib
+      - "64"
+      - --batch-wait-ms
+      - "10"
+      - --store-shards
+      - "1"
+      - --max-batch-records
+      - "4096"
+    ports:
+      - ${CHIPTRACE_COLLECTOR_BIND:-127.0.0.1:3010}:3010
+    volumes:
+      - ${CHIPTRACE_CAPTURE_ROOT:?set CHIPTRACE_CAPTURE_ROOT}:/data/capture
+      - ${CHIPTRACE_COLLECTOR_STATE_ROOT:?set CHIPTRACE_COLLECTOR_STATE_ROOT}:/data/state
+    networks:
+      data-plane:
+        aliases:
+          - chiptrace-collector
+    healthcheck:
+      test: ["CMD", "chiptrace", "probe", "--url", "http://127.0.0.1:3010/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  relay:
+    <<: *chiptrace-runtime
+    container_name: ${CHIPTRACE_RELAY_CONTAINER:-chiptrace-relay}
+    command:
+      - relay
+      - --root
+      - /data/outbox
+      - --state-root
+      - /data/outbox-state
+      - --delivery-state-root
+      - /data/delivery
+      - --collector-url
+      - http://${CHIPTRACE_COLLECTOR_CONTAINER:-chiptrace-collector}:3010
+      - --host
+      - 0.0.0.0
+      - --port
+      - "3012"
+      - --segment-max-mib
+      - "512"
+      - --max-envelope-mib
+      - "1024"
+      - --max-inflight-body-mib
+      - "4096"
+      - --queue-items
+      - "8192"
+      - --batch-records
+      - "256"
+      - --batch-mib
+      - "64"
+      - --batch-wait-ms
+      - "10"
+      - --store-shards
+      - "1"
+      - --max-batch-records
+      - "4096"
+      - --delivery-concurrency
+      - "16"
+      - --delivery-queue-items
+      - "16384"
+      - --delivery-batch-records
+      - "128"
+      - --delivery-batch-mib
+      - "16"
+      - --delivery-batch-wait-ms
+      - "2"
+      - --max-delivery-inflight-mib
+      - "4096"
+      - --request-timeout-seconds
+      - "30"
+    ports:
+      - ${CHIPTRACE_RELAY_BIND:-127.0.0.1:3011}:3012
+    volumes:
+      - ${CHIPTRACE_RELAY_ROOT:?set CHIPTRACE_RELAY_ROOT}:/data
+    depends_on:
+      collector:
+        condition: service_healthy
+    networks:
+      data-plane:
+        aliases:
+          - chiptrace-relay
+    healthcheck:
+      test: ["CMD", "chiptrace", "probe", "--url", "http://127.0.0.1:3012/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+networks:
+  data-plane:
+    name: ${CHIPTRACE_NETWORK:?set CHIPTRACE_NETWORK to an existing Docker network}
+    external: true
