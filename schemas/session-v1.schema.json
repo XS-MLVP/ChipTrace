@@ -202,6 +202,7 @@
         "roots",
         "open_node_ids",
         "unresolved_node_ids",
+        "status_conflict_node_ids",
         "terminal_rollout_ids",
         "kind_counts",
         "disposition_counts",
@@ -225,7 +226,7 @@
               "source_id": {"type": "string", "minLength": 1},
               "trace_id": {"type": "string", "minLength": 1},
               "status": {
-                "enum": ["running", "completed", "failed", "cancelled", "aborted", "terminated", "incomplete"]
+                "enum": ["running", "completed", "failed", "cancelled", "aborted", "terminated", "timeout", "incomplete"]
               },
               "disposition": {"enum": ["executed", "retry", "abandoned", "open_tail"]},
               "started_seq": {"type": "integer", "minimum": 0},
@@ -248,8 +249,11 @@
           }
         },
         "roots": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "root_mode": {"enum": ["single_rollout", "task_scoped_rollout_forest"]},
+        "task_session_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
         "open_node_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
         "unresolved_node_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "status_conflict_node_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
         "terminal_rollout_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
         "kind_counts": {"type": "object"},
         "disposition_counts": {"type": "object"},
@@ -257,6 +261,44 @@
         "applicable": {"type": "boolean"}
       },
       "additionalProperties": true
+    },
+    "inferenceApiConservation": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "matching_policy",
+        "applicable",
+        "complete",
+        "runtime_completed_inferences",
+        "runtime_correlatable_inferences",
+        "api_snapshots",
+        "api_correlatable_snapshots",
+        "matched_runtime_inferences",
+        "coverage",
+        "missing_api_capture_keys",
+        "runtime_without_correlation_capture_ids",
+        "duplicate_runtime_keys",
+        "extra_api_capture_keys",
+        "api_without_correlation_capture_ids"
+      ],
+      "properties": {
+        "schema_version": {"const": "chiptrace.inference-api-conservation.v1"},
+        "matching_policy": {"type": "string", "minLength": 1},
+        "applicable": {"type": "boolean"},
+        "complete": {"type": "boolean"},
+        "runtime_completed_inferences": {"type": "integer", "minimum": 0},
+        "runtime_correlatable_inferences": {"type": "integer", "minimum": 0},
+        "api_snapshots": {"type": "integer", "minimum": 0},
+        "api_correlatable_snapshots": {"type": "integer", "minimum": 0},
+        "matched_runtime_inferences": {"type": "integer", "minimum": 0},
+        "coverage": {"type": "number", "minimum": 0, "maximum": 1},
+        "missing_api_capture_keys": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "runtime_without_correlation_capture_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "duplicate_runtime_keys": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "extra_api_capture_keys": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "api_without_correlation_capture_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      },
+      "additionalProperties": false
     },
     "taskDag": {
       "type": "object",
@@ -301,6 +343,7 @@
         "source_namespace",
         "capture_dag",
         "runtime_dag",
+        "inference_api_conservation",
         "task_dag",
         "task_role",
         "lifecycle_events",
@@ -332,6 +375,7 @@
         "trace_contexts": {"type": "array", "items": {"type": "object"}},
         "capture_dag": {"$ref": "#/$defs/captureDag"},
         "runtime_dag": {"$ref": "#/$defs/runtimeDag"},
+        "inference_api_conservation": {"$ref": "#/$defs/inferenceApiConservation"},
         "task_dag": {"$ref": "#/$defs/taskDag"},
         "task_role": {"enum": ["root", "subagent"]},
         "lifecycle_events": {"type": "array", "items": {"type": "string"}},
@@ -389,6 +433,8 @@
         "system_prompt_variants": {"type": "array", "items": {"type": "string"}},
         "evaluation_evidence": {"type": "array", "items": {"type": "object"}},
         "schema_conflicts": {"type": "array", "items": {"type": "string"}},
+        "observed_schema_conflicts": {"type": "array", "items": {"type": "string"}},
+        "uncalled_schema_conflicts": {"type": "array", "items": {"type": "string"}},
         "trace_conflicts": {"type": "array", "items": {"type": "string"}},
         "usage_evidence": {"type": "array", "items": {"type": "object"}},
         "usage_settlement_evidence": {"type": "array", "items": {"type": "object"}},
@@ -397,6 +443,28 @@
         "rollout_usage_evidence": {"type": "array", "items": {"type": "object"}},
         "rollout_unknown_events": {"type": "array", "items": {"type": "string"}},
         "rollout_unmapped_tools": {"type": "array", "items": {"type": "string"}},
+        "code_mode_message_projection": {
+          "type": "object",
+          "required": [
+            "schema_version",
+            "evidence",
+            "excluded_parent_call_ids",
+            "excluded_tool_calls",
+            "excluded_tool_results",
+            "excluded_empty_messages",
+            "raw_runtime_events_retained"
+          ],
+          "properties": {
+            "schema_version": {"const": "chiptrace.code-mode-message-projection.v1"},
+            "evidence": {"const": "codex_rollout_trace_bundle.code_cell_started.model_visible_call_id"},
+            "excluded_parent_call_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+            "excluded_tool_calls": {"type": "integer", "minimum": 0},
+            "excluded_tool_results": {"type": "integer", "minimum": 0},
+            "excluded_empty_messages": {"type": "integer", "minimum": 0},
+            "raw_runtime_events_retained": {"const": true}
+          },
+          "additionalProperties": false
+        },
         "merge_divergences": {"type": "integer", "minimum": 0},
         "model_evidence": {
           "type": "object",

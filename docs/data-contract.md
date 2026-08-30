@@ -100,8 +100,9 @@ Tool Registry、模型调用 ID、工具名三者精确映射的 runtime 工具�
 `rollout_unknown_events` 和 `rollout_unmapped_tools`。Codex 0.150 的 `WebSearch`
 可识别，但源文件没有搜索结果正文时不生成有效工具返回。
 
-原生导出必须通过 `--tool-registry` 接收 dispatcher 在任务开始时导出的实际快照。
-缺 Registry 时仍保存真实工具参数、结果和状态，工具 Schema 为 null、provenance 为
+新 Codex producer 必须把 dispatcher 在任务开始时导出的实际 Registry 快照内联到
+原生 bundle；`--tool-registry` 只作为旧 bundle 的显式兼容输入。缺 Registry 时仍保存
+真实工具参数、结果和状态，工具 Schema 为 null、provenance 为
 `missing_runtime_registry`，并由 `rollout_unmapped_tools` 阻止严格 Release；不得从
 `source_js`、输出文本或工具名列表重建 Schema。
 
@@ -224,6 +225,8 @@ Assembly 输出 `schemas/session-v1.schema.json`，一行一个完整 Session。
 | `source_request_count` | API snapshot 数量，不包含 lifecycle/tool/evaluation/rollout Capture |
 | `source_capture_count` | 组成 Session 的全部不可变 Capture 数量 |
 | `meta.capture_dag` | response 链、状态、根、尾、环和缺失父节点 |
+| `meta.runtime_dag` | 原生 rollout/turn/inference/tool DAG；多进程任务可形成 task-scoped rollout forest |
+| `meta.inference_api_conservation` | 原生完成推理与 API snapshot 的精确 ID 守恒证明 |
 | `meta.task_dag` | root/subagent 关系和可拆分子轨迹 |
 | `meta.trace` | root/parent/goal/turn/agent/branch 标识 |
 | `meta.trace_contexts` | 每条 Capture 的完整 trace context 快照，保留 turn、span 和 response 链字段 |
@@ -314,6 +317,17 @@ Release 仍要求 Session 有明确终态且不悬停在工具调用。
 硬门槛失败；默认准入阈值为 90。消息合并分歧、工具 Schema/状态机冲突、producer
 sequence 缺口或重复、Trace/usage 冲突、未知/unmapped rollout、response DAG 环或
 缺失父节点、task DAG 不完整统一进入 `assembly_integrity` hard gate。
+
+原生 Codex runtime 还启用两个独立硬门槛：`runtime_dag_integrity` 要求所有原生节点
+闭合且没有 open/unresolved/terminal-status-conflict 节点；dispatcher 与 runtime
+终态分别保留。Codex dispatcher 的 `completed` 仅表示调用包装结束，结果以 runtime
+terminal 为准；显式 success/error/cancelled 声明矛盾时列入
+`runtime_dag.status_conflict_node_ids`。
+`inference_api_conservation` 要求每个
+`inference_completed` 都通过精确 `upstream_request_id` 或 `response_id` 命中真实
+`api_snapshot`。该对象包含 runtime/API 数量、覆盖率、缺失键、无关联 Capture、重复
+runtime key 和额外 API 键。匹配不使用 task、时间、模型、thread 或正文相似度；原生
+runtime 已存在但该对象缺失的旧 Assembly 直接失败。
 
 `chiptrace score` 的输出文件和 Release 的 `reports/assessments-part-*.jsonl.zst` 使用
 `schemas/assessment-v1.schema.json`，逐条给出 Gate、观测值、期望值、失败原因、

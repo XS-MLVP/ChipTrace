@@ -135,6 +135,13 @@ Native bundle exporter 以 `trace.jsonl` canonical path 为 checkpoint key，持
 manifest hash、配置指纹、byte offset、连续 seq、最后一行 SHA-256 及工具/模型
 关联上下文；先镜像 event/payload 原始字节，再在 durable ACK 后提交 checkpoint。
 
+`chiptrace codex-run` 是原生生产者的任务监督入口。它在启动 Codex 前创建 Harness
+身份和 W3C `traceparent`，把同一组 `x-chiptrace-*` 关联头注入模型请求，并在进程运行
+期间持续导出 bundle。`single` 在一个进程内创建并关闭任务；`begin`、`continue`、
+`finish` 允许同一显式任务跨多个 rollout，始终复用一个 Harness state，并为每个阶段
+使用独占 bundle 目录。Assembly 将这些 rollout 根组装为
+`runtime_dag.root_mode=task_scoped_rollout_forest`，不会把任一 rollout 结束误当成任务结束。
+
 兼容 Codex exporter 以源文件 canonical path 为 checkpoint key，持久化 byte offset、
 ordinal、最后一行 SHA-256 和解析上下文。Capture ID 由源 Session 与 ordinal
 确定；Relay 在 checkpoint 落后于投递时通过相同 ID 幂等去重。未换行的活动尾部
@@ -193,6 +200,13 @@ Assembly 先按 root Session 哈希分区，再并行组装：
   evaluator 证据原样进入 `meta.evaluation_evidence`。
 - API、原生 inference 和 Sub2API usage 按精确 ID 组成调用组件，每个组件只结算
   一次 Token；选择依据写入 `meta.usage_settlement_evidence`，组件内冲突触发硬门槛。
+- `meta.inference_api_conservation` 独立核对每个原生 `inference_completed` 与 18084
+  `api_snapshot`。只接受精确 `upstream_request_id` 或 `response_id`；缺 ID、漏采、
+  重复 runtime key 或无法覆盖都会使 `inference_api_conservation` hard gate 失败。
+- dispatcher `tool_call_ended` 与延后到达的 runtime terminal 状态分别保留。Codex 的
+  dispatcher `completed` 仅表示包装调用结束，工具结果以 runtime terminal 为准；若
+  dispatcher 明确声称 success/error/cancelled 且与 runtime 矛盾，则写入
+  `runtime_dag.status_conflict_node_ids`，Runtime DAG 标记为不完整。
 
 累计请求快照按 message ID、call ID 和 response DAG 合并；`turn_id`、span ID
 与 `previous_response_id` 保存在节点级，不作为 Session 冲突。单次模型 response
@@ -203,6 +217,10 @@ terminate 等显式事件关闭 Session。真实消息分歧、Schema 冲突、T
 runtime tool 也进入该 Gate。request/developer/response 属于不同 Prompt 层，
 文本不同只保留来源证据，不直接判为冲突。
 没有消息 ID 时按相同内容的出现序号合并累计快照，真实的重复追问不会被折叠。
+
+推理/API 守恒和 Token 去重是两项独立证明：前者证明生产者看见的模型调用没有在
+18084 旁路丢失，后者证明同一调用不会因 API、rollout、Sub2API 三份证据重复计费。
+原生 runtime 存在但 Assembly 缺少守恒对象时按失败处理，旧产物不能以缺字段绕过 Gate。
 
 ## 原始 OSS 归档
 

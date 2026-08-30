@@ -163,6 +163,28 @@ Codex 0.150 及以上优先使用原生 `codex-rollout-trace` bundle。它保留
 固定版本的 producer 补丁见
 [Codex 0.150 Runtime Tool Registry](integrations/codex/0.150.0-alpha.9/README.md)。
 
+生产任务优先由 `codex-run` 同时管理 Harness 边界、关联头、断线重试和原生 bundle
+增量导出。单个 Codex 进程使用默认的 `single` 阶段；一个任务跨多个 Codex 进程时，
+复用同一 `state-root`，并依次使用 `begin`、`continue`、`finish`：
+
+```bash
+TASK_PHASE=begin
+TRACE_PHASE=01
+chiptrace codex-run --codex-bin /usr/local/bin/codex \
+  --working-directory /workspace/project \
+  --state-root /var/lib/chiptrace/tasks/task-001 \
+  --trace-root "/var/lib/chiptrace/tasks/task-001/trace-${TRACE_PHASE}" \
+  --source-namespace router-v2-18084 --relay-url http://127.0.0.1:3011 \
+  --model-base-url http://172.28.11.121:18084/ --task-phase "$TASK_PHASE" \
+  --task-session-id task-001 -- exec --json "执行第一阶段"
+```
+
+后续以新的 `TRACE_PHASE` 依次执行 `continue` 和 `finish`。每个阶段的 `trace-root`
+必须独占且为空；`begin` 只创建一次任务开始事件，只有 `finish` 产生正常任务终态。
+身份不一致、未知 bundle 事件、未映射工具、open tail 或未清空的 durable spool 都会
+使本次运行标记为不完整。完整命令与运维约束见
+[部署与运维](docs/operations.md#codex-run-任务监督器)。
+
 ```bash
 target/release/chiptrace export-codex-trace-bundle \
   --input /var/lib/codex/trace-bundles/trace-<id> \
@@ -223,8 +245,16 @@ target/release/chiptrace restore-raw-archive \
 ## 交付
 
 ```bash
-target/release/chiptrace assemble \
+target/release/chiptrace enrich \
   --input /srv/chiptrace/restored/capture \
+  --usage-log /srv/sub2api/usage-logs.jsonl \
+  --output /srv/chiptrace/enriched
+
+target/release/chiptrace verify-enrichment \
+  --enrichment /srv/chiptrace/enriched
+
+target/release/chiptrace assemble \
+  --input /srv/chiptrace/enriched \
   --output /srv/chiptrace/assembly
 
 target/release/chiptrace release \

@@ -14,7 +14,7 @@ use crate::producer::{
 };
 use crate::tool_registry::{
     canonical_runtime_tool_name, canonical_tool_registry_sha256, canonical_tool_schema_sha256,
-    validate_tool_registry_value,
+    tool_definition_source_complete, validate_tool_registry_value,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -465,9 +465,17 @@ impl Harness {
         };
         validate_state(&harness.state)?;
         if let Some(target) = target {
-            harness.state.target = Some(
-                normalize_target(Some(target))?.expect("target normalization preserved target"),
-            );
+            let requested =
+                normalize_target(Some(target))?.expect("target normalization preserved target");
+            if let Some(persisted) = harness.state.target.as_ref() {
+                if persisted != &requested {
+                    bail!(
+                        "harness delivery target does not match persisted task target; use an explicit migration instead of splitting one task across sinks"
+                    );
+                }
+            } else {
+                harness.state.target = Some(requested);
+            }
         }
         validate_target(&harness.state.target, &harness.spool_path())?;
         harness.reconcile_spool()?;
@@ -699,7 +707,7 @@ impl Harness {
                     .to_owned();
                 let provenance = json!({
                     "source": if self.state.tool_registry.is_some() { "runtime_tool_registry" } else { "dispatcher_schema" },
-                    "source_complete": true,
+                    "source_complete": tool_definition_source_complete(&schema, &canonical_name),
                     "schema_sha256": digest,
                     "registry_sha256": self.state.tool_registry_sha256,
                 });
@@ -1037,6 +1045,8 @@ impl Harness {
 
     fn trace_context(&self, turn_id: Option<&str>) -> Value {
         let identity = &self.state.identity;
+        let (_, trace_id, span_id, trace_flags) = traceparent_parts(&identity.traceparent)
+            .expect("Harness identity contains a validated traceparent");
         let mut trace = Map::new();
         for (name, value) in [
             ("task_session_id", Some(identity.task_session_id.as_str())),
@@ -1057,6 +1067,12 @@ impl Harness {
                 trace.insert(name.to_owned(), Value::String(value.to_owned()));
             }
         }
+        trace.insert("trace_id".to_owned(), json!(trace_id.to_ascii_lowercase()));
+        trace.insert("span_id".to_owned(), json!(span_id.to_ascii_lowercase()));
+        trace.insert(
+            "trace_flags".to_owned(),
+            json!(trace_flags.to_ascii_lowercase()),
+        );
         if let Some(turn_id) = turn_id {
             trace.insert("turn_id".to_owned(), json!(turn_id));
             trace.insert("root_turn_id".to_owned(), json!(turn_id));
@@ -1490,38 +1506,10 @@ fn validate_schema_name(schema: &Value, expected: &str) -> Result<()> {
     if object.get("name").and_then(Value::as_str) != Some(expected) {
         bail!("tool schema name does not match tool call name");
     }
-    validate_nonempty(
-        object
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-        "tool schema description",
-    )?;
-    let parameters = object
-        .get("parameters")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow::anyhow!("tool schema parameters are required"))?;
-    if parameters.get("type").and_then(Value::as_str) != Some("object")
-        || !parameters.get("properties").is_some_and(Value::is_object)
-    {
-        bail!("tool schema parameters must be an object JSON Schema");
-    }
-    for (name, property) in parameters["properties"].as_object().unwrap() {
-        let property = property
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("tool schema property {name} must be an object"))?;
-        let typed = property.get("type").is_some()
-            || property.get("oneOf").is_some()
-            || property.get("anyOf").is_some()
-            || property.get("$ref").is_some();
-        if !typed
-            || property
-                .get("description")
-                .and_then(Value::as_str)
-                .is_none_or(|text| text.trim().is_empty())
-        {
-            bail!("tool schema property {name} needs type and description");
-        }
+    let has_parameters = object.get("parameters").is_some_and(Value::is_object);
+    let has_native_format = object.get("format").is_some_and(Value::is_object);
+    if !has_parameters && !has_native_format {
+        bail!("tool schema requires captured parameters or a native format");
     }
     Ok(())
 }
@@ -1770,26 +1758,36 @@ fn parse_rfc3339(value: &str, field: &str) -> Result<OffsetDateTime> {
 }
 
 fn validate_traceparent(value: &str) -> Result<()> {
-    let parts: Vec<&str> = value.split('-').collect();
-    if parts.len() < 4
-        || parts[0].len() != 2
-        || parts[1].len() != 32
-        || parts[2].len() != 16
-        || parts[3].len() != 2
-        || parts
-            .iter()
-            .take(4)
-            .any(|part| !part.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    {
+    let Some((version, trace_id, span_id, _)) = traceparent_parts(value) else {
         bail!("traceparent must follow W3C version-trace-parent-flags format");
-    }
-    if parts[0].eq_ignore_ascii_case("ff")
-        || parts[1].bytes().all(|byte| byte == b'0')
-        || parts[2].bytes().all(|byte| byte == b'0')
+    };
+    if version.eq_ignore_ascii_case("ff")
+        || trace_id.bytes().all(|byte| byte == b'0')
+        || span_id.bytes().all(|byte| byte == b'0')
     {
         bail!("traceparent version and trace/span identifiers are invalid");
     }
     Ok(())
+}
+
+fn traceparent_parts(value: &str) -> Option<(&str, &str, &str, &str)> {
+    let mut parts = value.split('-');
+    let version = parts.next()?;
+    let trace_id = parts.next()?;
+    let span_id = parts.next()?;
+    let flags = parts.next()?;
+    if parts.next().is_some()
+        || version.len() != 2
+        || trace_id.len() != 32
+        || span_id.len() != 16
+        || flags.len() != 2
+        || [version, trace_id, span_id, flags]
+            .into_iter()
+            .any(|part| !part.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+    Some((version, trace_id, span_id, flags))
 }
 
 fn validate_identifier(value: &str, field: &str) -> Result<()> {
@@ -1894,6 +1892,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut config = HarnessConfig::new(temp.path().to_path_buf(), "test-harness");
         config.task_session_id = Some("task-test".to_owned());
+        config.traceparent =
+            Some("00-11111111111111111111111111111111-2222222222222222-03".to_owned());
         config.tool_registry = Some(registry());
         let harness = Harness::start(config).unwrap();
         assert_eq!(harness.task_session_id(), "task-test");
@@ -1905,6 +1905,13 @@ mod tests {
         let event: Value = serde_json::from_str(lines.lines().next().unwrap()).unwrap();
         assert_eq!(event["recordType"], "lifecycle_event");
         assert_eq!(event["lifecycleEvent"]["type"], "task_start");
+        assert_eq!(
+            event["traceContext"]["trace_id"],
+            "11111111111111111111111111111111"
+        );
+        assert_eq!(event["traceContext"]["span_id"], "2222222222222222");
+        assert_eq!(event["traceContext"]["trace_flags"], "03");
+        assert!(event["traceContext"].get("parent_span_id").is_none());
         assert!(event["toolRegistrySha256"].as_str().is_some());
     }
 
@@ -2032,9 +2039,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_validator_rejects_incomplete_property() {
+    fn schema_validator_preserves_incomplete_property_for_quality_gating() {
         let bad = json!({"name":"x","description":"x","parameters":{"type":"object","properties":{"p":{}}}});
-        assert!(validate_schema_name(&bad, "x").is_err());
+        validate_schema_name(&bad, "x").unwrap();
+        assert!(!tool_definition_source_complete(&bad, "x"));
     }
 
     #[test]
@@ -2103,6 +2111,32 @@ mod tests {
         let mut config = HarnessConfig::new(root.clone(), "test-harness");
         config.target = Some(HarnessTarget::Jsonl(root.join(SPOOL_FILE)));
         assert!(Harness::start(config).is_err());
+    }
+
+    #[test]
+    fn resumed_task_rejects_delivery_target_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = HarnessConfig::new(temp.path().to_path_buf(), "test-harness");
+        config.target = Some(HarnessTarget::Relay("http://127.0.0.1:3011".to_owned()));
+        drop(Harness::start(config).unwrap());
+
+        let error = Harness::open_with_target(
+            temp.path(),
+            Some(HarnessTarget::Relay("http://127.0.0.1:4011".to_owned())),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("does not match persisted"));
+
+        let resumed = Harness::open_with_target(
+            temp.path(),
+            Some(HarnessTarget::Relay("http://127.0.0.1:3011".to_owned())),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.inspect().unwrap().target,
+            Some(HarnessTarget::Relay("http://127.0.0.1:3011".to_owned()))
+        );
     }
 
     #[test]

@@ -87,7 +87,14 @@
                 "runtime_dag_complete": {"type": "boolean"},
                 "runtime_dag_native_events": {"type": "integer", "minimum": 0},
                 "runtime_dag_open_nodes": {"type": "integer", "minimum": 0},
-                "runtime_dag_unresolved_nodes": {"type": "integer", "minimum": 0}
+                "runtime_dag_unresolved_nodes": {"type": "integer", "minimum": 0},
+                "runtime_dag_status_conflicts": {"type": "integer", "minimum": 0},
+                "inference_api_conservation_applicable": {"type": "boolean"},
+                "inference_api_conservation_complete": {"type": "boolean"},
+                "runtime_completed_inferences": {"type": "integer", "minimum": 0},
+                "api_snapshots": {"type": "integer", "minimum": 0},
+                "matched_runtime_inferences": {"type": "integer", "minimum": 0},
+                "missing_api_captures": {"type": "integer", "minimum": 0}
               }
             },
             "tokens": {"type": "object"},

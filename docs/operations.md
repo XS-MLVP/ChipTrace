@@ -193,6 +193,71 @@ Relay 的完整 durable ACK 会推进 checkpoint；业务层可以在投递失�
 
 ## Codex rollout 生产者
 
+### `codex-run` 任务监督器
+
+生产接入优先使用 `codex-run`。它在 Codex 进程启动前落盘 Harness task start，将
+`task_session_id`、root/parent、goal、agent、branch、session/thread、
+`previous_response_id` 和 W3C `traceparent` 作为 provider 环境请求头注入，同时强制
+启用 Runtime Tool Registry producer、至少 20 次采集投递尝试和至少 20 次 provider
+请求/流重试。运行期间每 250 ms 增量导出原生 bundle，只有 Relay durable ACK 后推进
+checkpoint；退出时完成严格 bundle 扫描和 spool flush。
+
+单进程任务使用默认的 `--task-phase single`：
+
+```bash
+chiptrace codex-run \
+  --codex-bin /usr/local/bin/codex \
+  --working-directory /workspace/project \
+  --state-root /var/lib/chiptrace/tasks/task-001 \
+  --source-namespace router-v2-18084 \
+  --relay-url http://127.0.0.1:3011 \
+  --model-base-url http://172.28.11.121:18084/ \
+  --task-session-id task-001 \
+  -- exec --json "执行并验证任务"
+```
+
+一个采购任务需要多个真实 User -> Assistant 交互时，使用同一 `state-root` 和 sink，
+为每个进程分配新的空 `trace-root`：
+
+```bash
+chiptrace codex-run --codex-bin /usr/local/bin/codex \
+  --working-directory /workspace/project \
+  --state-root /var/lib/chiptrace/tasks/task-001 \
+  --trace-root /var/lib/chiptrace/tasks/task-001/trace-01 \
+  --source-namespace router-v2-18084 --relay-url http://127.0.0.1:3011 \
+  --model-base-url http://172.28.11.121:18084/ --task-phase begin \
+  --task-session-id task-001 -- exec --json "执行第一阶段"
+
+chiptrace codex-run --codex-bin /usr/local/bin/codex \
+  --working-directory /workspace/project \
+  --state-root /var/lib/chiptrace/tasks/task-001 \
+  --trace-root /var/lib/chiptrace/tasks/task-001/trace-02 \
+  --source-namespace router-v2-18084 --relay-url http://127.0.0.1:3011 \
+  --model-base-url http://172.28.11.121:18084/ --task-phase continue \
+  -- exec --json "依据上一阶段继续修正"
+
+chiptrace codex-run --codex-bin /usr/local/bin/codex \
+  --working-directory /workspace/project \
+  --state-root /var/lib/chiptrace/tasks/task-001 \
+  --trace-root /var/lib/chiptrace/tasks/task-001/trace-03 \
+  --source-namespace router-v2-18084 --relay-url http://127.0.0.1:3011 \
+  --model-base-url http://172.28.11.121:18084/ --task-phase finish \
+  -- exec --json "执行最终验收"
+```
+
+`begin` 创建唯一 task start，`continue` 只追加 rollout，`finish` 根据最后一个 Codex
+进程与采集结果写入 completed/failed/incomplete 终态。SIGINT/SIGTERM 在任一阶段都会
+产生 cancelled/terminated 任务终态。恢复阶段会校验持久身份、namespace 和任务仍为
+open；不同 sink、已关闭任务、复用非空 trace 目录或通过 Codex `-c` 覆盖关联头、重试
+和 Runtime Tool Registry 设置都会失败。每阶段摘要必须满足 `ok=true`、
+`capture_complete=true`、`pending_records=0`；`finish` 还必须满足
+`task_terminal_emitted=true` 和 `task_status=closed`。
+
+入口部署必须包含业务进程的持久 `/capture-outbox` 挂载。只升级 `codex-run` 而入口仍
+运行旧的 direct-to-Relay 代码，会出现原生 `inference_completed` 多于 API Capture；
+Assembly 的 `inference_api_conservation` Gate 会拒绝该 Session，不能用 rollout 或
+Sub2API usage 补造缺失快照。
+
 ### 原生 trace bundle（优先）
 
 Codex 0.150+ 可通过 `CODEX_ROLLOUT_TRACE_ROOT` 写出原生 bundle：

@@ -465,20 +465,28 @@
     },
     "toolDefinition": {
       "type": "object",
-      "required": ["name", "description", "parameters"],
+      "required": ["name"],
       "properties": {
         "name": {"type": "string", "minLength": 1},
-        "description": {"type": "string", "minLength": 1},
+        "description": {"type": "string"},
         "parameters": {
           "type": "object",
-          "required": ["type", "properties"],
+          "additionalProperties": true
+        },
+        "format": {
+          "type": "object",
           "properties": {
-            "type": {"const": "object"},
-            "properties": {"type": "object"}
+            "type": {"type": "string"},
+            "syntax": {"type": "string"},
+            "definition": {"type": "string"}
           },
           "additionalProperties": true
         }
       },
+      "anyOf": [
+        {"required": ["parameters"]},
+        {"required": ["format"]}
+      ],
       "additionalProperties": true
     }
   },

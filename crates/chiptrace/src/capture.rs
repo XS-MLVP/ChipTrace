@@ -498,7 +498,7 @@ fn promote_protocol_fields(object: &mut Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
-fn trace_aliases() -> [(&'static str, &'static [&'static str]); 20] {
+fn trace_aliases() -> [(&'static str, &'static [&'static str]); 21] {
     [
         ("task_session_id", &["task_session_id", "taskSessionId"]),
         ("session_id", &["session_id", "sessionId"]),
@@ -525,6 +525,7 @@ fn trace_aliases() -> [(&'static str, &'static [&'static str]); 20] {
         ),
         ("session_final", &["session_final", "sessionFinal"]),
         ("traceparent", &["traceparent"]),
+        ("trace_flags", &["trace_flags", "traceFlags"]),
         ("tracestate", &["tracestate"]),
     ]
 }

@@ -9,6 +9,7 @@ use chiptrace::codex_rollout::{
     ExportConfig as CodexRolloutExportConfig, ExportTarget as CodexRolloutTarget,
     export_codex_rollout, resolve_hook_rollout, watch_codex_rollout,
 };
+use chiptrace::codex_run::{CodexRunConfig, CodexRunTarget, CodexTaskPhase, run_codex};
 use chiptrace::codex_trace_bundle::{
     BundleExportConfig as CodexTraceBundleExportConfig,
     BundleExportTarget as CodexTraceBundleTarget, export_codex_trace_bundle,
@@ -83,6 +84,8 @@ enum Command {
         visible_alias = "export-codex-bundle"
     )]
     ExportCodexTraceBundle(ExportCodexTraceBundleArgs),
+    /// 在明确任务边界内运行 Codex 并持续导出原生 runtime Trace。
+    CodexRun(CodexRunArgs),
     /// 校验 harness/dispatcher 事件并等待 Relay durable ACK。
     Produce(ProduceArgs),
     /// 由真实任务运行器创建边界并记录生命周期、工具和评估证据。
@@ -626,6 +629,79 @@ struct ExportCodexTraceBundleArgs {
 }
 
 #[derive(Debug, Args)]
+struct CodexRunArgs {
+    /// 启用了 Runtime Tool Registry producer 补丁的 Codex 二进制。
+    #[arg(long)]
+    codex_bin: PathBuf,
+    /// Codex 任务工作目录。
+    #[arg(long, default_value = ".")]
+    working_directory: PathBuf,
+    /// 本任务的 Harness、checkpoint 和 Raw mirror 根目录。
+    #[arg(long)]
+    state_root: PathBuf,
+    /// 本任务独占且启动前必须为空的原生 bundle 目录。
+    #[arg(long)]
+    trace_root: Option<PathBuf>,
+    #[arg(long)]
+    source_namespace: String,
+    /// 单进程任务，或同一显式任务的开始、继续、结束阶段。
+    #[arg(long, value_enum, default_value = "single")]
+    task_phase: CodexTaskPhase,
+    #[arg(long, conflicts_with = "output")]
+    relay_url: Option<String>,
+    #[arg(long, conflicts_with = "relay_url")]
+    output: Option<PathBuf>,
+    /// 共享 Codex 配置中的 provider key。
+    #[arg(long, default_value = "OpenAI")]
+    model_provider_id: String,
+    /// 可选的任务级 API 入口覆盖，例如 http://172.28.11.121:18084/。
+    #[arg(long)]
+    model_base_url: Option<String>,
+    #[arg(long)]
+    task_session_id: Option<String>,
+    #[arg(long)]
+    root_session_id: Option<String>,
+    #[arg(long)]
+    parent_session_id: Option<String>,
+    #[arg(long)]
+    goal_id: Option<String>,
+    #[arg(long)]
+    agent_id: Option<String>,
+    #[arg(long)]
+    branch_id: Option<String>,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[arg(long)]
+    thread_id: Option<String>,
+    #[arg(long)]
+    previous_response_id: Option<String>,
+    #[arg(long)]
+    traceparent: Option<String>,
+    /// 外部 Tool Registry 只用于旧 bundle 兼容；新 Codex 应内联实际快照。
+    #[arg(long)]
+    tool_registry: Option<PathBuf>,
+    #[arg(long, default_value_t = 250)]
+    poll_ms: u64,
+    #[arg(long, default_value_t = 30)]
+    shutdown_grace_seconds: u64,
+    #[arg(long, default_value_t = 25)]
+    retry_max_times: usize,
+    #[arg(long, default_value_t = 25)]
+    provider_request_max_retries: u64,
+    #[arg(long, default_value_t = 25)]
+    provider_stream_max_retries: u64,
+    #[arg(long, default_value_t = 30)]
+    request_timeout_seconds: u64,
+    #[arg(long, default_value_t = 1024)]
+    max_envelope_mib: usize,
+    #[arg(long, default_value_t = 128)]
+    batch_records: usize,
+    /// `--` 后原样传给 Codex，例如 `exec --json "任务"`。
+    #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
+    codex_args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
 struct VerifyEnrichmentArgs {
     #[arg(long)]
     enrichment: PathBuf,
@@ -1133,6 +1209,47 @@ async fn main() -> Result<()> {
                     traceparent: args.traceparent,
                     mirror_root: args.mirror_root,
                     require_complete: args.require_complete,
+                })
+                .await?,
+            )?
+        }
+        Command::CodexRun(args) => {
+            let target = match (args.relay_url, args.output) {
+                (Some(url), None) => CodexRunTarget::Relay(url),
+                (None, Some(path)) => CodexRunTarget::Jsonl(path),
+                _ => bail!("exactly one of --relay-url or --output is required"),
+            };
+            serde_json::to_value(
+                run_codex(CodexRunConfig {
+                    codex_bin: args.codex_bin,
+                    codex_args: args.codex_args,
+                    working_directory: args.working_directory,
+                    state_root: args.state_root,
+                    trace_root: args.trace_root,
+                    source_namespace: args.source_namespace,
+                    target,
+                    task_phase: args.task_phase,
+                    model_provider_id: args.model_provider_id,
+                    model_base_url: args.model_base_url,
+                    task_session_id: args.task_session_id,
+                    root_session_id: args.root_session_id,
+                    parent_session_id: args.parent_session_id,
+                    goal_id: args.goal_id,
+                    agent_id: args.agent_id,
+                    branch_id: args.branch_id,
+                    session_id: args.session_id,
+                    thread_id: args.thread_id,
+                    previous_response_id: args.previous_response_id,
+                    traceparent: args.traceparent,
+                    tool_registry: args.tool_registry,
+                    poll_interval: Duration::from_millis(args.poll_ms),
+                    shutdown_grace: Duration::from_secs(args.shutdown_grace_seconds),
+                    retry_max_times: args.retry_max_times,
+                    provider_request_max_retries: args.provider_request_max_retries,
+                    provider_stream_max_retries: args.provider_stream_max_retries,
+                    request_timeout: Duration::from_secs(args.request_timeout_seconds),
+                    max_envelope_bytes: checked_mib(args.max_envelope_mib)?,
+                    batch_records: args.batch_records,
                 })
                 .await?,
             )?

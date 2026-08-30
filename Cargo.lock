@@ -263,6 +263,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http-body-util",
+ "libc",
  "opendal",
  "rayon",
  "redb",

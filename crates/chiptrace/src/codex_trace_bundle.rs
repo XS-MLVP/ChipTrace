@@ -11,7 +11,7 @@ use crate::capture::normalize_capture;
 use crate::delivery::{DeliveryConfig, DeliveryTarget, deliver_batch};
 use crate::tool_registry::{
     LoadedToolRegistry, ToolRegistryEntry, canonical_runtime_tool_name, load_tool_registry,
-    load_tool_registry_value, registry_entry_identity,
+    load_tool_registry_value, registry_entry_identity, tool_definition_source_complete,
 };
 use anyhow::{Context, Result, bail};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -120,6 +120,7 @@ struct BundleContext {
     model_calls: BTreeMap<String, ModelCallContext>,
     tool_schemas: BTreeMap<String, Value>,
     pending_tools: BTreeMap<String, PendingToolContext>,
+    deferred_runtime_tools: BTreeSet<String>,
     code_cells: BTreeMap<String, CodeCellContext>,
     active_threads: BTreeSet<String>,
     active_turns: BTreeSet<String>,
@@ -448,7 +449,6 @@ pub async fn export_codex_trace_bundle(config: BundleExportConfig) -> Result<Bun
     };
 
     let mut file = File::open(&raw_event_path)?;
-    let file_len = file.metadata()?.len();
     file.seek(SeekFrom::Start(checkpoint.committed_offset))?;
     let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
     let mut batch = Vec::with_capacity(config.batch_records);
@@ -563,7 +563,8 @@ pub async fn export_codex_trace_bundle(config: BundleExportConfig) -> Result<Bun
     summary.committed_seq = batch_checkpoint.last_seq;
     summary.bundle_complete = runtime_complete(&batch_checkpoint.context);
     summary.open_runtime_objects = open_runtime_objects(&batch_checkpoint.context);
-    if summary.committed_offset > file_len {
+    let final_file_len = fs::metadata(&raw_event_path)?.len();
+    if summary.committed_offset > final_file_len {
         bail!("Codex trace-bundle checkpoint advanced beyond trace.jsonl");
     }
     if config.require_complete && (summary.open_tail_bytes != 0 || !summary.bundle_complete) {
@@ -1231,7 +1232,9 @@ fn project_event(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if let Some(pending) = context.pending_tools.get_mut(call_id) {
-                if event_type == "tool_call_runtime_ended" {
+                if event_type == "tool_call_runtime_started" {
+                    pending.runtime_status = Some("started".to_owned());
+                } else {
                     pending.runtime_status = event
                         .payload
                         .get("status")
@@ -1243,11 +1246,24 @@ fn project_event(
                     "runtime_payload":event.payload.get("runtime_payload"),
                     "status":event.payload.get("status"),
                 });
+            } else if event_type == "tool_call_runtime_ended"
+                && context.deferred_runtime_tools.remove(call_id)
+            {
+                capture["runtimeToolObservation"] = json!({
+                    "tool_call_id":call_id,
+                    "runtime_payload":event.payload.get("runtime_payload"),
+                    "status":event.payload.get("status"),
+                    "deferred_completion":true,
+                });
             } else {
                 unmapped_tool = true;
             }
             capture["rolloutEvent"]["runtime_call_correlation"] = json!(if unmapped_tool {
                 "missing_tool_start"
+            } else if event_type == "tool_call_runtime_ended"
+                && !context.pending_tools.contains_key(call_id)
+            {
+                "deferred_runtime_completion"
             } else {
                 "runtime_tool_call"
             });
@@ -1261,6 +1277,12 @@ fn project_event(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let pending = context.pending_tools.remove(call_id);
+            if pending
+                .as_ref()
+                .is_some_and(|pending| pending.runtime_status.as_deref() == Some("started"))
+            {
+                context.deferred_runtime_tools.insert(call_id.to_owned());
+            }
             let dispatch_status = event
                 .payload
                 .get("status")
@@ -1516,7 +1538,7 @@ fn projected_tool_schema(pending: &PendingToolContext, name: &str) -> (Option<Va
     let captured = pending.schema.clone();
     let schema = captured
         .clone()
-        .filter(|schema| complete_tool_schema(schema, name));
+        .filter(|schema| complete_tool_contract(schema, name));
     let provenance = captured
         .as_ref()
         .and_then(|schema| schema.get("schema_provenance"))
@@ -1990,18 +2012,43 @@ fn collect_request_tool_schemas(request: &Value, context: &mut BundleContext) ->
 }
 
 fn collect_tool_definitions(value: &Value, output: &mut Vec<Value>) {
+    collect_tool_definitions_with_namespace(value, None, output);
+}
+
+fn collect_tool_definitions_with_namespace(
+    value: &Value,
+    inherited_namespace: Option<&str>,
+    output: &mut Vec<Value>,
+) {
     if let Some(children) = value.get("tools").and_then(Value::as_array)
         && (value.get("parameters").is_none() && value.get("format").is_none())
     {
+        let namespace = if value.get("type").and_then(Value::as_str) == Some("namespace") {
+            value
+                .get("name")
+                .and_then(Value::as_str)
+                .or(inherited_namespace)
+        } else {
+            value
+                .get("namespace")
+                .and_then(Value::as_str)
+                .or(inherited_namespace)
+        };
         for child in children {
-            collect_tool_definitions(child, output);
+            collect_tool_definitions_with_namespace(child, namespace, output);
         }
         return;
     }
     let nested = value.get("function").unwrap_or(value);
-    let Some(name) = nested.get("name").and_then(Value::as_str) else {
+    let Some(runtime_tool) = nested.get("name").and_then(Value::as_str) else {
         return;
     };
+    let runtime_namespace = nested
+        .get("namespace")
+        .or_else(|| value.get("namespace"))
+        .and_then(Value::as_str)
+        .or(inherited_namespace);
+    let name = canonical_runtime_tool_name(runtime_namespace, runtime_tool);
     let description = nested
         .get("description")
         .and_then(Value::as_str)
@@ -2011,21 +2058,29 @@ fn collect_tool_definitions(value: &Value, output: &mut Vec<Value>) {
         .or_else(|| nested.get("input_schema"))
         .cloned();
     let native_format = nested.get("format").cloned();
-    let parameters = captured_parameters
-        .clone()
-        .unwrap_or_else(|| json!({"type":"object","properties":{}}));
-    let captured = json!({
-        "name":name,
+    let mut captured = json!({
+        "name":name.as_str(),
         "description":description,
-        "parameters":parameters,
-        "format":native_format,
         "type":value.get("type").and_then(Value::as_str).unwrap_or("function"),
     });
+    if let Some(parameters) = captured_parameters.as_ref() {
+        captured["parameters"] = parameters.clone();
+    }
+    if let Some(format) = native_format.as_ref() {
+        captured["format"] = format.clone();
+    }
+    if runtime_tool != name {
+        captured["runtime_tool"] = json!(runtime_tool);
+    }
+    if let Some(namespace) = runtime_namespace {
+        captured["runtime_namespace"] = json!(namespace);
+    }
     let hash = sha256(serde_json::to_vec(&captured).unwrap_or_default());
     let mut normalized = captured;
     normalized["schema_hash"] = json!(hash);
     normalized["schema_version"] = json!(format!("sha256:{hash}"));
-    let generated_adapter = captured_parameters.is_none();
+    let generated_adapter = captured_parameters.is_none() && native_format.is_none();
+    let source_complete = complete_tool_contract(&normalized, &name);
     normalized["schema_provenance"] = json!({
         "source":if captured_parameters.is_some() {
             "captured_json_schema"
@@ -2034,7 +2089,7 @@ fn collect_tool_definitions(value: &Value, output: &mut Vec<Value>) {
         } else {
             "missing"
         },
-        "source_complete":captured_parameters.is_some() && complete_tool_schema(&normalized, name),
+        "source_complete":source_complete,
         "generated_adapter":generated_adapter,
     });
     output.push(normalized);
@@ -2048,7 +2103,9 @@ fn install_tool_registry(
         return Ok(());
     };
     let registry_changed = context.tool_registry_sha256.as_deref() != Some(&registry.sha256);
-    if registry_changed && !context.pending_tools.is_empty() {
+    if registry_changed
+        && (!context.pending_tools.is_empty() || !context.deferred_runtime_tools.is_empty())
+    {
         bail!("Codex trace-bundle Tool Registry changed while tool calls were pending");
     }
     let snapshot = serde_json::to_value(&registry.registry)?;
@@ -2085,14 +2142,16 @@ fn projected_registry_schema(
         schema["runtime_namespace"] = json!(namespace);
     }
     let schema_hash = sha256(serde_json::to_vec(&schema)?);
-    let source_complete = complete_tool_schema(&schema, &name);
+    let source_complete = complete_tool_contract(&schema, &name);
     schema["schema_hash"] = json!(schema_hash);
     schema["schema_version"] = json!(format!("sha256:{schema_hash}"));
     schema["schema_provenance"] = json!({
-        "source":if source_complete {
+        "source":if schema.get("parameters").is_some() {
             "captured_runtime_registry"
-        } else {
+        } else if schema.get("format").is_some() {
             "captured_runtime_registry_native_format"
+        } else {
+            "missing"
         },
         "source_complete":source_complete,
         "registry_sha256":registry.sha256,
@@ -2128,7 +2187,7 @@ fn insert_tool_schema(context: &mut BundleContext, schema: Value) -> Result<()> 
         if existing
             .pointer("/schema_provenance/source")
             .and_then(Value::as_str)
-            == Some("captured_runtime_registry")
+            .is_some_and(|source| source.starts_with("captured_runtime_registry"))
         {
             return Ok(());
         }
@@ -2454,58 +2513,8 @@ fn normalize_tool_status(value: &str) -> &'static str {
     }
 }
 
-fn complete_tool_schema(schema: &Value, expected_name: &str) -> bool {
-    let Some(object) = schema.as_object() else {
-        return false;
-    };
-    object.get("name").and_then(Value::as_str) == Some(expected_name)
-        && !schema
-            .pointer("/schema_provenance/generated_adapter")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        && schema
-            .pointer("/schema_provenance/source_complete")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
-        && object
-            .get("description")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-        && object
-            .get("parameters")
-            .and_then(Value::as_object)
-            .is_some_and(|parameters| {
-                parameters.get("type").and_then(Value::as_str) == Some("object")
-                    && parameters
-                        .get("properties")
-                        .and_then(Value::as_object)
-                        .is_some_and(|properties| {
-                            properties.values().all(|property| {
-                                property.as_object().is_some_and(|property| {
-                                    (property.get("type").is_some()
-                                        || property.get("oneOf").is_some()
-                                        || property.get("anyOf").is_some()
-                                        || property.get("$ref").is_some())
-                                        && property
-                                            .get("description")
-                                            .and_then(Value::as_str)
-                                            .is_some_and(|value| !value.trim().is_empty())
-                                })
-                            })
-                        })
-                    && parameters.get("required").is_none_or(|required| {
-                        required.as_array().is_some_and(|required| {
-                            required.iter().all(|name| {
-                                name.as_str().is_some_and(|name| {
-                                    parameters
-                                        .get("properties")
-                                        .and_then(Value::as_object)
-                                        .is_some_and(|properties| properties.contains_key(name))
-                                })
-                            })
-                        })
-                    })
-            })
+fn complete_tool_contract(schema: &Value, expected_name: &str) -> bool {
+    tool_definition_source_complete(schema, expected_name)
 }
 
 fn native_turn_id(event: &BundleEvent) -> Option<&str> {
@@ -2521,6 +2530,7 @@ fn open_runtime_objects(context: &BundleContext) -> u64 {
         + context.active_turns.len()
         + context.active_inferences.len()
         + context.pending_tools.len()
+        + context.deferred_runtime_tools.len()
         + context.active_code_cells.len()
         + context.active_compactions.len()) as u64
 }
@@ -2546,6 +2556,9 @@ fn reconcile_checkpoint_context(context: &mut BundleContext, manifest: &TraceBun
         .seen_tools
         .extend(context.pending_tools.keys().cloned());
     context
+        .seen_tools
+        .extend(context.deferred_runtime_tools.iter().cloned());
+    context
         .seen_code_cells
         .extend(context.code_cells.keys().cloned());
     context
@@ -2564,6 +2577,7 @@ fn trim_context(context: &mut BundleContext) {
         + context.model_calls.len()
         + context.tool_schemas.len()
         + context.pending_tools.len()
+        + context.deferred_runtime_tools.len()
         + context.code_cells.len()
         > MAX_CONTEXT_ENTRIES
     {
@@ -2760,6 +2774,7 @@ fn mirror_bytes(
     let trace_component = safe_component(trace_id)?;
     let category_component = safe_component(category)?;
     let name_component = safe_component(name)?;
+    let mirror_reference = format!("{trace_component}/{category_component}/{name_component}");
     let directory = mirror_root.join(trace_component).join(category_component);
     fs::create_dir_all(&directory)?;
     let destination = directory.join(&name_component);
@@ -2771,7 +2786,7 @@ fn mirror_bytes(
                 destination.display()
             );
         }
-        return Ok(destination.to_string_lossy().into_owned());
+        return Ok(mirror_reference);
     }
     let temporary = directory.join(format!(
         ".{}.tmp-{}-{}",
@@ -2786,7 +2801,7 @@ fn mirror_bytes(
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(&temporary, &destination)?;
-    Ok(destination.to_string_lossy().into_owned())
+    Ok(mirror_reference)
 }
 
 fn safe_component(value: &str) -> Result<String> {
@@ -2949,6 +2964,45 @@ mod tests {
             .join("\n")
             + "\n";
         fs::write(root.join("bundle/trace.jsonl"), trace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn capture_bytes_do_not_depend_on_mirror_storage_root() {
+        let temp = tempfile::tempdir().unwrap();
+        write_minimal_complete_bundle(temp.path());
+        let first_output = temp.path().join("first.jsonl");
+        let second_output = temp.path().join("second.jsonl");
+
+        export_codex_trace_bundle(config(temp.path(), &first_output))
+            .await
+            .unwrap();
+        let mut second = config(temp.path(), &second_output);
+        second.state_root = temp.path().join("second-state");
+        second.mirror_root = Some(temp.path().join("second-mirror"));
+        export_codex_trace_bundle(second).await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(first_output).unwrap(),
+            fs::read_to_string(second_output).unwrap()
+        );
+        let first: Value = serde_json::from_str(
+            fs::read_to_string(temp.path().join("first.jsonl"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            first["rolloutEvent"]["bundle_manifest_mirror_path"],
+            "trace-1/manifest/manifest.json"
+        );
+        assert!(
+            !first["rolloutEvent"]["raw_event_mirror_path"]
+                .as_str()
+                .unwrap()
+                .starts_with('/')
+        );
     }
 
     #[tokio::test]
@@ -3408,6 +3462,16 @@ mod tests {
             4,
             json!({"type":"code_mode_response","value":{"exit_code":0,"output":""}}),
         );
+        let runtime_started = write_payload(
+            temp.path(),
+            5,
+            json!({"process_id":"42","status":"running"}),
+        );
+        let runtime_ended = write_payload(
+            temp.path(),
+            6,
+            json!({"process_id":"42","status":"completed","exit_code":0}),
+        );
         let events = vec![
             event(
                 1,
@@ -3453,30 +3517,42 @@ mod tests {
             ),
             event(
                 8,
-                json!({"type":"tool_call_ended","tool_call_id":"tool-1","status":"completed","result_payload":{"raw_payload_id":"result-1","kind":{"type":"tool_result"},"path":result}}),
+                json!({"type":"tool_call_runtime_started","tool_call_id":"tool-1","runtime_payload":{"raw_payload_id":"runtime-start-1","kind":{"type":"tool_runtime_event"},"path":runtime_started}}),
                 Some("thread-1"),
                 Some("turn-1"),
             ),
             event(
                 9,
-                json!({"type":"code_cell_ended","runtime_cell_id":"cell-1","status":"completed"}),
+                json!({"type":"tool_call_ended","tool_call_id":"tool-1","status":"completed","result_payload":{"raw_payload_id":"result-1","kind":{"type":"tool_result"},"path":result}}),
                 Some("thread-1"),
                 Some("turn-1"),
             ),
             event(
                 10,
-                json!({"type":"codex_turn_ended","codex_turn_id":"turn-1","status":"completed"}),
+                json!({"type":"tool_call_runtime_ended","tool_call_id":"tool-1","status":"completed","runtime_payload":{"raw_payload_id":"runtime-end-1","kind":{"type":"tool_runtime_event"},"path":runtime_ended}}),
                 Some("thread-1"),
                 Some("turn-1"),
             ),
             event(
                 11,
+                json!({"type":"code_cell_ended","runtime_cell_id":"cell-1","status":"completed"}),
+                Some("thread-1"),
+                Some("turn-1"),
+            ),
+            event(
+                12,
+                json!({"type":"codex_turn_ended","codex_turn_id":"turn-1","status":"completed"}),
+                Some("thread-1"),
+                Some("turn-1"),
+            ),
+            event(
+                13,
                 json!({"type":"thread_ended","thread_id":"thread-1","status":"completed"}),
                 None,
                 None,
             ),
             event(
-                12,
+                14,
                 json!({"type":"rollout_ended","status":"completed"}),
                 None,
                 None,
@@ -3546,6 +3622,10 @@ mod tests {
             tool["toolExecution"]["schema"]["schema_provenance"]["source"],
             "captured_runtime_registry"
         );
+        assert!(records.iter().any(|record| {
+            record["rolloutEvent"]["runtime_call_correlation"] == "deferred_runtime_completion"
+                && record["runtimeToolObservation"]["deferred_completion"] == true
+        }));
         let start = records
             .iter()
             .find(|record| record["rolloutEvent"]["event_type"] == "rollout_started")
@@ -3571,9 +3651,10 @@ mod tests {
                 "tools":[
                     {"runtime_item_type":"function","runtime_tool":"exec_command","tool":{
                         "name":"exec_command","description":"Execute a command.",
-                        "parameters":{"type":"object","properties":{"cmd":{
-                            "type":"string","description":"Command to execute."
-                        }},"required":["cmd"]}
+                        "parameters":{"type":"object","properties":{
+                            "cmd":{"type":"string","description":"Command to execute."},
+                            "cwd":{"type":"string"}
+                        },"required":["cmd"]}
                     }},
                     {"runtime_item_type":"custom","runtime_tool":"apply_patch","tool":{
                         "name":"apply_patch","description":"Apply a patch.",
@@ -3651,6 +3732,62 @@ mod tests {
             snapshot["toolRegistry"]["captured_at"],
             format_timestamp(1787961600003_i64).unwrap()
         );
+    }
+
+    #[test]
+    fn request_native_format_matches_runtime_registry_without_fabrication() {
+        let format = json!({
+            "type":"grammar",
+            "syntax":"lark",
+            "definition":"start: /.+/"
+        });
+        let registry = load_tool_registry_value(&json!({
+            "schema_version":"chiptrace.tool-registry.v1",
+            "producer":"codex-cli",
+            "producer_version":"0.150.0-alpha.9",
+            "tools":[{"runtime_item_type":"custom","runtime_tool":"exec",
+                "runtime_namespace":"functions","tool":{
+                    "type":"custom",
+                    "name":"exec",
+                    "description":"Execute tool code.",
+                    "format":format
+                }
+            }]
+        }))
+        .unwrap();
+        let mut context = BundleContext::default();
+        install_tool_registry(&mut context, Some(&registry)).unwrap();
+
+        collect_request_tool_schemas(
+            &json!({
+                "input":[{"type":"additional_tools","role":"developer","tools":[{
+                    "type":"namespace",
+                    "name":"functions",
+                    "description":"",
+                    "tools":[{
+                        "type":"custom",
+                        "name":"exec",
+                        "description":"Execute tool code.",
+                        "format":format
+                    }]
+                }]}]
+            }),
+            &mut context,
+        )
+        .unwrap();
+
+        assert_eq!(context.tool_schemas.len(), 1);
+        let schema = &context.tool_schemas["exec"];
+        assert!(schema.get("parameters").is_none());
+        assert_eq!(schema["format"], format);
+        assert_eq!(
+            schema["schema_provenance"]["source"],
+            "captured_runtime_registry_native_format"
+        );
+        assert_eq!(schema["schema_provenance"]["source_complete"], true);
+        assert_eq!(schema["schema_provenance"]["generated_adapter"], false);
+        assert!(complete_tool_contract(schema, "exec"));
+        assert!(schema.get("parameters").is_none());
     }
 
     #[test]

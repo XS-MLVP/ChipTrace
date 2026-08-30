@@ -171,6 +171,82 @@ pub fn registry_entry_identity(entry: &ToolRegistryEntry) -> Result<String> {
     ))
 }
 
+/// Buyer-facing completeness is a quality property, not an ingestion
+/// precondition. Runtime registries are preserved even when the producer did
+/// not describe every parameter; callers use this predicate to keep those
+/// schemas out of strict releases without fabricating the missing fields.
+pub fn tool_definition_source_complete(value: &Value, expected_name: &str) -> bool {
+    let nested = value.get("function").unwrap_or(value);
+    if nested.get("name").and_then(Value::as_str) != Some(expected_name)
+        || nested
+            .get("description")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        || nested
+            .pointer("/schema_provenance/generated_adapter")
+            .and_then(Value::as_bool)
+            == Some(true)
+        || nested
+            .pointer("/schema_provenance/source_complete")
+            .and_then(Value::as_bool)
+            == Some(false)
+    {
+        return false;
+    }
+
+    complete_json_parameters(nested) || complete_native_format(nested)
+}
+
+fn complete_json_parameters(tool: &Value) -> bool {
+    tool.get("parameters")
+        .and_then(Value::as_object)
+        .is_some_and(|parameters| {
+            parameters.get("type").and_then(Value::as_str) == Some("object")
+                && parameters
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|properties| {
+                        properties.values().all(|property| {
+                            property.as_object().is_some_and(|property| {
+                                (property.get("type").is_some()
+                                    || property.get("oneOf").is_some()
+                                    || property.get("anyOf").is_some()
+                                    || property.get("$ref").is_some())
+                                    && property
+                                        .get("description")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|value| !value.trim().is_empty())
+                            })
+                        })
+                    })
+                && parameters.get("required").is_none_or(|required| {
+                    required.as_array().is_some_and(|required| {
+                        required.iter().all(|name| {
+                            name.as_str().is_some_and(|name| {
+                                parameters
+                                    .get("properties")
+                                    .and_then(Value::as_object)
+                                    .is_some_and(|properties| properties.contains_key(name))
+                            })
+                        })
+                    })
+                })
+        })
+}
+
+fn complete_native_format(tool: &Value) -> bool {
+    tool.get("format")
+        .and_then(Value::as_object)
+        .is_some_and(|format| {
+            ["type", "syntax", "definition"].into_iter().all(|field| {
+                format
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+            })
+        })
+}
+
 fn validate_registry_tool(entry: &ToolRegistryEntry) -> Result<()> {
     if entry.runtime_item_type.trim().is_empty() {
         bail!("Tool Registry runtime_item_type must not be empty");
@@ -193,38 +269,11 @@ fn validate_registry_tool(entry: &ToolRegistryEntry) -> Result<()> {
     {
         bail!("Tool Registry runtime_namespace must not be empty");
     }
-    for field in ["name", "description"] {
-        tool.get(field)
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Tool Registry tool.{field} is required"))?;
-    }
-    if let Some(parameters) = tool.get("parameters").and_then(Value::as_object) {
-        if parameters.get("type").and_then(Value::as_str) != Some("object")
-            || !parameters.get("properties").is_some_and(Value::is_object)
-        {
-            bail!("Tool Registry parameters must be a JSON object schema");
-        }
-        if parameters["properties"]
-            .as_object()
-            .unwrap()
-            .values()
-            .any(|property| {
-                property.as_object().is_none_or(|property| {
-                    let typed = property.get("type").is_some()
-                        || property.get("oneOf").is_some()
-                        || property.get("anyOf").is_some()
-                        || property.get("$ref").is_some();
-                    let described = property
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| !value.trim().is_empty());
-                    !typed || !described
-                })
-            })
-        {
-            bail!("Tool Registry parameter properties require type and description");
-        }
+    tool.get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Tool Registry tool.name is required"))?;
+    if tool.get("parameters").is_some_and(Value::is_object) {
         return Ok(());
     }
 
@@ -234,12 +283,8 @@ fn validate_registry_tool(entry: &ToolRegistryEntry) -> Result<()> {
         .ok_or_else(|| {
             anyhow::anyhow!("Tool Registry tool requires parameters or a native format")
         })?;
-    for field in ["type", "syntax", "definition"] {
-        format
-            .get(field)
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Tool Registry tool.format.{field} is required"))?;
+    if format.is_empty() {
+        bail!("Tool Registry native format must not be empty");
     }
     Ok(())
 }
@@ -250,7 +295,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn registry_requires_complete_parameter_schemas() {
+    fn registry_preserves_incomplete_parameter_schemas_for_quality_gating() {
         let registry = json!({
             "schema_version":TOOL_REGISTRY_SCHEMA_VERSION,
             "producer":"codex-cli",
@@ -268,7 +313,11 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("description");
-        assert!(validate_tool_registry_value(&invalid).is_err());
+        validate_tool_registry_value(&invalid).unwrap();
+        assert!(!tool_definition_source_complete(
+            &invalid["tools"][0]["tool"],
+            "exec_command"
+        ));
     }
 
     #[test]

@@ -116,6 +116,20 @@ pub struct AcceptanceMetrics {
     pub runtime_dag_native_events: u64,
     pub runtime_dag_open_nodes: u64,
     pub runtime_dag_unresolved_nodes: u64,
+    #[serde(default)]
+    pub runtime_dag_status_conflicts: u64,
+    #[serde(default)]
+    pub inference_api_conservation_applicable: bool,
+    #[serde(default)]
+    pub inference_api_conservation_complete: bool,
+    #[serde(default)]
+    pub runtime_completed_inferences: u64,
+    #[serde(default)]
+    pub api_snapshots: u64,
+    #[serde(default)]
+    pub matched_runtime_inferences: u64,
+    #[serde(default)]
+    pub missing_api_captures: u64,
     pub task_dag_present: bool,
     pub task_dag_complete: bool,
     pub task_start_event_present: bool,

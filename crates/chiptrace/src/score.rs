@@ -384,6 +384,40 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         .pointer("/meta/runtime_dag/unresolved_node_ids")
         .and_then(Value::as_array)
         .map_or(0, |nodes| nodes.len() as u64);
+    let runtime_dag_status_conflicts = session
+        .pointer("/meta/runtime_dag/status_conflict_node_ids")
+        .and_then(Value::as_array)
+        .map_or(0, |nodes| nodes.len() as u64);
+    let inference_api_conservation_applicable = session
+        .pointer("/meta/inference_api_conservation/applicable")
+        .and_then(Value::as_bool)
+        .unwrap_or(runtime_dag_applicable);
+    let inference_api_conservation_complete = session
+        .pointer("/meta/inference_api_conservation/complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(!inference_api_conservation_applicable);
+    let runtime_completed_inferences = session
+        .pointer("/meta/inference_api_conservation/runtime_completed_inferences")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let api_snapshots = session
+        .pointer("/meta/inference_api_conservation/api_snapshots")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let matched_runtime_inferences = session
+        .pointer("/meta/inference_api_conservation/matched_runtime_inferences")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let missing_api_captures = session
+        .pointer("/meta/inference_api_conservation/missing_api_capture_keys")
+        .and_then(Value::as_array)
+        .map_or(0, |keys| keys.len() as u64)
+        .saturating_add(
+            session
+                .pointer("/meta/inference_api_conservation/runtime_without_correlation_capture_ids")
+                .and_then(Value::as_array)
+                .map_or(0, |captures| captures.len() as u64),
+        );
     let task_dag_present = session
         .pointer("/meta/task_dag")
         .is_some_and(Value::is_object);
@@ -484,6 +518,13 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         runtime_dag_native_events,
         runtime_dag_open_nodes,
         runtime_dag_unresolved_nodes,
+        runtime_dag_status_conflicts,
+        inference_api_conservation_applicable,
+        inference_api_conservation_complete,
+        runtime_completed_inferences,
+        api_snapshots,
+        matched_runtime_inferences,
+        missing_api_captures,
         task_dag_present,
         task_dag_complete,
         task_start_event_present,
@@ -707,7 +748,8 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
             && runtime_dag_complete
             && runtime_dag_native_events > 0
             && runtime_dag_open_nodes == 0
-            && runtime_dag_unresolved_nodes == 0);
+            && runtime_dag_unresolved_nodes == 0
+            && runtime_dag_status_conflicts == 0);
     push_gate(
         &mut gates,
         "runtime_dag_integrity",
@@ -720,10 +762,34 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
             "complete": runtime_dag_complete,
             "open_nodes": runtime_dag_open_nodes,
             "unresolved_nodes": runtime_dag_unresolved_nodes,
+            "status_conflicts": runtime_dag_status_conflicts,
         }),
-        "when native Codex bundle evidence is present, runtime DAG complete=true with at least one native event and zero open or unresolved nodes",
+        "when native Codex bundle evidence is present, runtime DAG complete=true with at least one native event and zero open, unresolved, or terminal-status-conflict nodes",
         Some(
             "API-only Sessions are not reclassified as runtime-complete; native runtime evidence cannot be omitted to bypass this gate",
+        ),
+    );
+    let inference_api_conservation_pass = !inference_api_conservation_applicable
+        || (inference_api_conservation_complete
+            && runtime_completed_inferences > 0
+            && matched_runtime_inferences == runtime_completed_inferences
+            && missing_api_captures == 0);
+    push_gate(
+        &mut gates,
+        "inference_api_conservation",
+        inference_api_conservation_pass,
+        true,
+        json!({
+            "applicable":inference_api_conservation_applicable,
+            "complete":inference_api_conservation_complete,
+            "runtime_completed_inferences":runtime_completed_inferences,
+            "api_snapshots":api_snapshots,
+            "matched_runtime_inferences":matched_runtime_inferences,
+            "missing_api_captures":missing_api_captures,
+        }),
+        "every completed native inference is exactly correlated to a captured API snapshot",
+        Some(
+            "matching uses exact upstream request or response IDs; task, time, model, and thread proximity are never accepted as substitutes",
         ),
     );
     let model_result = model_eligible(session, profile);
@@ -847,6 +913,9 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         || session.pointer("/meta/rollout_unmapped_tools").is_none()
         || session.pointer("/meta/capture_dag").is_none()
         || session.pointer("/meta/task_dag").is_none()
+        || session
+            .pointer("/meta/inference_api_conservation")
+            .is_none()
     {
         warnings.push("assembly_integrity_evidence_missing".to_owned());
     }
@@ -1872,7 +1941,7 @@ pub fn assessment_contract_valid(
     profile: Profile,
     minimum_score: f64,
 ) -> bool {
-    const REQUIRED_GATES: [&str; 15] = [
+    const REQUIRED_GATES: [&str; 16] = [
         "required_fields",
         "message_roles",
         "first_message_role",
@@ -1885,6 +1954,7 @@ pub fn assessment_contract_valid(
         "machine_turn_ratio",
         "assembly_integrity",
         "runtime_dag_integrity",
+        "inference_api_conservation",
         "model",
         "session_closed",
         "content_domain",
@@ -2013,6 +2083,15 @@ mod tests {
             .unwrap();
         assert!(!gate.pass);
         assert_eq!(quality.buyer_acceptance.metrics.runtime_dag_open_nodes, 1);
+        assert!(
+            !quality
+                .buyer_acceptance
+                .gates
+                .iter()
+                .find(|gate| gate.name == "inference_api_conservation")
+                .unwrap()
+                .pass
+        );
 
         session["meta"]["runtime_dag"]["complete"] = json!(true);
         session["meta"]["runtime_dag"]["open_node_ids"] = json!([]);
@@ -2024,6 +2103,24 @@ mod tests {
             .find(|gate| gate.name == "runtime_dag_integrity")
             .unwrap();
         assert!(gate.pass);
+
+        session["meta"]["runtime_dag"]["complete"] = json!(false);
+        session["meta"]["runtime_dag"]["status_conflict_node_ids"] = json!(["tool-1"]);
+        let quality = assess_session(&session, Profile::BuyerV7, 90.0);
+        let gate = quality
+            .buyer_acceptance
+            .gates
+            .iter()
+            .find(|gate| gate.name == "runtime_dag_integrity")
+            .unwrap();
+        assert!(!gate.pass);
+        assert_eq!(
+            quality
+                .buyer_acceptance
+                .metrics
+                .runtime_dag_status_conflicts,
+            1
+        );
 
         session["meta"]
             .as_object_mut()
@@ -2037,6 +2134,86 @@ mod tests {
             .find(|gate| gate.name == "runtime_dag_integrity")
             .unwrap();
         assert!(!gate.pass);
+    }
+
+    #[test]
+    fn runtime_dag_without_conservation_evidence_cannot_bypass_the_gate() {
+        let session = json!({
+            "trajectory_id":"runtime-conservation-fallback",
+            "session_id":"runtime-conservation-fallback",
+            "provider":"OpenAI",
+            "model":"gpt-5.6-sol",
+            "created_at":"2026-08-30T00:00:00Z",
+            "status":"incomplete",
+            "is_final_snapshot":false,
+            "source_request_count":0,
+            "system_prompt":"system",
+            "tools":[],
+            "messages":[{"role":"system","content":"system"}],
+            "usage":{},
+            "meta":{
+                "runtime_dag":{
+                    "applicable":true,
+                    "native_event_count":1,
+                    "complete":true,
+                    "open_node_ids":[],
+                    "unresolved_node_ids":[]
+                }
+            }
+        });
+
+        let quality = assess_session(&session, Profile::BuyerV7, 90.0);
+        let gate = quality
+            .buyer_acceptance
+            .gates
+            .iter()
+            .find(|gate| gate.name == "inference_api_conservation")
+            .unwrap();
+        assert!(!gate.pass);
+        assert!(
+            quality
+                .buyer_acceptance
+                .metrics
+                .inference_api_conservation_applicable
+        );
+    }
+
+    #[test]
+    fn native_inference_api_loss_is_a_separate_hard_gate() {
+        let session = json!({
+            "trajectory_id":"inference-api-loss",
+            "session_id":"inference-api-loss",
+            "provider":"openai",
+            "model":"gpt-5.6-sol",
+            "created_at":"2026-08-29T00:00:00Z",
+            "status":"completed",
+            "is_final_snapshot":true,
+            "source_request_count":10,
+            "system_prompt":"system",
+            "tools":[],
+            "messages":[{"role":"system","content":"system"}],
+            "usage":{},
+            "meta":{
+                "inference_api_conservation":{
+                    "applicable":true,
+                    "complete":false,
+                    "runtime_completed_inferences":11,
+                    "api_snapshots":10,
+                    "matched_runtime_inferences":10,
+                    "missing_api_capture_keys":["upstream_request_id:missing"],
+                    "runtime_without_correlation_capture_ids":[]
+                }
+            }
+        });
+        let quality = assess_session(&session, Profile::BuyerV7, 90.0);
+        let gate = quality
+            .buyer_acceptance
+            .gates
+            .iter()
+            .find(|gate| gate.name == "inference_api_conservation")
+            .unwrap();
+        assert!(!gate.pass);
+        assert_eq!(quality.buyer_acceptance.metrics.missing_api_captures, 1);
     }
 
     #[test]

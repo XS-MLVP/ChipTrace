@@ -50,6 +50,8 @@ all_required_gates_pass && score >= minimum_score
 任何 Assembly 冲突、producer sequence 缺口/重复、工具状态机不闭合、DAG 环、
 未解析父节点、工具 schema 缺失、非法工具参数或未配对结果都不能由高分抵消。工具
 执行状态只从真实事件或返回字段读取；缺失状态为 `unknown`，不会被清洗为成功。
+存在原生 runtime 时，`runtime_dag_integrity` 和 `inference_api_conservation` 也是独立
+hard gate：前者拒绝 open/unresolved 节点，后者拒绝任一完成推理没有精确 API Capture。
 
 ## 当前线上样本复核
 
@@ -138,13 +140,43 @@ API/rollout/Sub2API 精确关联工作正常，也证明生产者语义不完整
 
 该 canary 同时覆盖了 lineage 守恒回归：Assembly、Enrich、Release 各自拒绝将
 lineaged 输入与 legacy 无 lineage 输入混入同一产物；全 lineaged 或全 legacy 的
-既有路径保持兼容。三条混合输入测试与全工作区 166 条测试均通过，Clippy 在
+既有路径保持兼容。三条混合输入测试与全工作区 185 条测试均通过，Clippy 在
 `-D warnings` 下无告警。
 
 失败尝试遵循同一证据边界：没有模型响应、provider 报告或精确 usage 的纯拒绝请求仍
 进入 Session 的原始消息和 Capture 计数，但在
 `model_evidence.non_attestable_api_snapshots` 中显式标记，不以缺失账单行伪造 Token
 或 provider 证明；同一 Session 中其他成功请求的精确证明不会被这类失败尝试错误阻断。
+
+## 多 rollout 真实闭环 canary v5（2026-08-30）
+
+隔离环境使用新的入口 outbox、Relay 和 Collector，通过 `codex-run begin/finish` 在
+同一显式任务下执行两个真实 Codex rollout。未修改或重启线上 `18084` 及生产
+Relay/Collector。原始证据目录为
+`/var/tmp/chiptrace-full-proof-v5-20260830-eMWhHz`。
+
+| 阶段 | 结果 |
+| --- | --- |
+| Producer Capture | 139 条：14 API snapshot、3 lifecycle、98 rollout、24 tool execution |
+| 任务边界 | 一个 `task_session_id`、两个 rollout 根；Harness 只生成一次 task start/end |
+| Runtime DAG | `task_scoped_rollout_forest`；unknown/unmapped/open/unresolved/conflict 均为 0 |
+| inference/API 守恒 | 14 个 completed inference 与 14 个 API Capture 通过精确 ID 全部配对 |
+| buyer-v7 | 14 个有效轮次、2 个真实 User -> Assistant 轮、12 次调用、5 个不同工具、12/12 结果配对、1 次真实失败；100 分、全部 hard gate 通过 |
+| 模型证据 | `provider=openai`、`model=gpt-5.6-sol`，Sub2API 路由证明完整 |
+| Token | API input 225,400，其中 cached input 211,712；output 3,054；reasoning 1,435；normalized corpus 17,369；supervised output 2,634 |
+| Raw lineage | sealed WAL 139 条、6,697,716 bytes；Archive/Verify/Restore、记录数与 SHA-256 全部通过 |
+| Buyer package | UTF-8 JSONL + tar.gz，`lineage_status=complete`，Release 与采购包验证通过 |
+
+当前二进制已从 v5 的 `raw-restored` 重新执行 Enrich、Assembly、Score、Release 和
+Buyer Package，结果仍为 100 分、14/14 守恒和 1/1 eligible。直接跳过 Enrich 的
+对照组为 95 分并仅失败于 `model` Gate，证明缺少 Sub2API provider 路由证据时不会
+被模型名称字符串误放行。
+
+前一轮隔离验证曾出现 11 个 completed inference 只有 10 个 API Capture，buyer-v7
+因此被新守恒 Gate 拒绝。根因是入口容器仍运行旧 direct-to-Relay 进程，没有加载已
+落盘的入口 outbox 代码。v5 使用新隔离入口后 `accepted/localDurable/durable=14/14/14`，
+pending/processing/failed/conflict/rejected 全为 0。这一对照证明守恒 Gate 能暴露真实
+漏采，也证明 Assembly、Score 和 Release 无需通过伪造或近似关联修补数据。
 
 ## 正式交付门槛
 
