@@ -39,7 +39,8 @@
       ]
     },
     "is_final_snapshot": {"type": "boolean"},
-    "source_request_count": {"type": "integer", "minimum": 1},
+    "source_request_count": {"type": "integer", "minimum": 0},
+    "source_capture_count": {"type": "integer", "minimum": 1},
     "system_prompt": {"type": "string"},
     "tools": {
       "type": "array",
@@ -76,11 +77,25 @@
       ],
       "properties": {
         "name": {"type": "string", "minLength": 1},
+        "runtime_tool": {"type": "string", "minLength": 1},
+        "runtime_namespace": {"type": "string", "minLength": 1},
         "description": {"type": "string"},
         "parameters": {"type": "object"},
         "type": {"type": "string"},
         "schema_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "schema_version": {"type": ["string", "integer"]}
+        "schema_version": {"type": ["string", "integer"]},
+        "native_format": {},
+        "schema_provenance": {
+          "type": "object",
+          "required": ["source", "source_complete", "generated_adapter"],
+          "properties": {
+            "source": {"enum": ["captured_json_schema", "captured_native_format", "missing"]},
+            "source_complete": {"type": "boolean"},
+            "adapter_version": {"type": ["string", "null"]},
+            "generated_adapter": {"type": "boolean"}
+          },
+          "additionalProperties": true
+        }
       },
       "additionalProperties": true
     },
@@ -100,7 +115,7 @@
           "additionalProperties": true
         },
         "execution_status": {
-          "enum": ["executed", "failed", "open_tail", "unpaired"]
+          "enum": ["executed", "failed", "unknown", "open_tail", "unpaired"]
         },
         "result_status": {"type": "string"},
         "result_message_index": {"type": "integer", "minimum": 0}
@@ -120,6 +135,8 @@
         "tool_call_id": {"type": ["string", "null"]},
         "status": {"type": "string"},
         "is_error": {"type": "boolean"},
+        "status_source": {"type": "string"},
+        "status_conflict": {"type": "boolean"},
         "reasoning": {},
         "thinking": {},
         "meta": {"type": "object"}
@@ -147,6 +164,9 @@
             "properties": {
               "node_id": {"type": "string"},
               "capture_id": {"type": "string"},
+              "record_type": {
+                "enum": ["api_snapshot", "lifecycle_event", "tool_execution", "evaluation", "rollout_event"]
+              },
               "response_id": {"type": ["string", "null"]},
               "previous_response_id": {"type": ["string", "null"]},
               "timestamp": {"type": "string"},
@@ -154,6 +174,7 @@
               "http_status": {"type": ["integer", "null"]},
               "disposition": {"enum": ["executed", "retry", "abandoned", "open_tail"]},
               "lifecycle_events": {"type": "array", "items": {"type": "string"}},
+              "lifecycle_event_records": {"type": "array", "items": {"type": "object"}},
               "trace": {"type": "object"}
             },
             "additionalProperties": true
@@ -164,8 +185,76 @@
         "tips": {"type": "array", "items": {"type": "string"}},
         "open_tail_call_ids": {"type": "array", "items": {"type": "string"}},
         "unresolved_parent_response_ids": {"type": "array", "items": {"type": "string"}},
+        "unresolved_parent_span_ids": {"type": "array", "items": {"type": "string"}},
         "has_cycle": {"type": "boolean"},
         "disposition_counts": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "runtimeDag": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "source",
+        "native_event_count",
+        "nodes",
+        "edges",
+        "roots",
+        "open_node_ids",
+        "unresolved_node_ids",
+        "terminal_rollout_ids",
+        "kind_counts",
+        "disposition_counts",
+        "complete",
+        "applicable"
+      ],
+      "properties": {
+        "schema_version": {"const": "chiptrace.runtime-dag.v1"},
+        "source": {"const": "codex_rollout_trace_bundle"},
+        "native_event_count": {"type": "integer", "minimum": 0},
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["node_id", "node_type", "source_id", "trace_id", "status", "disposition"],
+            "properties": {
+              "node_id": {"type": "string", "minLength": 1},
+              "node_type": {
+                "enum": ["rollout", "thread", "turn", "inference", "code_cell", "tool", "compaction"]
+              },
+              "source_id": {"type": "string", "minLength": 1},
+              "trace_id": {"type": "string", "minLength": 1},
+              "status": {
+                "enum": ["running", "completed", "failed", "cancelled", "aborted", "terminated", "incomplete"]
+              },
+              "disposition": {"enum": ["executed", "retry", "abandoned", "open_tail"]},
+              "started_seq": {"type": "integer", "minimum": 0},
+              "ended_seq": {"type": "integer", "minimum": 0}
+            },
+            "additionalProperties": true
+          }
+        },
+        "edges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["from", "to", "kind"],
+            "properties": {
+              "from": {"type": "string", "minLength": 1},
+              "to": {"type": "string", "minLength": 1},
+              "kind": {"type": "string", "minLength": 1}
+            },
+            "additionalProperties": true
+          }
+        },
+        "roots": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "open_node_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "unresolved_node_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "terminal_rollout_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "kind_counts": {"type": "object"},
+        "disposition_counts": {"type": "object"},
+        "complete": {"type": "boolean"},
+        "applicable": {"type": "boolean"}
       },
       "additionalProperties": true
     },
@@ -211,32 +300,140 @@
         "session_identity_source",
         "source_namespace",
         "capture_dag",
+        "runtime_dag",
         "task_dag",
         "task_role",
         "lifecycle_events",
+        "tool_executions",
+        "tool_execution_conflicts",
+        "producer_streams",
+        "producer_event_conflicts",
         "evaluation_evidence",
         "schema_conflicts",
         "trace_conflicts",
+        "usage_evidence",
+        "usage_settlement_evidence",
+        "usage_conflicts",
+        "rollout_events",
+        "rollout_usage_evidence",
+        "rollout_unknown_events",
+        "rollout_unmapped_tools",
         "merge_divergences",
         "model_evidence",
         "trace"
       ],
       "properties": {
         "source_request_ids": {"type": "array", "items": {"type": "string"}},
+        "source_client_request_ids": {"type": "array", "items": {"type": "string"}},
+        "source_capture_ids": {"type": "array", "items": {"type": "string"}},
         "response_ids": {"type": "array", "items": {"type": "string"}},
         "session_identity_source": {"type": "string"},
         "source_namespace": {"type": "string"},
+        "trace_contexts": {"type": "array", "items": {"type": "object"}},
         "capture_dag": {"$ref": "#/$defs/captureDag"},
+        "runtime_dag": {"$ref": "#/$defs/runtimeDag"},
         "task_dag": {"$ref": "#/$defs/taskDag"},
         "task_role": {"enum": ["root", "subagent"]},
         "lifecycle_events": {"type": "array", "items": {"type": "string"}},
+        "lifecycle_event_records": {"type": "array", "items": {"type": "object"}},
+        "turn_ids": {"type": "array", "items": {"type": "string"}},
+        "previous_response_ids": {"type": "array", "items": {"type": "string"}},
+        "tool_executions": {"type": "array", "items": {"type": "object"}},
+        "tool_execution_conflicts": {"type": "array", "items": {"type": "string"}},
+        "producer_streams": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "producer",
+              "stream_id",
+              "first_sequence",
+              "last_sequence",
+              "event_count",
+              "capture_ids",
+              "duplicate_sequences",
+              "duplicate_event_ids",
+              "gaps",
+              "contiguous"
+            ],
+            "properties": {
+              "producer": {"type": "string", "minLength": 1},
+              "stream_id": {"type": "string", "minLength": 1},
+              "producer_versions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "uniqueItems": true
+              },
+              "first_sequence": {"type": "integer", "minimum": 0},
+              "last_sequence": {"type": "integer", "minimum": 0},
+              "event_count": {"type": "integer", "minimum": 1},
+              "capture_ids": {"type": "array", "items": {"type": "string"}},
+              "duplicate_sequences": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 0},
+                "uniqueItems": true
+              },
+              "duplicate_event_ids": {"type": "boolean"},
+              "gaps": {"type": "array", "items": {"type": "object"}},
+              "contiguous": {"type": "boolean"}
+            },
+            "additionalProperties": true
+          }
+        },
+        "producer_event_conflicts": {"type": "array", "items": {"type": "string"}},
+        "tool_registry_evidence": {"type": "array", "items": {"type": "object"}},
+        "field_evidence": {"type": "array", "items": {"type": "object"}},
+        "protocol_conflicts": {"type": "array", "items": {"type": "object"}},
+        "system_prompt_evidence": {"type": "array", "items": {"type": "object"}},
+        "system_prompt_conflicts": {"type": "array", "items": {"type": "string"}},
+        "system_prompt_variants": {"type": "array", "items": {"type": "string"}},
         "evaluation_evidence": {"type": "array", "items": {"type": "object"}},
         "schema_conflicts": {"type": "array", "items": {"type": "string"}},
         "trace_conflicts": {"type": "array", "items": {"type": "string"}},
+        "usage_evidence": {"type": "array", "items": {"type": "object"}},
+        "usage_settlement_evidence": {"type": "array", "items": {"type": "object"}},
+        "usage_conflicts": {"type": "array", "items": {"type": "string"}},
+        "rollout_events": {"type": "array", "items": {"type": "object"}},
+        "rollout_usage_evidence": {"type": "array", "items": {"type": "object"}},
+        "rollout_unknown_events": {"type": "array", "items": {"type": "string"}},
+        "rollout_unmapped_tools": {"type": "array", "items": {"type": "string"}},
         "merge_divergences": {"type": "integer", "minimum": 0},
         "model_evidence": {
           "type": "object",
-          "required": ["request_models", "response_models", "providers", "attested", "scope"]
+          "required": [
+            "request_models",
+            "response_models",
+            "effective_models",
+            "providers",
+            "consistent",
+            "proxy_route_verified",
+            "provider_identity_attested",
+            "attested",
+            "scope"
+          ],
+          "properties": {
+            "request_models": {"type": "array", "items": {"type": "string"}},
+            "response_models": {"type": "array", "items": {"type": "string"}},
+            "gateway_requested_models": {"type": "array", "items": {"type": "string"}},
+            "gateway_upstream_models": {"type": "array", "items": {"type": "string"}},
+            "effective_models": {"type": "array", "items": {"type": "string"}},
+            "providers": {"type": "array", "items": {"type": "string"}},
+            "provider_candidates": {"type": "array", "items": {"type": "string"}},
+            "gateway_providers": {"type": "array", "items": {"type": "string"}},
+            "model_mapping_chains": {"type": "array", "items": {"type": "string"}},
+            "gateway_evidence": {"type": "array", "items": {"type": "object"}},
+            "provider_evidence": {"type": "array", "items": {"type": "object"}},
+            "conflicts": {"type": "array", "items": {"type": "string"}},
+            "consistent": {"type": "boolean"},
+            "proxy_route_verified": {"type": "boolean"},
+            "provider_identity_attested": {"type": "boolean"},
+            "api_snapshot_count": {"type": "integer", "minimum": 0},
+            "attestation_candidate_count": {"type": "integer", "minimum": 0},
+            "non_attestable_api_snapshots": {"type": "array", "items": {"type": "object"}},
+            "attested": {"type": "boolean"},
+            "scope": {"type": "string"}
+          },
+          "additionalProperties": true
         },
         "trace": {"type": "object"}
       },

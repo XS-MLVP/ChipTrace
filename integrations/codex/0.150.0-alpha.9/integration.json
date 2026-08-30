@@ -1,0 +1,13 @@
+{
+  "schema_version": "chiptrace.codex-integration.v1",
+  "integration": "codex-runtime-tool-registry",
+  "upstream_repository": "https://github.com/openai/codex",
+  "upstream_tag": "rust-v0.150.0-alpha.9",
+  "upstream_commit": "a1a7e0b1d11436a3c33d14b2f019004bdf453777",
+  "patch_file": "runtime-tool-registry.patch",
+  "patch_sha256": "a392999dfc70bc03b99b18ef57ab5c793f25d89e34f77f88682b76e72aec09f3",
+  "producer_schema": "codex.runtime-tool-registry.v1",
+  "consumer_schema": "chiptrace.tool-registry.v1",
+  "verified_at": "2026-08-30",
+  "rust_toolchain": "1.95.0"
+}

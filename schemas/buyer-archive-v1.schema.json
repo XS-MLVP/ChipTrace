@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/buyer-archive-v1.schema.json",
+  "title": "ChipTrace buyer archive metadata v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "release_id",
+    "buyer_profile",
+    "minimum_score",
+    "format",
+    "encoding",
+    "session_atomic",
+    "source_part",
+    "lineage_status",
+    "records",
+    "jsonl_file",
+    "jsonl_bytes",
+    "jsonl_sha256",
+    "validation_status"
+  ],
+  "properties": {
+    "schema_version": {"const": "chiptrace.buyer-archive.v1"},
+    "release_id": {"type": "string", "minLength": 1},
+    "buyer_profile": {"const": "buyer-v7"},
+    "minimum_score": {"type": "number", "minimum": 90, "maximum": 100},
+    "format": {"const": "one complete Session per JSONL line"},
+    "encoding": {"const": "UTF-8"},
+    "session_atomic": {"const": true},
+    "source_part": {"type": "string", "minLength": 1},
+    "lineage_status": {"enum": ["complete", "legacy_unbound"]},
+    "records": {"type": "integer", "minimum": 1},
+    "jsonl_file": {"const": "sessions.jsonl"},
+    "jsonl_bytes": {"type": "integer", "minimum": 1},
+    "jsonl_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "validation_status": {"const": "pass"}
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/raw-checkpoint-v1.schema.json",
+  "title": "ChipTrace Raw Archive Checkpoint v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "archive_id",
+    "state",
+    "completeness",
+    "committed_at_utc",
+    "manifest_key",
+    "manifest_sha256",
+    "segment_count",
+    "total_records",
+    "total_bytes"
+  ],
+  "properties": {
+    "schema_version": {"const": "chiptrace.raw-checkpoint.v1"},
+    "archive_id": {"type": "string", "minLength": 1},
+    "state": {"const": "committed"},
+    "completeness": {"enum": ["complete", "partial"]},
+    "committed_at_utc": {"type": "string", "minLength": 1},
+    "manifest_key": {"type": "string", "minLength": 1},
+    "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "segment_count": {"type": "integer", "minimum": 1},
+    "total_records": {"type": "integer", "minimum": 1},
+    "total_bytes": {"type": "integer", "minimum": 1}
+  },
+  "additionalProperties": false
+}

@@ -1,5 +1,6 @@
 use crate::capture::{CaptureRecord, normalize_capture, normalize_capture_batch};
 use crate::ingest::{BodyReadError, InflightBodyBudget};
+use crate::producer::{prepare_producer_capture, prepare_producer_capture_batch};
 use crate::sharded::{ShardedCaptureStore, ShardedStoreHealth};
 use crate::store::{CaptureLocator, StoreConfig, SubmitAck, SubmitError, SubmitErrorKind};
 use anyhow::{Context, Result, bail};
@@ -606,6 +607,10 @@ impl DurableRelay {
 
     pub async fn enqueue(&self, raw: &[u8]) -> Result<SubmitAck> {
         let record = normalize_capture(raw, self.inner.config.max_envelope_bytes)?;
+        self.enqueue_record(record).await
+    }
+
+    async fn enqueue_record(&self, record: CaptureRecord) -> Result<SubmitAck> {
         let capture_id = record.capture_id.clone();
         let raw_sha256 = record.sha256.clone();
         let ack = self
@@ -1175,6 +1180,8 @@ pub async fn serve_relay(
     let app = Router::new()
         .route("/capture", post(relay_capture))
         .route("/captures", post(relay_captures))
+        .route("/producer/event", post(relay_producer_event))
+        .route("/producer/events", post(relay_producer_events))
         .route("/health", get(relay_health))
         .route("/flush", post(relay_flush))
         .fallback(relay_not_found)
@@ -1219,6 +1226,31 @@ async fn relay_captures(State(state): State<RelayAppState>, request: Request) ->
             );
         }
     };
+    relay_enqueue_batch(&state, records).await
+}
+
+async fn relay_producer_events(State(state): State<RelayAppState>, request: Request) -> Response {
+    let body = match state.body_budget.read_ndjson(request).await {
+        Ok(body) => body,
+        Err(error) => return relay_body_error_response(error),
+    };
+    let records = match prepare_producer_capture_batch(
+        &body.bytes,
+        state.relay.inner.config.max_envelope_bytes,
+        state.max_batch_records,
+    ) {
+        Ok(records) => records,
+        Err(error) => {
+            return relay_response(
+                StatusCode::BAD_REQUEST,
+                json!({"ok": false, "reason": "invalid_producer_event_batch", "detail": error.to_string()}),
+            );
+        }
+    };
+    relay_enqueue_batch(&state, records).await
+}
+
+async fn relay_enqueue_batch(state: &RelayAppState, records: Vec<CaptureRecord>) -> Response {
     let capture_ids: Vec<String> = records
         .iter()
         .map(|record| record.capture_id.clone())
@@ -1301,6 +1333,55 @@ async fn relay_captures(State(state): State<RelayAppState>, request: Request) ->
             "results": outcomes,
         }),
     )
+}
+
+async fn relay_producer_event(State(state): State<RelayAppState>, request: Request) -> Response {
+    let body = match state.body_budget.read_json(request).await {
+        Ok(body) => body,
+        Err(error) => return relay_body_error_response(error),
+    };
+    let record = match prepare_producer_capture(
+        &body.bytes,
+        state.relay.inner.config.max_envelope_bytes,
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            return relay_response(
+                StatusCode::BAD_REQUEST,
+                json!({"ok":false,"reason":"invalid_producer_event","detail":error.to_string()}),
+            );
+        }
+    };
+    match state.relay.enqueue_record(record).await {
+        Ok(ack) => relay_response(
+            if ack.duplicate {
+                StatusCode::OK
+            } else {
+                StatusCode::ACCEPTED
+            },
+            json!({
+                "ok":true,
+                "durable":true,
+                "local_durable":true,
+                "duplicate":ack.duplicate,
+                "capture":ack,
+            }),
+        ),
+        Err(error)
+            if error
+                .downcast_ref::<crate::store::SubmitError>()
+                .is_some_and(|error| error.kind == SubmitErrorKind::Conflict) =>
+        {
+            relay_response(
+                StatusCode::CONFLICT,
+                json!({"ok":false,"reason":"capture_id_conflict"}),
+            )
+        }
+        Err(error) => relay_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"ok":false,"reason":"relay_unavailable","detail":error.to_string()}),
+        ),
+    }
 }
 
 async fn relay_capture(State(state): State<RelayAppState>, request: Request) -> Response {

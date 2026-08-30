@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/buyer-package-v1.schema.json",
+  "title": "ChipTrace buyer package manifest v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "release_id",
+    "created_at_utc",
+    "format",
+    "encoding",
+    "archive_format",
+    "buyer_profile",
+    "minimum_score",
+    "source_release_manifest_sha256",
+    "lineage_status",
+    "raw_sources",
+    "eligible_sessions",
+    "eligible_tokens",
+    "packages",
+    "validation_status"
+  ],
+  "properties": {
+    "schema_version": {"const": "chiptrace.buyer-package.v1"},
+    "release_id": {"type": "string", "minLength": 1},
+    "created_at_utc": {"type": "string"},
+    "format": {"type": "string", "minLength": 1},
+    "encoding": {"const": "UTF-8"},
+    "archive_format": {"type": "string", "pattern": "^tar\\.gz; gzip-[0-9]$"},
+    "buyer_profile": {"const": "buyer-v7"},
+    "minimum_score": {"type": "number", "minimum": 90, "maximum": 100},
+    "source_release_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "lineage_status": {"enum": ["complete", "legacy_unbound"]},
+    "raw_sources": {
+      "type": "array",
+      "items": {"$ref": "raw-lineage-v1.schema.json"}
+    },
+    "eligible_sessions": {"type": "integer", "minimum": 1},
+    "eligible_tokens": {"$ref": "release-manifest-v1.schema.json#/$defs/tokenCounts"},
+    "packages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "file",
+          "sha256",
+          "bytes",
+          "records",
+          "jsonl_bytes",
+          "jsonl_sha256",
+          "source_part"
+        ],
+        "properties": {
+          "file": {"type": "string", "pattern": "^packages/sessions-part-[0-9]{5}\\.tar\\.gz$"},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "bytes": {"type": "integer", "minimum": 1},
+          "records": {"type": "integer", "minimum": 1},
+          "jsonl_bytes": {"type": "integer", "minimum": 1},
+          "jsonl_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "source_part": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "validation_status": {"const": "pass"}
+  },
+  "additionalProperties": false
+}

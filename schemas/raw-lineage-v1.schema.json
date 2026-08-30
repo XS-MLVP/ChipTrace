@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/raw-lineage-v1.schema.json",
+  "title": "ChipTrace Raw Source Lineage v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "archive_id",
+    "completeness",
+    "checkpoint_key",
+    "checkpoint_sha256",
+    "manifest_key",
+    "manifest_sha256",
+    "segment_count",
+    "total_records",
+    "total_bytes"
+  ],
+  "properties": {
+    "schema_version": {"const": "chiptrace.raw-lineage.v1"},
+    "archive_id": {"type": "string", "minLength": 1},
+    "completeness": {"enum": ["complete", "partial"]},
+    "checkpoint_key": {"type": "string", "minLength": 1},
+    "checkpoint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "manifest_key": {"type": "string", "minLength": 1},
+    "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "segment_count": {"type": "integer", "minimum": 1},
+    "total_records": {"type": "integer", "minimum": 1},
+    "total_bytes": {"type": "integer", "minimum": 1}
+  },
+  "additionalProperties": false
+}

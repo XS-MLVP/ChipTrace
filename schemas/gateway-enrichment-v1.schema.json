@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/gateway-enrichment-v1.schema.json",
+  "title": "ChipTrace gateway enrichment manifest v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "created_at_utc",
+    "capture_inputs",
+    "usage_log_inputs",
+    "input_records",
+    "output_records",
+    "usage_rows",
+    "usable_usage_rows",
+    "invalid_usage_rows",
+    "matched",
+    "already_enriched",
+    "unmatched",
+    "ambiguous",
+    "conflicting_existing_evidence",
+    "output_sha256",
+    "output_bytes",
+    "output_file",
+    "match_rule_counts",
+    "unmatched_reason_counts"
+  ],
+  "properties": {
+    "schema_version": {"const": "chiptrace.gateway-enrichment.v1"},
+    "created_at_utc": {"type": "string", "minLength": 1},
+    "capture_inputs": {"type": "array", "items": {"$ref": "#/$defs/source"}},
+    "usage_log_inputs": {"type": "array", "items": {"$ref": "#/$defs/source"}},
+    "raw_sources": {"type": "array", "items": {"type": "object"}},
+    "input_records": {"type": "integer", "minimum": 0},
+    "output_records": {"type": "integer", "minimum": 0},
+    "usage_rows": {"type": "integer", "minimum": 0},
+    "usable_usage_rows": {"type": "integer", "minimum": 0},
+    "invalid_usage_rows": {"type": "integer", "minimum": 0},
+    "matched": {"type": "integer", "minimum": 0},
+    "already_enriched": {"type": "integer", "minimum": 0},
+    "unmatched": {"type": "integer", "minimum": 0},
+    "ambiguous": {"type": "integer", "minimum": 0},
+    "conflicting_existing_evidence": {"type": "integer", "minimum": 0},
+    "output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "output_bytes": {"type": "integer", "minimum": 0},
+    "output_file": {"const": "captures/enriched-captures.jsonl.zst"},
+    "match_rule_counts": {
+      "type": "object",
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "unmatched_reason_counts": {
+      "type": "object",
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "bytes": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

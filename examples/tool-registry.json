@@ -1,0 +1,33 @@
+{
+  "schema_version": "chiptrace.tool-registry.v1",
+  "producer": "agent-tool-dispatcher",
+  "producer_version": "1.0.0",
+  "captured_at": "2026-08-29T00:00:00Z",
+  "tools": [
+    {
+      "runtime_item_type": "CommandExecution",
+      "runtime_tool": "exec_command",
+      "tool": {
+        "type": "function",
+        "name": "exec_command",
+        "description": "Execute a command in the task workspace.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "cmd": {
+              "type": "string",
+              "description": "Command to execute."
+            },
+            "workdir": {
+              "type": "string",
+              "description": "Working directory for the command."
+            }
+          },
+          "required": [
+            "cmd"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -37,6 +37,10 @@
     "compression": {"type": "string", "pattern": "^zstd-"},
     "processing_workers": {"type": "integer", "minimum": 1},
     "target_part_bytes": {"type": "integer", "minimum": 1},
+    "raw_sources": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/rawSource"}
+    },
     "counts": {
       "type": "object",
       "required": [
@@ -69,6 +73,34 @@
     "validation_status": {"enum": ["pass", "fail"]}
   },
   "$defs": {
+    "rawSource": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "archive_id",
+        "completeness",
+        "checkpoint_key",
+        "checkpoint_sha256",
+        "manifest_key",
+        "manifest_sha256",
+        "segment_count",
+        "total_records",
+        "total_bytes"
+      ],
+      "properties": {
+        "schema_version": {"const": "chiptrace.raw-lineage.v1"},
+        "archive_id": {"type": "string", "minLength": 1},
+        "completeness": {"const": "complete"},
+        "checkpoint_key": {"type": "string", "minLength": 1},
+        "checkpoint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "manifest_key": {"type": "string", "minLength": 1},
+        "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "segment_count": {"type": "integer", "minimum": 1},
+        "total_records": {"type": "integer", "minimum": 0},
+        "total_bytes": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
     "file": {
       "type": "object",
       "required": ["file", "sha256", "bytes"],

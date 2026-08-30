@@ -1,8 +1,10 @@
 openapi: 3.1.0
 info:
-  title: 芯迹 Collector API
+  title: 芯迹采集 API
   version: 0.5.1
-  description: Rust Collector 的单条和批量持久化采集接口。
+  description: >-
+    Rust Collector/Relay 的持久化采集接口。Capture 与 producer event 最终进入
+    同一 durable WAL；producer 路径由本机 Relay 提供。
 paths:
   /capture:
     post:
@@ -12,7 +14,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: ./capture-v1.schema.json
+              $ref: ./capture-v2.schema.json
       responses:
         "202": {description: WAL 与 ledger 已完成持久化}
         "200": {description: 相同 captureId 与字节已持久化}
@@ -43,6 +45,40 @@ paths:
         "400": {description: NDJSON 或 Capture 无效}
         "413": {description: 批次超过字节或记录数上限}
         "415": {description: Content-Type 不是 NDJSON}
+        "503": {description: 背压或存储不可用}
+  /producer/event:
+    post:
+      summary: 校验并持久化一条 Harness/dispatcher 事件
+      description: Relay 根据 producer 身份与 sequence 生成确定性 Capture ID。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./producer-event-v1.schema.json
+      responses:
+        "202": {description: 已生成 Capture ID 并持久化到本地 outbox}
+        "200": {description: 相同事件已持久化}
+        "400": {description: producer event 无效}
+        "409": {description: 确定性 Capture ID 对应不同字节}
+        "503": {description: 背压或存储不可用}
+  /producer/events:
+    post:
+      summary: 批量校验并持久化 Harness/dispatcher NDJSON
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            schema:
+              type: string
+          application/ndjson:
+            schema:
+              type: string
+      responses:
+        "202": {description: 全部事件已持久化，至少一条为首次提交}
+        "200": {description: 全部事件均为幂等重复}
+        "207": {description: 部分事件失败，读取 results 获取逐条结果}
+        "400": {description: NDJSON 或 producer event 无效}
         "503": {description: 背压或存储不可用}
   /health:
     get:

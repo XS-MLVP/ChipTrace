@@ -5,7 +5,10 @@ use std::collections::BTreeMap;
 pub const SESSION_SCHEMA_VERSION: &str = "chiptrace.session.v1";
 pub const ASSESSMENT_SCHEMA_VERSION: &str = "chiptrace.assessment.v1";
 pub const RELEASE_SCHEMA_VERSION: &str = "chiptrace.jsonl-release.v1";
-pub const COMMIT_SCHEMA_VERSION: &str = "chiptrace.object-commit.v1";
+pub const OBJECT_COMMIT_SCHEMA_VERSION: &str = "chiptrace.object-commit.v1";
+pub const RAW_ARCHIVE_SCHEMA_VERSION: &str = "chiptrace.raw-archive.v1";
+pub const RAW_CHECKPOINT_SCHEMA_VERSION: &str = "chiptrace.raw-checkpoint.v1";
+pub const RAW_LINEAGE_SCHEMA_VERSION: &str = "chiptrace.raw-lineage.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GateResult {
@@ -72,12 +75,18 @@ pub struct AcceptanceMetrics {
     pub user_turns: u64,
     pub machine_turns: u64,
     pub machine_turn_ratio: f64,
+    pub human_user_assistant_turns: u64,
     pub effective_turns: u64,
     pub tool_calls: u64,
     pub unique_tool_call_ids: u64,
     pub distinct_tool_names: u64,
+    #[serde(default)]
+    pub invalid_tool_arguments: u64,
     pub tool_results: u64,
     pub valid_tool_results: u64,
+    pub tool_results_with_explicit_status: u64,
+    pub unknown_tool_results: u64,
+    pub conflicting_tool_results: u64,
     pub paired_required_tool_calls: u64,
     pub paired_required_tool_results: u64,
     pub orphan_tool_results: u64,
@@ -90,11 +99,36 @@ pub struct AcceptanceMetrics {
     pub assembly_merge_divergences: u64,
     pub assembly_schema_conflicts: u64,
     pub assembly_trace_conflicts: u64,
+    pub assembly_system_prompt_conflicts: u64,
+    pub assembly_usage_conflicts: u64,
+    #[serde(default)]
+    pub assembly_tool_execution_conflicts: u64,
+    #[serde(default)]
+    pub assembly_producer_event_conflicts: u64,
+    pub rollout_unknown_events: u64,
+    pub rollout_unmapped_tools: u64,
     pub response_dag_cycle: bool,
     pub response_dag_unresolved_parents: u64,
     pub capture_dag_present: bool,
+    pub runtime_dag_present: bool,
+    pub runtime_dag_applicable: bool,
+    pub runtime_dag_complete: bool,
+    pub runtime_dag_native_events: u64,
+    pub runtime_dag_open_nodes: u64,
+    pub runtime_dag_unresolved_nodes: u64,
     pub task_dag_present: bool,
     pub task_dag_complete: bool,
+    pub task_start_event_present: bool,
+    pub task_terminal_event_present: bool,
+    pub task_boundary_attested: bool,
+    pub model_evidence_consistent: bool,
+    #[serde(default)]
+    pub provider_identity_attested: bool,
+    #[serde(default)]
+    pub model_attestation_candidate_count: u64,
+    #[serde(default)]
+    pub non_attestable_api_snapshot_count: u64,
+    pub proxy_route_verified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -188,6 +222,8 @@ pub struct ReleaseManifest {
     pub compression: String,
     pub processing_workers: usize,
     pub target_part_bytes: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_sources: Vec<RawSourceLineage>,
     pub counts: ReleaseCounts,
     pub eligible_tokens: TokenCounts,
     pub assessed_tokens: TokenCounts,
@@ -200,10 +236,13 @@ pub struct ReleaseManifest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ObjectCommit {
     pub schema_version: String,
-    pub release_id: String,
+    pub artifact_kind: String,
+    pub artifact_id: String,
     pub committed_at_utc: String,
-    pub release_manifest_sha256: String,
-    pub release_manifest_key: String,
+    pub manifest_sha256: String,
+    pub manifest_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_release_manifest_sha256: Option<String>,
     pub objects: Vec<ObjectEntry>,
 }
 
@@ -212,6 +251,80 @@ pub struct ObjectEntry {
     pub key: String,
     pub sha256: String,
     pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RawSegmentEntry {
+    pub shard: String,
+    pub segment_id: u64,
+    pub object_key: String,
+    pub source_path: String,
+    pub bytes: u64,
+    pub records: u64,
+    pub sha256: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RawArchiveManifest {
+    pub schema_version: String,
+    pub archive_id: String,
+    pub created_at_utc: String,
+    pub format: String,
+    pub completeness: String,
+    pub segment_count: u64,
+    /// Sealed zero-record rotation markers discovered in the source WAL.
+    /// Their bytes are archived for audit and recovery, but they do not count
+    /// as data segments or records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub empty_segments: Vec<RawEmptySegmentEntry>,
+    pub total_records: u64,
+    pub total_bytes: u64,
+    pub segments: Vec<RawSegmentEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RawEmptySegmentEntry {
+    pub shard: String,
+    pub segment_id: u64,
+    pub object_key: String,
+    pub source_path: String,
+    pub bytes: u64,
+    pub records: u64,
+    pub sha256: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RawArchiveCheckpoint {
+    pub schema_version: String,
+    pub archive_id: String,
+    pub state: String,
+    pub completeness: String,
+    pub committed_at_utc: String,
+    pub manifest_key: String,
+    pub manifest_sha256: String,
+    pub segment_count: u64,
+    pub total_records: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RawSourceLineage {
+    pub schema_version: String,
+    pub archive_id: String,
+    pub completeness: String,
+    pub checkpoint_key: String,
+    pub checkpoint_sha256: String,
+    pub manifest_key: String,
+    pub manifest_sha256: String,
+    pub segment_count: u64,
+    pub total_records: u64,
+    pub total_bytes: u64,
 }
 
 #[cfg(test)]
@@ -225,9 +338,20 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas");
         let expected = [
             "assessment-v1.schema.json",
+            "buyer-archive-v1.schema.json",
+            "buyer-package-v1.schema.json",
             "capture-v1.schema.json",
+            "capture-v2.schema.json",
+            "codex-trace-bundle-v1.schema.json",
+            "gateway-enrichment-v1.schema.json",
+            "object-commit-v1.schema.json",
+            "producer-event-v1.schema.json",
             "release-manifest-v1.schema.json",
+            "raw-archive-v1.schema.json",
+            "raw-checkpoint-v1.schema.json",
+            "raw-lineage-v1.schema.json",
             "session-v1.schema.json",
+            "tool-registry-v1.schema.json",
         ];
         for name in expected {
             let bytes = fs::read(root.join(name)).unwrap();

@@ -1,0 +1,524 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/capture-v2.schema.json",
+  "title": "ChipTrace Capture v2",
+  "type": "object",
+  "required": ["captureId", "recordType"],
+  "properties": {
+    "version": {"const": "chiptrace.capture.v2"},
+    "recordType": {
+      "enum": ["api_snapshot", "lifecycle_event", "tool_execution", "evaluation", "rollout_event"]
+    },
+    "captureId": {
+      "type": "string",
+      "pattern": "^cap-[A-Za-z0-9._:-]+$",
+      "maxLength": 256
+    },
+    "sourceNamespace": {"type": ["string", "null"], "maxLength": 256},
+    "upstreamRequestId": {"type": ["string", "null"]},
+    "requestId": {"type": ["string", "null"]},
+    "provider": {"type": ["string", "null"]},
+    "actualProvider": {"type": ["string", "null"]},
+    "runtimeProvider": {"type": ["string", "null"]},
+    "captureStage": {
+      "enum": ["ingress", "upstream_request", "upstream_response", "egress", "combined", "event"]
+    },
+    "receivedAt": {"type": ["string", "null"]},
+    "startedAt": {"type": ["string", "null"]},
+    "finishedAt": {"type": ["string", "null"]},
+    "method": {"type": ["string", "null"]},
+    "inboundPath": {"type": ["string", "null"]},
+    "proxiedPath": {"type": ["string", "null"]},
+    "apiKeyFingerprint": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "actor": {"type": ["object", "null"]},
+    "actorMetadataStatus": {
+      "enum": ["resolved", "missing", "pending", "error"]
+    },
+    "requestHeaders": {"type": ["object", "null"]},
+    "responseHeaders": {"type": ["object", "null"]},
+    "requestBodyText": {"type": ["string", "null"]},
+    "responseBodyText": {"type": ["string", "null"]},
+    "requestBody": {"$ref": "#/$defs/capturedBody"},
+    "responseBody": {"$ref": "#/$defs/capturedBody"},
+    "requestBytesCaptured": {"type": "integer", "minimum": 0},
+    "responseBytesCaptured": {"type": "integer", "minimum": 0},
+    "requestBodySha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "responseBodySha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "requestBodyTextOriginalSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "responseBodyTextOriginalSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "redactedBodyFields": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "captureSanitization": {
+      "type": "object",
+      "required": ["version", "bodyRedacted", "fields"],
+      "properties": {
+        "version": {"const": "chiptrace.capture-sanitization.v1"},
+        "bodyRedacted": {"const": true},
+        "fields": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "requestTruncated": {"type": "boolean"},
+    "responseTruncated": {"type": "boolean"},
+    "clientRequestAborted": {"type": "boolean"},
+    "clientResponseClosedBeforeFinish": {"type": "boolean"},
+    "upstreamResponseCompleted": {"type": "boolean"},
+    "responseStatus": {
+      "oneOf": [
+        {"type": "integer", "minimum": 100, "maximum": 599},
+        {"type": "string", "pattern": "^[1-5][0-9]{2}$"},
+        {"type": "null"}
+      ]
+    },
+    "stream": {"type": "boolean"},
+    "captureError": {"type": ["string", "null"]},
+    "captureErrorCode": {"type": ["string", "null"]},
+    "isFinalSnapshot": {"type": "boolean"},
+    "producerModel": {"type": ["string", "null"]},
+    "systemPrompt": {"type": ["string", "null"]},
+    "rolloutMessages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["role", "content"],
+        "properties": {
+          "role": {"enum": ["system", "user", "assistant", "tool"]},
+          "content": {}
+        },
+        "additionalProperties": true
+      }
+    },
+    "rolloutUsage": {"type": "object"},
+    "runtimeToolObservation": {"type": "object"},
+    "producerEvent": {"$ref": "#/$defs/producerEvent"},
+    "toolRegistry": {"$ref": "tool-registry-v1.schema.json"},
+    "toolRegistrySha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "rolloutEvent": {"$ref": "#/$defs/rolloutEvent"},
+    "traceContext": {
+      "type": "object",
+      "properties": {
+        "task_session_id": {"type": ["string", "null"]},
+        "session_id": {"type": ["string", "null"]},
+        "thread_id": {"type": ["string", "null"]},
+        "conversation_id": {"type": ["string", "null"]},
+        "trace_id": {"type": ["string", "null"]},
+        "span_id": {"type": ["string", "null"]},
+        "parent_span_id": {"type": ["string", "null"]},
+        "task_id": {"type": ["string", "null"]},
+        "root_session_id": {"type": ["string", "null"]},
+        "parent_session_id": {"type": ["string", "null"]},
+        "goal_id": {"type": ["string", "null"]},
+        "root_turn_id": {"type": ["string", "null"]},
+        "turn_id": {"type": ["string", "null"]},
+        "agent_id": {"type": ["string", "null"]},
+        "agent_path": {"type": ["string", "null"]},
+        "branch_id": {"type": ["string", "null"]},
+        "previous_response_id": {"type": ["string", "null"]},
+        "traceparent": {"type": ["string", "null"]},
+        "tracestate": {"type": ["string", "null"]},
+        "trace_flags": {"type": ["string", "null"]},
+        "session_final": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "observedLifecycleEvents": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "evaluationEvidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/evaluationEvidence"}
+    },
+    "evaluation_evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/evaluationEvidence"}
+    },
+    "lifecycleEvent": {"$ref": "#/$defs/lifecycleEvent"},
+    "toolExecution": {"$ref": "#/$defs/toolExecution"},
+    "fieldEvidence": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/fieldEvidence"}
+    },
+    "fieldEvidenceConflicts": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/fieldEvidenceConflict"}
+    },
+    "gatewayEvidence": {"$ref": "#/$defs/gatewayEvidence"},
+    "gatewayEvidenceJoin": {"$ref": "#/$defs/gatewayEvidenceJoin"}
+  },
+  "$defs": {
+    "producerEvent": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "event_id",
+        "producer",
+        "producer_version",
+        "identity_scheme",
+        "stream_id",
+        "sequence"
+      ],
+      "properties": {
+        "schema_version": {"const": "chiptrace.producer-event.v1"},
+        "event_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._:-]+$",
+          "maxLength": 256
+        },
+        "producer": {"type": "string", "minLength": 1},
+        "producer_version": {"type": "string", "minLength": 1},
+        "identity_scheme": {
+          "enum": ["chiptrace.deterministic-capture.v1", "source-native"]
+        },
+        "stream_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._:-]+$",
+          "maxLength": 256
+        },
+        "sequence": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "capturedBody": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string"},
+        {
+          "type": "object",
+          "properties": {
+            "kind": {"enum": ["json", "text", "binary", "sse"]},
+            "value": {}
+          },
+          "additionalProperties": true
+        },
+        {"type": "array"},
+        {"type": "number"},
+        {"type": "boolean"}
+      ]
+    },
+    "rolloutEvent": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "source",
+        "source_session_id",
+        "source_ordinal",
+        "source_line",
+        "source_line_sha256",
+        "classification"
+      ],
+      "properties": {
+        "schema_version": {"const": "chiptrace.codex-rollout.v1"},
+        "source": {"enum": ["codex_rollout_jsonl", "codex_rollout_trace_bundle"]},
+        "source_session_id": {"type": "string", "minLength": 1},
+        "source_ordinal": {"type": "integer", "minimum": 0},
+        "source_cli_version": {"type": ["string", "null"]},
+        "source_line": {"type": "string"},
+        "source_line_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "raw_event_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "bundle_trace_id": {"type": ["string", "null"]},
+        "bundle_manifest_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "bundle_manifest_raw": {"type": ["string", "null"]},
+        "bundle_manifest_mirror_path": {"type": ["string", "null"]},
+        "bundle_root_thread_id": {"type": ["string", "null"]},
+        "raw_event_mirror_path": {"type": ["string", "null"]},
+        "payloads": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["raw_payload_id", "path", "sha256", "bytes", "mirror_path", "raw_json"],
+            "properties": {
+              "raw_payload_id": {"type": "string", "minLength": 1},
+              "path": {"type": "string", "minLength": 1},
+              "kind": {},
+              "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "bytes": {"type": "integer", "minimum": 0},
+              "mirror_path": {"type": "string", "minLength": 1},
+              "raw_json": {"type": "string"},
+              "content": {}
+            },
+            "additionalProperties": true
+          }
+        },
+        "top_level_type": {"type": ["string", "null"]},
+        "event_type": {"type": ["string", "null"]},
+        "item_type": {"type": ["string", "null"]},
+        "classification": {"enum": ["known", "unknown"]},
+        "projection": {"type": "string"},
+        "unmapped_tool": {"type": "boolean"},
+        "runtime_call_correlation": {
+          "enum": [
+            "matched_model_call",
+            "runtime_tool_call",
+            "missing_registry",
+            "missing_model_call",
+            "missing_tool_start",
+            "missing_call_id",
+            "tool_name_mismatch",
+            null
+          ]
+        },
+        "tool_registry_sha256": {"type": ["string", "null"]},
+        "parent_agent_thread_id": {"type": ["string", "null"]},
+        "agent_path": {"type": ["string", "null"]},
+        "thread_source": {"type": ["object", "string", "null"]},
+        "bundle_complete": {"type": "boolean"},
+        "open_runtime_objects": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    },
+    "fieldEvidence": {
+      "type": "object",
+      "required": ["field", "value", "source", "producer", "authority"],
+      "properties": {
+        "field": {"type": "string", "minLength": 1},
+        "value": {},
+        "source": {"type": "string", "minLength": 1},
+        "producer": {"type": "string", "minLength": 1},
+        "authority": {
+          "enum": [
+            "producer_asserted",
+            "client_asserted",
+            "protocol_observed",
+            "proxy_attested",
+            "provider_reported",
+            "runtime_attested",
+            "evaluator_attested",
+            "derived"
+          ]
+        },
+        "selected": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "fieldEvidenceConflict": {
+      "type": "object",
+      "required": ["field", "evidence"],
+      "properties": {
+        "field": {"type": "string", "minLength": 1},
+        "evidence": {
+          "type": "array",
+          "minItems": 2,
+          "items": {"type": "object"}
+        }
+      },
+      "additionalProperties": true
+    },
+    "gatewayEvidence": {
+      "type": "object",
+      "required": ["source", "request_id", "requested_model", "provider"],
+      "properties": {
+        "source": {"enum": ["sub2api_usage_log", "sub2api.usage_logs"]},
+        "request_id": {"type": "string", "minLength": 1},
+        "requested_model": {"type": "string", "minLength": 1},
+        "upstream_model": {"type": ["string", "null"]},
+        "response_model": {"type": ["string", "null"]},
+        "provider": {"type": "string", "minLength": 1},
+        "provider_source": {"type": ["string", "null"]},
+        "model_mapping_chain": {"type": ["string", "null"]},
+        "user_id": {"type": ["string", "integer", "null"]},
+        "api_key_id": {"type": ["string", "integer", "null"]},
+        "account_id": {"type": ["string", "integer", "null"]},
+        "group_id": {"type": ["string", "integer", "null"]},
+        "channel_id": {"type": ["string", "integer", "null"]},
+        "usage_log_id": {"type": ["string", "integer", "null"]},
+        "input_tokens": {"type": "integer", "minimum": 0},
+        "api_input_tokens": {"type": "integer", "minimum": 0},
+        "input_tokens_semantics": {"const": "sub2api_non_cached_input"},
+        "output_tokens": {"type": "integer", "minimum": 0},
+        "cache_creation_tokens": {"type": "integer", "minimum": 0},
+        "cache_read_tokens": {"type": "integer", "minimum": 0},
+        "observed_at": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "gatewayEvidenceJoin": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "mode",
+        "request_id",
+        "capture_request_id",
+        "capture_field",
+        "transform",
+        "usage_fact_sha256"
+      ],
+      "properties": {
+        "schema_version": {"const": "chiptrace.gateway-enrichment.v1"},
+        "mode": {"const": "exact_request_id"},
+        "request_id": {"type": "string", "minLength": 1},
+        "capture_request_id": {"type": "string", "minLength": 1},
+        "capture_field": {
+          "enum": [
+            "upstreamRequestId",
+            "requestId",
+            "requestHeaders.x-client-request-id",
+            "responseHeaders.x-client-request-id",
+            "responseHeaders.x-request-id"
+          ]
+        },
+        "transform": {"enum": ["exact", "sub2api_client_prefix"]},
+        "usage_fact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "evaluationEvidence": {
+      "type": "object",
+      "required": ["kind", "source"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "test",
+            "build",
+            "search",
+            "user_correction",
+            "final_acceptance",
+            "evaluator"
+          ]
+        },
+        "source": {"type": "string", "minLength": 1},
+        "status": {"type": "string"},
+        "passed": {"type": "boolean"},
+        "reward": {"type": "number", "minimum": 0, "maximum": 1},
+        "score": {"type": "number", "minimum": 0, "maximum": 1},
+        "artifact": {},
+        "observed_at": {"type": "string"}
+      },
+      "anyOf": [
+        {"required": ["status"]},
+        {"required": ["passed"]},
+        {"required": ["reward"]},
+        {"required": ["score"]}
+      ],
+      "additionalProperties": true
+    },
+    "lifecycleEvent": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "event_id": {"type": "string", "minLength": 1},
+        "type": {"type": "string", "minLength": 1, "maxLength": 128},
+        "status": {"type": "string"},
+        "reason": {"type": ["string", "null"]},
+        "occurred_at": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "toolExecution": {
+      "type": "object",
+      "required": ["call_id", "name", "status", "initiator", "arguments"],
+      "properties": {
+        "call_id": {"type": "string", "minLength": 1},
+        "parent_call_id": {"type": ["string", "null"]},
+        "name": {"type": "string", "minLength": 1},
+        "runtime_tool": {"type": ["string", "null"], "minLength": 1},
+        "runtime_namespace": {"type": ["string", "null"], "minLength": 1},
+        "status": {
+          "enum": ["started", "success", "error", "cancelled", "timeout", "unknown"]
+        },
+        "initiator": {"enum": ["assistant", "runtime", "user"]},
+        "arguments": {},
+        "result": {},
+        "error": {},
+        "schema": {
+          "oneOf": [
+            {"$ref": "#/$defs/toolDefinition"},
+            {"type": "null"}
+          ]
+        },
+        "schema_provenance": {
+          "type": "object",
+          "properties": {
+            "source": {"type": "string", "minLength": 1},
+            "source_complete": {"type": "boolean"}
+          },
+          "additionalProperties": true
+        },
+        "started_at": {"type": ["string", "null"]},
+        "finished_at": {"type": ["string", "null"]},
+        "model_call_matched": {"type": "boolean"},
+        "result_content_captured": {"type": "boolean"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "success"}}},
+          "then": {"required": ["result"]}
+        },
+        {
+          "if": {"properties": {"status": {"enum": ["error", "cancelled", "timeout"]}}},
+          "then": {"anyOf": [{"required": ["result"]}, {"required": ["error"]}]}
+        }
+      ],
+      "additionalProperties": true
+    },
+    "toolDefinition": {
+      "type": "object",
+      "required": ["name", "description", "parameters"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "description": {"type": "string", "minLength": 1},
+        "parameters": {
+          "type": "object",
+          "required": ["type", "properties"],
+          "properties": {
+            "type": {"const": "object"},
+            "properties": {"type": "object"}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "recordType": {"enum": ["lifecycle_event", "tool_execution", "evaluation"]}
+        },
+        "required": ["recordType"]
+      },
+      "then": {
+        "required": ["sourceNamespace", "traceContext"],
+        "properties": {
+          "sourceNamespace": {"type": "string", "minLength": 1, "maxLength": 256},
+          "traceContext": {
+            "required": ["task_session_id"],
+            "properties": {
+              "task_session_id": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"recordType": {"const": "lifecycle_event"}}, "required": ["recordType"]},
+      "then": {"required": ["lifecycleEvent"]}
+    },
+    {
+      "if": {"properties": {"recordType": {"const": "tool_execution"}}, "required": ["recordType"]},
+      "then": {"required": ["toolExecution"]}
+    },
+    {
+      "if": {"properties": {"recordType": {"const": "evaluation"}}, "required": ["recordType"]},
+      "then": {"anyOf": [{"required": ["evaluationEvidence"]}, {"required": ["evaluation_evidence"]}]}
+    },
+    {
+      "if": {"properties": {"recordType": {"const": "rollout_event"}}, "required": ["recordType"]},
+      "then": {"required": ["rolloutEvent"]}
+    }
+  ],
+  "additionalProperties": true
+}

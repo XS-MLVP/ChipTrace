@@ -3,19 +3,25 @@ FROM rust:1.91-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release --locked --bin chiptrace
+ARG CHIPTRACE_CARGO_REGISTRY_INDEX=""
+RUN --mount=type=cache,id=chiptrace-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=chiptrace-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=chiptrace-cargo-target,target=/src/target,sharing=locked \
+    if [ -n "$CHIPTRACE_CARGO_REGISTRY_INDEX" ]; then \
+      CARGO_REGISTRIES_CRATES_IO_INDEX="$CHIPTRACE_CARGO_REGISTRY_INDEX" \
+        cargo build --release --locked --bin chiptrace; \
+    else \
+      cargo build --release --locked --bin chiptrace; \
+    fi \
+    && install -D -m 0755 /src/target/release/chiptrace /out/chiptrace
 
 FROM debian:bookworm-slim
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --home /nonexistent --shell /usr/sbin/nologin chiptrace
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN install -d -m 1777 /tmp
 
-COPY --from=builder /src/target/release/chiptrace /usr/local/bin/chiptrace
+COPY --from=builder /out/chiptrace /usr/local/bin/chiptrace
 
 USER 10001:10001
-HEALTHCHECK --interval=20s --timeout=5s --retries=5 --start-period=10s \
-  CMD ["chiptrace", "probe"]
 ENTRYPOINT ["chiptrace"]
 CMD ["--help"]

@@ -1,14 +1,25 @@
 pub mod assemble;
+pub mod buyer;
 pub mod capture;
+pub mod codex_rollout;
+pub mod codex_trace_bundle;
 pub mod collector;
+pub mod delivery;
+pub mod enrich;
+pub mod harness;
 pub mod ingest;
 pub mod jsonl;
+pub mod object_store;
+pub mod producer;
 pub mod publish;
+pub mod raw_archive;
 pub mod relay;
 pub mod release;
+pub mod runtime_canary;
 pub mod schema;
 pub mod score;
 pub mod sharded;
 pub mod store;
+pub mod tool_registry;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

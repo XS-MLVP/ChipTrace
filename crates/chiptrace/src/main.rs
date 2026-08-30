@@ -1,18 +1,44 @@
 use anyhow::{Context, Result, bail};
 use chiptrace::assemble::{AssembleConfig, assemble, verify_assembly};
-use chiptrace::capture::normalize_capture;
+use chiptrace::buyer::{
+    BuyerPackageConfig, package_buyer_release, package_buyer_release_legacy, verify_buyer_package,
+    verify_buyer_package_legacy,
+};
+use chiptrace::capture::{CAPTURE_SCHEMA_VERSION, normalize_capture};
+use chiptrace::codex_rollout::{
+    ExportConfig as CodexRolloutExportConfig, ExportTarget as CodexRolloutTarget,
+    export_codex_rollout, resolve_hook_rollout, watch_codex_rollout,
+};
+use chiptrace::codex_trace_bundle::{
+    BundleExportConfig as CodexTraceBundleExportConfig,
+    BundleExportTarget as CodexTraceBundleTarget, export_codex_trace_bundle,
+};
 use chiptrace::collector::{CollectorConfig, serve};
-use chiptrace::publish::{Backend, PublishConfig, publish};
+use chiptrace::enrich::{EnrichConfig, enrich_captures, verify_enrichment};
+use chiptrace::harness::{
+    EvaluationInput, Harness, HarnessConfig, HarnessTarget, LifecycleEventInput, ToolEndInput,
+    ToolStartInput,
+};
+use chiptrace::producer::{ProducerConfig, ProducerTarget, submit_producer_events};
+use chiptrace::publish::{
+    ArtifactKind, Backend, PublishConfig, PublishSource, VerifyPublishedConfig, publish,
+    verify_published,
+};
+use chiptrace::raw_archive::{
+    RawArchiveConfig, RawArchiveRestoreConfig, RawArchiveVerifyConfig, archive_raw,
+    restore_raw_archive, verify_raw_archive,
+};
 use chiptrace::relay::{RelayConfig, serve_relay};
 use chiptrace::release::{ReleaseConfig, build_release, verify_release};
+use chiptrace::runtime_canary::{RuntimeCanaryConfig, run_runtime_canary};
 use chiptrace::score::{Profile, score_jsonl};
 use chiptrace::sharded::{ShardedCaptureStore, audit_sharded_store};
-use chiptrace::store::{CaptureStore, StoreConfig};
+use chiptrace::store::StoreConfig;
 use clap::{Args, Parser, Subcommand};
 use rayon::prelude::*;
 use serde_json::{Value, json};
-use std::fs::{self, File};
-use std::io::{BufRead, BufWriter, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufWriter, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,21 +68,56 @@ enum Command {
     Assemble(AssembleArgs),
     /// 对 canonical Session JSONL 输出逐条验收结果。
     Score(ScoreArgs),
+    /// 按显式 request_id 将 Sub2API usage log 精确关联到 Capture。
+    Enrich(EnrichArgs),
+    /// 从 Codex rollout JSONL 可靠导出任务、工具和生命周期事实。
+    ExportCodexRollout(ExportCodexRolloutArgs),
+    /// 持续增量导出活动 Codex rollout；用于实时 sidecar。
+    WatchCodexRollout(WatchCodexRolloutArgs),
+    /// 从 Codex Stop hook stdin 定位 rollout 并可靠导出。
+    CodexHook(CodexHookArgs),
+    /// 从 Codex 原生 rollout-trace bundle 校验并导出完整运行时事实。
+    #[command(
+        name = "export-codex-trace-bundle",
+        visible_alias = "import-codex-trace-bundle",
+        visible_alias = "export-codex-bundle"
+    )]
+    ExportCodexTraceBundle(ExportCodexTraceBundleArgs),
+    /// 校验 harness/dispatcher 事件并等待 Relay durable ACK。
+    Produce(ProduceArgs),
+    /// 由真实任务运行器创建边界并记录生命周期、工具和评估证据。
+    Harness(HarnessArgs),
+    /// 只读验证 Enrich 产物、记录数、SHA-256 和 Raw lineage。
+    VerifyEnrichment(VerifyEnrichmentArgs),
     /// 去重、评分并生成仅含准入 Session 的 JSONL.zst Release。
     Release(ReleaseArgs),
     /// 只读验证 Assembly。
     VerifyAssembly(VerifyAssemblyArgs),
     /// 只读验证 Release。
     VerifyRelease(VerifyReleaseArgs),
-    /// 将 Release 通过 staging + commit manifest 发布到 OSS/S3/本地对象目录。
+    /// 将内部 Release 转换为采购方 tar.gz + UTF-8 JSONL 交付包。
+    PackageBuyer(PackageBuyerArgs),
+    /// 只读验证采购方交付包、归档内容与全部 SHA-256。
+    VerifyBuyerPackage(VerifyBuyerPackageArgs),
+    /// 将已验收的内部 Release 或采购包原子发布到对象存储。
     Publish(PublishArgs),
+    /// 从远端 COMMIT 只读复验已发布对象及完整 SHA-256。
+    VerifyPublished(VerifyPublishedArgs),
+    /// 将已封存的原始 WAL Segment 发布到统一 OSS 原始层。
+    ArchiveRaw(RawArchiveArgs),
+    /// 校验 OSS 原始层 Checkpoint、Manifest、Segment 和记录。
+    VerifyRawArchive(VerifyRawArchiveArgs),
+    /// 从 OSS 原始层恢复已提交的 sealed WAL Segment。
+    RestoreRawArchive(RestoreRawArchiveArgs),
     /// 检查 Collector 或 Relay HTTP 健康接口。
     Probe(ProbeArgs),
     /// 运行隔离的采集到交付闭环自测。
     SelfTest,
+    /// 执行五个真实工具并验证 runtime-full 生产者通路。
+    RuntimeCanary(RuntimeCanaryArgs),
     /// 测量本地 WAL/ledger 持久化吞吐。
     BenchmarkStore(BenchmarkStoreArgs),
-    /// 测量环回 HTTP 批量接收与持久化确认吞吐。
+    /// 测量环回 HTTP、可选 Relay 双 WAL 与 producer 入口吞吐。
     BenchmarkHttp(BenchmarkHttpArgs),
     /// 测量 JSONL zstd 压缩吞吐。
     BenchmarkCompression(BenchmarkCompressionArgs),
@@ -166,7 +227,7 @@ struct AuditArgs {
 struct AssembleArgs {
     #[arg(long, required = true)]
     input: Vec<PathBuf>,
-    #[arg(long)]
+    #[arg(long, required = true)]
     output: PathBuf,
     #[arg(long, default_value_t = 256)]
     partitions: usize,
@@ -188,6 +249,386 @@ struct ScoreArgs {
     minimum_score: f64,
     #[arg(long, default_value_t = 1)]
     zstd_level: i32,
+}
+
+#[derive(Debug, Args)]
+struct EnrichArgs {
+    /// Capture JSONL、sealed NDJSON 或包含这些文件的目录，可重复指定。
+    #[arg(long, required = true)]
+    input: Vec<PathBuf>,
+    /// Sub2API usage log JSON/JSONL 文件或目录，可重复指定。
+    #[arg(long = "usage-log", required = true)]
+    usage_log: Vec<PathBuf>,
+    #[arg(long, required = true)]
+    output: PathBuf,
+    #[arg(long, default_value_t = 1)]
+    zstd_level: i32,
+    #[arg(long)]
+    replace: bool,
+}
+
+#[derive(Debug, Args)]
+struct ExportCodexRolloutArgs {
+    /// Codex rollout JSONL 文件。
+    #[arg(long)]
+    input: PathBuf,
+    /// exporter 的持久化 byte offset/ordinal checkpoint 目录。
+    #[arg(long)]
+    state_root: PathBuf,
+    /// Rust Relay 地址；与 --output 二选一。
+    #[arg(long, conflicts_with = "output")]
+    relay_url: Option<String>,
+    /// 本地验证用 NDJSON；与 --relay-url 二选一。
+    #[arg(long, conflicts_with = "relay_url")]
+    output: Option<PathBuf>,
+    /// 必须与 18084 Capture 使用相同 namespace 才能组装为同一任务。
+    #[arg(long)]
+    source_namespace: String,
+    /// 由实际 Agent runtime 导出的版本化 Tool Registry 快照。
+    #[arg(long)]
+    tool_registry: Option<PathBuf>,
+    #[arg(long, default_value_t = 128)]
+    batch_records: usize,
+    #[arg(long, default_value_t = 1024)]
+    max_envelope_mib: usize,
+    #[arg(long, default_value_t = 30)]
+    request_timeout_seconds: u64,
+    #[arg(long, default_value_t = 25)]
+    retry_max_times: usize,
+    /// 由 harness 显式创建的完整任务 Session ID；不从 Codex thread/turn 推断。
+    #[arg(long)]
+    task_session_id: Option<String>,
+    /// 由 harness 显式提供的根任务 Session；未提供时不推断。
+    #[arg(long)]
+    root_session_id: Option<String>,
+    /// 由 harness 显式提供的父任务 Session；不从 thread ID 推断。
+    #[arg(long)]
+    parent_session_id: Option<String>,
+    #[arg(long)]
+    goal_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct WatchCodexRolloutArgs {
+    #[command(flatten)]
+    export: ExportCodexRolloutArgs,
+    #[arg(long, default_value_t = 250)]
+    poll_ms: u64,
+    /// 非零时，在无新增完整行达到该秒数后退出；生产 sidecar 保持 0。
+    #[arg(long, default_value_t = 0)]
+    idle_exit_seconds: u64,
+}
+
+#[derive(Debug, Args)]
+struct CodexHookArgs {
+    /// 只允许读取该目录下的 rollout 文件。
+    #[arg(long)]
+    session_root: PathBuf,
+    #[arg(long)]
+    state_root: PathBuf,
+    #[arg(long, conflicts_with = "output")]
+    relay_url: Option<String>,
+    #[arg(long, conflicts_with = "relay_url")]
+    output: Option<PathBuf>,
+    #[arg(long)]
+    source_namespace: String,
+    #[arg(long)]
+    tool_registry: Option<PathBuf>,
+    #[arg(long, default_value_t = 128)]
+    batch_records: usize,
+    #[arg(long, default_value_t = 1024)]
+    max_envelope_mib: usize,
+    #[arg(long, default_value_t = 30)]
+    request_timeout_seconds: u64,
+    #[arg(long, default_value_t = 25)]
+    retry_max_times: usize,
+    #[arg(long)]
+    task_session_id: Option<String>,
+    #[arg(long)]
+    root_session_id: Option<String>,
+    #[arg(long)]
+    parent_session_id: Option<String>,
+    #[arg(long)]
+    goal_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ProduceArgs {
+    /// Capture v2 producer-event JSONL；使用 - 从 stdin 读取。
+    #[arg(long)]
+    input: PathBuf,
+    /// 本机 Rust Relay 地址；与 --output 二选一。
+    #[arg(long, conflicts_with = "output")]
+    relay_url: Option<String>,
+    /// 隔离验证用 NDJSON；与 --relay-url 二选一。
+    #[arg(long, conflicts_with = "relay_url")]
+    output: Option<PathBuf>,
+    #[arg(long, default_value_t = 128)]
+    batch_records: usize,
+    #[arg(long, default_value_t = 1024)]
+    max_envelope_mib: usize,
+    #[arg(long, default_value_t = 30)]
+    request_timeout_seconds: u64,
+    #[arg(long, default_value_t = 25)]
+    retry_max_times: usize,
+}
+
+#[derive(Debug, Args)]
+struct HarnessArgs {
+    #[command(subcommand)]
+    command: HarnessCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum HarnessCommand {
+    /// 创建任务身份并立即写入 task_start 事件。
+    Start(HarnessStartArgs),
+    /// 写入任意生命周期事实（task/session 边界除外的事件也在此记录）。
+    Lifecycle(HarnessLifecycleArgs),
+    /// 写入工具 dispatcher 的 started 事实。
+    ToolStart(HarnessToolStartArgs),
+    /// 写入工具 dispatcher 的真实终态和返回。
+    ToolEnd(HarnessToolEndArgs),
+    /// 写入测试、构建、搜索、修正或验收证据。
+    Evaluate(HarnessEvaluateArgs),
+    /// 写入 task_end 终态。
+    End(HarnessEndArgs),
+    /// 将本地 spool 中尚未收到 durable ACK 的事件续投。
+    Flush(HarnessFlushArgs),
+    /// 查看身份、队列和活动工具。
+    Inspect(HarnessInspectArgs),
+    /// 更新后续事件使用的 previous_response_id。
+    SetPreviousResponse(HarnessSetPreviousResponseArgs),
+}
+
+#[derive(Debug, Args)]
+struct HarnessStartArgs {
+    #[arg(long)]
+    state_root: PathBuf,
+    #[arg(long)]
+    source_namespace: String,
+    #[arg(long, conflicts_with = "output")]
+    relay_url: Option<String>,
+    #[arg(long, conflicts_with = "relay_url")]
+    output: Option<PathBuf>,
+    #[arg(long)]
+    task_session_id: Option<String>,
+    #[arg(long)]
+    root_session_id: Option<String>,
+    #[arg(long)]
+    parent_session_id: Option<String>,
+    #[arg(long)]
+    goal_id: Option<String>,
+    #[arg(long)]
+    agent_id: Option<String>,
+    #[arg(long)]
+    branch_id: Option<String>,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[arg(long)]
+    thread_id: Option<String>,
+    #[arg(long)]
+    previous_response_id: Option<String>,
+    #[arg(long)]
+    traceparent: Option<String>,
+    /// Harness 启动时由实际 dispatcher 导出的 Tool Registry JSON。
+    #[arg(long)]
+    tool_registry: Option<PathBuf>,
+    #[arg(long, default_value_t = 25)]
+    retry_max_times: usize,
+    #[arg(long, default_value_t = 30)]
+    request_timeout_seconds: u64,
+    #[arg(long, default_value_t = 1024)]
+    max_envelope_mib: usize,
+    #[arg(long, default_value_t = 128)]
+    batch_records: usize,
+}
+
+#[derive(Debug, Args)]
+struct HarnessStateArgs {
+    #[arg(long)]
+    state_root: PathBuf,
+    #[arg(long, conflicts_with = "output")]
+    relay_url: Option<String>,
+    #[arg(long, conflicts_with = "relay_url")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct HarnessLifecycleArgs {
+    #[command(flatten)]
+    state: HarnessStateArgs,
+    #[arg(long = "type")]
+    event_type: String,
+    #[arg(long)]
+    status: String,
+    #[arg(long)]
+    reason: Option<String>,
+    #[arg(long)]
+    turn_id: Option<String>,
+    /// JSON 对象或普通文本；作为生命周期 details 保存。
+    #[arg(long)]
+    details: Option<String>,
+    #[arg(long)]
+    occurred_at: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct HarnessToolStartArgs {
+    #[command(flatten)]
+    state: HarnessStateArgs,
+    #[arg(long)]
+    call_id: String,
+    #[arg(long)]
+    name: String,
+    /// Optional dispatcher namespace. Canonical Session identity is
+    /// `namespace.name` while the raw components are retained.
+    #[arg(long)]
+    runtime_namespace: Option<String>,
+    /// Optional raw dispatcher tool name when `name` is already canonical.
+    #[arg(long)]
+    runtime_tool: Option<String>,
+    /// JSON 参数；无法解析为 JSON 时按字符串保存，不会改变工具状态。
+    #[arg(long)]
+    arguments: String,
+    /// 完整工具 Schema JSON 文件。缺省时只允许从启动时 Registry 精确查找。
+    #[arg(long)]
+    schema: Option<PathBuf>,
+    #[arg(long, default_value = "assistant")]
+    initiator: String,
+    #[arg(long)]
+    parent_call_id: Option<String>,
+    #[arg(long)]
+    turn_id: Option<String>,
+    #[arg(long)]
+    started_at: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct HarnessToolEndArgs {
+    #[command(flatten)]
+    state: HarnessStateArgs,
+    #[arg(long)]
+    call_id: String,
+    #[arg(long)]
+    status: String,
+    /// JSON 结果；无法解析时按字符串保存。
+    #[arg(long)]
+    result: Option<String>,
+    /// JSON 错误；无法解析时按字符串保存。
+    #[arg(long)]
+    error: Option<String>,
+    #[arg(long)]
+    finished_at: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct HarnessEvaluateArgs {
+    #[command(flatten)]
+    state: HarnessStateArgs,
+    #[arg(long)]
+    kind: String,
+    #[arg(long)]
+    source: String,
+    #[arg(long)]
+    status: Option<String>,
+    #[arg(long)]
+    passed: Option<bool>,
+    #[arg(long)]
+    reward: Option<f64>,
+    #[arg(long)]
+    score: Option<f64>,
+    #[arg(long)]
+    artifact: Option<String>,
+    #[arg(long)]
+    observed_at: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct HarnessEndArgs {
+    #[command(flatten)]
+    state: HarnessStateArgs,
+    #[arg(long, default_value = "completed")]
+    status: String,
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct HarnessFlushArgs {
+    #[command(flatten)]
+    state: HarnessStateArgs,
+}
+
+#[derive(Debug, Args)]
+struct HarnessInspectArgs {
+    #[arg(long)]
+    state_root: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct HarnessSetPreviousResponseArgs {
+    #[command(flatten)]
+    state: HarnessStateArgs,
+    #[arg(long)]
+    value: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ExportCodexTraceBundleArgs {
+    /// 原生 Codex trace bundle 目录（manifest.json、trace.jsonl、payloads/）。
+    #[arg(long)]
+    input: PathBuf,
+    /// exporter checkpoint 目录。
+    #[arg(long)]
+    state_root: PathBuf,
+    /// Rust Relay 地址；与 --output 二选一。
+    #[arg(long, conflicts_with = "output")]
+    relay_url: Option<String>,
+    /// 本地验证用 Capture JSONL；与 --relay-url 二选一。
+    #[arg(long, conflicts_with = "relay_url")]
+    output: Option<PathBuf>,
+    #[arg(long)]
+    source_namespace: String,
+    /// Harness 在任务开始时导出的实际运行时 Tool Registry 快照。
+    #[arg(long)]
+    tool_registry: Option<PathBuf>,
+    #[arg(long, default_value_t = 128)]
+    batch_records: usize,
+    #[arg(long, default_value_t = 1024)]
+    max_envelope_mib: usize,
+    #[arg(long, default_value_t = 30)]
+    request_timeout_seconds: u64,
+    #[arg(long, default_value_t = 25)]
+    retry_max_times: usize,
+    /// Harness 显式创建的完整任务 Session ID；不会从 Codex thread 推断。
+    #[arg(long)]
+    task_session_id: Option<String>,
+    #[arg(long)]
+    root_session_id: Option<String>,
+    #[arg(long)]
+    parent_session_id: Option<String>,
+    #[arg(long)]
+    goal_id: Option<String>,
+    #[arg(long)]
+    agent_id: Option<String>,
+    #[arg(long)]
+    branch_id: Option<String>,
+    /// Harness 生成并注入 API 的同一 W3C traceparent。
+    #[arg(long)]
+    traceparent: Option<String>,
+    /// 原始 event/payload 字节镜像目录；默认位于 state_root/raw-bundles。
+    #[arg(long)]
+    mirror_root: Option<PathBuf>,
+    /// 要求 bundle 已观察到 rollout_ended 且没有活动尾部。
+    #[arg(long)]
+    require_complete: bool,
+}
+
+#[derive(Debug, Args)]
+struct VerifyEnrichmentArgs {
+    #[arg(long)]
+    enrichment: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -229,9 +670,42 @@ struct VerifyReleaseArgs {
 }
 
 #[derive(Debug, Args)]
-struct PublishArgs {
+struct PackageBuyerArgs {
     #[arg(long)]
     release: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long, default_value_t = 1)]
+    gzip_level: u32,
+    #[arg(long, default_value_t = 0)]
+    workers: usize,
+    #[arg(long)]
+    replace: bool,
+    /// 仅迁移没有 OSS Raw lineage 的历史 Release；不适用于对外交付。
+    #[arg(long)]
+    allow_legacy_lineage: bool,
+}
+
+#[derive(Debug, Args)]
+struct VerifyBuyerPackageArgs {
+    #[arg(long)]
+    package: PathBuf,
+    /// 允许验证仅供历史迁移使用的 legacy_unbound 包。
+    #[arg(long)]
+    allow_legacy_lineage: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    clap::ArgGroup::new("artifact")
+        .required(true)
+        .args(["release", "buyer_package"])
+))]
+struct PublishArgs {
+    #[arg(long)]
+    release: Option<PathBuf>,
+    #[arg(long)]
+    buyer_package: Option<PathBuf>,
     #[arg(long, value_enum)]
     backend: Backend,
     #[arg(long)]
@@ -250,8 +724,114 @@ struct PublishArgs {
     multipart_concurrency: usize,
     #[arg(long, default_value_t = 16)]
     multipart_chunk_mib: usize,
+    #[arg(long, default_value_t = 25)]
+    retry_max_times: usize,
+    /// 仅用于受控 staging；跳过远端对象的完整 SHA-256 回读。
     #[arg(long)]
-    verify_remote_sha256: bool,
+    skip_remote_sha256: bool,
+}
+
+#[derive(Debug, Args)]
+struct VerifyPublishedArgs {
+    #[arg(long, value_enum)]
+    artifact_kind: ArtifactKind,
+    #[arg(long)]
+    artifact_id: String,
+    #[arg(long, value_enum)]
+    backend: Backend,
+    #[arg(long)]
+    root: Option<PathBuf>,
+    #[arg(long)]
+    endpoint: Option<String>,
+    #[arg(long)]
+    bucket: Option<String>,
+    #[arg(long)]
+    region: Option<String>,
+    #[arg(long, default_value = "chiptrace")]
+    prefix: String,
+    #[arg(long, default_value_t = 8)]
+    file_concurrency: usize,
+    #[arg(long, default_value_t = 25)]
+    retry_max_times: usize,
+}
+
+#[derive(Debug, Args)]
+struct RawArchiveArgs {
+    #[arg(long, required = true)]
+    input: Vec<PathBuf>,
+    #[arg(long)]
+    archive_id: String,
+    #[arg(long, value_enum)]
+    backend: Backend,
+    #[arg(long)]
+    root: Option<PathBuf>,
+    #[arg(long)]
+    endpoint: Option<String>,
+    #[arg(long)]
+    bucket: Option<String>,
+    #[arg(long)]
+    region: Option<String>,
+    #[arg(long, default_value = "chiptrace")]
+    prefix: String,
+    #[arg(long, default_value_t = 8)]
+    file_concurrency: usize,
+    #[arg(long, default_value_t = 8)]
+    multipart_concurrency: usize,
+    #[arg(long, default_value_t = 16)]
+    multipart_chunk_mib: usize,
+    #[arg(long, default_value_t = 25)]
+    retry_max_times: usize,
+    #[arg(long)]
+    allow_segment_gaps: bool,
+}
+
+#[derive(Debug, Args)]
+struct VerifyRawArchiveArgs {
+    #[arg(long)]
+    archive_id: String,
+    #[arg(long, value_enum)]
+    backend: Backend,
+    #[arg(long)]
+    root: Option<PathBuf>,
+    #[arg(long)]
+    endpoint: Option<String>,
+    #[arg(long)]
+    bucket: Option<String>,
+    #[arg(long)]
+    region: Option<String>,
+    #[arg(long, default_value = "chiptrace")]
+    prefix: String,
+    #[arg(long)]
+    verify_records: bool,
+    /// 仅允许校验取证用的 partial 快照；默认拒绝。
+    #[arg(long)]
+    allow_partial: bool,
+}
+
+#[derive(Debug, Args)]
+struct RestoreRawArchiveArgs {
+    #[arg(long)]
+    archive_id: String,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long, value_enum)]
+    backend: Backend,
+    #[arg(long)]
+    root: Option<PathBuf>,
+    #[arg(long)]
+    endpoint: Option<String>,
+    #[arg(long)]
+    bucket: Option<String>,
+    #[arg(long)]
+    region: Option<String>,
+    #[arg(long, default_value = "chiptrace")]
+    prefix: String,
+    #[arg(long)]
+    verify_records: bool,
+    #[arg(long)]
+    replace: bool,
+    #[arg(long)]
+    allow_partial: bool,
 }
 
 #[derive(Debug, Args)]
@@ -260,6 +840,36 @@ struct ProbeArgs {
     url: String,
     #[arg(long, default_value_t = 5)]
     timeout_seconds: u64,
+}
+
+#[derive(Debug, Args)]
+struct RuntimeCanaryArgs {
+    #[arg(long)]
+    state_root: PathBuf,
+    #[arg(long)]
+    source_namespace: String,
+    #[arg(long)]
+    relay_url: String,
+    #[arg(long)]
+    task_session_id: String,
+    #[arg(long)]
+    root_session_id: Option<String>,
+    #[arg(long)]
+    goal_id: Option<String>,
+    #[arg(long, default_value = "runtime-canary")]
+    agent_id: String,
+    #[arg(long, default_value = "main")]
+    branch_id: String,
+    #[arg(long)]
+    collector_health_url: String,
+    #[arg(long)]
+    evidence_jsonl: PathBuf,
+    #[arg(long)]
+    expected_missing_path: PathBuf,
+    #[arg(long, default_value_t = 25)]
+    retry_max_times: usize,
+    #[arg(long, default_value_t = 30)]
+    request_timeout_seconds: u64,
 }
 
 #[derive(Debug, Args)]
@@ -294,6 +904,12 @@ struct BenchmarkHttpArgs {
     work_root: Option<PathBuf>,
     #[arg(long)]
     no_fsync: bool,
+    /// 经 Relay 本地 outbox 续投 Collector，并等待最终守恒。
+    #[arg(long)]
+    relay: bool,
+    /// 使用 Harness/dispatcher producer 事件入口；必须同时启用 --relay。
+    #[arg(long, requires = "relay")]
+    producer_events: bool,
 }
 
 #[derive(Debug, Args)]
@@ -319,6 +935,7 @@ async fn main() -> Result<()> {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_writer(std::io::stderr)
         .with_target(false)
         .init();
     let cli = Cli::parse();
@@ -397,6 +1014,169 @@ async fn main() -> Result<()> {
             args.minimum_score,
             args.zstd_level,
         )?)?,
+        Command::Enrich(args) => serde_json::to_value(enrich_captures(EnrichConfig {
+            inputs: args.input,
+            usage_logs: args.usage_log,
+            output: args.output,
+            zstd_level: args.zstd_level,
+            replace: args.replace,
+        })?)?,
+        Command::ExportCodexRollout(args) => {
+            let target = match (args.relay_url, args.output) {
+                (Some(url), None) => CodexRolloutTarget::Relay(url),
+                (None, Some(path)) => CodexRolloutTarget::Jsonl(path),
+                _ => bail!("exactly one of --relay-url or --output is required"),
+            };
+            serde_json::to_value(
+                export_codex_rollout(CodexRolloutExportConfig {
+                    input: args.input,
+                    state_root: args.state_root,
+                    target,
+                    source_namespace: args.source_namespace,
+                    tool_registry: args.tool_registry,
+                    batch_records: args.batch_records,
+                    max_envelope_bytes: checked_mib(args.max_envelope_mib)?,
+                    request_timeout: Duration::from_secs(args.request_timeout_seconds),
+                    retry_max_times: args.retry_max_times,
+                    task_session_id: args.task_session_id,
+                    root_session_id: args.root_session_id,
+                    parent_session_id: args.parent_session_id,
+                    goal_id: args.goal_id,
+                })
+                .await?,
+            )?
+        }
+        Command::WatchCodexRollout(args) => {
+            let export = args.export;
+            let target = match (export.relay_url, export.output) {
+                (Some(url), None) => CodexRolloutTarget::Relay(url),
+                (None, Some(path)) => CodexRolloutTarget::Jsonl(path),
+                _ => bail!("exactly one of --relay-url or --output is required"),
+            };
+            let idle_exit =
+                (args.idle_exit_seconds > 0).then(|| Duration::from_secs(args.idle_exit_seconds));
+            serde_json::to_value(
+                watch_codex_rollout(
+                    CodexRolloutExportConfig {
+                        input: export.input,
+                        state_root: export.state_root,
+                        target,
+                        source_namespace: export.source_namespace,
+                        tool_registry: export.tool_registry,
+                        batch_records: export.batch_records,
+                        max_envelope_bytes: checked_mib(export.max_envelope_mib)?,
+                        request_timeout: Duration::from_secs(export.request_timeout_seconds),
+                        retry_max_times: export.retry_max_times,
+                        task_session_id: export.task_session_id,
+                        root_session_id: export.root_session_id,
+                        parent_session_id: export.parent_session_id,
+                        goal_id: export.goal_id,
+                    },
+                    Duration::from_millis(args.poll_ms),
+                    idle_exit,
+                    shutdown_signal(),
+                )
+                .await?,
+            )?
+        }
+        Command::CodexHook(args) => {
+            let target = match (args.relay_url, args.output) {
+                (Some(url), None) => CodexRolloutTarget::Relay(url),
+                (None, Some(path)) => CodexRolloutTarget::Jsonl(path),
+                _ => bail!("exactly one of --relay-url or --output is required"),
+            };
+            let mut hook_input = Vec::new();
+            std::io::stdin().read_to_end(&mut hook_input)?;
+            let input = resolve_hook_rollout(&hook_input, &args.session_root)?;
+            serde_json::to_value(
+                export_codex_rollout(CodexRolloutExportConfig {
+                    input,
+                    state_root: args.state_root,
+                    target,
+                    source_namespace: args.source_namespace,
+                    tool_registry: args.tool_registry,
+                    batch_records: args.batch_records,
+                    max_envelope_bytes: checked_mib(args.max_envelope_mib)?,
+                    request_timeout: Duration::from_secs(args.request_timeout_seconds),
+                    retry_max_times: args.retry_max_times,
+                    task_session_id: args.task_session_id,
+                    root_session_id: args.root_session_id,
+                    parent_session_id: args.parent_session_id,
+                    goal_id: args.goal_id,
+                })
+                .await?,
+            )?
+        }
+        Command::ExportCodexTraceBundle(args) => {
+            let target = match (args.relay_url, args.output) {
+                (Some(url), None) => CodexTraceBundleTarget::Relay(url),
+                (None, Some(path)) => CodexTraceBundleTarget::Jsonl(path),
+                _ => bail!("exactly one of --relay-url or --output is required"),
+            };
+            serde_json::to_value(
+                export_codex_trace_bundle(CodexTraceBundleExportConfig {
+                    input: args.input,
+                    state_root: args.state_root,
+                    target,
+                    source_namespace: args.source_namespace,
+                    tool_registry: args.tool_registry,
+                    batch_records: args.batch_records,
+                    max_envelope_bytes: checked_mib(args.max_envelope_mib)?,
+                    request_timeout: Duration::from_secs(args.request_timeout_seconds),
+                    retry_max_times: args.retry_max_times,
+                    task_session_id: args.task_session_id,
+                    root_session_id: args.root_session_id,
+                    parent_session_id: args.parent_session_id,
+                    goal_id: args.goal_id,
+                    agent_id: args.agent_id,
+                    branch_id: args.branch_id,
+                    traceparent: args.traceparent,
+                    mirror_root: args.mirror_root,
+                    require_complete: args.require_complete,
+                })
+                .await?,
+            )?
+        }
+        Command::Produce(args) => {
+            let target = match (args.relay_url, args.output) {
+                (Some(url), None) => ProducerTarget::ProducerRelay(url),
+                (None, Some(path)) => ProducerTarget::Jsonl(path),
+                _ => bail!("exactly one of --relay-url or --output is required"),
+            };
+            serde_json::to_value(
+                submit_producer_events(ProducerConfig {
+                    input: args.input,
+                    target,
+                    batch_records: args.batch_records,
+                    max_envelope_bytes: checked_mib(args.max_envelope_mib)?,
+                    request_timeout: Duration::from_secs(args.request_timeout_seconds),
+                    retry_max_times: args.retry_max_times,
+                })
+                .await?,
+            )?
+        }
+        Command::Harness(args) => match args.command {
+            HarnessCommand::Start(args) => harness_start(args).await?,
+            HarnessCommand::Lifecycle(args) => harness_lifecycle(args).await?,
+            HarnessCommand::ToolStart(args) => harness_tool_start(args).await?,
+            HarnessCommand::ToolEnd(args) => harness_tool_end(args).await?,
+            HarnessCommand::Evaluate(args) => harness_evaluate(args).await?,
+            HarnessCommand::End(args) => harness_end(args).await?,
+            HarnessCommand::Flush(args) => harness_flush(args).await?,
+            HarnessCommand::Inspect(args) => {
+                serde_json::to_value(Harness::open(args.state_root)?.inspect()?)?
+            }
+            HarnessCommand::SetPreviousResponse(args) => {
+                let target = harness_target(args.state.relay_url, args.state.output)?;
+                let mut harness =
+                    chiptrace::harness::Harness::open_with_target(args.state.state_root, target)?;
+                harness.set_previous_response_id(args.value)?;
+                serde_json::to_value(harness.inspect()?)?
+            }
+        },
+        Command::VerifyEnrichment(args) => {
+            serde_json::to_value(verify_enrichment(&args.enrichment)?)?
+        }
         Command::Release(args) => {
             if !args.target_part_gib.is_finite() || args.target_part_gib <= 0.0 {
                 bail!("target_part_gib must be positive");
@@ -418,9 +1198,68 @@ async fn main() -> Result<()> {
         Command::VerifyRelease(args) => {
             serde_json::to_value(verify_release(&args.release, args.require_pass)?)?
         }
-        Command::Publish(args) => serde_json::to_value(
-            publish(PublishConfig {
+        Command::PackageBuyer(args) => {
+            let config = BuyerPackageConfig {
                 release: args.release,
+                output: args.output,
+                gzip_level: args.gzip_level,
+                workers: args.workers,
+                replace: args.replace,
+            };
+            serde_json::to_value(if args.allow_legacy_lineage {
+                package_buyer_release_legacy(config)?
+            } else {
+                package_buyer_release(config)?
+            })?
+        }
+        Command::VerifyBuyerPackage(args) => serde_json::to_value(if args.allow_legacy_lineage {
+            verify_buyer_package_legacy(&args.package)?
+        } else {
+            verify_buyer_package(&args.package)?
+        })?,
+        Command::Publish(args) => {
+            let source = match (args.release, args.buyer_package) {
+                (Some(path), None) => PublishSource::Release(path),
+                (None, Some(path)) => PublishSource::BuyerPackage(path),
+                _ => bail!("exactly one of --release or --buyer-package is required"),
+            };
+            serde_json::to_value(
+                publish(PublishConfig {
+                    source,
+                    backend: args.backend,
+                    root: args.root,
+                    endpoint: args.endpoint,
+                    bucket: args.bucket,
+                    region: args.region,
+                    prefix: args.prefix,
+                    file_concurrency: args.file_concurrency,
+                    multipart_concurrency: args.multipart_concurrency,
+                    multipart_chunk_bytes: checked_mib(args.multipart_chunk_mib)?,
+                    retry_max_times: args.retry_max_times,
+                    verify_remote_sha256: !args.skip_remote_sha256,
+                })
+                .await?,
+            )?
+        }
+        Command::VerifyPublished(args) => serde_json::to_value(
+            verify_published(VerifyPublishedConfig {
+                artifact_kind: args.artifact_kind,
+                artifact_id: args.artifact_id,
+                backend: args.backend,
+                root: args.root,
+                endpoint: args.endpoint,
+                bucket: args.bucket,
+                region: args.region,
+                prefix: args.prefix,
+                file_concurrency: args.file_concurrency,
+                retry_max_times: args.retry_max_times,
+            })
+            .await?,
+        )?,
+        Command::ArchiveRaw(args) => serde_json::to_value(
+            archive_raw(RawArchiveConfig {
+                inputs: args.input,
+                archive_id: args.archive_id,
                 backend: args.backend,
                 root: args.root,
                 endpoint: args.endpoint,
@@ -430,12 +1269,61 @@ async fn main() -> Result<()> {
                 file_concurrency: args.file_concurrency,
                 multipart_concurrency: args.multipart_concurrency,
                 multipart_chunk_bytes: checked_mib(args.multipart_chunk_mib)?,
-                verify_remote_sha256: args.verify_remote_sha256,
+                retry_max_times: args.retry_max_times,
+                allow_segment_gaps: args.allow_segment_gaps,
+            })
+            .await?,
+        )?,
+        Command::VerifyRawArchive(args) => serde_json::to_value(
+            verify_raw_archive(RawArchiveVerifyConfig {
+                archive_id: args.archive_id,
+                backend: args.backend,
+                root: args.root,
+                endpoint: args.endpoint,
+                bucket: args.bucket,
+                region: args.region,
+                prefix: args.prefix,
+                verify_records: args.verify_records,
+                allow_partial: args.allow_partial,
+            })
+            .await?,
+        )?,
+        Command::RestoreRawArchive(args) => serde_json::to_value(
+            restore_raw_archive(RawArchiveRestoreConfig {
+                archive_id: args.archive_id,
+                output: args.output,
+                backend: args.backend,
+                root: args.root,
+                endpoint: args.endpoint,
+                bucket: args.bucket,
+                region: args.region,
+                prefix: args.prefix,
+                verify_records: args.verify_records,
+                replace: args.replace,
+                allow_partial: args.allow_partial,
             })
             .await?,
         )?,
         Command::Probe(args) => probe(args).await?,
         Command::SelfTest => self_test().await?,
+        Command::RuntimeCanary(args) => serde_json::to_value(
+            run_runtime_canary(RuntimeCanaryConfig {
+                state_root: args.state_root,
+                source_namespace: args.source_namespace,
+                relay_url: args.relay_url,
+                task_session_id: args.task_session_id,
+                root_session_id: args.root_session_id,
+                goal_id: args.goal_id,
+                agent_id: Some(args.agent_id),
+                branch_id: Some(args.branch_id),
+                collector_health_url: args.collector_health_url,
+                evidence_jsonl: args.evidence_jsonl,
+                expected_missing_path: args.expected_missing_path,
+                retry_max_times: args.retry_max_times,
+                request_timeout: Duration::from_secs(args.request_timeout_seconds),
+            })
+            .await?,
+        )?,
         Command::BenchmarkStore(args) => benchmark_store(args).await?,
         Command::BenchmarkHttp(args) => benchmark_http(args).await?,
         Command::BenchmarkCompression(args) => benchmark_compression(args)?,
@@ -512,125 +1400,261 @@ async fn shutdown_signal() {
 async fn self_test() -> Result<Value> {
     let temporary = tempfile::tempdir()?;
     let capture_root = temporary.path().join("capture");
-    let state_root = temporary.path().join("state");
-    let store = CaptureStore::open(StoreConfig {
-        root: capture_root.clone(),
-        state_root,
-        segment_max_bytes: 1024 * 1024,
-        segment_max_age: Duration::from_secs(60),
-        queue_items: 32,
-        batch_records: 8,
-        batch_bytes: 1024 * 1024,
-        batch_wait: Duration::from_millis(1),
-        fsync: true,
+    let collector_bind = reserve_local_address()?;
+    let (collector_shutdown_tx, collector_shutdown_rx) = tokio::sync::oneshot::channel();
+    let collector = tokio::spawn(serve(
+        CollectorConfig {
+            bind: collector_bind,
+            store: StoreConfig {
+                root: capture_root.clone(),
+                state_root: temporary.path().join("collector-state"),
+                segment_max_bytes: 1024 * 1024,
+                segment_max_age: Duration::from_secs(60),
+                queue_items: 64,
+                batch_records: 16,
+                batch_bytes: 2 * 1024 * 1024,
+                batch_wait: Duration::from_millis(1),
+                fsync: true,
+            },
+            store_shards: 1,
+            max_connections: 32,
+            max_envelope_bytes: 4 * 1024 * 1024,
+            max_inflight_body_bytes: 16 * 1024 * 1024,
+            max_batch_records: 64,
+        },
+        async move {
+            let _ = collector_shutdown_rx.await;
+        },
+    ));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    wait_for_health(&client, &format!("http://{collector_bind}/health")).await?;
+    let relay_bind = reserve_local_address()?;
+    let (relay_shutdown_tx, relay_shutdown_rx) = tokio::sync::oneshot::channel();
+    let relay = tokio::spawn(serve_relay(
+        RelayConfig {
+            bind: relay_bind,
+            store: StoreConfig {
+                root: temporary.path().join("outbox"),
+                state_root: temporary.path().join("outbox-state"),
+                segment_max_bytes: 1024 * 1024,
+                segment_max_age: Duration::from_secs(60),
+                queue_items: 64,
+                batch_records: 16,
+                batch_bytes: 2 * 1024 * 1024,
+                batch_wait: Duration::from_millis(1),
+                fsync: true,
+            },
+            store_shards: 1,
+            delivery_state_root: temporary.path().join("delivery-state"),
+            collector_url: format!("http://{collector_bind}"),
+            delivery_concurrency: 2,
+            delivery_queue_items: 64,
+            delivery_batch_records: 16,
+            delivery_batch_bytes: 2 * 1024 * 1024,
+            delivery_batch_wait: Duration::from_millis(1),
+            max_delivery_inflight_bytes: 16 * 1024 * 1024,
+            request_timeout: Duration::from_secs(5),
+            base_retry_delay: Duration::from_millis(5),
+            max_retry_delay: Duration::from_millis(50),
+            max_connections: 32,
+            max_envelope_bytes: 4 * 1024 * 1024,
+            max_inflight_body_bytes: 16 * 1024 * 1024,
+            max_batch_records: 64,
+        },
+        async move {
+            let _ = relay_shutdown_rx.await;
+        },
+    ));
+    wait_for_health(&client, &format!("http://{relay_bind}/health")).await?;
+    // Generate lifecycle, dispatcher and evaluator records through the same
+    // public Harness API used by production producers.  API snapshots remain
+    // a deterministic fixture, while producer semantics are exercised as a
+    // real durable spool and resume path.
+    let harness_events = self_test_harness_events(temporary.path()).await?;
+    let mut captures = self_test_captures();
+    captures.retain(|capture| capture["recordType"] == "api_snapshot");
+    captures.extend(harness_events);
+    let api_snapshots: Vec<&Value> = captures
+        .iter()
+        .filter(|capture| capture["recordType"] == "api_snapshot")
+        .collect();
+    let producer_events: Vec<&Value> = captures
+        .iter()
+        .filter(|capture| capture["recordType"] != "api_snapshot")
+        .collect();
+    let mut submission_routes = Vec::new();
+    for (route, records) in [
+        ("captures", api_snapshots.as_slice()),
+        ("producer/events", producer_events.as_slice()),
+    ] {
+        let mut body = Vec::new();
+        for record in records {
+            body.extend_from_slice(&serde_json::to_vec(record)?);
+            body.push(b'\n');
+        }
+        let response = client
+            .post(format!("http://{relay_bind}/{route}"))
+            .header("content-type", "application/x-ndjson")
+            .body(body)
+            .send()
+            .await?;
+        let status = response.status();
+        let result: Value = response.json().await?;
+        if !status.is_success()
+            || result.get("durable").and_then(Value::as_bool) != Some(true)
+            || result.pointer("/counts/total").and_then(Value::as_u64) != Some(records.len() as u64)
+        {
+            bail!("self-test Relay {route} batch was not durably accepted: {result}");
+        }
+        submission_routes.push(json!({
+            "route":format!("/{route}"),
+            "http_status":status.as_u16(),
+            "counts":result.get("counts"),
+        }));
+    }
+    let mut producer_replay = Vec::new();
+    for record in &producer_events {
+        producer_replay.extend_from_slice(&serde_json::to_vec(record)?);
+        producer_replay.push(b'\n');
+    }
+    let replay_response = client
+        .post(format!("http://{relay_bind}/producer/events"))
+        .header("content-type", "application/x-ndjson")
+        .body(producer_replay)
+        .send()
+        .await?;
+    let replay_status = replay_response.status();
+    let replay_result: Value = replay_response.json().await?;
+    if !replay_status.is_success()
+        || replay_result
+            .pointer("/counts/duplicates")
+            .and_then(Value::as_u64)
+            != Some(producer_events.len() as u64)
+    {
+        bail!("self-test producer replay was not idempotent: {replay_result}");
+    }
+    let submit_summary = json!({
+        "durable":true,
+        "records":captures.len(),
+        "routes":submission_routes,
+        "producer_replay_duplicates":replay_result.pointer("/counts/duplicates"),
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let relay_health = loop {
+        let health: Value = client
+            .get(format!("http://{relay_bind}/health"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if health.get("delivered").and_then(Value::as_u64) == Some(captures.len() as u64) {
+            break health;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("self-test Relay did not drain its outbox: {health:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    client
+        .post(format!("http://{relay_bind}/flush"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let _ = relay_shutdown_tx.send(());
+    relay.await??;
+    client
+        .post(format!("http://{collector_bind}/flush"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let _ = collector_shutdown_tx.send(());
+    collector.await??;
+    let raw_object_root = temporary.path().join("raw-object-store");
+    let raw_archive = archive_raw(RawArchiveConfig {
+        inputs: vec![capture_root.clone()],
+        archive_id: "self-test-raw".to_owned(),
+        backend: Backend::Fs,
+        root: Some(raw_object_root.clone()),
+        endpoint: None,
+        bucket: None,
+        region: None,
+        prefix: "datasets/chiptrace".to_owned(),
+        file_concurrency: 2,
+        multipart_concurrency: 1,
+        multipart_chunk_bytes: 5 * 1024 * 1024,
+        retry_max_times: 3,
+        allow_segment_gaps: false,
     })
     .await?;
-    let tool_names = [
-        "read_workspace",
-        "search_source",
-        "run_tests",
-        "check_format",
-        "verify_release",
-    ];
-    let tools: Vec<Value> = tool_names
-        .iter()
-        .map(|name| {
-            json!({
-                "name": name,
-                "description": format!("Execute the {name} verification step."),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "target": {"type": "string", "description": "Workspace target to inspect."}
-                    },
-                    "required": ["target"]
-                }
-            })
-        })
-        .collect();
-    let mut input = Vec::new();
-    for index in 1..=5 {
-        input.push(json!({
-            "type": "message",
-            "role": "user",
-            "content": format!("Inspect verification stage {index} in /workspace/chip.")
-        }));
-        input.push(json!({
-            "type": "message",
-            "role": "assistant",
-            "content": format!("I will verify stage {index} against the workspace evidence.")
-        }));
+    let raw_verify = verify_raw_archive(RawArchiveVerifyConfig {
+        archive_id: "self-test-raw".to_owned(),
+        backend: Backend::Fs,
+        root: Some(raw_object_root.clone()),
+        endpoint: None,
+        bucket: None,
+        region: None,
+        prefix: "datasets/chiptrace".to_owned(),
+        verify_records: true,
+        allow_partial: false,
+    })
+    .await?;
+    let raw_restore_root = temporary.path().join("raw-restored");
+    let raw_restore = restore_raw_archive(RawArchiveRestoreConfig {
+        archive_id: "self-test-raw".to_owned(),
+        output: raw_restore_root.clone(),
+        backend: Backend::Fs,
+        root: Some(raw_object_root),
+        endpoint: None,
+        bucket: None,
+        region: None,
+        prefix: "datasets/chiptrace".to_owned(),
+        verify_records: true,
+        replace: false,
+        allow_partial: false,
+    })
+    .await?;
+    let usage_log_path = temporary.path().join("sub2api-usage.jsonl");
+    let mut usage_log = Vec::new();
+    for ordinal in 1..=5 {
+        usage_log.extend_from_slice(&serde_json::to_vec(&json!({
+            "id": ordinal,
+            "request_id": format!("request-{ordinal}"),
+            "requested_model": "gpt-5.6-sol",
+            "upstream_model": "gpt-5.6-sol",
+            "provider": "OpenAI",
+            "input_tokens": 200,
+            "output_tokens": 80,
+            "cache_read_tokens": 800 + ordinal * 100,
+        }))?);
+        usage_log.push(b'\n');
     }
-    for (index, name) in tool_names.iter().enumerate() {
-        input.push(json!({
-            "type": "function_call",
-            "call_id": format!("call-{}", index + 1),
-            "name": name,
-            "arguments": "{\"target\":\"/workspace/chip\"}"
-        }));
-        input.push(json!({
-            "type": "function_call_output",
-            "call_id": format!("call-{}", index + 1),
-            "output": format!("{name} completed with recorded evidence"),
-            "status": "completed"
-        }));
-    }
-    let captures = vec![json!({
-        "captureId": "cap-self-test-v7",
-        "sourceNamespace": "self-test",
-        "startedAt": "2026-08-27T00:00:00Z",
-        "finishedAt": "2026-08-27T00:00:03Z",
-        "proxiedPath": "/v1/responses",
-        "traceContext": {
-            "session_id": "session-self-test-v7",
-            "root_session_id": "session-self-test-v7",
-            "goal_id": "goal-self-test",
-            "turn_id": "turn-5",
-            "agent_id": "agent-root",
-            "branch_id": "main"
-        },
-        "requestBody": {"kind": "json", "value": {
-            "model": "gpt-5.6-sol",
-            "instructions": "You are a coding agent. Preserve real tool evidence.",
-            "tools": tools,
-            "input": input
-        }},
-        "responseStatus": 200,
-        "responseBody": {"kind": "json", "value": {
-            "id": "response-self-test-v7",
-            "model": "gpt-5.6-sol",
-            "status": "completed",
-            "output": [{
-                "type":"message",
-                "role":"assistant",
-                "content":[{"type":"output_text","text":"All five verification stages passed."}]
-            }],
-            "usage": {
-                "input_tokens": 1200,
-                "input_tokens_details": {"cached_tokens": 900},
-                "output_tokens": 180,
-                "output_tokens_details": {"reasoning_tokens": 40},
-                "total_tokens": 1380
-            }
-        }},
-        "evaluationEvidence": [
-            {"kind":"test","source":"cargo test","status":"passed","artifact":"25 tests"},
-            {"kind":"build","source":"cargo build --release","status":"passed"},
-            {"kind":"final_acceptance","source":"self-test","status":"accepted"}
-        ],
-        "observedLifecycleEvents": ["session_start", "session_end"]
-    })];
-    for capture in captures {
-        let raw = serde_json::to_vec(&capture)?;
-        store
-            .submit(normalize_capture(&raw, 1024 * 1024)?)
-            .await
-            .map_err(anyhow::Error::from)?;
-    }
-    store.close().await?;
+    usage_log.extend_from_slice(&serde_json::to_vec(&json!({
+        "id": 6,
+        "request_id": "request-final",
+        "requested_model": "gpt-5.6-sol",
+        "upstream_model": "gpt-5.6-sol",
+        "provider": "OpenAI",
+        "input_tokens": 200,
+        "output_tokens": 100,
+        "cache_read_tokens": 1800,
+    }))?);
+    usage_log.push(b'\n');
+    fs::write(&usage_log_path, usage_log)?;
+    let enriched_root = temporary.path().join("enriched");
+    let enrichment = enrich_captures(EnrichConfig {
+        inputs: vec![raw_restore_root],
+        usage_logs: vec![usage_log_path],
+        output: enriched_root.clone(),
+        zstd_level: 1,
+        replace: false,
+    })?;
+    let enrichment_verified = verify_enrichment(&enriched_root)?;
     let assembly_root = temporary.path().join("assembly");
     let assembly = assemble(AssembleConfig {
-        inputs: vec![capture_root],
+        inputs: vec![enriched_root],
         output: assembly_root.clone(),
         partitions: 4,
         zstd_level: 1,
@@ -649,7 +1673,60 @@ async fn self_test() -> Result<Value> {
         workers: 4,
         replace: false,
     })?;
-    let verified = verify_release(&release_root, true)?;
+    let rejection_diagnostic = if release.validation_status == "pass" {
+        None
+    } else {
+        let report = release
+            .reports
+            .iter()
+            .find(|report| report.file.starts_with("reports/assessments-part-"))
+            .context("self-test Release has no assessment report")?;
+        let mut reader = chiptrace::jsonl::open_jsonl_reader(&release_root.join(&report.file))?;
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line)?;
+        Some(serde_json::from_slice::<Value>(&line)?)
+    };
+    let verified = verify_release(&release_root, true).with_context(|| {
+        format!(
+            "self-test release verification failed: counts={:?} failure_reasons={:?} assessment={}",
+            release.counts,
+            release.failure_reason_counts,
+            rejection_diagnostic
+                .as_ref()
+                .map(Value::to_string)
+                .unwrap_or_else(|| "null".to_owned()),
+        )
+    })?;
+    let buyer_root = temporary.path().join("buyer-package");
+    let buyer = package_buyer_release(BuyerPackageConfig {
+        release: release_root.clone(),
+        output: buyer_root.clone(),
+        gzip_level: 1,
+        workers: 4,
+        replace: false,
+    })?;
+    let verified_buyer = verify_buyer_package(&buyer_root)?;
+    let tampered_buyer_root = temporary.path().join("tampered-buyer-package");
+    fs::create_dir_all(tampered_buyer_root.join("packages"))?;
+    fs::copy(
+        buyer_root.join("manifest.json"),
+        tampered_buyer_root.join("manifest.json"),
+    )?;
+    fs::copy(
+        buyer_root.join("SHA256SUMS"),
+        tampered_buyer_root.join("SHA256SUMS"),
+    )?;
+    let buyer_archive = buyer
+        .packages
+        .first()
+        .context("self-test buyer package has no archive")?;
+    let tampered_archive = tampered_buyer_root.join(&buyer_archive.file);
+    fs::copy(buyer_root.join(&buyer_archive.file), &tampered_archive)?;
+    OpenOptions::new()
+        .append(true)
+        .open(&tampered_archive)?
+        .write_all(b"tamper")?;
+    let buyer_tamper_detected = verify_buyer_package(&tampered_buyer_root).is_err();
     let delivered_part = release
         .parts
         .first()
@@ -670,7 +1747,15 @@ async fn self_test() -> Result<Value> {
         .pointer("/meta/task_dag/complete")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let executed_tool_calls = delivered
+    let proxy_route_verified = delivered
+        .pointer("/meta/model_evidence/proxy_route_verified")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let provider_identity_attested = delivered
+        .pointer("/meta/model_evidence/provider_identity_attested")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let tool_call_statuses: Vec<&str> = delivered
         .get("messages")
         .and_then(Value::as_array)
         .into_iter()
@@ -682,16 +1767,55 @@ async fn self_test() -> Result<Value> {
                 .into_iter()
                 .flatten()
         })
-        .filter(|call| call.get("execution_status").and_then(Value::as_str) == Some("executed"))
+        .filter_map(|call| call.get("execution_status").and_then(Value::as_str))
+        .collect();
+    let completed_tool_calls = tool_call_statuses
+        .iter()
+        .filter(|status| matches!(**status, "executed" | "failed"))
+        .count();
+    let failed_tool_calls = tool_call_statuses
+        .iter()
+        .filter(|status| **status == "failed")
         .count();
     let semantic_reward_available = delivered
         .pointer("/quality/semantic_quality/reward_available")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let tool_execution_audit_pass = delivered
+        .pointer("/meta/tool_execution_conflicts")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+        && delivered
+            .pointer("/meta/tool_executions")
+            .and_then(Value::as_array)
+            .is_some_and(|executions| {
+                executions.len() == 5
+                    && executions.iter().all(|execution| {
+                        execution["evidence_mode"] == "producer_state_machine"
+                            && execution["state"] == "closed"
+                            && execution["started_capture_ids"]
+                                .as_array()
+                                .is_some_and(|captures| captures.len() == 1)
+                            && execution["terminal_capture_ids"]
+                                .as_array()
+                                .is_some_and(|captures| captures.len() == 1)
+                    })
+            });
+    let producer_stream_audit_pass = delivered
+        .pointer("/meta/producer_event_conflicts")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+        && delivered
+            .pointer("/meta/producer_streams")
+            .and_then(Value::as_array)
+            .is_some_and(|streams| {
+                streams.len() == 3 && streams.iter().all(|stream| stream["contiguous"] == true)
+            });
+    let published_object_root = temporary.path().join("object-store");
     let publish_config = PublishConfig {
-        release: release_root,
+        source: PublishSource::Release(release_root),
         backend: Backend::Fs,
-        root: Some(temporary.path().join("object-store")),
+        root: Some(published_object_root.clone()),
         endpoint: None,
         bucket: None,
         region: None,
@@ -699,26 +1823,124 @@ async fn self_test() -> Result<Value> {
         file_concurrency: 4,
         multipart_concurrency: 2,
         multipart_chunk_bytes: 5 * 1024 * 1024,
+        retry_max_times: 25,
         verify_remote_sha256: true,
     };
     let first_publish = publish(publish_config.clone()).await?;
     let second_publish = publish(publish_config).await?;
-    Ok(json!({
-        "ok": release.counts.eligible_sessions == 1
+    let published_release = verify_published(VerifyPublishedConfig {
+        artifact_kind: ArtifactKind::Release,
+        artifact_id: "self-test-release".to_owned(),
+        backend: Backend::Fs,
+        root: Some(published_object_root.clone()),
+        endpoint: None,
+        bucket: None,
+        region: None,
+        prefix: "self-test".to_owned(),
+        file_concurrency: 4,
+        retry_max_times: 25,
+    })
+    .await?;
+    let buyer_publish_config = PublishConfig {
+        source: PublishSource::BuyerPackage(buyer_root),
+        backend: Backend::Fs,
+        root: Some(published_object_root.clone()),
+        endpoint: None,
+        bucket: None,
+        region: None,
+        prefix: "self-test".to_owned(),
+        file_concurrency: 4,
+        multipart_concurrency: 2,
+        multipart_chunk_bytes: 5 * 1024 * 1024,
+        retry_max_times: 25,
+        verify_remote_sha256: true,
+    };
+    let first_buyer_publish = publish(buyer_publish_config.clone()).await?;
+    let second_buyer_publish = publish(buyer_publish_config).await?;
+    let published_buyer = verify_published(VerifyPublishedConfig {
+        artifact_kind: ArtifactKind::BuyerPackage,
+        artifact_id: "self-test-release".to_owned(),
+        backend: Backend::Fs,
+        root: Some(published_object_root),
+        endpoint: None,
+        bucket: None,
+        region: None,
+        prefix: "self-test".to_owned(),
+        file_concurrency: 4,
+        retry_max_times: 25,
+    })
+    .await?;
+    let self_test_checks = json!({
+        "buyer_v7_session_eligible":release.counts.eligible_sessions == 1
             && release.buyer_profile == "buyer-v7"
             && score == 100.0
-            && hard_gate_pass
-            && task_dag_complete
-            && delivered.pointer("/meta/capture_dag").is_some()
-            && executed_tool_calls == 5
-            && semantic_reward_available
-            && verified.validation_status == "pass"
-            && !first_publish.idempotent
-            && second_publish.idempotent,
+            && hard_gate_pass,
+        "task_and_provider_evidence":task_dag_complete
+            && proxy_route_verified
+            && provider_identity_attested
+            && delivered.pointer("/meta/capture_dag").is_some(),
+        "tool_projection":completed_tool_calls == 5 && failed_tool_calls == 1,
+        "tool_execution_state_machine":tool_execution_audit_pass,
+        "producer_stream_conservation":producer_stream_audit_pass,
+        "capture_counts":delivered["source_request_count"] == 6
+            && delivered["source_capture_count"] == captures.len(),
+        "assembly_integrity":assembly.merge_divergences == 0
+            && assembly.capture_schema_versions.len() == 1
+            && assembly.capture_schema_versions.contains(CAPTURE_SCHEMA_VERSION),
+        "relay_delivery_conservation":relay_health.get("delivered").and_then(Value::as_u64)
+                == Some(captures.len() as u64)
+            && relay_health.get("pending").and_then(Value::as_u64) == Some(0)
+            && relay_health.get("inflight").and_then(Value::as_u64) == Some(0)
+            && relay_health.get("conservation_ok").and_then(Value::as_bool) == Some(true),
+        "raw_archive_lineage":raw_archive.segment_count == raw_verify.segment_count
+            && raw_archive.completeness == "complete"
+            && raw_verify.completeness == "complete"
+            && raw_restore.completeness == "complete"
+            && raw_verify.total_records == raw_archive.total_records
+            && raw_restore.segment_count == raw_archive.segment_count
+            && assembly.raw_sources.len() == 1
+            && assembly.raw_sources[0].archive_id == "self-test-raw"
+            && release.raw_sources == assembly.raw_sources,
+        "gateway_enrichment":enrichment.matched == 6
+            && enrichment.unmatched == producer_events.len() as u64
+            && enrichment.ambiguous == 0
+            && enrichment == enrichment_verified,
+        "semantic_reward":semantic_reward_available,
+        "release_verification":verified.validation_status == "pass",
+        "buyer_package_verification":buyer.eligible_sessions == 1
+            && buyer.packages.len() == 1
+            && verified_buyer == buyer
+            && buyer_tamper_detected,
+        "release_publish_idempotency":!first_publish.idempotent
+            && second_publish.idempotent
+            && published_release.ok,
+        "buyer_publish_idempotency":!first_buyer_publish.idempotent
+            && second_buyer_publish.idempotent
+            && published_buyer.ok,
+    });
+    let self_test_ok = self_test_checks
+        .as_object()
+        .is_some_and(|checks| checks.values().all(|check| check == &Value::Bool(true)));
+    Ok(json!({
+        "ok": self_test_ok,
+        "checks":self_test_checks,
         "assembly": assembly,
+        "collection": relay_health,
+        "collection_submission": submit_summary,
+        "raw_archive": raw_archive,
+        "raw_archive_verify": raw_verify,
+        "raw_archive_restore": raw_restore,
+        "enrichment": enrichment,
+        "enrichment_verify": enrichment_verified,
         "release": release,
+        "buyer_package": buyer,
+        "buyer_tamper_detected": buyer_tamper_detected,
         "publish": first_publish,
         "publish_retry": second_publish,
+        "published_release_verify": published_release,
+        "buyer_publish": first_buyer_publish,
+        "buyer_publish_retry": second_buyer_publish,
+        "published_buyer_verify": published_buyer,
         "acceptance": {
             "profile": release.buyer_profile,
             "minimum_score": release.minimum_score,
@@ -726,10 +1948,647 @@ async fn self_test() -> Result<Value> {
             "hard_gate_pass": hard_gate_pass,
             "capture_dag_present": delivered.pointer("/meta/capture_dag").is_some(),
             "task_dag_complete": task_dag_complete,
-            "executed_tool_calls": executed_tool_calls,
+            "proxy_route_verified": proxy_route_verified,
+            "provider_identity_attested": provider_identity_attested,
+            "completed_tool_calls": completed_tool_calls,
+            "failed_tool_calls": failed_tool_calls,
+            "tool_execution_audit_pass":tool_execution_audit_pass,
+            "producer_stream_audit_pass":producer_stream_audit_pass,
+            "source_request_count": delivered["source_request_count"],
+            "source_capture_count": delivered["source_capture_count"],
             "semantic_reward_available": semantic_reward_available,
         },
     }))
+}
+
+fn reserve_local_address() -> Result<SocketAddr> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?)
+}
+
+async fn wait_for_health(client: &reqwest::Client, url: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if client
+            .get(url)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("service did not become healthy: {url}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn harness_target(
+    relay_url: Option<String>,
+    output: Option<PathBuf>,
+) -> Result<Option<HarnessTarget>> {
+    match (relay_url, output) {
+        (Some(url), None) => {
+            if url.trim().is_empty() {
+                bail!("--relay-url must not be empty");
+            }
+            Ok(Some(HarnessTarget::Relay(url)))
+        }
+        (None, Some(path)) => Ok(Some(HarnessTarget::Jsonl(path))),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => bail!("--relay-url and --output are mutually exclusive"),
+    }
+}
+
+fn parse_harness_value(raw: &str, field: &str) -> Result<Value> {
+    if let Some(path) = raw.strip_prefix('@') {
+        let bytes = fs::read(path).with_context(|| format!("read {field} file {path}"))?;
+        return serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse {field} JSON file {path}"));
+    }
+    match serde_json::from_str(raw) {
+        Ok(value) => Ok(value),
+        Err(_) => Ok(Value::String(raw.to_owned())),
+    }
+}
+
+fn parse_harness_json_file(path: Option<PathBuf>, field: &str) -> Result<Option<Value>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let bytes = fs::read(&path).with_context(|| format!("read {field} {}", path.display()))?;
+    Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
+        format!("parse {field} {}", path.display())
+    })?))
+}
+
+fn open_harness_state(
+    state_root: PathBuf,
+    relay_url: Option<String>,
+    output: Option<PathBuf>,
+) -> Result<Harness> {
+    let target = harness_target(relay_url, output)?;
+    Harness::open_with_target(state_root, target)
+}
+
+async fn harness_start(args: HarnessStartArgs) -> Result<Value> {
+    let target = harness_target(args.relay_url, args.output)?;
+    let registry = parse_harness_json_file(args.tool_registry, "tool registry")?;
+    let mut config = HarnessConfig::new(args.state_root, args.source_namespace);
+    config.task_session_id = args.task_session_id;
+    config.root_session_id = args.root_session_id;
+    config.parent_session_id = args.parent_session_id;
+    config.goal_id = args.goal_id;
+    config.agent_id = args.agent_id;
+    config.branch_id = args.branch_id;
+    config.session_id = args.session_id;
+    config.thread_id = args.thread_id;
+    config.previous_response_id = args.previous_response_id;
+    config.traceparent = args.traceparent;
+    config.target = target;
+    config.tool_registry = registry;
+    config.retry_max_times = args.retry_max_times;
+    config.request_timeout = Duration::from_secs(args.request_timeout_seconds);
+    config.max_envelope_bytes = checked_mib(args.max_envelope_mib)?;
+    config.batch_records = args.batch_records;
+    let mut harness = Harness::start(config)?;
+    let delivery = match harness.flush().await {
+        Ok(summary) => json!({"ok":true,"summary":summary}),
+        Err(error) => json!({"ok":false,"error":error.to_string(),"durable_spool":true}),
+    };
+    Ok(json!({
+        "ok":true,
+        "identity":harness.identity(),
+        "delivery":delivery,
+        "inspection":harness.inspect()?,
+    }))
+}
+
+async fn harness_lifecycle(args: HarnessLifecycleArgs) -> Result<Value> {
+    let target = harness_target(args.state.relay_url, args.state.output)?;
+    let mut harness = Harness::open_with_target(args.state.state_root, target)?;
+    let details = args
+        .details
+        .as_deref()
+        .map(|raw| parse_harness_value(raw, "details"))
+        .transpose()?;
+    let receipt = harness.emit_lifecycle(LifecycleEventInput {
+        event_type: args.event_type,
+        status: args.status,
+        reason: args.reason,
+        turn_id: args.turn_id,
+        details,
+        occurred_at: args.occurred_at,
+    })?;
+    let delivery = match harness.flush().await {
+        Ok(summary) => json!({"ok":true,"summary":summary}),
+        Err(error) => json!({"ok":false,"error":error.to_string(),"durable_spool":true}),
+    };
+    Ok(json!({"ok":true,"receipt":receipt,"delivery":delivery,"inspection":harness.inspect()?}))
+}
+
+async fn harness_tool_start(args: HarnessToolStartArgs) -> Result<Value> {
+    let target = harness_target(args.state.relay_url, args.state.output)?;
+    let mut harness = Harness::open_with_target(args.state.state_root, target)?;
+    let schema = parse_harness_json_file(args.schema, "tool schema")?;
+    let arguments = parse_harness_value(&args.arguments, "arguments")?;
+    let receipt = harness.tool_start(ToolStartInput {
+        call_id: args.call_id,
+        name: args.name,
+        runtime_namespace: args.runtime_namespace,
+        runtime_tool: args.runtime_tool,
+        arguments,
+        schema,
+        parent_call_id: args.parent_call_id,
+        initiator: args.initiator,
+        turn_id: args.turn_id,
+        started_at: args.started_at,
+    })?;
+    let delivery = match harness.flush().await {
+        Ok(summary) => json!({"ok":true,"summary":summary}),
+        Err(error) => json!({"ok":false,"error":error.to_string(),"durable_spool":true}),
+    };
+    Ok(json!({"ok":true,"receipt":receipt,"delivery":delivery,"inspection":harness.inspect()?}))
+}
+
+async fn harness_tool_end(args: HarnessToolEndArgs) -> Result<Value> {
+    let target = harness_target(args.state.relay_url, args.state.output)?;
+    let mut harness = Harness::open_with_target(args.state.state_root, target)?;
+    let result = args
+        .result
+        .as_deref()
+        .map(|raw| parse_harness_value(raw, "result"))
+        .transpose()?;
+    let error = args
+        .error
+        .as_deref()
+        .map(|raw| parse_harness_value(raw, "error"))
+        .transpose()?;
+    let receipt = harness.tool_end(ToolEndInput {
+        call_id: args.call_id,
+        status: args.status,
+        result,
+        error,
+        finished_at: args.finished_at,
+    })?;
+    let delivery = match harness.flush().await {
+        Ok(summary) => json!({"ok":true,"summary":summary}),
+        Err(error) => json!({"ok":false,"error":error.to_string(),"durable_spool":true}),
+    };
+    Ok(json!({"ok":true,"receipt":receipt,"delivery":delivery,"inspection":harness.inspect()?}))
+}
+
+async fn harness_evaluate(args: HarnessEvaluateArgs) -> Result<Value> {
+    let target = harness_target(args.state.relay_url, args.state.output)?;
+    let mut harness = Harness::open_with_target(args.state.state_root, target)?;
+    let artifact = args
+        .artifact
+        .as_deref()
+        .map(|raw| parse_harness_value(raw, "artifact"))
+        .transpose()?;
+    let receipt = harness.evaluate(EvaluationInput {
+        kind: args.kind,
+        source: args.source,
+        status: args.status,
+        passed: args.passed,
+        reward: args.reward,
+        score: args.score,
+        artifact,
+        observed_at: args.observed_at,
+    })?;
+    let delivery = match harness.flush().await {
+        Ok(summary) => json!({"ok":true,"summary":summary}),
+        Err(error) => json!({"ok":false,"error":error.to_string(),"durable_spool":true}),
+    };
+    Ok(json!({"ok":true,"receipt":receipt,"delivery":delivery,"inspection":harness.inspect()?}))
+}
+
+async fn harness_end(args: HarnessEndArgs) -> Result<Value> {
+    let target = harness_target(args.state.relay_url, args.state.output)?;
+    let mut harness = Harness::open_with_target(args.state.state_root, target)?;
+    let receipt = harness.task_end(args.status, args.reason)?;
+    let delivery = match harness.flush().await {
+        Ok(summary) => json!({"ok":true,"summary":summary}),
+        Err(error) => json!({"ok":false,"error":error.to_string(),"durable_spool":true}),
+    };
+    Ok(json!({"ok":true,"receipt":receipt,"delivery":delivery,"inspection":harness.inspect()?}))
+}
+
+async fn harness_flush(args: HarnessFlushArgs) -> Result<Value> {
+    let mut harness = open_harness_state(
+        args.state.state_root,
+        args.state.relay_url,
+        args.state.output,
+    )?;
+    let summary = harness.flush().await?;
+    Ok(json!({"ok":true,"summary":summary,"inspection":harness.inspect()?}))
+}
+
+fn self_test_tool_schema(name: &str) -> Value {
+    json!({
+        "type":"function",
+        "name":name,
+        "description":format!("Execute the {name} verification step."),
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "target":{"type":"string","description":"Workspace target to inspect."}
+            },
+            "required":["target"]
+        }
+    })
+}
+
+fn self_test_trace(turn_id: Option<&str>) -> Value {
+    let mut trace = json!({
+        "task_session_id":"task-self-test-v7",
+        "session_id":"thread-self-test",
+        "thread_id":"thread-self-test",
+        "root_session_id":"task-self-test-v7",
+        "goal_id":"goal-self-test",
+        "agent_id":"agent-root",
+        "branch_id":"main"
+    });
+    if let Some(turn_id) = turn_id {
+        trace["root_turn_id"] = json!(turn_id);
+        trace["turn_id"] = json!(turn_id);
+    }
+    trace
+}
+
+fn self_test_producer_event(
+    producer: &str,
+    stream_id: &str,
+    event_id: &str,
+    sequence: u64,
+) -> Value {
+    json!({
+        "schema_version":"chiptrace.producer-event.v1",
+        "event_id":event_id,
+        "producer":producer,
+        "producer_version":"0.5.1",
+        "identity_scheme":"chiptrace.deterministic-capture.v1",
+        "stream_id":stream_id,
+        "sequence":sequence,
+    })
+}
+
+async fn self_test_harness_events(root: &std::path::Path) -> Result<Vec<Value>> {
+    let state_root = root.join("harness-state");
+    let delivery_path = root.join("harness-delivery.ndjson");
+    let names = [
+        "read_workspace",
+        "search_source",
+        "run_tests",
+        "check_format",
+        "verify_release",
+    ];
+    let registry = json!({
+        "schema_version":"chiptrace.tool-registry.v1",
+        "producer":"codex-cli",
+        "producer_version":"0.150.0-alpha.9",
+        "captured_at":"2026-08-27T00:00:00Z",
+        "tools":names.iter().map(|name| json!({
+            "runtime_item_type":"CodeModeTool",
+            "tool":self_test_tool_schema(name)
+        })).collect::<Vec<_>>()
+    });
+    let mut config = HarnessConfig::new(state_root, "self-test");
+    config.task_session_id = Some("task-self-test-v7".to_owned());
+    config.root_session_id = Some("task-self-test-v7".to_owned());
+    config.goal_id = Some("goal-self-test".to_owned());
+    config.agent_id = Some("agent-root".to_owned());
+    config.branch_id = Some("main".to_owned());
+    config.session_id = Some("thread-self-test".to_owned());
+    config.thread_id = Some("thread-self-test".to_owned());
+    config.target = Some(HarnessTarget::Jsonl(delivery_path));
+    config.tool_registry = Some(registry);
+    config.retry_max_times = 25;
+    config.batch_records = 32;
+    let mut harness = Harness::start(config)?;
+    for (index, name) in names.iter().enumerate() {
+        let turn_id = format!("turn-{}", index + 1);
+        harness.tool_start(ToolStartInput {
+            call_id: format!("call-{}", index + 1),
+            name: (*name).to_owned(),
+            runtime_namespace: None,
+            runtime_tool: None,
+            arguments: json!({"target":"/workspace/chip"}),
+            schema: None,
+            parent_call_id: None,
+            initiator: "assistant".to_owned(),
+            turn_id: Some(turn_id),
+            started_at: Some(format!("2026-08-27T00:00:{:02}Z", index * 3 + 2)),
+        })?;
+        let end = if index == 0 {
+            ToolEndInput {
+                call_id: format!("call-{}", index + 1),
+                status: "error".to_owned(),
+                result: Some(json!("permission denied while reading workspace")),
+                error: None,
+                finished_at: Some(format!("2026-08-27T00:00:{:02}Z", index * 3 + 3)),
+            }
+        } else {
+            ToolEndInput {
+                call_id: format!("call-{}", index + 1),
+                status: "success".to_owned(),
+                result: Some(json!("completed with recorded workspace evidence")),
+                error: None,
+                finished_at: Some(format!("2026-08-27T00:00:{:02}Z", index * 3 + 3)),
+            }
+        };
+        harness.tool_end(end)?;
+    }
+    harness.evaluate(EvaluationInput {
+        kind: "test".to_owned(),
+        source: "cargo test --workspace".to_owned(),
+        status: Some("passed".to_owned()),
+        passed: Some(true),
+        reward: None,
+        score: None,
+        artifact: Some(json!({"all_tests_passed":true})),
+        observed_at: Some("2026-08-27T00:00:17Z".to_owned()),
+    })?;
+    harness.evaluate(EvaluationInput {
+        kind: "build".to_owned(),
+        source: "cargo build --release".to_owned(),
+        status: Some("passed".to_owned()),
+        passed: Some(true),
+        reward: None,
+        score: None,
+        artifact: Some(json!({"binary":"target/release/chiptrace"})),
+        observed_at: Some("2026-08-27T00:00:17Z".to_owned()),
+    })?;
+    harness.evaluate(EvaluationInput {
+        kind: "final_acceptance".to_owned(),
+        source: "self-test evaluator".to_owned(),
+        status: Some("accepted".to_owned()),
+        passed: Some(true),
+        reward: Some(1.0),
+        score: None,
+        artifact: Some(json!({"profile":"buyer-v7"})),
+        observed_at: Some("2026-08-27T00:00:17Z".to_owned()),
+    })?;
+    harness.task_end("completed", Some("self-test complete".to_owned()))?;
+    let flushed = harness.flush().await?;
+    if flushed.pending_records != 0 {
+        bail!(
+            "harness self-test left pending records: {}",
+            flushed.pending_records
+        );
+    }
+    let mut events = Vec::new();
+    let reader = std::io::BufReader::new(File::open(harness.spool_path())?);
+    for line in reader.lines() {
+        let line = line?;
+        if !line.trim().is_empty() {
+            events.push(serde_json::from_str(&line)?);
+        }
+    }
+    if events.len() != 15 {
+        bail!(
+            "harness self-test expected 15 producer events, got {}",
+            events.len()
+        );
+    }
+    Ok(events)
+}
+
+fn self_test_captures() -> Vec<Value> {
+    let names = [
+        "read_workspace",
+        "search_source",
+        "run_tests",
+        "check_format",
+        "verify_release",
+    ];
+    let schemas: Vec<Value> = names
+        .iter()
+        .map(|name| self_test_tool_schema(name))
+        .collect();
+    let tool_namespace = json!({
+        "type":"additional_tools",
+        "role":"developer",
+        "tools":[{
+            "type":"namespace",
+            "name":"functions",
+            "description":"Workspace verification tools.",
+            "tools":schemas
+        }]
+    });
+    let system_prompt =
+        "You are a coding agent. Preserve real tool evidence and verify the final result.";
+    let user_prompts = [
+        "Inspect the workspace before changing anything.",
+        "The first read failed; search the source using another path.",
+        "Run the focused tests against the recovered source.",
+        "Check formatting after the tests pass.",
+        "Verify the release artifact and report the evidence.",
+    ];
+    let mut captures = vec![json!({
+        "recordType":"lifecycle_event",
+        "sourceNamespace":"self-test",
+        "traceContext":self_test_trace(None),
+        "producerEvent":self_test_producer_event(
+            "chiptrace-harness", "harness-self-test", "life-start", 0
+        ),
+        "lifecycleEvent":{
+            "event_id":"life-start",
+            "type":"task_start",
+            "status":"started",
+            "occurred_at":"2026-08-27T00:00:00Z"
+        }
+    })];
+    let mut history = Vec::new();
+    let mut previous_response_id: Option<String> = None;
+    for (index, name) in names.iter().enumerate() {
+        let ordinal = index + 1;
+        let turn_id = format!("turn-{ordinal}");
+        let call_id = format!("call-{ordinal}");
+        let response_id = format!("response-{ordinal}");
+        let user = json!({
+            "type":"message",
+            "id":format!("user-{ordinal}"),
+            "role":"user",
+            "content":user_prompts[index]
+        });
+        history.push(user);
+        let mut request_input = vec![
+            tool_namespace.clone(),
+            json!({"type":"message","role":"developer","content":system_prompt}),
+        ];
+        request_input.extend(history.clone());
+        let assistant_text = format!("I will execute {name} and retain its real result.");
+        let arguments = json!({"target":"/workspace/chip"});
+        captures.push(json!({
+            "recordType":"api_snapshot",
+            "captureId":format!("cap-self-api-{ordinal}"),
+            "upstreamRequestId":format!("request-{ordinal}"),
+            "sourceNamespace":"self-test",
+            "startedAt":format!("2026-08-27T00:00:{:02}Z", index * 3 + 1),
+            "finishedAt":format!("2026-08-27T00:00:{:02}Z", index * 3 + 1),
+            "proxiedPath":"/v1/responses",
+            "traceContext":self_test_trace(Some(&turn_id)),
+            "requestBody":{"kind":"json","value":{
+                "model":"gpt-5.6-sol",
+                "previous_response_id":previous_response_id,
+                "input":request_input
+            }},
+            "responseStatus":200,
+            "responseHeaders":{"x-request-id":format!("request-{ordinal}")},
+            "responseBody":{"kind":"json","value":{
+                "id":response_id,
+                "model":"gpt-5.6-sol",
+                "provider":"OpenAI",
+                "status":"completed",
+                "instructions":system_prompt,
+                "output":[
+                    {"type":"message","id":format!("assistant-{ordinal}"),"role":"assistant","content":assistant_text},
+                    {"type":"function_call","id":format!("tool-item-{ordinal}"),"call_id":call_id,"name":name,
+                     "arguments":serde_json::to_string(&arguments).unwrap()}
+                ],
+                "usage":{
+                    "input_tokens":1000 + ordinal * 100,
+                    "input_tokens_details":{"cached_tokens":800 + ordinal * 100},
+                    "output_tokens":80,
+                    "output_tokens_details":{"reasoning_tokens":20},
+                    "total_tokens":1080 + ordinal * 100
+                }
+            }}
+        }));
+        let (status, result_field, result) = if index == 0 {
+            (
+                "error",
+                "error",
+                "permission denied while reading workspace",
+            )
+        } else {
+            (
+                "success",
+                "result",
+                "completed with recorded workspace evidence",
+            )
+        };
+        let started_at = format!("2026-08-27T00:00:{:02}Z", index * 3 + 2);
+        captures.push(json!({
+            "recordType":"tool_execution",
+            "sourceNamespace":"self-test",
+            "traceContext":self_test_trace(Some(&turn_id)),
+            "producerEvent":self_test_producer_event(
+                "tool-dispatcher",
+                "dispatcher-self-test",
+                &format!("tool-{ordinal}-start"),
+                (index * 2) as u64,
+            ),
+            "toolExecution":{
+                "call_id":call_id,
+                "name":name,
+                "initiator":"assistant",
+                "status":"started",
+                "arguments":arguments,
+                "schema":schemas[index],
+                "started_at":started_at,
+            }
+        }));
+        let mut execution = json!({
+            "call_id":call_id,
+            "name":name,
+            "initiator":"assistant",
+            "status":status,
+            "arguments":arguments,
+            "schema":schemas[index],
+            "started_at":started_at,
+            "finished_at":format!("2026-08-27T00:00:{:02}Z", index * 3 + 3)
+        });
+        execution[result_field] = json!(result);
+        captures.push(json!({
+            "recordType":"tool_execution",
+            "sourceNamespace":"self-test",
+            "traceContext":self_test_trace(Some(&turn_id)),
+            "producerEvent":self_test_producer_event(
+                "tool-dispatcher",
+                "dispatcher-self-test",
+                &format!("tool-{ordinal}-finish"),
+                (index * 2 + 1) as u64,
+            ),
+            "toolExecution":execution
+        }));
+        history.push(json!({
+            "type":"message","id":format!("assistant-{ordinal}"),"role":"assistant","content":assistant_text
+        }));
+        history.push(json!({
+            "type":"function_call","id":format!("tool-item-{ordinal}"),"call_id":call_id,
+            "name":name,"arguments":serde_json::to_string(&arguments).unwrap()
+        }));
+        history.push(json!({
+            "type":"function_call_output","id":format!("result-item-{ordinal}"),
+            "call_id":call_id,"output":result
+        }));
+        previous_response_id = Some(format!("response-{ordinal}"));
+    }
+    let mut final_input = vec![
+        tool_namespace,
+        json!({"type":"message","role":"developer","content":system_prompt}),
+    ];
+    final_input.extend(history);
+    captures.push(json!({
+        "recordType":"api_snapshot",
+        "captureId":"cap-self-api-final",
+        "upstreamRequestId":"request-final",
+        "sourceNamespace":"self-test",
+        "startedAt":"2026-08-27T00:00:16Z",
+        "finishedAt":"2026-08-27T00:00:16Z",
+        "proxiedPath":"/v1/responses",
+        "traceContext":self_test_trace(Some("turn-5")),
+        "requestBody":{"kind":"json","value":{
+            "model":"gpt-5.6-sol",
+            "previous_response_id":previous_response_id,
+            "input":final_input
+        }},
+        "responseStatus":200,
+        "responseHeaders":{"x-request-id":"request-final"},
+        "responseBody":{"kind":"json","value":{
+            "id":"response-final","model":"gpt-5.6-sol","provider":"OpenAI","status":"completed",
+            "instructions":system_prompt,
+            "output":[{"type":"message","id":"assistant-final","role":"assistant",
+                       "content":"The release passed tests, formatting, and final verification."}],
+            "usage":{"input_tokens":2000,"input_tokens_details":{"cached_tokens":1800},
+                     "output_tokens":100,"output_tokens_details":{"reasoning_tokens":20},"total_tokens":2100}
+        }}
+    }));
+    captures.push(json!({
+        "recordType":"evaluation",
+        "sourceNamespace":"self-test",
+        "traceContext":self_test_trace(Some("turn-5")),
+        "producerEvent":self_test_producer_event(
+            "chiptrace-harness", "harness-self-test", "evaluation-final", 1
+        ),
+        "receivedAt":"2026-08-27T00:00:17Z",
+        "evaluationEvidence":[
+            {"kind":"test","source":"cargo test --workspace","status":"passed","artifact":"all tests passed",
+             "observed_at":"2026-08-27T00:00:17Z"},
+            {"kind":"build","source":"cargo build --release","status":"passed","artifact":"release binary",
+             "observed_at":"2026-08-27T00:00:17Z"},
+            {"kind":"final_acceptance","source":"self-test evaluator","status":"accepted","reward":1.0,
+             "observed_at":"2026-08-27T00:00:17Z"}
+        ]
+    }));
+    captures.push(json!({
+        "recordType":"lifecycle_event",
+        "sourceNamespace":"self-test",
+        "traceContext":self_test_trace(None),
+        "producerEvent":self_test_producer_event(
+            "chiptrace-harness", "harness-self-test", "life-end", 2
+        ),
+        "lifecycleEvent":{
+            "event_id":"life-end",
+            "type":"task_end",
+            "status":"completed",
+            "occurred_at":"2026-08-27T00:00:18Z"
+        }
+    }));
+    captures
 }
 
 async fn benchmark_store(args: BenchmarkStoreArgs) -> Result<Value> {
@@ -817,7 +2676,7 @@ async fn benchmark_http(args: BenchmarkHttpArgs) -> Result<Value> {
         .work_root
         .unwrap_or_else(|| owned_temporary.as_ref().unwrap().path().to_path_buf());
     let reserved = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let bind = reserved.local_addr()?;
+    let collector_bind = reserved.local_addr()?;
     drop(reserved);
     let estimated_batch_bytes = args
         .payload_kib
@@ -832,10 +2691,10 @@ async fn benchmark_http(args: BenchmarkHttpArgs) -> Result<Value> {
     let max_inflight_body_bytes = max_body_bytes
         .checked_mul(args.concurrency)
         .ok_or_else(|| anyhow::anyhow!("HTTP benchmark inflight budget overflows usize"))?;
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(serve(
+    let (collector_shutdown_tx, collector_shutdown_rx) = tokio::sync::oneshot::channel();
+    let collector = tokio::spawn(serve(
         CollectorConfig {
-            bind,
+            bind: collector_bind,
             store: StoreConfig {
                 root: root.join("capture"),
                 state_root: root.join("state"),
@@ -857,31 +2716,76 @@ async fn benchmark_http(args: BenchmarkHttpArgs) -> Result<Value> {
             max_batch_records: args.batch_records,
         },
         async move {
-            let _ = shutdown_rx.await;
+            let _ = collector_shutdown_rx.await;
         },
     ));
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(args.concurrency)
         .timeout(Duration::from_secs(120))
         .build()?;
-    let health_url = format!("http://{bind}/health");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if client
-            .get(&health_url)
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
-        {
-            break;
+    wait_for_health(&client, &format!("http://{collector_bind}/health")).await?;
+    let mut relay_shutdown_tx = None;
+    let mut relay_server = None;
+    let ingest_bind = if args.relay {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let relay_bind = reserved.local_addr()?;
+        drop(reserved);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        relay_server = Some(tokio::spawn(serve_relay(
+            RelayConfig {
+                bind: relay_bind,
+                store: StoreConfig {
+                    root: root.join("outbox"),
+                    state_root: root.join("outbox-state"),
+                    segment_max_bytes: 1024 * 1024 * 1024,
+                    segment_max_age: Duration::from_secs(3600),
+                    queue_items: args
+                        .concurrency
+                        .saturating_mul(args.batch_records)
+                        .max(1024),
+                    batch_records: 512,
+                    batch_bytes: 256 * 1024 * 1024,
+                    batch_wait: Duration::from_millis(5),
+                    fsync: !args.no_fsync,
+                },
+                store_shards: args.store_shards,
+                delivery_state_root: root.join("delivery-state"),
+                collector_url: format!("http://{collector_bind}"),
+                delivery_concurrency: args.concurrency,
+                delivery_queue_items: args
+                    .concurrency
+                    .saturating_mul(args.batch_records)
+                    .max(1024),
+                delivery_batch_records: args.batch_records,
+                delivery_batch_bytes: max_body_bytes,
+                delivery_batch_wait: Duration::from_millis(2),
+                max_delivery_inflight_bytes: max_inflight_body_bytes,
+                request_timeout: Duration::from_secs(120),
+                base_retry_delay: Duration::from_millis(5),
+                max_retry_delay: Duration::from_millis(100),
+                max_connections: args.concurrency.saturating_mul(2),
+                max_envelope_bytes: max_body_bytes,
+                max_inflight_body_bytes,
+                max_batch_records: args.batch_records,
+            },
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )));
+        relay_shutdown_tx = Some(shutdown_tx);
+        wait_for_health(&client, &format!("http://{relay_bind}/health")).await?;
+        relay_bind
+    } else {
+        collector_bind
+    };
+    let capture_url = format!(
+        "http://{ingest_bind}/{}",
+        if args.producer_events {
+            "producer/events"
+        } else {
+            "captures"
         }
-        if tokio::time::Instant::now() >= deadline {
-            let _ = shutdown_tx.send(());
-            bail!("HTTP benchmark Collector did not become ready");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let capture_url = format!("http://{bind}/captures");
+    );
     let payload = Arc::new("x".repeat(args.payload_kib * 1024));
     let semaphore = Arc::new(tokio::sync::Semaphore::new(args.concurrency));
     let mut tasks = tokio::task::JoinSet::new();
@@ -893,22 +2797,46 @@ async fn benchmark_http(args: BenchmarkHttpArgs) -> Result<Value> {
         let client = client.clone();
         let capture_url = capture_url.clone();
         let payload = Arc::clone(&payload);
+        let producer_events = args.producer_events;
         tasks.spawn(async move {
             let _permit = permit;
             let mut body = Vec::with_capacity(
                 (payload.len().saturating_add(1024)).saturating_mul(count as usize),
             );
             for index in first..first + count {
-                serde_json::to_writer(
-                    &mut body,
-                    &json!({
+                let record = if producer_events {
+                    json!({
+                        "recordType":"evaluation",
+                        "sourceNamespace":"benchmark",
+                        "traceContext":{"task_session_id":"task-http-benchmark"},
+                        "producerEvent":{
+                            "schema_version":"chiptrace.producer-event.v1",
+                            "event_id":format!("evaluation-{index:020}"),
+                            "producer":"benchmark-evaluator",
+                            "producer_version":"0.5.1",
+                            "identity_scheme":"chiptrace.deterministic-capture.v1",
+                            "stream_id":"benchmark-evaluator-stream",
+                            "sequence":index,
+                        },
+                        "receivedAt":"2026-08-29T00:00:00Z",
+                        "evaluationEvidence":[{
+                            "kind":"evaluator",
+                            "source":"benchmark-http",
+                            "passed":true,
+                            "observed_at":"2026-08-29T00:00:00Z",
+                            "artifact":payload.as_str(),
+                        }],
+                    })
+                } else {
+                    json!({
                         "captureId": format!("cap-http-benchmark-{index:020}"),
                         "startedAt": "2026-08-27T00:00:00Z",
                         "requestBody": {"kind":"json","value":{"model":"gpt-5.6-sol","input":payload.as_str()}},
                         "responseStatus": 200,
                         "responseBody": {"kind":"json","value":{"status":"completed"}}
-                    }),
-                )?;
+                    })
+                };
+                serde_json::to_writer(&mut body, &record)?;
                 body.push(b'\n');
             }
             let wire_bytes = body.len() as u64;
@@ -957,9 +2885,53 @@ async fn benchmark_http(args: BenchmarkHttpArgs) -> Result<Value> {
             }
         }
     }
-    let elapsed = started.elapsed().as_secs_f64();
-    let _ = shutdown_tx.send(());
-    server.await.context("join HTTP benchmark Collector")??;
+    let ingress_elapsed = started.elapsed().as_secs_f64();
+    let mut relay_health = Value::Null;
+    if benchmark_error.is_none() && args.relay {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let health = match client
+                .get(format!("http://{ingest_bind}/health"))
+                .send()
+                .await
+            {
+                Ok(response) => match response.json::<Value>().await {
+                    Ok(health) => health,
+                    Err(error) => {
+                        benchmark_error = Some(error.into());
+                        break;
+                    }
+                },
+                Err(error) => {
+                    benchmark_error = Some(error.into());
+                    break;
+                }
+            };
+            if health.get("delivered").and_then(Value::as_u64) == Some(observed_records)
+                && health.get("pending").and_then(Value::as_u64) == Some(0)
+                && health.get("inflight").and_then(Value::as_u64) == Some(0)
+            {
+                relay_health = health;
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                benchmark_error = Some(anyhow::anyhow!(
+                    "HTTP benchmark Relay did not drain: {health}"
+                ));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    let end_to_end_elapsed = started.elapsed().as_secs_f64();
+    if let Some(shutdown_tx) = relay_shutdown_tx {
+        let _ = shutdown_tx.send(());
+    }
+    if let Some(server) = relay_server {
+        server.await.context("join HTTP benchmark Relay")??;
+    }
+    let _ = collector_shutdown_tx.send(());
+    collector.await.context("join HTTP benchmark Collector")??;
     if let Some(error) = benchmark_error {
         return Err(error);
     }
@@ -973,17 +2945,28 @@ async fn benchmark_http(args: BenchmarkHttpArgs) -> Result<Value> {
         "concurrency": args.concurrency,
         "store_shards": args.store_shards,
         "fsync": !args.no_fsync,
-        "elapsed_seconds": elapsed,
-        "records_per_second": observed_records as f64 / elapsed,
-        "payload_mib_per_second": payload_bytes / elapsed / 1024.0 / 1024.0,
-        "wire_mib_per_second": wire_bytes as f64 / elapsed / 1024.0 / 1024.0,
+        "relay":args.relay,
+        "producer_events":args.producer_events,
+        "ingress_ack_elapsed_seconds": ingress_elapsed,
+        "end_to_end_elapsed_seconds":end_to_end_elapsed,
+        "delivery_drain_seconds":end_to_end_elapsed - ingress_elapsed,
+        "ingress_records_per_second": observed_records as f64 / ingress_elapsed,
+        "end_to_end_records_per_second":observed_records as f64 / end_to_end_elapsed,
+        "ingress_payload_mib_per_second": payload_bytes / ingress_elapsed / 1024.0 / 1024.0,
+        "end_to_end_payload_mib_per_second":payload_bytes / end_to_end_elapsed / 1024.0 / 1024.0,
+        "ingress_wire_mib_per_second": wire_bytes as f64 / ingress_elapsed / 1024.0 / 1024.0,
+        "relay_health":relay_health,
         "batch_latency_ms": {
             "p50": percentile(&latency_ms, 0.50),
             "p95": percentile(&latency_ms, 0.95),
             "p99": percentile(&latency_ms, 0.99),
             "max": latency_ms.last().copied().unwrap_or(0.0),
         },
-        "scope": "loopback HTTP NDJSON batching + normalization + sharded WAL/redb durable acknowledgements; excludes Relay and object upload",
+        "scope": if args.relay {
+            "loopback HTTP NDJSON + Relay durable outbox + async Collector delivery + two sharded WAL/redb durable acknowledgements; excludes object upload"
+        } else {
+            "loopback HTTP NDJSON batching + normalization + sharded Collector WAL/redb durable acknowledgements; excludes Relay and object upload"
+        },
     }))
 }
 

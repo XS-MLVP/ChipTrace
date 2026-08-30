@@ -1,0 +1,816 @@
+diff --git a/codex-rs/core/src/tools/mod.rs b/codex-rs/core/src/tools/mod.rs
+index df6b596..d38e1fe 100644
+--- a/codex-rs/core/src/tools/mod.rs
++++ b/codex-rs/core/src/tools/mod.rs
+@@ -18,6 +18,7 @@ pub(crate) mod sandboxing;
+ pub(crate) mod spec_plan;
+ pub(crate) mod tool_dispatch_trace;
+ mod tool_namespaces_info;
++mod tool_registry_trace;
+
+ use std::borrow::Cow;
+
+diff --git a/codex-rs/core/src/tools/router.rs b/codex-rs/core/src/tools/router.rs
+index e5e6124..8b7f87c 100644
+--- a/codex-rs/core/src/tools/router.rs
++++ b/codex-rs/core/src/tools/router.rs
+@@ -110,6 +110,12 @@ impl ToolRouter {
+         Arc::clone(&self.model_visible_specs)
+     }
+
++    pub(crate) fn runtime_tool_registry_snapshot(
++        &self,
++    ) -> anyhow::Result<codex_rollout_trace::RuntimeToolRegistrySnapshot> {
++        crate::tools::tool_registry_trace::runtime_tool_registry_snapshot(&self.registry)
++    }
++
+     pub(crate) fn deferred_tool_namespaces(&self) -> BTreeMap<String, String> {
+         self.registry.deferred_tool_namespaces()
+     }
+diff --git a/codex-rs/core/src/tools/spec_plan.rs b/codex-rs/core/src/tools/spec_plan.rs
+index b317ca2..47077bc 100644
+--- a/codex-rs/core/src/tools/spec_plan.rs
++++ b/codex-rs/core/src/tools/spec_plan.rs
+@@ -162,12 +162,24 @@ pub(crate) fn build_tool_router(
+         hosted_model_tool_specs(turn_context, standalone_web_search_tool.as_slice())
+     };
+
+-    finalize_tool_router(
++    let router = finalize_tool_router(
+         turn_context,
+         registry,
+         hosted_specs,
+         &session.services.tool_search_handler_cache,
+-    )
++    )?;
++    if session.services.rollout_thread_trace.is_enabled() {
++        match router.runtime_tool_registry_snapshot() {
++            Ok(snapshot) => session
++                .services
++                .rollout_thread_trace
++                .record_tool_registry_snapshot(turn_context.sub_id.clone(), &snapshot),
++            Err(err) => {
++                tracing::warn!("failed to capture runtime Tool Registry: {err:#}");
++            }
++        }
++    }
++    Ok(router)
+ }
+
+ fn apply_mcp_tool_exposure_policy(
+diff --git a/codex-rs/core/src/tools/tool_registry_trace.rs b/codex-rs/core/src/tools/tool_registry_trace.rs
+new file mode 100644
+index 0000000..1a196a6
+--- /dev/null
++++ b/codex-rs/core/src/tools/tool_registry_trace.rs
+@@ -0,0 +1,124 @@
++//! Lossless projection of the executable core registry into rollout evidence.
++
++use anyhow::Context;
++use anyhow::Result;
++use anyhow::bail;
++use codex_rollout_trace::RuntimeToolRegistryEntry;
++use codex_rollout_trace::RuntimeToolRegistrySnapshot;
++use codex_tools::ResponsesApiNamespaceTool;
++use codex_tools::ToolName;
++use codex_tools::ToolSpec;
++use serde_json::json;
++
++use crate::tools::registry::ToolRegistry;
++
++pub(crate) fn runtime_tool_registry_snapshot(
++    registry: &ToolRegistry,
++) -> Result<RuntimeToolRegistrySnapshot> {
++    let mut tools = registry
++        .entries()
++        .map(|registered| {
++            let runtime_name = registered.runtime.tool_name().with_default_namespace();
++            let spec = registered.runtime.spec();
++            runtime_registry_entry(&runtime_name, &spec)
++        })
++        .collect::<Result<Vec<_>>>()?;
++    tools.sort_by(|left, right| {
++        left.runtime_namespace
++            .cmp(&right.runtime_namespace)
++            .then(left.runtime_tool.cmp(&right.runtime_tool))
++    });
++    if tools.is_empty() {
++        bail!("runtime Tool Registry is empty");
++    }
++    Ok(RuntimeToolRegistrySnapshot::new(
++        env!("CARGO_PKG_VERSION"),
++        tools,
++    ))
++}
++
++fn runtime_registry_entry(
++    runtime_name: &ToolName,
++    spec: &ToolSpec,
++) -> Result<RuntimeToolRegistryEntry> {
++    let (runtime_item_type, mut tool) = match spec {
++        ToolSpec::Function(function) => {
++            ensure_runtime_name(runtime_name, &function.name)?;
++            ("function", serde_json::to_value(spec)?)
++        }
++        ToolSpec::Freeform(freeform) => {
++            ensure_runtime_name(runtime_name, &freeform.name)?;
++            ("custom", serde_json::to_value(spec)?)
++        }
++        ToolSpec::Namespace(namespace) => {
++            let child = namespace
++                .tools
++                .iter()
++                .find(|child| namespace_tool_name(child) == runtime_name.name)
++                .with_context(|| {
++                    format!(
++                        "runtime tool {} is absent from namespace {}",
++                        runtime_name.name, namespace.name
++                    )
++                })?;
++            let runtime_item_type = match child {
++                ResponsesApiNamespaceTool::Function(_) => "function",
++                ResponsesApiNamespaceTool::Custom(_) => "custom",
++            };
++            let mut value = serde_json::to_value(child)?;
++            value["namespace"] = json!(namespace.name);
++            (runtime_item_type, value)
++        }
++        ToolSpec::ToolSearch {
++            execution,
++            description,
++            parameters,
++        } => {
++            ensure_runtime_name(runtime_name, "tool_search")?;
++            (
++                "tool_search",
++                json!({
++                    "type":"tool_search",
++                    "name":"tool_search",
++                    "execution":execution,
++                    "description":description,
++                    "parameters":parameters,
++                }),
++            )
++        }
++        ToolSpec::WebSearch { .. } => {
++            bail!("hosted web_search must not appear in the executable runtime Tool Registry")
++        }
++    };
++    let object = tool
++        .as_object_mut()
++        .context("runtime Tool Registry definition must serialize as an object")?;
++    object.insert("runtime_name".to_string(), json!(runtime_name));
++    Ok(RuntimeToolRegistryEntry::new(
++        runtime_item_type,
++        runtime_name.name.clone(),
++        runtime_name.namespace.clone(),
++        tool,
++    ))
++}
++
++fn ensure_runtime_name(runtime_name: &ToolName, definition_name: &str) -> Result<()> {
++    if runtime_name.name != definition_name {
++        bail!(
++            "runtime tool {} does not match definition {definition_name}",
++            runtime_name.name
++        );
++    }
++    Ok(())
++}
++
++fn namespace_tool_name(tool: &ResponsesApiNamespaceTool) -> &str {
++    match tool {
++        ResponsesApiNamespaceTool::Function(tool) => &tool.name,
++        ResponsesApiNamespaceTool::Custom(tool) => &tool.name,
++    }
++}
++
++#[cfg(test)]
++#[path = "tool_registry_trace_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/tools/tool_registry_trace_tests.rs b/codex-rs/core/src/tools/tool_registry_trace_tests.rs
+new file mode 100644
+index 0000000..8d0c8c1
+--- /dev/null
++++ b/codex-rs/core/src/tools/tool_registry_trace_tests.rs
+@@ -0,0 +1,251 @@
++use std::collections::BTreeMap;
++use std::fs;
++use std::path::PathBuf;
++use std::sync::Arc;
++
++use codex_protocol::protocol::SessionSource;
++use codex_rollout_trace::RawTraceEvent;
++use codex_rollout_trace::RawTraceEventPayload;
++use codex_rollout_trace::ThreadStartedTraceMetadata;
++use codex_tools::FreeformTool;
++use codex_tools::FreeformToolFormat;
++use codex_tools::JsonSchema;
++use codex_tools::ResponsesApiNamespace;
++use codex_tools::ResponsesApiNamespaceTool;
++use codex_tools::ResponsesApiTool;
++use codex_tools::ToolName;
++use codex_tools::ToolSpec;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++use tempfile::TempDir;
++
++use super::*;
++use crate::session::step_context::StepContext;
++use crate::session::tests::make_session_and_context;
++use crate::tools::context::FunctionToolOutput;
++use crate::tools::context::ToolInvocation;
++use crate::tools::context::ToolOutput;
++use crate::tools::registry::CoreToolRuntime;
++use crate::tools::registry::ToolExecutor;
++
++struct TestRuntime {
++    name: ToolName,
++    spec: ToolSpec,
++}
++
++impl ToolExecutor<ToolInvocation> for TestRuntime {
++    fn tool_name(&self) -> ToolName {
++        self.name.clone()
++    }
++
++    fn spec(&self) -> ToolSpec {
++        self.spec.clone()
++    }
++
++    fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
++        Box::pin(async {
++            Ok(
++                Box::new(FunctionToolOutput::from_text("ok".to_string(), Some(true)))
++                    as Box<dyn ToolOutput>,
++            )
++        })
++    }
++}
++
++impl CoreToolRuntime for TestRuntime {}
++
++#[test]
++fn snapshot_preserves_function_freeform_and_namespace_contracts() -> anyhow::Result<()> {
++    let command_schema = JsonSchema::object(
++        BTreeMap::from([(
++            "cmd".to_string(),
++            JsonSchema::string(Some("Command to execute.".to_string())),
++        )]),
++        Some(vec!["cmd".to_string()]),
++        Some(false.into()),
++    );
++    let registry = ToolRegistry::from_tools([
++        Arc::new(TestRuntime {
++            name: ToolName::plain("exec_command"),
++            spec: ToolSpec::Function(ResponsesApiTool {
++                name: "exec_command".to_string(),
++                description: "Execute a command.".to_string(),
++                strict: false,
++                defer_loading: None,
++                parameters: command_schema,
++                output_schema: None,
++            }),
++        }) as Arc<dyn CoreToolRuntime>,
++        Arc::new(TestRuntime {
++            name: ToolName::plain("apply_patch"),
++            spec: ToolSpec::Freeform(FreeformTool {
++                name: "apply_patch".to_string(),
++                description: "Apply a patch.".to_string(),
++                defer_loading: None,
++                format: FreeformToolFormat {
++                    r#type: "grammar".to_string(),
++                    syntax: "lark".to_string(),
++                    definition: "start: /.+/".to_string(),
++                },
++            }),
++        }),
++        Arc::new(TestRuntime {
++            name: ToolName::namespaced("clock", "sleep"),
++            spec: ToolSpec::Namespace(ResponsesApiNamespace {
++                name: "clock".to_string(),
++                description: "Clock tools.".to_string(),
++                tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
++                    name: "sleep".to_string(),
++                    description: "Pause execution.".to_string(),
++                    strict: false,
++                    defer_loading: None,
++                    parameters: JsonSchema::object(
++                        BTreeMap::from([(
++                            "duration_ms".to_string(),
++                            JsonSchema::number(Some("Duration in milliseconds.".to_string())),
++                        )]),
++                        Some(vec!["duration_ms".to_string()]),
++                        Some(false.into()),
++                    ),
++                    output_schema: None,
++                })],
++            }),
++        }),
++    ]);
++
++    let snapshot = runtime_tool_registry_snapshot(&registry)?;
++    assert_eq!(
++        serde_json::to_value(snapshot)?,
++        json!({
++            "schema_version":"codex.runtime-tool-registry.v1",
++            "producer":"codex-cli",
++            "producer_version":env!("CARGO_PKG_VERSION"),
++            "tools":[
++                {
++                    "runtime_item_type":"function",
++                    "runtime_tool":"sleep",
++                    "runtime_namespace":"clock",
++                    "tool":{
++                        "type":"function",
++                        "name":"sleep",
++                        "namespace":"clock",
++                        "description":"Pause execution.",
++                        "strict":false,
++                        "parameters":{
++                            "type":"object",
++                            "properties":{"duration_ms":{
++                                "type":"number","description":"Duration in milliseconds."
++                            }},
++                            "required":["duration_ms"],
++                            "additionalProperties":false
++                        },
++                        "runtime_name":{"name":"sleep","namespace":"clock"}
++                    }
++                },
++                {
++                    "runtime_item_type":"custom",
++                    "runtime_tool":"apply_patch",
++                    "runtime_namespace":"functions",
++                    "tool":{
++                        "type":"custom",
++                        "name":"apply_patch",
++                        "description":"Apply a patch.",
++                        "format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"},
++                        "runtime_name":{"name":"apply_patch","namespace":"functions"}
++                    }
++                },
++                {
++                    "runtime_item_type":"function",
++                    "runtime_tool":"exec_command",
++                    "runtime_namespace":"functions",
++                    "tool":{
++                        "type":"function",
++                        "name":"exec_command",
++                        "description":"Execute a command.",
++                        "strict":false,
++                        "parameters":{
++                            "type":"object",
++                            "properties":{"cmd":{
++                                "type":"string","description":"Command to execute."
++                            }},
++                            "required":["cmd"],
++                            "additionalProperties":false
++                        },
++                        "runtime_name":{"name":"exec_command","namespace":"functions"}
++                    }
++                }
++            ]
++        })
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn active_tool_router_writes_its_registry_to_the_turn_bundle() -> anyhow::Result<()> {
++    let temp = TempDir::new()?;
++    let (mut session, turn) = make_session_and_context().await;
++    let thread_id = session.thread_id;
++    let trace = codex_rollout_trace::ThreadTraceContext::start_root_in_root_for_test(
++        temp.path(),
++        ThreadStartedTraceMetadata {
++            thread_id: thread_id.to_string(),
++            agent_path: "/root".to_string(),
++            task_name: None,
++            nickname: None,
++            agent_role: None,
++            session_source: SessionSource::Exec,
++            cwd: PathBuf::from("/workspace"),
++            rollout_path: None,
++            model: "gpt-test".to_string(),
++            provider_name: "test-provider".to_string(),
++            approval_policy: "never".to_string(),
++            sandbox_policy: "danger-full-access".to_string(),
++        },
++    )?;
++    trace.record_codex_turn_started(turn.sub_id.as_str());
++    session.services.rollout_thread_trace = trace;
++    let turn = Arc::new(turn);
++    let step_context = StepContext::for_test(Arc::clone(&turn));
++
++    let router = crate::tools::spec_plan::build_tool_router(
++        &session,
++        step_context.turn.as_ref(),
++        &step_context.environments,
++        &step_context.mcp,
++        /*apps_enabled*/ false,
++        &turn.extension_data,
++        /*tool_suggest_candidates*/ None,
++    )?;
++    let expected = serde_json::to_value(router.runtime_tool_registry_snapshot()?)?;
++
++    let mut bundles = fs::read_dir(temp.path())?
++        .map(|entry| entry.map(|entry| entry.path()))
++        .collect::<Result<Vec<_>, _>>()?;
++    assert_eq!(bundles.len(), 1);
++    let bundle = bundles.remove(0);
++    let events = fs::read_to_string(bundle.join("trace.jsonl"))?
++        .lines()
++        .map(serde_json::from_str::<RawTraceEvent>)
++        .collect::<Result<Vec<_>, _>>()?;
++    let snapshots = events
++        .iter()
++        .filter_map(|event| match &event.payload {
++            RawTraceEventPayload::Other { kind, payloads, .. }
++                if kind == "tool_registry_snapshot" =>
++            {
++                Some((event, payloads))
++            }
++            _ => None,
++        })
++        .collect::<Vec<_>>();
++    assert_eq!(snapshots.len(), 1);
++    let (event, payloads) = snapshots[0];
++    assert_eq!(event.thread_id, Some(thread_id.to_string()));
++    assert_eq!(event.codex_turn_id.as_deref(), Some(turn.sub_id.as_str()));
++    assert_eq!(payloads.len(), 1);
++    let observed =
++        serde_json::from_slice::<serde_json::Value>(&fs::read(bundle.join(&payloads[0].path))?)?;
++    assert_eq!(observed, expected);
++
++    Ok(())
++}
+diff --git a/codex-rs/rollout-trace/src/lib.rs b/codex-rs/rollout-trace/src/lib.rs
+index 54094f0..04e8599 100644
+--- a/codex-rs/rollout-trace/src/lib.rs
++++ b/codex-rs/rollout-trace/src/lib.rs
+@@ -18,6 +18,7 @@ mod raw_event;
+ mod reducer;
+ mod thread;
+ mod tool_dispatch;
++mod tool_registry;
+ mod writer;
+
+ /// Conventional reduced-state cache name written next to a raw trace bundle.
+@@ -74,5 +75,11 @@ pub use tool_dispatch::ToolDispatchRequester;
+ pub use tool_dispatch::ToolDispatchResult;
+ /// No-op-capable handle for recording one resolved tool dispatch.
+ pub use tool_dispatch::ToolDispatchTraceContext;
++/// Runtime Tool Registry payload schema version.
++pub use tool_registry::RUNTIME_TOOL_REGISTRY_SCHEMA_VERSION;
++/// One executable tool in a runtime registry snapshot.
++pub use tool_registry::RuntimeToolRegistryEntry;
++/// Exact dispatcher registry active for one Codex turn.
++pub use tool_registry::RuntimeToolRegistrySnapshot;
+ /// Append-only writer used by hot-path Codex instrumentation.
+ pub use writer::TraceWriter;
+diff --git a/codex-rs/rollout-trace/src/thread.rs b/codex-rs/rollout-trace/src/thread.rs
+index 514b8d3..0e9af9d 100644
+--- a/codex-rs/rollout-trace/src/thread.rs
++++ b/codex-rs/rollout-trace/src/thread.rs
+@@ -28,6 +28,7 @@ use crate::RawPayloadRef;
+ use crate::RawTraceEventContext;
+ use crate::RawTraceEventPayload;
+ use crate::RolloutStatus;
++use crate::RuntimeToolRegistrySnapshot;
+ use crate::ToolCallId;
+ use crate::ToolDispatchInvocation;
+ use crate::ToolDispatchTraceContext;
+@@ -301,6 +302,27 @@ impl ThreadTraceContext {
+         );
+     }
+
++    /// Records the exact dispatcher registry active before a turn can execute tools.
++    pub fn record_tool_registry_snapshot(
++        &self,
++        codex_turn_id: impl Into<CodexTurnId>,
++        snapshot: &RuntimeToolRegistrySnapshot,
++    ) {
++        let ThreadTraceContextState::Enabled(context) = &self.state else {
++            return;
++        };
++        let event_context = RawTraceEventContext {
++            thread_id: Some(context.thread_id.clone()),
++            codex_turn_id: Some(codex_turn_id.into()),
++        };
++        if let Err(err) = context
++            .writer
++            .append_tool_registry_snapshot(event_context, snapshot)
++        {
++            warn!("failed to append runtime Tool Registry snapshot: {err:#}");
++        }
++    }
++
+     /// Starts a first-class code-mode cell lifecycle and returns its trace handle.
+     pub fn start_code_cell_trace(
+         &self,
+diff --git a/codex-rs/rollout-trace/src/thread_tests.rs b/codex-rs/rollout-trace/src/thread_tests.rs
+index e0a5547..0791230 100644
+--- a/codex-rs/rollout-trace/src/thread_tests.rs
++++ b/codex-rs/rollout-trace/src/thread_tests.rs
+@@ -18,6 +18,8 @@ use crate::CompactionCheckpointTracePayload;
+ use crate::ExecutionStatus;
+ use crate::RawTraceEventPayload;
+ use crate::RolloutStatus;
++use crate::RuntimeToolRegistryEntry;
++use crate::RuntimeToolRegistrySnapshot;
+ use crate::replay_bundle;
+
+ #[test]
+@@ -225,6 +227,81 @@ fn protocol_wrapper_records_selected_events_as_raw_payloads() -> anyhow::Result<
+     Ok(())
+ }
+
++#[test]
++fn runtime_tool_registry_is_ordered_before_dispatch_and_deduplicated() -> anyhow::Result<()> {
++    let temp = TempDir::new()?;
++    let thread_id = ThreadId::new();
++    let thread_trace =
++        ThreadTraceContext::start_root_in_root_for_test(temp.path(), minimal_metadata(thread_id))?;
++    let snapshot = RuntimeToolRegistrySnapshot::new(
++        "0.150.0-alpha.9",
++        vec![RuntimeToolRegistryEntry::new(
++            "function",
++            "exec_command",
++            Some("functions".to_string()),
++            serde_json::json!({
++                "type":"function",
++                "name":"exec_command",
++                "description":"Execute a command.",
++                "parameters":{"type":"object","properties":{}}
++            }),
++        )],
++    );
++    let changed_snapshot = RuntimeToolRegistrySnapshot::new(
++        "0.150.0-alpha.9",
++        vec![RuntimeToolRegistryEntry::new(
++            "custom",
++            "apply_patch",
++            Some("functions".to_string()),
++            serde_json::json!({
++                "type":"custom",
++                "name":"apply_patch",
++                "description":"Apply a patch.",
++                "format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}
++            }),
++        )],
++    );
++
++    thread_trace.record_tool_registry_snapshot("turn-1", &snapshot);
++    thread_trace.record_tool_registry_snapshot("turn-1", &snapshot);
++    thread_trace.record_tool_registry_snapshot("turn-2", &changed_snapshot);
++    thread_trace.record_tool_registry_snapshot("turn-3", &snapshot);
++
++    let bundle_dir = single_bundle_dir(temp.path())?;
++    let events = fs::read_to_string(bundle_dir.join("trace.jsonl"))?
++        .lines()
++        .map(serde_json::from_str::<crate::RawTraceEvent>)
++        .collect::<Result<Vec<_>, _>>()?;
++    let registry_events = events
++        .iter()
++        .filter_map(|event| match &event.payload {
++            RawTraceEventPayload::Other { kind, payloads, .. }
++                if kind == "tool_registry_snapshot" =>
++            {
++                Some((event, payloads))
++            }
++            _ => None,
++        })
++        .collect::<Vec<_>>();
++    assert_eq!(registry_events.len(), 3);
++    assert_eq!(
++        registry_events[0].0.codex_turn_id.as_deref(),
++        Some("turn-1")
++    );
++    let payload_path = bundle_dir.join(&registry_events[0].1[0].path);
++    let payload: serde_json::Value = serde_json::from_slice(&fs::read(payload_path)?)?;
++    assert_eq!(payload, serde_json::to_value(snapshot)?);
++    assert_eq!(
++        registry_events[1].0.codex_turn_id.as_deref(),
++        Some("turn-2")
++    );
++    assert_eq!(
++        registry_events[2].0.codex_turn_id.as_deref(),
++        Some("turn-3")
++    );
++    Ok(())
++}
++
+ fn minimal_metadata(thread_id: ThreadId) -> ThreadStartedTraceMetadata {
+     ThreadStartedTraceMetadata {
+         thread_id: thread_id.to_string(),
+diff --git a/codex-rs/rollout-trace/src/tool_registry.rs b/codex-rs/rollout-trace/src/tool_registry.rs
+new file mode 100644
+index 0000000..e4d3824
+--- /dev/null
++++ b/codex-rs/rollout-trace/src/tool_registry.rs
+@@ -0,0 +1,53 @@
++//! Runtime Tool Registry payload stored in a raw rollout bundle.
++
++use serde::Serialize;
++use serde_json::Value;
++
++/// Wire version consumed by lossless trace exporters.
++pub const RUNTIME_TOOL_REGISTRY_SCHEMA_VERSION: &str = "codex.runtime-tool-registry.v1";
++
++/// Exact dispatcher registry active for one Codex turn.
++#[derive(Debug, Clone, PartialEq, Serialize)]
++pub struct RuntimeToolRegistrySnapshot {
++    pub schema_version: &'static str,
++    pub producer: &'static str,
++    pub producer_version: String,
++    pub tools: Vec<RuntimeToolRegistryEntry>,
++}
++
++impl RuntimeToolRegistrySnapshot {
++    pub fn new(producer_version: impl Into<String>, tools: Vec<RuntimeToolRegistryEntry>) -> Self {
++        Self {
++            schema_version: RUNTIME_TOOL_REGISTRY_SCHEMA_VERSION,
++            producer: "codex-cli",
++            producer_version: producer_version.into(),
++            tools,
++        }
++    }
++}
++
++/// One executable runtime tool and its source definition.
++#[derive(Debug, Clone, PartialEq, Serialize)]
++pub struct RuntimeToolRegistryEntry {
++    pub runtime_item_type: String,
++    pub runtime_tool: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub runtime_namespace: Option<String>,
++    pub tool: Value,
++}
++
++impl RuntimeToolRegistryEntry {
++    pub fn new(
++        runtime_item_type: impl Into<String>,
++        runtime_tool: impl Into<String>,
++        runtime_namespace: Option<String>,
++        tool: Value,
++    ) -> Self {
++        Self {
++            runtime_item_type: runtime_item_type.into(),
++            runtime_tool: runtime_tool.into(),
++            runtime_namespace,
++            tool,
++        }
++    }
++}
+diff --git a/codex-rs/rollout-trace/src/writer.rs b/codex-rs/rollout-trace/src/writer.rs
+index 925f7ba..4939af5 100644
+--- a/codex-rs/rollout-trace/src/writer.rs
++++ b/codex-rs/rollout-trace/src/writer.rs
+@@ -27,6 +27,7 @@ use crate::raw_event::RAW_TRACE_EVENT_SCHEMA_VERSION;
+ use crate::raw_event::RawTraceEvent;
+ use crate::raw_event::RawTraceEventContext;
+ use crate::raw_event::RawTraceEventPayload;
++use crate::tool_registry::RuntimeToolRegistrySnapshot;
+
+ /// Local trace bundle writer.
+ ///
+@@ -44,6 +45,7 @@ struct TraceWriterInner {
+     event_log: BufWriter<File>,
+     next_seq: u64,
+     next_payload_ordinal: u64,
++    active_tool_registry_snapshot: Option<Vec<u8>>,
+ }
+
+ impl TraceWriter {
+@@ -78,6 +80,7 @@ impl TraceWriter {
+                 event_log: BufWriter::new(event_log),
+                 next_seq: 1,
+                 next_payload_ordinal: 1,
++                active_tool_registry_snapshot: None,
+             }),
+         })
+     }
+@@ -88,21 +91,7 @@ impl TraceWriter {
+         kind: RawPayloadKind,
+         value: &impl Serialize,
+     ) -> Result<RawPayloadRef> {
+-        let mut inner = self.lock_inner();
+-        let ordinal = inner.next_payload_ordinal;
+-        inner.next_payload_ordinal += 1;
+-        let raw_payload_id = format!("raw_payload:{ordinal}");
+-        let relative_path = format!("{PAYLOADS_DIR_NAME}/{ordinal}.json");
+-        let absolute_path = inner.payloads_dir.join(format!("{ordinal}.json"));
+-        // Payload files are created before the event that references them. A
+-        // replay interrupted after an event is appended should never point at a
+-        // payload file that the writer planned but had not written yet.
+-        write_json_file(&absolute_path, value)?;
+-        Ok(RawPayloadRef {
+-            raw_payload_id,
+-            kind,
+-            path: relative_path,
+-        })
++        write_json_payload_locked(&mut self.lock_inner(), kind, value)
+     }
+
+     /// Appends one raw event with no extra envelope context.
+@@ -116,21 +105,36 @@ impl TraceWriter {
+         context: RawTraceEventContext,
+         payload: RawTraceEventPayload,
+     ) -> Result<RawTraceEvent> {
++        append_with_context_locked(&mut self.lock_inner(), context, payload)
++    }
++
++    /// Atomically records a new runtime Tool Registry before later dispatch events.
++    /// Consecutive identical snapshots are suppressed. A later A -> B -> A
++    /// transition is recorded because it changes the active dispatcher state.
++    pub(crate) fn append_tool_registry_snapshot(
++        &self,
++        context: RawTraceEventContext,
++        snapshot: &RuntimeToolRegistrySnapshot,
++    ) -> Result<bool> {
++        let canonical = serde_json::to_vec(snapshot)?;
+         let mut inner = self.lock_inner();
+-        let event = RawTraceEvent {
+-            schema_version: RAW_TRACE_EVENT_SCHEMA_VERSION,
+-            seq: inner.next_seq,
+-            wall_time_unix_ms: unix_time_ms(),
+-            rollout_id: inner.manifest.rollout_id.clone(),
+-            thread_id: context.thread_id,
+-            codex_turn_id: context.codex_turn_id,
+-            payload,
+-        };
+-        inner.next_seq += 1;
+-        serde_json::to_writer(&mut inner.event_log, &event)?;
+-        inner.event_log.write_all(b"\n")?;
+-        inner.event_log.flush()?;
+-        Ok(event)
++        if inner.active_tool_registry_snapshot.as_deref() == Some(canonical.as_slice()) {
++            return Ok(false);
++        }
++        let payload_ref =
++            write_json_payload_locked(&mut inner, RawPayloadKind::ProtocolEvent, snapshot)?;
++        append_with_context_locked(
++            &mut inner,
++            context,
++            RawTraceEventPayload::Other {
++                kind: "tool_registry_snapshot".to_string(),
++                summary: "Runtime tool registry snapshot".to_string(),
++                payloads: vec![payload_ref],
++                metadata: serde_json::json!({"scope": "dispatcher"}),
++            },
++        )?;
++        inner.active_tool_registry_snapshot = Some(canonical);
++        Ok(true)
+     }
+
+     fn lock_inner(&self) -> MutexGuard<'_, TraceWriterInner> {
+@@ -141,6 +145,48 @@ impl TraceWriter {
+     }
+ }
+
++fn write_json_payload_locked(
++    inner: &mut TraceWriterInner,
++    kind: RawPayloadKind,
++    value: &impl Serialize,
++) -> Result<RawPayloadRef> {
++    let ordinal = inner.next_payload_ordinal;
++    inner.next_payload_ordinal += 1;
++    let raw_payload_id = format!("raw_payload:{ordinal}");
++    let relative_path = format!("{PAYLOADS_DIR_NAME}/{ordinal}.json");
++    let absolute_path = inner.payloads_dir.join(format!("{ordinal}.json"));
++    // Payload files are created before the event that references them. A
++    // replay interrupted after an event is appended should never point at a
++    // payload file that the writer planned but had not written yet.
++    write_json_file(&absolute_path, value)?;
++    Ok(RawPayloadRef {
++        raw_payload_id,
++        kind,
++        path: relative_path,
++    })
++}
++
++fn append_with_context_locked(
++    inner: &mut TraceWriterInner,
++    context: RawTraceEventContext,
++    payload: RawTraceEventPayload,
++) -> Result<RawTraceEvent> {
++    let event = RawTraceEvent {
++        schema_version: RAW_TRACE_EVENT_SCHEMA_VERSION,
++        seq: inner.next_seq,
++        wall_time_unix_ms: unix_time_ms(),
++        rollout_id: inner.manifest.rollout_id.clone(),
++        thread_id: context.thread_id,
++        codex_turn_id: context.codex_turn_id,
++        payload,
++    };
++    inner.next_seq += 1;
++    serde_json::to_writer(&mut inner.event_log, &event)?;
++    inner.event_log.write_all(b"\n")?;
++    inner.event_log.flush()?;
++    Ok(event)
++}
++
+ fn write_json_file(path: &Path, value: &impl Serialize) -> Result<()> {
+     let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+     serde_json::to_writer_pretty(file, value)

@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/producer-event-v1.schema.json",
+  "title": "ChipTrace Producer Event v1",
+  "type": "object",
+  "required": ["recordType", "sourceNamespace", "traceContext", "producerEvent"],
+  "properties": {
+    "recordType": {
+      "enum": ["lifecycle_event", "tool_execution", "evaluation"]
+    },
+    "sourceNamespace": {"type": "string", "minLength": 1, "maxLength": 256},
+    "traceContext": {
+      "type": "object",
+      "required": ["task_session_id"],
+      "properties": {
+        "task_session_id": {"type": "string", "minLength": 1},
+        "root_session_id": {"type": ["string", "null"]},
+        "parent_session_id": {"type": ["string", "null"]},
+        "goal_id": {"type": ["string", "null"]},
+        "turn_id": {"type": ["string", "null"]},
+        "agent_id": {"type": ["string", "null"]},
+        "branch_id": {"type": ["string", "null"]},
+        "previous_response_id": {"type": ["string", "null"]},
+        "traceparent": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "producerEvent": {
+      "allOf": [
+        {"$ref": "capture-v2.schema.json#/$defs/producerEvent"},
+        {
+          "properties": {
+            "identity_scheme": {"const": "chiptrace.deterministic-capture.v1"}
+          }
+        }
+      ]
+    },
+    "lifecycleEvent": {"$ref": "capture-v2.schema.json#/$defs/lifecycleEvent"},
+    "toolExecution": {"$ref": "capture-v2.schema.json#/$defs/toolExecution"},
+    "evaluationEvidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "capture-v2.schema.json#/$defs/evaluationEvidence"}
+    },
+    "evaluation_evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "capture-v2.schema.json#/$defs/evaluationEvidence"}
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"recordType": {"const": "lifecycle_event"}},
+        "required": ["recordType"]
+      },
+      "then": {"required": ["lifecycleEvent"]}
+    },
+    {
+      "if": {
+        "properties": {"recordType": {"const": "tool_execution"}},
+        "required": ["recordType"]
+      },
+      "then": {"required": ["toolExecution"]}
+    },
+    {
+      "if": {
+        "properties": {"recordType": {"const": "evaluation"}},
+        "required": ["recordType"]
+      },
+      "then": {
+        "anyOf": [
+          {"required": ["evaluationEvidence"]},
+          {"required": ["evaluation_evidence"]}
+        ]
+      }
+    }
+  ],
+  "additionalProperties": true
+}

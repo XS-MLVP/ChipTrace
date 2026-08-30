@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/raw-archive-v1.schema.json",
+  "title": "ChipTrace Raw Archive Manifest v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "archive_id",
+    "created_at_utc",
+    "format",
+    "completeness",
+    "segment_count",
+    "total_records",
+    "total_bytes",
+    "segments"
+  ],
+  "properties": {
+    "schema_version": {"const": "chiptrace.raw-archive.v1"},
+    "archive_id": {"type": "string", "minLength": 1},
+    "created_at_utc": {"type": "string", "minLength": 1},
+    "format": {"const": "UTF-8 NDJSON sealed WAL"},
+    "completeness": {"enum": ["complete", "partial"]},
+    "segment_count": {"type": "integer", "minimum": 1},
+    "total_records": {"type": "integer", "minimum": 1},
+    "total_bytes": {"type": "integer", "minimum": 1},
+    "segments": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/segment"}
+    },
+    "empty_segments": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/empty_segment"}
+    }
+  },
+  "$defs": {
+    "segment": {
+      "type": "object",
+      "required": [
+        "shard",
+        "segment_id",
+        "object_key",
+        "source_path",
+        "bytes",
+        "records",
+        "sha256",
+        "created_at"
+      ],
+      "properties": {
+        "shard": {"type": "string", "minLength": 1},
+        "segment_id": {"type": "integer", "minimum": 1},
+        "object_key": {"type": "string", "minLength": 1},
+        "source_path": {"type": "string", "minLength": 1},
+        "bytes": {"type": "integer", "minimum": 1},
+        "records": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "created_at": {"type": "string", "minLength": 1},
+        "sealed_at": {"type": ["string", "null"]}
+      },
+      "additionalProperties": false
+    },
+    "empty_segment": {
+      "type": "object",
+      "required": [
+        "shard",
+        "segment_id",
+        "object_key",
+        "source_path",
+        "bytes",
+        "records",
+        "sha256",
+        "created_at"
+      ],
+      "properties": {
+        "shard": {"type": "string", "minLength": 1},
+        "segment_id": {"type": "integer", "minimum": 1},
+        "object_key": {"type": "string", "minLength": 1},
+        "source_path": {"type": "string", "minLength": 1},
+        "bytes": {"type": "integer", "minimum": 0},
+        "records": {"const": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "created_at": {"type": "string", "minLength": 1},
+        "sealed_at": {"type": ["string", "null"]}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

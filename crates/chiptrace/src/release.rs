@@ -1,10 +1,11 @@
 use crate::jsonl::{absolute_path, ensure_safe_relative_path, sha256_file, string_field, utc_now};
 use crate::schema::{
-    FileManifest, RELEASE_SCHEMA_VERSION, ReleaseCounts, ReleaseManifest, TokenCounts,
+    BuyerAssessment, FileManifest, RAW_LINEAGE_SCHEMA_VERSION, RELEASE_SCHEMA_VERSION,
+    RawSourceLineage, ReleaseCounts, ReleaseManifest, TokenCounts,
 };
 use crate::score::{
-    Profile, assess_session, exact_content_fingerprint, is_contiguous_subsequence,
-    message_fingerprints,
+    Profile, assess_session, assessment_contract_valid, eligible_assessment_contract_valid,
+    exact_content_fingerprint, is_contiguous_subsequence, message_fingerprints,
 };
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
@@ -64,6 +65,20 @@ struct ScorePartitionResult {
     assessment: Option<FileManifest>,
 }
 
+#[derive(Debug, Default)]
+struct ReportAudit {
+    assessed: u64,
+    eligible: u64,
+    rejected: u64,
+    divergent_conflicts: u64,
+    divergent_records: u64,
+    assessed_tokens: TokenCounts,
+    eligible_tokens: TokenCounts,
+    failure_reason_counts: BTreeMap<String, u64>,
+    eligible_fingerprints: HashSet<String>,
+    assessment_fingerprints: HashSet<String>,
+}
+
 pub fn build_release(config: ReleaseConfig) -> Result<ReleaseManifest> {
     if config.inputs.is_empty() {
         bail!("at least one Session JSONL input is required");
@@ -89,6 +104,7 @@ pub fn build_release(config: ReleaseConfig) -> Result<ReleaseManifest> {
     if inputs.is_empty() {
         bail!("no Session JSONL inputs found");
     }
+    let raw_sources = discover_release_raw_sources(&config.inputs, &inputs)?;
     let output = absolute_path(&config.output)?;
     if output.exists() && !config.replace {
         bail!("release output already exists: {}", output.display());
@@ -286,6 +302,7 @@ pub fn build_release(config: ReleaseConfig) -> Result<ReleaseManifest> {
         compression: format!("zstd-{level}", level = config.zstd_level),
         processing_workers: release_workers,
         target_part_bytes: config.target_part_bytes,
+        raw_sources,
         counts,
         eligible_tokens,
         assessed_tokens,
@@ -298,12 +315,12 @@ pub fn build_release(config: ReleaseConfig) -> Result<ReleaseManifest> {
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
     write_checksums(&staging, &manifest)?;
     sync_tree(&staging)?;
+    verify_release(&staging, false)?;
     if output.exists() {
         fs::remove_dir_all(&output)?;
     }
     fs::rename(&staging, &output)?;
     sync_directory(parent)?;
-    verify_release(&output, false)?;
     Ok(manifest)
 }
 
@@ -316,6 +333,17 @@ pub fn verify_release(root: &Path, require_pass: bool) -> Result<ReleaseManifest
     if !manifest.session_atomic || manifest.session_split_count != 0 {
         bail!("release is not Session atomic");
     }
+    for source in &manifest.raw_sources {
+        validate_release_raw_source(source)?;
+    }
+    if !manifest.minimum_score.is_finite() || !(0.0..=100.0).contains(&manifest.minimum_score) {
+        bail!("release minimum_score must be between 0 and 100");
+    }
+    let profile = match manifest.buyer_profile.as_str() {
+        "buyer-v6" => Profile::BuyerV6,
+        "buyer-v7" => Profile::BuyerV7,
+        value => bail!("unsupported release buyer profile {value:?}"),
+    };
     if require_pass && manifest.validation_status != "pass" {
         bail!(
             "release validation status is {}, not pass",
@@ -324,6 +352,8 @@ pub fn verify_release(root: &Path, require_pass: bool) -> Result<ReleaseManifest
     }
     let mut expected_files = HashSet::from(["manifest.json".to_owned(), "SHA256SUMS".to_owned()]);
     let mut eligible = 0_u64;
+    let mut eligible_tokens = TokenCounts::default();
+    let mut eligible_fingerprints = HashSet::new();
     for file in manifest.parts.iter().chain(manifest.reports.iter()) {
         ensure_safe_relative_path(&file.file)?;
         if !expected_files.insert(file.file.clone()) {
@@ -343,51 +373,249 @@ pub fn verify_release(root: &Path, require_pass: bool) -> Result<ReleaseManifest
         let mut reader = crate::jsonl::open_jsonl_reader(&path)?;
         let mut line = Vec::new();
         let mut part_records = 0_u64;
+        let mut part_bytes = 0_u64;
         loop {
             line.clear();
             if reader.read_until(b'\n', &mut line)? == 0 {
                 break;
             }
             if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
+                bail!("release part contains an empty JSONL line: {}", part.file);
             }
+            part_bytes = part_bytes.saturating_add(line.len() as u64);
             let session: Value = serde_json::from_slice(&line)?;
-            if !session
-                .pointer("/quality/buyer_acceptance/eligible")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                bail!("release part contains an ineligible session");
+            let assessment =
+                validate_embedded_acceptance(&session, profile, manifest.minimum_score)?;
+            if !eligible_fingerprints.insert(exact_content_fingerprint(&session)) {
+                bail!("release contains duplicate eligible Session content");
             }
+            eligible_tokens.add_assign(&assessment.tokens);
             part_records += 1;
             eligible += 1;
         }
         if part.records != Some(part_records) {
             bail!("release part record count mismatch: {}", part.file);
         }
+        if part.uncompressed_bytes != Some(part_bytes) {
+            bail!(
+                "release part uncompressed byte count mismatch: {}",
+                part.file
+            );
+        }
     }
     if eligible != manifest.counts.eligible_sessions {
         bail!("release eligible session count mismatch");
     }
-    let actual_files: HashSet<String> = WalkDir::new(root)
-        .min_depth(1)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-        .map(|entry| {
-            entry
-                .path()
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/")
-        })
-        .collect();
+    if eligible_tokens != manifest.eligible_tokens {
+        bail!("release eligible Token totals mismatch");
+    }
+    let report_audit = verify_release_reports(root, &manifest, profile)?;
+    if report_audit.assessed != manifest.counts.assessed_sessions
+        || report_audit.eligible != manifest.counts.eligible_sessions
+        || report_audit
+            .rejected
+            .saturating_add(report_audit.divergent_records)
+            != manifest.counts.rejected_sessions
+        || report_audit.divergent_conflicts != manifest.counts.divergent_session_conflicts
+        || report_audit.divergent_records != manifest.counts.divergent_session_records
+        || report_audit.assessed_tokens != manifest.assessed_tokens
+        || report_audit.eligible_tokens != manifest.eligible_tokens
+        || report_audit.failure_reason_counts != manifest.failure_reason_counts
+        || report_audit.eligible_fingerprints != eligible_fingerprints
+    {
+        bail!("release assessment, rejection, Token, or fingerprint totals are inconsistent");
+    }
+    let conserved = manifest.counts.input_records
+        == manifest
+            .counts
+            .parse_failures
+            .saturating_add(manifest.counts.exact_duplicates_removed)
+            .saturating_add(manifest.counts.subset_snapshots_removed)
+            .saturating_add(manifest.counts.divergent_session_records)
+            .saturating_add(manifest.counts.assessed_sessions);
+    let expected_status = if manifest.counts.parse_failures == 0
+        && manifest.counts.eligible_sessions > 0
+        && conserved
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+    if !conserved || manifest.validation_status != expected_status {
+        bail!("release conservation or validation status is inconsistent");
+    }
+    let mut actual_files = HashSet::new();
+    for entry in WalkDir::new(root).min_depth(1).follow_links(false) {
+        let entry = entry?;
+        let relative = entry
+            .path()
+            .strip_prefix(root)?
+            .to_str()
+            .context("release path is not UTF-8")?
+            .replace('\\', "/");
+        if entry.file_type().is_file() {
+            actual_files.insert(relative);
+        } else if !entry.file_type().is_dir() || !matches!(relative.as_str(), "data" | "reports") {
+            bail!("release contains an unexpected entry: {relative}");
+        }
+    }
     if actual_files != expected_files {
         bail!("release file set does not match manifest");
     }
     verify_checksum_file(root, &manifest)?;
     Ok(manifest)
+}
+
+fn verify_release_reports(
+    root: &Path,
+    manifest: &ReleaseManifest,
+    profile: Profile,
+) -> Result<ReportAudit> {
+    let mut audit = ReportAudit::default();
+    for report in &manifest.reports {
+        let mut reader = crate::jsonl::open_jsonl_reader(&root.join(&report.file))?;
+        let mut line = Vec::new();
+        let mut records = 0_u64;
+        let mut uncompressed_bytes = 0_u64;
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                bail!(
+                    "release report contains an empty JSONL line: {}",
+                    report.file
+                );
+            }
+            records = records.saturating_add(1);
+            uncompressed_bytes = uncompressed_bytes.saturating_add(line.len() as u64);
+            let value: Value = serde_json::from_slice(&line)?;
+            if report.file.starts_with("reports/assessments-part-")
+                && report.file.ends_with(".jsonl.zst")
+            {
+                audit_assessment_record(&value, manifest, profile, &mut audit)?;
+            } else if report.file == "reports/divergent-sessions.jsonl.zst" {
+                audit_divergent_record(&value, &mut audit)?;
+            } else {
+                bail!("release contains an unsupported report: {}", report.file);
+            }
+        }
+        if report.records != Some(records)
+            || report
+                .uncompressed_bytes
+                .is_some_and(|expected| expected != uncompressed_bytes)
+        {
+            bail!(
+                "release report record or byte count mismatch: {}",
+                report.file
+            );
+        }
+    }
+    if audit.assessment_fingerprints.len() as u64 != audit.assessed {
+        bail!("release assessment report contains duplicate content fingerprints");
+    }
+    Ok(audit)
+}
+
+fn audit_assessment_record(
+    value: &Value,
+    manifest: &ReleaseManifest,
+    profile: Profile,
+    audit: &mut ReportAudit,
+) -> Result<()> {
+    let assessment: BuyerAssessment = serde_json::from_value(
+        value
+            .pointer("/quality/buyer_acceptance")
+            .cloned()
+            .context("assessment report has no quality.buyer_acceptance")?,
+    )?;
+    if !assessment_contract_valid(&assessment, profile, manifest.minimum_score) {
+        bail!("release report contains an inconsistent Session assessment");
+    }
+    let decision = string_field(value, "release_decision");
+    if decision
+        != Some(if assessment.eligible {
+            "eligible"
+        } else {
+            "rejected"
+        })
+    {
+        bail!("release report decision does not match its assessment");
+    }
+    let fingerprint = string_field(value, "content_fingerprint")
+        .filter(|value| valid_sha256(value))
+        .context("release assessment has an invalid content fingerprint")?
+        .to_owned();
+    if !audit.assessment_fingerprints.insert(fingerprint.clone()) {
+        bail!("release assessment report contains duplicate content fingerprints");
+    }
+    audit.assessed = audit.assessed.saturating_add(1);
+    audit.assessed_tokens.add_assign(&assessment.tokens);
+    if assessment.eligible {
+        audit.eligible = audit.eligible.saturating_add(1);
+        audit.eligible_tokens.add_assign(&assessment.tokens);
+        audit.eligible_fingerprints.insert(fingerprint);
+    } else {
+        audit.rejected = audit.rejected.saturating_add(1);
+    }
+    for reason in assessment.failure_reasons {
+        *audit.failure_reason_counts.entry(reason).or_insert(0) += 1;
+    }
+    Ok(())
+}
+
+fn audit_divergent_record(value: &Value, audit: &mut ReportAudit) -> Result<()> {
+    let candidate_count = value
+        .get("candidate_count")
+        .and_then(Value::as_u64)
+        .filter(|count| *count >= 2)
+        .context("divergent Session report has an invalid candidate_count")?;
+    let fingerprints = value
+        .get("content_fingerprints")
+        .and_then(Value::as_array)
+        .context("divergent Session report has no content_fingerprints")?;
+    if string_field(value, "reason") != Some("divergent_session_snapshots")
+        || fingerprints.len() as u64 != candidate_count
+        || fingerprints.iter().any(|fingerprint| {
+            fingerprint
+                .as_str()
+                .is_none_or(|value| !valid_sha256(value))
+        })
+    {
+        bail!("divergent Session report is inconsistent");
+    }
+    audit.divergent_conflicts = audit.divergent_conflicts.saturating_add(1);
+    audit.divergent_records = audit.divergent_records.saturating_add(candidate_count);
+    Ok(())
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_embedded_acceptance(
+    session: &Value,
+    profile: Profile,
+    minimum_score: f64,
+) -> Result<BuyerAssessment> {
+    let assessment: BuyerAssessment = serde_json::from_value(
+        session
+            .pointer("/quality/buyer_acceptance")
+            .cloned()
+            .context("release Session has no quality.buyer_acceptance")?,
+    )?;
+    if !eligible_assessment_contract_valid(&assessment, profile, minimum_score) {
+        bail!("release contains an inconsistent or ineligible Session assessment");
+    }
+    let recomputed = assess_session(session, profile, minimum_score).buyer_acceptance;
+    if recomputed != assessment {
+        bail!("release Session quality does not match its canonical content");
+    }
+    Ok(assessment)
 }
 
 fn deduplicate_partition(
@@ -425,15 +653,10 @@ fn deduplicate_partition(
                 stats.exact_removed += 1;
             }
         }
-        unique.sort_by_key(|session| {
-            std::cmp::Reverse(
-                session
-                    .get("messages")
-                    .and_then(Value::as_array)
-                    .map(Vec::len)
-                    .unwrap_or(0),
-            )
-        });
+        // Pick the most complete snapshot deterministically.  HashMap
+        // iteration order must never decide which equal-length snapshot is
+        // exported.
+        unique.sort_by_key(|session| std::cmp::Reverse(snapshot_order_key(session)));
         let full = unique.first().expect("dedup group empty");
         let full_messages = message_fingerprints(full);
         let subset = unique.iter().skip(1).all(|session| {
@@ -475,6 +698,36 @@ fn deduplicate_partition(
     writer.flush()?;
     writer.get_ref().sync_all()?;
     Ok((stats, candidate_count, conflict_count))
+}
+
+fn snapshot_order_key(session: &Value) -> (u8, u8, u64, u64, String) {
+    let final_snapshot = session
+        .get("is_final_snapshot")
+        .and_then(Value::as_bool)
+        .unwrap_or(false) as u8;
+    let terminal_status = string_field(session, "status").is_some_and(|status| {
+        matches!(
+            status.to_ascii_lowercase().as_str(),
+            "completed" | "terminated" | "failed" | "cancelled" | "canceled" | "incomplete"
+        )
+    }) as u8;
+    let message_count = session
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0) as u64;
+    let capture_count = session
+        .get("source_capture_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let fingerprint = exact_content_fingerprint(session);
+    (
+        final_snapshot,
+        terminal_status,
+        message_count,
+        capture_count,
+        fingerprint,
+    )
 }
 
 fn score_partition(
@@ -800,6 +1053,88 @@ fn verify_checksum_file(root: &Path, manifest: &ReleaseManifest) -> Result<()> {
     Ok(())
 }
 
+fn discover_release_raw_sources(
+    inputs: &[PathBuf],
+    session_inputs: &[PathBuf],
+) -> Result<Vec<RawSourceLineage>> {
+    let mut sources: BTreeMap<String, RawSourceLineage> = BTreeMap::new();
+    let mut lineaged = Vec::new();
+    let mut unlineaged = Vec::new();
+    for input in inputs {
+        let canonical = input.canonicalize()?;
+        let contributes = if canonical.is_file() {
+            session_inputs.contains(&canonical)
+        } else {
+            session_inputs
+                .iter()
+                .any(|path| path.starts_with(&canonical))
+        };
+        if !contributes {
+            continue;
+        }
+        if !canonical.is_dir() {
+            unlineaged.push(canonical);
+            continue;
+        }
+        let manifest_path = canonical.join("manifest.json");
+        if !manifest_path.is_file() {
+            unlineaged.push(canonical);
+            continue;
+        }
+        let value: Value = serde_json::from_slice(&fs::read(&manifest_path)?)
+            .with_context(|| format!("parse input manifest {}", manifest_path.display()))?;
+        if string_field(&value, "schema_version") != Some(crate::assemble::ASSEMBLY_SCHEMA_VERSION)
+        {
+            unlineaged.push(canonical);
+            continue;
+        }
+        let assembly = crate::assemble::verify_assembly(&canonical)?;
+        if assembly.raw_sources.is_empty() {
+            unlineaged.push(canonical);
+            continue;
+        }
+        for source in assembly.raw_sources {
+            validate_release_raw_source(&source)?;
+            if let Some(existing) = sources.get(&source.archive_id)
+                && existing != &source
+            {
+                bail!(
+                    "conflicting raw source lineage for archive {}",
+                    source.archive_id
+                );
+            }
+            sources.insert(source.archive_id.clone(), source);
+        }
+        lineaged.push(canonical);
+    }
+    if !lineaged.is_empty() && !unlineaged.is_empty() {
+        bail!(
+            "cannot mix Raw-lineaged and unlineaged Session inputs: lineaged={lineaged:?}, unlineaged={unlineaged:?}"
+        );
+    }
+    Ok(sources.into_values().collect())
+}
+
+fn validate_release_raw_source(source: &RawSourceLineage) -> Result<()> {
+    let valid_digest =
+        |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if source.schema_version != RAW_LINEAGE_SCHEMA_VERSION
+        || source.archive_id.trim().is_empty()
+        || source.completeness != "complete"
+        || source.segment_count == 0
+        || source.checkpoint_key.trim().is_empty()
+        || source.manifest_key.trim().is_empty()
+        || !valid_digest(&source.checkpoint_sha256)
+        || !valid_digest(&source.manifest_sha256)
+    {
+        bail!(
+            "invalid raw source lineage for archive {}",
+            source.archive_id
+        );
+    }
+    Ok(())
+}
+
 fn discover_session_inputs(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut output = Vec::new();
     for input in inputs {
@@ -861,6 +1196,21 @@ fn sync_directory(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn complete_raw_lineage() -> RawSourceLineage {
+        RawSourceLineage {
+            schema_version: RAW_LINEAGE_SCHEMA_VERSION.to_owned(),
+            archive_id: "archive-test".to_owned(),
+            completeness: "complete".to_owned(),
+            checkpoint_key: "raw/archive-test/CHECKPOINT.json".to_owned(),
+            checkpoint_sha256: "a".repeat(64),
+            manifest_key: "raw/archive-test/manifest.json".to_owned(),
+            manifest_sha256: "b".repeat(64),
+            segment_count: 1,
+            total_records: 1,
+            total_bytes: 1,
+        }
+    }
 
     fn session(id: &str, messages: Vec<Value>) -> Value {
         json!({
@@ -974,5 +1324,50 @@ mod tests {
         assert_eq!(manifest.counts.exact_duplicates_removed, 1);
         assert_eq!(manifest.counts.assessed_sessions, 1);
         assert_eq!(manifest.counts.rejected_sessions, 1);
+    }
+
+    #[test]
+    fn release_rejects_mixed_raw_lineage_inputs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let raw = temporary.path().join("raw");
+        fs::create_dir_all(&raw).unwrap();
+        fs::write(
+            raw.join("captures.ndjson"),
+            format!(
+                "{}\n",
+                json!({
+                    "captureId":"cap-release-lineage",
+                    "requestBody":{"kind":"json","value":{"model":"gpt-5.6-sol"}},
+                    "responseBody":{"kind":"json","value":{}},
+                    "responseHeaders":{"x-request-id":"request-release-lineage"}
+                })
+            ),
+        )
+        .unwrap();
+        fs::write(
+            raw.join("RAW_SOURCE.json"),
+            serde_json::to_vec(&complete_raw_lineage()).unwrap(),
+        )
+        .unwrap();
+        let assembly = temporary.path().join("assembly");
+        crate::assemble::assemble(crate::assemble::AssembleConfig {
+            inputs: vec![raw],
+            output: assembly.clone(),
+            partitions: 1,
+            zstd_level: 1,
+            replace: false,
+        })
+        .unwrap();
+        let session_inputs = discover_session_inputs(std::slice::from_ref(&assembly)).unwrap();
+        assert!(!session_inputs.is_empty());
+
+        let error =
+            discover_release_raw_sources(&[assembly, session_inputs[0].clone()], &session_inputs)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot mix Raw-lineaged and unlineaged Session inputs")
+        );
     }
 }

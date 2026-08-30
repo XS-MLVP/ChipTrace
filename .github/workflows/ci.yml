@@ -21,6 +21,20 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked
       - run: cargo run --locked --bin chiptrace -- self-test
+      - name: Verify Relay producer benchmark path
+        run: |
+          cargo run --locked --bin chiptrace -- benchmark-http \
+            --records 32 --payload-kib 4 --batch-records 8 \
+            --concurrency 4 --store-shards 2 --relay --producer-events \
+          | python3 -c '
+          import json, sys
+          result = json.load(sys.stdin)
+          assert result["records"] == 32
+          assert result["relay"] is True
+          assert result["producer_events"] is True
+          assert result["relay_health"]["delivered"] == 32
+          assert result["relay_health"]["conservation_ok"] is True
+          '
       - run: cargo build --release --locked --bin chiptrace
       - run: target/release/chiptrace --help
 
@@ -30,3 +44,25 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -t chiptrace:ci .
       - run: docker run --rm chiptrace:ci --help
+      - name: Verify container JSONL delivery closure
+        run: |
+          docker run --rm --network none chiptrace:ci self-test | python3 -c '
+          import json, sys
+          result = json.load(sys.stdin)
+          assert result["ok"] is True
+          assert result["acceptance"]["hard_gate_pass"] is True
+          assert result["acceptance"]["score"] == 100
+          assert result["collection_submission"]["durable"] is True
+          assert result["collection_submission"]["producer_replay_duplicates"] == 15
+          assert result["checks"]["producer_stream_conservation"] is True
+          assert result["checks"]["tool_execution_state_machine"] is True
+          assert result["acceptance"]["source_capture_count"] == 21
+          assert result["assembly"]["capture_schema_versions"] == ["chiptrace.capture.v2"]
+          assert result["buyer_package"]["buyer_profile"] == "buyer-v7"
+          assert result["buyer_package"]["minimum_score"] >= 90
+          assert result["buyer_package"]["eligible_sessions"] == 1
+          assert result["buyer_tamper_detected"] is True
+          assert result["buyer_publish"]["artifact_kind"] == "buyer_package"
+          assert result["buyer_publish_retry"]["idempotent"] is True
+          assert result["published_buyer_verify"]["ok"] is True
+          '
