@@ -225,6 +225,30 @@ runtime 结果，并通过六项完整性硬门槛。
 旧 `buyer-v7` Release/Buyer Package 也能以只读别名复验。Rust 全量测试、Clippy
 `-D warnings` 和闭环 self-test 通过。
 
+## Responses M0 真实闭环（2026-08-31）
+
+独立端口 `18088/3131/3130` 使用统一 Codex producer 完成一个两阶段真实任务。生产
+`18084` 未修改或重启。Raw Archive ID 为
+`chiptrace-m0-function-v1-r2-20260831`。
+
+| 阶段 | 结果 |
+| --- | --- |
+| Raw | 6 个 sealed Segment、785 条、36,237,461 bytes；Archive/Verify/Restore 逐对象、逐行通过，重放为幂等成功 |
+| Wire | 21 个 Responses streaming 交互；原始请求/响应字节、长度、SHA-256 和协议终态 21/21 完整，`delivery_ready=true` |
+| Runtime | 78 个 span、1 个 Task Root、77/77 内部父引用解析；19/19 模型调用有结果和真实执行 |
+| 路由 | 21/21 Sub2API usage 按响应 client ID 精确关联；`provider=openai`、`model=gpt-5.6-sol` |
+| Buyer | 33 个有效轮次、2 个真实 User -> Assistant 轮、31 次调用、5 个不同工具、31/31 配对、21 个有效返回、1 次真实失败；100 分且全部 hard gate 通过 |
+| OTLP | 99 个 span、1 个根、98/98 内部父引用解析，缺失父节点为 0 |
+| Token | API 总量 365,307，其中缓存输入 319,232；规范化语料 23,254；监督输出 6,261 |
+| Buyer package | 1/1 eligible；UTF-8 JSONL + tar.gz 为 1,231,411 bytes，SHA-256 为 `8c46174efb698e87385004ba0ccf38076e3ddd9f4b27c02e4434f6be8f57b755` |
+| 回归 | Rust 210/210、Clippy、格式、self-test 和入口 outbox 8/8 通过；25 次网络尝试在第 25 次 durable ACK 后清空队列 |
+
+首次 Archive 在一个长流结束前约 51 秒提交，因此只含 20 个 API Snapshot；该流结束后
+7 ms 进入本地 outbox、18 ms 获得 Relay durable ACK、26 ms 提交到 Collector。根因是
+封存时仍有请求在途，不是 outbox 重试延迟。纳入第 6 个 sealed Segment 后，21/21 守恒
+恢复。该 Session 没有带分值的 evaluator evidence，因此 Buyer 100 分仍只代表结构
+验收通过，不代表语义奖励可用。
+
 ## 正式交付门槛
 
 正式 buyer 包必须满足：

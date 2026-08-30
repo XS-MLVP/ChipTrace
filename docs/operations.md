@@ -343,6 +343,15 @@ Code Mode 内层执行无法关联外层调用时仍被拒绝。`WebSearch` 缺�
 `partial` Checkpoint 默认不能恢复到标准处理目录；取证时需显式使用
 `restore-raw-archive --allow-partial`。
 
+专用验收入口在 `POST /flush` 前必须先停止发起新请求，并等待入口 `/health` 同时满足：
+
+- `stats.acceptedCount == submitter.offered` 且 `pendingLocalWrites == 0`；
+- outbox 的 `pending/processing/failedFiles/conflicts/rejected` 均为 0；
+- Rust Relay 的 `pending/inflight` 为 0 且 `conservationOk == true`。
+
+Collector `flush` 只能封存已经收到的记录，不能结束仍在上游执行的流。任一条件不满足时
+不得把 Archive 声明为该任务的完整快照。
+
 Raw 输入必须直接来自 sealed Segment，不得通过 `jq -c`、JSON pretty-printer 或其他
 解析后重序列化步骤生成。Capture 可能包含带独立长度和 SHA-256 的原生 rollout 字节；
 任何字符解码、替换、截断或换行改写都会使证据失效，并由 Enrich、Assembly 或
