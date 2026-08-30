@@ -1184,10 +1184,20 @@ fn validate_tool_execution(object: &Map<String, Value>) -> Result<()> {
     {
         bail!("toolExecution.schema.description is required");
     }
-    let parameters = schema
-        .get("parameters")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow::anyhow!("toolExecution.schema.parameters is required"))?;
+    match (schema.get("parameters"), schema.get("format")) {
+        (None, None) => {
+            bail!("toolExecution.schema requires parameters or a native format");
+        }
+        (Some(parameters), _) => validate_tool_parameters(parameters)?,
+        (None, Some(format)) => validate_tool_format(format)?,
+    }
+    validate_tool_execution_result(execution, status)
+}
+
+fn validate_tool_parameters(parameters: &Value) -> Result<()> {
+    let parameters = parameters
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("toolExecution.schema.parameters must be an object"))?;
     if parameters.get("type").and_then(Value::as_str) != Some("object")
         || !parameters.get("properties").is_some_and(Value::is_object)
     {
@@ -1227,7 +1237,23 @@ fn validate_tool_execution(object: &Map<String, Value>) -> Result<()> {
     }) {
         bail!("toolExecution.schema.parameters.required must reference defined properties");
     }
-    validate_tool_execution_result(execution, status)
+    Ok(())
+}
+
+fn validate_tool_format(format: &Value) -> Result<()> {
+    let format = format
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("toolExecution.schema.format must be an object"))?;
+    for field in ["type", "syntax", "definition"] {
+        if format
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            bail!("toolExecution.schema.format.{field} is required");
+        }
+    }
+    Ok(())
 }
 
 fn validate_tool_execution_result(execution: &Map<String, Value>, status: &str) -> Result<()> {
@@ -1672,6 +1698,46 @@ mod tests {
             }
         });
         normalize_capture(&serde_json::to_vec(&tool).unwrap(), 4096).unwrap();
+
+        let native_tool = json!({
+            "recordType":"tool_execution",
+            "captureId":"cap-tool-native-1",
+            "sourceNamespace":"test",
+            "traceContext":{"task_session_id":"task-1"},
+            "toolExecution":{
+                "call_id":"call-native-1",
+                "name":"apply_patch",
+                "status":"success",
+                "initiator":"assistant",
+                "arguments":"*** Begin Patch\n*** End Patch",
+                "schema":{
+                    "name":"apply_patch",
+                    "description":"Apply a patch.",
+                    "format":{
+                        "type":"grammar",
+                        "syntax":"lark",
+                        "definition":"start: /.+/"
+                    }
+                },
+                "result":"Done!"
+            }
+        });
+        let native = normalize_capture(&serde_json::to_vec(&native_tool).unwrap(), 4096).unwrap();
+        let native: Value = serde_json::from_slice(&native.canonical).unwrap();
+        assert!(
+            native["toolExecution"]["schema"]
+                .get("parameters")
+                .is_none()
+        );
+        assert_eq!(
+            native["toolExecution"]["schema"]["format"]["syntax"],
+            "lark"
+        );
+
+        let mut invalid_native = native_tool;
+        invalid_native["captureId"] = json!("cap-tool-native-invalid");
+        invalid_native["toolExecution"]["schema"]["format"]["definition"] = json!("");
+        assert!(normalize_capture(&serde_json::to_vec(&invalid_native).unwrap(), 4096).is_err());
 
         let evaluation = json!({
             "recordType":"evaluation",
