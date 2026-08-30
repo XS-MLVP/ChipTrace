@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/runtime-span-v1.schema.json",
+  "title": "ChipTrace Runtime Span v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "span_id",
+    "trace_context",
+    "span_kind",
+    "name",
+    "status",
+    "arguments",
+    "result",
+    "raw_capture_refs",
+    "extensions"
+  ],
+  "properties": {
+    "schema_version": {"const": "chiptrace.runtime-span.v1"},
+    "span_id": {"type": "string", "minLength": 1},
+    "trace_context": {"type": "object", "additionalProperties": true},
+    "span_kind": {"type": "string", "minLength": 1},
+    "name": {"type": "string", "minLength": 1},
+    "call_id": {"type": ["string", "null"]},
+    "parent_call_id": {"type": ["string", "null"]},
+    "parent_span_id": {"type": ["string", "null"]},
+    "status": {"type": "string", "minLength": 1},
+    "started_at": {"type": ["string", "null"]},
+    "finished_at": {"type": ["string", "null"]},
+    "arguments": {},
+    "result": {},
+    "error": {},
+    "tool_schema": {},
+    "raw_capture_refs": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "extensions": {"type": "object", "additionalProperties": true}
+  },
+  "additionalProperties": true
+}

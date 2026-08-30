@@ -1,0 +1,21 @@
+{
+  "model": "model-family-latest",
+  "stream": true,
+  "reasoning": {"effort": "medium"},
+  "tools": [
+    {
+      "type": "function",
+      "name": "run_query",
+      "description": "Run a structured query.",
+      "parameters": {
+        "type": "object",
+        "properties": {"sql": {"type": "string"}},
+        "required": ["sql"]
+      }
+    }
+  ],
+  "input": [
+    {"type": "message", "role": "developer", "content": "Keep unknown items."},
+    {"type": "message", "role": "user", "content": "Count the rows."}
+  ]
+}

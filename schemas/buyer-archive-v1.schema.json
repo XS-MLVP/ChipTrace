@@ -22,7 +22,7 @@
   "properties": {
     "schema_version": {"const": "chiptrace.buyer-archive.v1"},
     "release_id": {"type": "string", "minLength": 1},
-    "buyer_profile": {"const": "buyer-v7"},
+    "buyer_profile": {"enum": ["buyer-v7", "buyer-v7-codex-runtime-expanded"]},
     "minimum_score": {"type": "number", "minimum": 90, "maximum": 100},
     "format": {"const": "one complete Session per JSONL line"},
     "encoding": {"const": "UTF-8"},

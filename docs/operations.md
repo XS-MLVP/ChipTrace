@@ -39,44 +39,17 @@ Relay 的 `--max-delivery-inflight-mib` 是跨全部投递 Worker 的 Payload �
 State、Capture 与 outbox 使用本地持久化 ext4/XFS；生产数据目录使用服务专属账号和
 `0700` 权限。对象存储凭据通过环境或运行时密钥服务注入。
 
-## Docker
+## Linux 隔离验收
+
+仓库只保留一个 Docker Compose 测试环境。容器禁用外部网络、使用只读根文件系统，
+临时数据仅写入 tmpfs：
 
 ```bash
-export CHIPTRACE_CAPTURE_DATA_ROOT=/srv/chiptrace/capture
-export CHIPTRACE_CAPTURE_STATE_ROOT=/var/lib/chiptrace/state
-export CHIPTRACE_RELAY_DATA_ROOT=/var/lib/chiptrace/relay/outbox
-export CHIPTRACE_RELAY_STATE_ROOT=/var/lib/chiptrace/relay/outbox-state
-export CHIPTRACE_RELAY_DELIVERY_ROOT=/var/lib/chiptrace/relay/delivery
-export CHIPTRACE_UID="$(id -u)"
-export CHIPTRACE_GID="$(id -g)"
-
-install -d -m 0700 \
-  "$CHIPTRACE_CAPTURE_DATA_ROOT" \
-  "$CHIPTRACE_CAPTURE_STATE_ROOT" \
-  "$CHIPTRACE_RELAY_DATA_ROOT" \
-  "$CHIPTRACE_RELAY_STATE_ROOT" \
-  "$CHIPTRACE_RELAY_DELIVERY_ROOT"
-
-docker compose -f deploy/docker-compose.yml up -d --build
-curl --fail http://127.0.0.1:3010/health
-curl --fail http://127.0.0.1:3011/health
+make m0-test
 ```
 
-隔离的端到端验收不需要业务数据目录：
-
-```bash
-docker build -t chiptrace:self-test .
-docker run --rm chiptrace:self-test self-test
-```
-
-自测生成累计 API snapshot、任务 start/end、真实工具成功/失败和 evaluator
-事件，通过 Relay 的真实 HTTP NDJSON 批量入口进入 outbox，再经 Collector WAL、
-Assembly、buyer-v7 评分、Release 与本地对象提交完成闭环；输出必须为
-`ok=true`、100 分且 hard gate 通过。自测还会生成最终 `tar.gz + JSONL` 采购包，
-逐行复验后破坏副本并确认 SHA-256 校验能够拒绝篡改。
-
-Compose 可通过 `CHIPTRACE_STORE_SHARDS` 设置分片数。默认值为 1，适用于单盘和
-既有数据目录。
+验收主路径为 `Responses streaming -> Relay -> Collector -> Project -> Verify -> OTLP -> Verify`。
+输出必须包含 `ok=true`、`m0_interaction_delivery=true` 和 `m0_otlp_tree=true`。
 
 ## 18084 入口适配器
 
@@ -189,7 +162,8 @@ Harness 状态契约见 `schemas/harness-session-v1.schema.json`。每个任务�
 生产者进程持有；进程异常退出后下一次 `harness flush` 会重放未确认的完整行。只有
 Relay 的完整 durable ACK 会推进 checkpoint；业务层可以在投递失败时继续执行，但该
 任务必须在待投递队列清空前标记为未交付。工具没有完整 Registry Schema 时仍保存
-原始事件，`schema_provenance.source_complete=false`，严格 buyer-v7 评分会拒绝。
+原始事件，`schema_provenance.source_complete=false`，严格
+`buyer-v7-codex-runtime-expanded` 评分会拒绝。
 
 ## Codex rollout 生产者
 
@@ -205,13 +179,15 @@ checkpoint；退出时完成严格 bundle 扫描和 spool flush。
 单进程任务使用默认的 `--task-phase single`：
 
 ```bash
+export CHIPTRACE_MODEL_BASE_URL=http://gateway.internal:18084/
+
 chiptrace codex-run \
   --codex-bin /usr/local/bin/codex \
   --working-directory /workspace/project \
   --state-root /var/lib/chiptrace/tasks/task-001 \
   --source-namespace router-v2-18084 \
   --relay-url http://127.0.0.1:3011 \
-  --model-base-url http://172.28.11.121:18084/ \
+  --model-base-url "$CHIPTRACE_MODEL_BASE_URL" \
   --task-session-id task-001 \
   -- exec --json "执行并验证任务"
 ```
@@ -225,7 +201,7 @@ chiptrace codex-run --codex-bin /usr/local/bin/codex \
   --state-root /var/lib/chiptrace/tasks/task-001 \
   --trace-root /var/lib/chiptrace/tasks/task-001/trace-01 \
   --source-namespace router-v2-18084 --relay-url http://127.0.0.1:3011 \
-  --model-base-url http://172.28.11.121:18084/ --task-phase begin \
+  --model-base-url "$CHIPTRACE_MODEL_BASE_URL" --task-phase begin \
   --task-session-id task-001 -- exec --json "执行第一阶段"
 
 chiptrace codex-run --codex-bin /usr/local/bin/codex \
@@ -233,7 +209,7 @@ chiptrace codex-run --codex-bin /usr/local/bin/codex \
   --state-root /var/lib/chiptrace/tasks/task-001 \
   --trace-root /var/lib/chiptrace/tasks/task-001/trace-02 \
   --source-namespace router-v2-18084 --relay-url http://127.0.0.1:3011 \
-  --model-base-url http://172.28.11.121:18084/ --task-phase continue \
+  --model-base-url "$CHIPTRACE_MODEL_BASE_URL" --task-phase continue \
   -- exec --json "依据上一阶段继续修正"
 
 chiptrace codex-run --codex-bin /usr/local/bin/codex \
@@ -241,7 +217,7 @@ chiptrace codex-run --codex-bin /usr/local/bin/codex \
   --state-root /var/lib/chiptrace/tasks/task-001 \
   --trace-root /var/lib/chiptrace/tasks/task-001/trace-03 \
   --source-namespace router-v2-18084 --relay-url http://127.0.0.1:3011 \
-  --model-base-url http://172.28.11.121:18084/ --task-phase finish \
+  --model-base-url "$CHIPTRACE_MODEL_BASE_URL" --task-phase finish \
   -- exec --json "执行最终验收"
 ```
 
@@ -286,7 +262,8 @@ chiptrace export-codex-trace-bundle \
 和 requester。真实 call/result 即使缺少 Registry 也保存为 `toolExecution`，此时
 `schema=null`、provenance 为 `missing_runtime_registry`，同时标记 `unmapped_tool`；
 不得从 `source_js` 或工具名补造 Schema。只有实际 dispatcher 导出的 Registry 与
-runtime 工具精确匹配时才成为 buyer-v7 合格定义。`rollout_ended` 只表示 bundle
+runtime 工具精确匹配时才成为
+`buyer-v7-codex-runtime-expanded` 合格定义。`rollout_ended` 只表示 bundle
 运行结束，任务终态仍需 harness 的 `task_end/session_end/cancel` 事件。
 `--require-complete` 只检查原生 bundle 的 rollout 终止和无 open tail，不会把它
 提升为任务终态。
@@ -352,12 +329,6 @@ Code Mode 内层执行无法关联外层调用时仍被拒绝。`WebSearch` 缺�
 `agent_id` 记录稳定实例身份，两者不互相覆盖。任务 start/end/cancel 仍由 harness
 另行提交。
 
-## open21 复现环境
-
-`open21` 是由独立 Docker Compose 管理的复现 fixture，不是 ChipTrace 生产
-服务。其容器网络与生产数据平面隔离；复现场景通过业务入口进入唯一的 Rust
-Trace 链路。open21 的容器、数据库和目录均不作为 Collector/Relay 实现。
-
 ## OSS 原始归档
 
 原始归档器只读取 Collector 已封存的 `.sealed.ndjson`。先执行 Collector 的
@@ -367,6 +338,13 @@ Trace 链路。open21 的容器、数据库和目录均不作为 Collector/Relay
 执行 Assembly、Score 和 Release，完整命令见 [OSS 原始层与提交协议](object-storage.md)。
 `partial` Checkpoint 默认不能恢复到标准处理目录；取证时需显式使用
 `restore-raw-archive --allow-partial`。
+
+Raw 输入必须直接来自 sealed Segment，不得通过 `jq -c`、JSON pretty-printer 或其他
+解析后重序列化步骤生成。Capture 可能包含带独立长度和 SHA-256 的原生 rollout 字节；
+任何字符解码、替换、截断或换行改写都会使证据失效，并由 Enrich、Assembly 或
+`verify-raw-archive --verify-records` 拒绝。需要筛选单个任务做隔离验证时，将原始行
+提交到临时 Collector，由 capture-v2 校验器规范化并重新封存，不能把筛选后的文本
+直接标记为 Raw Archive。
 
 `archive-raw` 是显式的离线封存步骤，不会在 Collector 进程内后台扫描或上传。生产
 环境应由受监管的 systemd timer、Kubernetes CronJob 或外部编排器在 `/flush` 成功后
@@ -379,22 +357,6 @@ Trace 链路。open21 的容器、数据库和目录均不作为 Collector/Relay
 - Raw 对象启用版本保护或 WORM 策略，禁止覆盖已提交对象；
 - 仅允许发布服务账号写入 `raw/`，消费账号只读 Checkpoint 引用的对象；
 - 保留 Raw Zone 和 Release Zone 的独立生命周期、容量和校验告警。
-
-## systemd
-
-```bash
-cargo build --release --locked
-install -m 0755 target/release/chiptrace "$HOME/.local/bin/chiptrace"
-install -d "$HOME/.config/systemd/user"
-cp deploy/chiptrace.service "$HOME/.config/systemd/user/"
-systemctl --user daemon-reload
-systemctl --user enable --now chiptrace.service
-systemctl --user status chiptrace.service
-```
-
-服务默认监听 loopback，采集接口不实现应用层认证。跨主机部署时放在受控内网
-或服务网格中，并由网络策略限制 `/flush` 与 `/audit`。认证头在写入 WAL 前
-移除，Trace 正文不做内容改写。
 
 ## 上线验收
 
@@ -445,7 +407,8 @@ chiptrace benchmark-compression \
 - WAL locator 覆盖连续且 SHA-256 一致；
 - Session 不跨 Release Part；
 - 去重与评分数量守恒；
-- 采购包逐行可解析，全部 Session 为 buyer-v7、得分不低于 90 且硬门槛通过；
+- 采购包逐行可解析，全部 Session 为
+  `buyer-v7-codex-runtime-expanded`、得分不低于 90 且硬门槛通过；
 - 采购包记录数、有效 Token、归档内外 SHA-256 守恒；
 - OSS/S3 在 COMMIT 出现前不可见为完整制品，且 `verify-published` 逐对象复验通过。
 
@@ -459,7 +422,8 @@ chiptrace benchmark-compression \
 3. 连续验证入口 outbox 与 Rust Relay 的 Capture 数守恒、pending 回落、P99 业务
    延迟差异和磁盘增长，并执行一次进程退出后的 processing 恢复。
 4. 从候选封存段构建 Release，要求 parse failure、merge divergence、trace/schema
-   conflict 均为 0，且符合业务条件的 fixture 达到 buyer-v7 100 分。
+   conflict 均为 0，且符合业务条件的 fixture 达到
+   `buyer-v7-codex-runtime-expanded` 100 分。
 5. 对旧 Collector 故障、Relay 重启、重复投递和断网恢复做注入测试。
 6. 达标后再切换采集目标；旧链路只读保留至新链路完成一个 Release 周期。
 

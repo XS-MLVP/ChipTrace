@@ -5,7 +5,8 @@ use crate::schema::{
 };
 use crate::score::{
     Profile, assess_session, assessment_contract_valid, eligible_assessment_contract_valid,
-    exact_content_fingerprint, is_contiguous_subsequence, message_fingerprints,
+    exact_content_fingerprint, is_contiguous_subsequence, materialize_profile_session,
+    message_fingerprints, normalize_assessment_profile,
 };
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
@@ -341,7 +342,7 @@ pub fn verify_release(root: &Path, require_pass: bool) -> Result<ReleaseManifest
     }
     let profile = match manifest.buyer_profile.as_str() {
         "buyer-v6" => Profile::BuyerV6,
-        "buyer-v7" => Profile::BuyerV7,
+        "buyer-v7" | "buyer-v7-codex-runtime-expanded" => Profile::BuyerV7,
         value => bail!("unsupported release buyer profile {value:?}"),
     };
     if require_pass && manifest.validation_status != "pass" {
@@ -612,7 +613,9 @@ fn validate_embedded_acceptance(
         bail!("release contains an inconsistent or ineligible Session assessment");
     }
     let recomputed = assess_session(session, profile, minimum_score).buyer_acceptance;
-    if recomputed != assessment {
+    let mut comparable = assessment.clone();
+    normalize_assessment_profile(&mut comparable, profile);
+    if recomputed != comparable {
         bail!("release Session quality does not match its canonical content");
     }
     Ok(assessment)
@@ -767,6 +770,7 @@ fn score_partition(
             .get("session")
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("candidate session missing"))?;
+        let session = materialize_profile_session(&session, config.profile);
         let fingerprint = exact_content_fingerprint(&session);
         if !exact_fingerprints.insert(fingerprint.clone()) {
             result.exact_removed += 1;

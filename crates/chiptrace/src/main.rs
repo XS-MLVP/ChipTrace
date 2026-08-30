@@ -20,6 +20,9 @@ use chiptrace::harness::{
     EvaluationInput, Harness, HarnessConfig, HarnessTarget, LifecycleEventInput, ToolEndInput,
     ToolStartInput,
 };
+use chiptrace::model_interaction::{
+    InteractionProjectConfig, project_interactions, verify_interaction_projection,
+};
 use chiptrace::producer::{ProducerConfig, ProducerTarget, submit_producer_events};
 use chiptrace::publish::{
     ArtifactKind, Backend, PublishConfig, PublishSource, VerifyPublishedConfig, publish,
@@ -35,6 +38,7 @@ use chiptrace::runtime_canary::{RuntimeCanaryConfig, run_runtime_canary};
 use chiptrace::score::{Profile, score_jsonl};
 use chiptrace::sharded::{ShardedCaptureStore, audit_sharded_store};
 use chiptrace::store::StoreConfig;
+use chiptrace::telemetry::{OtlpExportConfig, export_otlp, verify_otlp_export};
 use clap::{Args, Parser, Subcommand};
 use rayon::prelude::*;
 use serde_json::{Value, json};
@@ -67,6 +71,14 @@ enum Command {
     Audit(AuditArgs),
     /// 将 Capture NDJSON 组装为 canonical Session JSONL。
     Assemble(AssembleArgs),
+    /// 将 Capture 投影为 vendor-neutral ModelInteraction 与 RuntimeSpan。
+    ProjectInteractions(ProjectInteractionsArgs),
+    /// 只读验证 ModelInteraction 双轨投影。
+    VerifyInteractions(VerifyInteractionsArgs),
+    /// 从 delivery-ready canonical Trace 生成单一 OTLP 树。
+    ExportOtlp(ExportOtlpArgs),
+    /// 只读验证 OTLP 文件、SHA-256 和内部父子关系。
+    VerifyOtlp(VerifyOtlpArgs),
     /// 对 canonical Session JSONL 输出逐条验收结果。
     Score(ScoreArgs),
     /// 按显式 request_id 将 Sub2API usage log 精确关联到 Capture。
@@ -241,12 +253,52 @@ struct AssembleArgs {
 }
 
 #[derive(Debug, Args)]
+struct ProjectInteractionsArgs {
+    /// Capture JSONL、sealed NDJSON 或包含这些文件的目录，可重复指定。
+    #[arg(long, required = true)]
+    input: Vec<PathBuf>,
+    #[arg(long, required = true)]
+    output: PathBuf,
+    /// 仅投影这一完整任务；混合输入中存在多个任务时必须指定。
+    #[arg(long)]
+    task_session_id: Option<String>,
+    #[arg(long, default_value_t = 1)]
+    zstd_level: i32,
+    #[arg(long)]
+    replace: bool,
+}
+
+#[derive(Debug, Args)]
+struct VerifyInteractionsArgs {
+    #[arg(long, required = true)]
+    projection: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ExportOtlpArgs {
+    #[arg(long, required = true)]
+    projection: PathBuf,
+    #[arg(long, required = true)]
+    output: PathBuf,
+    #[arg(long, default_value_t = 1)]
+    zstd_level: i32,
+    #[arg(long)]
+    replace: bool,
+}
+
+#[derive(Debug, Args)]
+struct VerifyOtlpArgs {
+    #[arg(long, required = true)]
+    projection: PathBuf,
+}
+
+#[derive(Debug, Args)]
 struct ScoreArgs {
     #[arg(long, required = true)]
     input: Vec<PathBuf>,
     #[arg(long)]
     output: PathBuf,
-    #[arg(long, value_enum, default_value = "buyer-v7")]
+    #[arg(long, value_enum, default_value = "buyer-v7-codex-runtime-expanded")]
     profile: Profile,
     #[arg(long, default_value_t = 90.0)]
     minimum_score: f64,
@@ -654,7 +706,7 @@ struct CodexRunArgs {
     /// 共享 Codex 配置中的 provider key。
     #[arg(long, default_value = "OpenAI")]
     model_provider_id: String,
-    /// 可选的任务级 API 入口覆盖，例如 http://172.28.11.121:18084/。
+    /// 可选的任务级 API 入口覆盖，例如 http://gateway.internal:18084/。
     #[arg(long)]
     model_base_url: Option<String>,
     #[arg(long)]
@@ -715,7 +767,7 @@ struct ReleaseArgs {
     output: PathBuf,
     #[arg(long)]
     release_id: String,
-    #[arg(long, value_enum, default_value = "buyer-v7")]
+    #[arg(long, value_enum, default_value = "buyer-v7-codex-runtime-expanded")]
     profile: Profile,
     #[arg(long, default_value_t = 90.0)]
     minimum_score: f64,
@@ -1083,6 +1135,25 @@ async fn main() -> Result<()> {
             zstd_level: args.zstd_level,
             replace: args.replace,
         })?)?,
+        Command::ProjectInteractions(args) => {
+            serde_json::to_value(project_interactions(InteractionProjectConfig {
+                inputs: args.input,
+                output: args.output,
+                task_session_id: args.task_session_id,
+                zstd_level: args.zstd_level,
+                replace: args.replace,
+            })?)?
+        }
+        Command::VerifyInteractions(args) => {
+            serde_json::to_value(verify_interaction_projection(&args.projection)?)?
+        }
+        Command::ExportOtlp(args) => serde_json::to_value(export_otlp(OtlpExportConfig {
+            projection: args.projection,
+            output: args.output,
+            zstd_level: args.zstd_level,
+            replace: args.replace,
+        })?)?,
+        Command::VerifyOtlp(args) => serde_json::to_value(verify_otlp_export(&args.projection)?)?,
         Command::Score(args) => serde_json::to_value(score_jsonl(
             &args.input,
             &args.output,
@@ -1769,6 +1840,23 @@ async fn self_test() -> Result<Value> {
         replace: false,
     })?;
     let enrichment_verified = verify_enrichment(&enriched_root)?;
+    let interaction_root = temporary.path().join("interactions");
+    let interaction = project_interactions(InteractionProjectConfig {
+        inputs: vec![enriched_root.clone()],
+        output: interaction_root.clone(),
+        task_session_id: Some("task-self-test-v7".to_owned()),
+        zstd_level: 1,
+        replace: false,
+    })?;
+    let interaction_verified = verify_interaction_projection(&interaction_root)?;
+    let otlp_root = temporary.path().join("otlp");
+    let otlp = export_otlp(OtlpExportConfig {
+        projection: interaction_root,
+        output: otlp_root.clone(),
+        zstd_level: 1,
+        replace: false,
+    })?;
+    let otlp_verified = verify_otlp_export(&otlp_root)?;
     let assembly_root = temporary.path().join("assembly");
     let assembly = assemble(AssembleConfig {
         inputs: vec![enriched_root],
@@ -1989,7 +2077,7 @@ async fn self_test() -> Result<Value> {
     .await?;
     let self_test_checks = json!({
         "buyer_v7_session_eligible":release.counts.eligible_sessions == 1
-            && release.buyer_profile == "buyer-v7"
+            && release.buyer_profile == "buyer-v7-codex-runtime-expanded"
             && score == 100.0
             && hard_gate_pass,
         "task_and_provider_evidence":task_dag_complete
@@ -2023,6 +2111,14 @@ async fn self_test() -> Result<Value> {
             && enrichment.ambiguous == 0
             && enrichment == enrichment_verified,
         "semantic_reward":semantic_reward_available,
+        "m0_interaction_delivery":interaction.integrity.delivery_ready
+            && interaction.validation_status == "delivery_ready"
+            && interaction_verified == interaction,
+        "m0_otlp_tree":otlp.root_spans == 1
+            && otlp.internal_parent_references == otlp.resolved_internal_parents
+            && otlp.resolved_internal_parent_rate == 1.0
+            && otlp.missing_parent_nodes.is_empty()
+            && otlp_verified == otlp,
         "release_verification":verified.validation_status == "pass",
         "buyer_package_verification":buyer.eligible_sessions == 1
             && buyer.packages.len() == 1
@@ -2049,6 +2145,10 @@ async fn self_test() -> Result<Value> {
         "raw_archive_restore": raw_restore,
         "enrichment": enrichment,
         "enrichment_verify": enrichment_verified,
+        "interaction":interaction,
+        "interaction_verify":interaction_verified,
+        "otlp":otlp,
+        "otlp_verify":otlp_verified,
         "release": release,
         "buyer_package": buyer,
         "buyer_tamper_detected": buyer_tamper_detected,
@@ -2325,7 +2425,11 @@ fn self_test_trace(turn_id: Option<&str>) -> Value {
         "root_session_id":"task-self-test-v7",
         "goal_id":"goal-self-test",
         "agent_id":"agent-root",
-        "branch_id":"main"
+        "branch_id":"main",
+        "trace_id":"0123456789abcdef0123456789abcdef",
+        "parent_span_id":"1111111111111111",
+        "trace_flags":"01",
+        "traceparent":"00-0123456789abcdef0123456789abcdef-1111111111111111-01"
     });
     if let Some(turn_id) = turn_id {
         trace["root_turn_id"] = json!(turn_id);
@@ -2379,6 +2483,7 @@ async fn self_test_harness_events(root: &std::path::Path) -> Result<Vec<Value>> 
     config.branch_id = Some("main".to_owned());
     config.session_id = Some("thread-self-test".to_owned());
     config.thread_id = Some("thread-self-test".to_owned());
+    config.traceparent = Some("00-0123456789abcdef0123456789abcdef-1111111111111111-01".to_owned());
     config.target = Some(HarnessTarget::Jsonl(delivery_path));
     config.tool_registry = Some(registry);
     config.retry_max_times = 25;
@@ -2444,7 +2549,7 @@ async fn self_test_harness_events(root: &std::path::Path) -> Result<Vec<Value>> 
         passed: Some(true),
         reward: Some(1.0),
         score: None,
-        artifact: Some(json!({"profile":"buyer-v7"})),
+        artifact: Some(json!({"profile":"buyer-v7-codex-runtime-expanded"})),
         observed_at: Some("2026-08-27T00:00:17Z".to_owned()),
     })?;
     harness.task_end("completed", Some("self-test complete".to_owned()))?;
@@ -2538,6 +2643,37 @@ fn self_test_captures() -> Vec<Value> {
         request_input.extend(history.clone());
         let assistant_text = format!("I will execute {name} and retain its real result.");
         let arguments = json!({"target":"/workspace/chip"});
+        let request_value = json!({
+            "model":"gpt-5.6-sol",
+            "stream":true,
+            "previous_response_id":previous_response_id,
+            "input":request_input
+        });
+        let response_value = json!({
+            "id":response_id,
+            "model":"gpt-5.6-sol",
+            "provider":"OpenAI",
+            "status":"completed",
+            "instructions":system_prompt,
+            "output":[
+                {"type":"message","id":format!("assistant-{ordinal}"),"role":"assistant","content":assistant_text},
+                {"type":"function_call","id":format!("tool-item-{ordinal}"),"call_id":call_id,"name":name,
+                 "arguments":serde_json::to_string(&arguments).unwrap()}
+            ],
+            "usage":{
+                "input_tokens":1000 + ordinal * 100,
+                "input_tokens_details":{"cached_tokens":800 + ordinal * 100},
+                "output_tokens":80,
+                "output_tokens_details":{"reasoning_tokens":20},
+                "total_tokens":1080 + ordinal * 100
+            }
+        });
+        let request_raw = serde_json::to_string(&request_value).unwrap();
+        let response_raw = format!(
+            "event: response.created\ndata: {}\n\nevent: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"type":"response.created","response":{"id":format!("response-{ordinal}"),"status":"in_progress","model":"gpt-5.6-sol","output":[]}}),
+            json!({"type":"response.completed","response":response_value})
+        );
         captures.push(json!({
             "recordType":"api_snapshot",
             "captureId":format!("cap-self-api-{ordinal}"),
@@ -2546,33 +2682,15 @@ fn self_test_captures() -> Vec<Value> {
             "startedAt":format!("2026-08-27T00:00:{:02}Z", index * 3 + 1),
             "finishedAt":format!("2026-08-27T00:00:{:02}Z", index * 3 + 1),
             "proxiedPath":"/v1/responses",
+            "stream":true,
+            "upstreamResponseCompleted":true,
+            "clientRequestAborted":false,
+            "clientResponseClosedBeforeFinish":false,
             "traceContext":self_test_trace(Some(&turn_id)),
-            "requestBody":{"kind":"json","value":{
-                "model":"gpt-5.6-sol",
-                "previous_response_id":previous_response_id,
-                "input":request_input
-            }},
+            "requestBodyText":request_raw,
             "responseStatus":200,
             "responseHeaders":{"x-request-id":format!("request-{ordinal}")},
-            "responseBody":{"kind":"json","value":{
-                "id":response_id,
-                "model":"gpt-5.6-sol",
-                "provider":"OpenAI",
-                "status":"completed",
-                "instructions":system_prompt,
-                "output":[
-                    {"type":"message","id":format!("assistant-{ordinal}"),"role":"assistant","content":assistant_text},
-                    {"type":"function_call","id":format!("tool-item-{ordinal}"),"call_id":call_id,"name":name,
-                     "arguments":serde_json::to_string(&arguments).unwrap()}
-                ],
-                "usage":{
-                    "input_tokens":1000 + ordinal * 100,
-                    "input_tokens_details":{"cached_tokens":800 + ordinal * 100},
-                    "output_tokens":80,
-                    "output_tokens_details":{"reasoning_tokens":20},
-                    "total_tokens":1080 + ordinal * 100
-                }
-            }}
+            "responseBodyText":response_raw
         }));
         let (status, result_field, result) = if index == 0 {
             (
@@ -2649,6 +2767,26 @@ fn self_test_captures() -> Vec<Value> {
         json!({"type":"message","role":"developer","content":system_prompt}),
     ];
     final_input.extend(history);
+    let final_request_value = json!({
+        "model":"gpt-5.6-sol",
+        "stream":true,
+        "previous_response_id":previous_response_id,
+        "input":final_input
+    });
+    let final_response_value = json!({
+        "id":"response-final","model":"gpt-5.6-sol","provider":"OpenAI","status":"completed",
+        "instructions":system_prompt,
+        "output":[{"type":"message","id":"assistant-final","role":"assistant",
+                   "content":"The release passed tests, formatting, and final verification."}],
+        "usage":{"input_tokens":2000,"input_tokens_details":{"cached_tokens":1800},
+                 "output_tokens":100,"output_tokens_details":{"reasoning_tokens":20},"total_tokens":2100}
+    });
+    let final_request_raw = serde_json::to_string(&final_request_value).unwrap();
+    let final_response_raw = format!(
+        "event: response.created\ndata: {}\n\nevent: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"type":"response.created","response":{"id":"response-final","status":"in_progress","model":"gpt-5.6-sol","output":[]}}),
+        json!({"type":"response.completed","response":final_response_value})
+    );
     captures.push(json!({
         "recordType":"api_snapshot",
         "captureId":"cap-self-api-final",
@@ -2657,22 +2795,15 @@ fn self_test_captures() -> Vec<Value> {
         "startedAt":"2026-08-27T00:00:16Z",
         "finishedAt":"2026-08-27T00:00:16Z",
         "proxiedPath":"/v1/responses",
+        "stream":true,
+        "upstreamResponseCompleted":true,
+        "clientRequestAborted":false,
+        "clientResponseClosedBeforeFinish":false,
         "traceContext":self_test_trace(Some("turn-5")),
-        "requestBody":{"kind":"json","value":{
-            "model":"gpt-5.6-sol",
-            "previous_response_id":previous_response_id,
-            "input":final_input
-        }},
+        "requestBodyText":final_request_raw,
         "responseStatus":200,
         "responseHeaders":{"x-request-id":"request-final"},
-        "responseBody":{"kind":"json","value":{
-            "id":"response-final","model":"gpt-5.6-sol","provider":"OpenAI","status":"completed",
-            "instructions":system_prompt,
-            "output":[{"type":"message","id":"assistant-final","role":"assistant",
-                       "content":"The release passed tests, formatting, and final verification."}],
-            "usage":{"input_tokens":2000,"input_tokens_details":{"cached_tokens":1800},
-                     "output_tokens":100,"output_tokens_details":{"reasoning_tokens":20},"total_tokens":2100}
-        }}
+        "responseBodyText":final_response_raw
     }));
     captures.push(json!({
         "recordType":"evaluation",

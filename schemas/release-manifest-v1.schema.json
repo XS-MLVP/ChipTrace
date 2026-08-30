@@ -31,7 +31,7 @@
     "format": {"type": "string"},
     "session_atomic": {"const": true},
     "session_split_count": {"const": 0},
-    "buyer_profile": {"enum": ["buyer-v6", "buyer-v7"]},
+    "buyer_profile": {"enum": ["buyer-v6", "buyer-v7", "buyer-v7-codex-runtime-expanded"]},
     "minimum_score": {"type": "number", "minimum": 0, "maximum": 100},
     "tokenizer": {"type": "string"},
     "compression": {"type": "string", "pattern": "^zstd-"},

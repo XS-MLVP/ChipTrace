@@ -10,14 +10,18 @@ ChipTrace 将原始采集、轨迹组装、质量评分和采购交付拆成四�
 | --- | --- | --- | --- | --- |
 | Raw OSS | Collector sealed WAL | Segment、Manifest、Checkpoint | 字节、记录数、SHA-256、快照完整性 | Session 边界、工具语义、任务正确性 |
 | Assembly | `complete` Raw 恢复目录 | 一行一个 canonical Session | 时间顺序、Response/Task DAG、去重来源、工具状态 | 模型供应商的密码学身份、用户任务是否正确 |
-| Score | canonical Session | 三套质量结果和 buyer-v7 Gate | 结构门槛、失败原因、Token 分类、准入决定 | 真实感和业务正确性（需 evaluator evidence） |
+| Score | canonical Session | 三套质量结果和 expanded Profile Gate | 结构门槛、失败原因、Token 分类、准入决定 | 真实感和业务正确性（需 evaluator evidence） |
 | Release/Buyer | 通过评分的 Session | JSONL.zst、tar.gz、Manifest、SHA256SUMS | Session 原子分包、数量/Token/校验守恒 | 缺失原始事件的事后补造 |
+
+本文 2026-08-30 及更早历史结果中写作 `buyer-v7` 的口径，现冻结并正式命名为
+`buyer-v7-codex-runtime-expanded`。这些分数只表示 expanded Session 采购结构验收，
+不表示 OpenAI wire 字节完整性；新产物统一写正式名称。
 
 ## 采购 v6/v7 映射
 
 仓库同时保留两个版本化 Profile，不能把不同合同的阈值混用：
 
-| 规则 | buyer-v6 | buyer-v7 |
+| 规则 | buyer-v6 | buyer-v7-codex-runtime-expanded |
 | --- | ---: | ---: |
 | 有效交互轮次 | >=2 | >=10 |
 | 真实 User -> Assistant 轮 | 至少 2（Session 定义） | 至少 2 |
@@ -140,7 +144,7 @@ API/rollout/Sub2API 精确关联工作正常，也证明生产者语义不完整
 
 该 canary 同时覆盖了 lineage 守恒回归：Assembly、Enrich、Release 各自拒绝将
 lineaged 输入与 legacy 无 lineage 输入混入同一产物；全 lineaged 或全 legacy 的
-既有路径保持兼容。三条混合输入测试与全工作区 185 条测试均通过，Clippy 在
+既有路径保持兼容。三条混合输入测试与全工作区 186 条测试均通过，Clippy 在
 `-D warnings` 下无告警。
 
 失败尝试遵循同一证据边界：没有模型响应、provider 报告或精确 usage 的纯拒绝请求仍
@@ -178,13 +182,57 @@ Buyer Package，结果仍为 100 分、14/14 守恒和 1/1 eligible。直接跳�
 pending/processing/failed/conflict/rejected 全为 0。这一对照证明守恒 Gate 能暴露真实
 漏采，也证明 Assembly、Score 和 Release 无需通过伪造或近似关联修补数据。
 
+## 18084 在线 runtime-full v2（2026-08-30）
+
+真实任务通过 18084 产生 API 快照，patched Codex producer 提供原生 rollout，Harness
+提供显式任务边界。生产服务未切换；producer 事件经隔离兼容 Relay durable 投递，随后
+从生产 Collector sealed Segment 提取同一 `task_session_id`，在临时 Collector 中重新
+校验封存并完成 Raw Archive/Restore。
+
+| 阶段 | 结果 |
+| --- | --- |
+| Capture | 249 条：24 API snapshot、3 lifecycle、166 rollout、56 tool execution |
+| Sub2API 精确关联 | 24/24 命中 `client:<response x-client-request-id>`；provider 为 OpenAI，upstream model 为 `gpt-5.6-sol` |
+| Runtime/Task DAG | 222 个原生事件；24/24 completed inference 与 API snapshot 守恒；open/unresolved/unknown/unmapped/conflict 均为 0 |
+| buyer-v7-codex-runtime-expanded | 30 个有效轮次、2 个真实 User -> Assistant 轮、28 次调用、5 个不同工具、28/28 配对、1 次真实失败；100 分，全部 hard gate 通过 |
+| Token | API 总量 522,626，其中缓存输入 452,864；规范化语料 37,342；监督输出 6,663 |
+| Raw lineage | 1 个 sealed Segment、249 条、14,209,890 bytes；Archive/Verify/Restore 后 SHA-256 逐字节一致 |
+| Release | 1/1 eligible；`verify-release --require-pass` 与 `verify-buyer-package` 通过，Buyer tar.gz 为 1,796,555 bytes |
+
+该结果证明生产者补齐后，现有 Relay、Collector、Raw、Assembly、Score 和 Release 可以
+形成符合 expanded Profile 结构门槛的在线闭环。Assessment 仍保留
+`model_attestation_missing` 警告：Sub2API 路由和 provider 观察足以通过当前结构规则，
+但不等同于供应商密码学身份签名。该 Session 也没有带分值的 evaluator evidence，
+因此 100 分只表示确定性结构验收通过，不证明任务语义正确性。
+
+## ModelInteraction 双轨回放（2026-08-30）
+
+当前实现从上述在线 v2 和多 rollout v5 的已提交 Raw lineage 重新生成
+ModelInteraction、RuntimeSpan、精确 Link、Session、Release 和 Buyer Package：
+
+| 样本 | Wire | Runtime | expanded Session |
+| --- | --- | --- | --- |
+| v5 | 14 个 Responses 交互；12 个模型 `exec`；模型工具名只有 1 个 | 45 个 span，含 1 个 Task Root；44/44 内部父节点已解析 | 外层 12 个 `exec` 全部保留，采购投影统计 12 个内层执行；14 个有效轮次、100 分 |
+| 在线 v2 | 24 个 Responses 交互；22 个模型 `exec`；模型工具名只有 1 个 | 81 个 span，含 1 个 Task Root；80/80 内部父节点已解析 | 外层 22 个 `exec` 全部保留，采购投影统计 28 个内层执行；30 个有效轮次、100 分 |
+
+两批历史 Capture 都没有保存请求 body 的原始 UTF-8 字节，因此
+`raw_bytes_complete=false`、`delivery_ready=false`；响应原始流、协议终态、未知 item
+和 runtime 证据仍可恢复。该失败是历史采集事实，不通过重新序列化修补。M0 正向
+canary 保存请求/响应字节、长度、SHA-256、三个独立状态、Task Root、精确 Link 和
+runtime 结果，并通过六项完整性硬门槛。
+
+两批新 Release 和 Buyer Package 均使用正式 Profile 名、1/1 eligible 并通过复验；
+旧 `buyer-v7` Release/Buyer Package 也能以只读别名复验。Rust 全量测试、Clippy
+`-D warnings` 和闭环 self-test 通过。
+
 ## 正式交付门槛
 
 正式 buyer 包必须满足：
 
 - Raw Checkpoint `completeness=complete`，并在 Release/Buyer Manifest 中携带
   `lineage_status=complete`；
-- `verify-release --require-pass` 成功，所有 Session 的 buyer-v7 score >=90；
+- `verify-release --require-pass` 成功，所有 Session 的
+  `buyer-v7-codex-runtime-expanded` score >=90；
 - `verify-buyer-package` 成功，UTF-8 JSONL、Session 原子、Token/记录数/SHA-256
   守恒；
 - 正式采购包发布到 `deliveries/<release_id>/COMMIT.json`，`verify-published` 通过，

@@ -358,6 +358,10 @@ mod tests {
             "capture-v2.schema.json",
             "codex-trace-bundle-v1.schema.json",
             "gateway-enrichment-v1.schema.json",
+            "interaction-link-v1.schema.json",
+            "interaction-manifest-v1.schema.json",
+            "model-interaction-v1.schema.json",
+            "otlp-manifest-v1.schema.json",
             "object-commit-v1.schema.json",
             "producer-event-v1.schema.json",
             "release-manifest-v1.schema.json",
@@ -366,6 +370,7 @@ mod tests {
             "raw-lineage-v1.schema.json",
             "session-v1.schema.json",
             "tool-registry-v1.schema.json",
+            "runtime-span-v1.schema.json",
         ];
         for name in expected {
             let bytes = fs::read(root.join(name)).unwrap();

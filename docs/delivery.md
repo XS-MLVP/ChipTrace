@@ -23,7 +23,7 @@ release/
 时生成独立超限 Part，并在 Manifest 标记。`.jsonl.zst` 是 zstd 压缩的标准
 UTF-8 JSONL，解压后每行均可独立解析。
 
-生成 buyer-v7、90 分准入集：
+生成 `buyer-v7-codex-runtime-expanded`、90 分准入集：
 
 ```bash
 chiptrace restore-raw-archive \
@@ -51,7 +51,7 @@ chiptrace release \
   --input /srv/chiptrace/assembly \
   --output /srv/chiptrace/release-v1 \
   --release-id chiptrace-20260827-v1 \
-  --profile buyer-v7 \
+  --profile buyer-v7-codex-runtime-expanded \
   --minimum-score 90 \
   --target-part-gib 10 \
   --dedup-partitions 256 \
@@ -64,7 +64,7 @@ chiptrace verify-release \
 
 `enrich` 不修改 Raw 恢复目录；它只按上游 request ID 或 Sub2API 的
 `client:<X-Client-Request-ID>` 规则生成版本化投影。未命中和歧义记录仍原样输出，
-但没有 `proxy_route_verified`，不能靠模型名推断通过 buyer-v7 模型门槛。
+但没有 `proxy_route_verified`，不能靠模型名推断通过 expanded Profile 的模型门槛。
 
 目录输入只读取已封存的 `.sealed.ndjson`；如果发现非空的仍在写入
 `.open.ndjson`，`archive-raw` 会直接失败而不会静默跳过活动尾段。`POST /flush`
@@ -73,7 +73,9 @@ chiptrace verify-release \
 逐个作为 `--input` 传入。
 
 `reports/assessments-part-*.jsonl.zst` 包含每条去重 Session 的完整 Gate、失败原因、
-三类质量结果和 Token，字段遵循 `schemas/assessment-v1.schema.json`。`data/`
+采购 Gate、附加完整性/语义观测和 Token，字段遵循
+`schemas/assessment-v1.schema.json`。canonical 的 wire/runtime/buyer 三类结果保存在
+Interaction 投影 Manifest。`data/`
 只包含 `eligible=true` 的 Session。
 
 若输入来自 OSS Raw Zone，Release Manifest 的 `raw_sources` 保存原始 Checkpoint、
@@ -116,7 +118,8 @@ sessions-part-00001.tar.gz
 └── SHA256SUMS
 ```
 
-`package-buyer` 只接受 `buyer-v7`、`minimum_score >= 90`、Release 校验状态为
+`package-buyer` 只接受 `buyer-v7-codex-runtime-expanded`（或历史只读别名
+`buyer-v7`）、`minimum_score >= 90`、Release 校验状态为
 `pass` 且至少含一条准入 Session 的输入。它在临时目录并行流式转换，不生成
 巨型中间 JSONL；完整解包、逐行 JSON 解析、Gate 一致性、记录数、Token 汇总和
 SHA-256 全部通过后才原子发布目标目录。`verify-buyer-package` 执行相同的只读复验。

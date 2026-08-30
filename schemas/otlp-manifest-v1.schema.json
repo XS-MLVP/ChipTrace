@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/otlp-manifest-v1.schema.json",
+  "title": "ChipTrace OTLP Export Manifest v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "created_at_utc",
+    "source_projection_schema_version",
+    "source_projection_manifest_sha256",
+    "interactions",
+    "runtime_spans",
+    "links",
+    "root_spans",
+    "internal_parent_references",
+    "resolved_internal_parents",
+    "resolved_internal_parent_rate",
+    "missing_parent_nodes",
+    "body_policy",
+    "parts",
+    "validation_status"
+  ],
+  "properties": {
+    "schema_version": {"const": "chiptrace.otlp-export.v1"},
+    "created_at_utc": {"type": "string"},
+    "source_projection_schema_version": {"const": "chiptrace.interaction-projection.v1"},
+    "source_projection_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "interactions": {"type": "integer", "minimum": 0},
+    "runtime_spans": {"type": "integer", "minimum": 1},
+    "links": {"type": "integer", "minimum": 0},
+    "root_spans": {"const": 1},
+    "internal_parent_references": {"type": "integer", "minimum": 0},
+    "resolved_internal_parents": {"type": "integer", "minimum": 0},
+    "resolved_internal_parent_rate": {"const": 1.0},
+    "missing_parent_nodes": {"type": "array", "maxItems": 0},
+    "body_policy": {"const": "summary_and_raw_reference_only; request, response, arguments, and results are not copied"},
+    "parts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["file", "sha256", "bytes", "records"],
+        "properties": {
+          "file": {"const": "otlp/otlp.jsonl.zst"},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "bytes": {"type": "integer", "minimum": 0},
+          "records": {"type": "integer", "minimum": 1},
+          "uncompressed_bytes": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": true
+      }
+    },
+    "validation_status": {"const": "verified"}
+  },
+  "additionalProperties": false
+}

@@ -10,6 +10,7 @@ pub mod enrich;
 pub mod harness;
 pub mod ingest;
 pub mod jsonl;
+pub mod model_interaction;
 pub mod object_store;
 pub mod producer;
 pub mod publish;
@@ -21,6 +22,7 @@ pub mod schema;
 pub mod score;
 pub mod sharded;
 pub mod store;
+pub mod telemetry;
 pub mod tool_registry;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

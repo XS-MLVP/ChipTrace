@@ -1,0 +1,20 @@
+{
+  "id": "resp-responses-non-stream",
+  "object": "response",
+  "status": "completed",
+  "model": "model-family-latest",
+  "output": [
+    {"type": "reasoning", "id": "reason-1", "summary": [{"type": "summary_text", "text": "Inspect both sources."}]},
+    {"type": "function_call", "id": "item-call-1", "call_id": "call-search", "name": "search_docs", "arguments": "{\"query\":\"adapter\"}"},
+    {"type": "function_call", "id": "item-call-2", "call_id": "call-read", "name": "read_file", "arguments": "{\"path\":\"src/lib.rs\"}"},
+    {"type": "message", "id": "message-1", "role": "assistant", "content": [{"type": "output_text", "text": "I will inspect both."}]},
+    {"type": "future_output_item", "id": "future-1", "revision": 9, "payload": [1, 2, 3]}
+  ],
+  "usage": {
+    "input_tokens": 120,
+    "input_tokens_details": {"cached_tokens": 80},
+    "output_tokens": 30,
+    "output_tokens_details": {"reasoning_tokens": 10},
+    "total_tokens": 150
+  }
+}

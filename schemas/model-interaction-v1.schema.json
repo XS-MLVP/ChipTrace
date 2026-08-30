@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/model-interaction-v1.schema.json",
+  "title": "ChipTrace Model Interaction v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "interaction_id",
+    "protocol",
+    "trace_context",
+    "request",
+    "response",
+    "tool_definitions",
+    "model_tool_calls",
+    "tool_results_submitted",
+    "usage",
+    "timing",
+    "error",
+    "raw_capture_refs",
+    "integrity",
+    "extensions"
+  ],
+  "properties": {
+    "schema_version": {"const": "chiptrace.model-interaction.v1"},
+    "interaction_id": {"type": "string", "minLength": 1},
+    "protocol": {
+      "type": "object",
+      "required": ["family", "endpoint", "transport", "features", "adapter_version"],
+      "properties": {
+        "family": {"type": "string", "minLength": 1},
+        "endpoint": {"type": "string", "minLength": 1},
+        "transport": {"type": "string", "minLength": 1},
+        "features": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "adapter_version": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": true
+    },
+    "provenance": {
+      "type": "object",
+      "properties": {
+        "producer": {"type": ["string", "null"]},
+        "producer_version": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "trace_context": {"type": "object", "additionalProperties": true},
+    "request": {"$ref": "#/$defs/request"},
+    "response": {"$ref": "#/$defs/response"},
+    "tool_definitions": {"type": "array", "items": {"$ref": "#/$defs/toolDefinition"}},
+    "model_tool_calls": {"type": "array", "items": {"$ref": "#/$defs/modelToolCall"}},
+    "tool_results_submitted": {"type": "array", "items": {"$ref": "#/$defs/toolResultSubmitted"}},
+    "usage": {"type": ["object", "null"], "additionalProperties": true},
+    "timing": {"type": "object", "additionalProperties": true},
+    "error": {"type": ["object", "null"], "additionalProperties": true},
+    "raw_capture_refs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/rawCaptureRef"}
+    },
+    "integrity": {
+      "type": "object",
+      "required": [
+        "artifact_valid",
+        "raw_bytes_complete",
+        "protocol_complete",
+        "stream_outcome",
+        "status_dimensions_complete",
+        "malformed_sse_events",
+        "unknown_item_count"
+      ],
+      "properties": {
+        "artifact_valid": {"type": "boolean"},
+        "raw_bytes_complete": {"type": "boolean"},
+        "protocol_complete": {"type": "boolean"},
+        "stream_outcome": {
+          "enum": [
+            "completed",
+            "failed",
+            "incomplete",
+            "cancelled",
+            "eof_without_terminal",
+            "transport_error"
+          ]
+        },
+        "status_dimensions_complete": {"type": "boolean"},
+        "malformed_sse_events": {"type": "integer", "minimum": 0},
+        "unknown_item_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "extensions": {"type": "object", "additionalProperties": true}
+  },
+  "$defs": {
+    "wireItem": {
+      "type": "object",
+      "required": ["index", "item_type", "raw"],
+      "properties": {
+        "index": {"type": "integer", "minimum": 0},
+        "item_type": {"type": "string"},
+        "item_id": {"type": ["string", "null"]},
+        "role": {"type": ["string", "null"]},
+        "raw": {}
+      },
+      "additionalProperties": true
+    },
+    "request": {
+      "type": "object",
+      "required": ["model", "input_items", "raw"],
+      "properties": {
+        "model": {"type": ["string", "null"]},
+        "input_items": {"type": "array", "items": {"$ref": "#/$defs/wireItem"}},
+        "raw": {}
+      },
+      "additionalProperties": true
+    },
+    "response": {
+      "type": "object",
+      "required": ["id", "model", "status", "output_items", "choices", "raw"],
+      "properties": {
+        "id": {"type": ["string", "null"]},
+        "model": {"type": ["string", "null"]},
+        "status": {"type": "string"},
+        "output_items": {"type": "array", "items": {"$ref": "#/$defs/wireItem"}},
+        "choices": {"type": "array", "items": {}},
+        "raw": {}
+      },
+      "additionalProperties": true
+    },
+    "toolDefinition": {
+      "type": "object",
+      "required": ["index", "name", "raw"],
+      "properties": {
+        "index": {"type": "integer", "minimum": 0},
+        "name": {"type": ["string", "null"]},
+        "raw": {}
+      },
+      "additionalProperties": true
+    },
+    "modelToolCall": {
+      "type": "object",
+      "required": ["call_id", "name", "arguments", "raw"],
+      "properties": {
+        "call_id": {"type": ["string", "null"]},
+        "item_id": {"type": ["string", "null"]},
+        "name": {"type": ["string", "null"]},
+        "arguments": {},
+        "choice_index": {"type": ["integer", "null"], "minimum": 0},
+        "output_index": {"type": ["integer", "null"], "minimum": 0},
+        "raw": {}
+      },
+      "additionalProperties": true
+    },
+    "toolResultSubmitted": {
+      "type": "object",
+      "required": ["call_id", "content", "raw"],
+      "properties": {
+        "call_id": {"type": ["string", "null"]},
+        "content": {},
+        "status": {"type": ["string", "null"]},
+        "raw": {}
+      },
+      "additionalProperties": true
+    },
+    "rawCaptureRef": {
+      "type": "object",
+      "required": ["capture_id", "record_type"],
+      "properties": {
+        "capture_id": {"type": "string", "minLength": 1},
+        "record_type": {"type": "string", "minLength": 1},
+        "request_body_sha256": {"type": ["string", "null"]},
+        "response_body_sha256": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

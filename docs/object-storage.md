@@ -143,7 +143,7 @@ chiptrace assemble \
 | JSON 合法 | 每行 JSON 对象和 `captureId` | UTF-8 JSONL 逐行解析 |
 | Session 边界 | 保存所有原始 API/事件，不猜测任务结束 | 依据 `task_session_id`、Response DAG 和生命周期组装 |
 | Tool 配对 | 原始事件不删改 | Call/Result 配对率、schema 和状态硬门槛 |
-| 质量准入 | 不做过滤 | buyer-v7、分数阈值和 hard gate |
+| 质量准入 | 不做过滤 | buyer-v7-codex-runtime-expanded、分数阈值和 hard gate |
 | 分包 | 不切断 Segment | Session 原子 `tar.gz + JSONL`，目标约 10 GiB |
 
 只有同时接入 Agent harness 和工具执行器，记录 task start/end、cancel/retry、

@@ -540,14 +540,6 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
             }
             tools_by_name.insert(name.to_owned(), tool.clone());
         }
-        if let Some(execution) = &capture.tool_execution {
-            divergences += project_tool_execution(
-                &mut messages,
-                &mut tools_by_name,
-                &mut schema_conflicts,
-                execution,
-            );
-        }
         if let Some(registry) = &capture.tool_registry_evidence {
             tool_registry_evidence.push(registry.clone());
         }
@@ -834,11 +826,29 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     let ended_at = final_snapshot
         .then(|| parsed.last().map(|capture| capture.timestamp.clone()))
         .flatten();
-    let tools: Vec<Value> = tools_by_name.into_values().collect();
+    let mut expanded_messages = Vec::new();
+    let mut expanded_tools_by_name = tools_by_name.clone();
+    let wire_observed_schema_conflicts = schema_conflicts.clone();
+    let mut expanded_schema_conflicts = schema_conflicts.clone();
+    for execution in &tool_executions {
+        divergences += project_tool_execution(
+            &mut expanded_messages,
+            &mut expanded_tools_by_name,
+            &mut expanded_schema_conflicts,
+            execution,
+        );
+    }
+    annotate_tool_call_statuses(&mut expanded_messages);
+    let mut expanded_view = messages.clone();
     let code_mode_message_projection =
-        exclude_code_mode_parent_messages(&mut messages, &code_mode_parent_call_ids);
+        exclude_code_mode_parent_messages(&mut expanded_view, &code_mode_parent_call_ids);
+    expanded_view.extend(expanded_messages.iter().cloned());
     let (schema_conflicts, uncalled_schema_conflicts) =
-        partition_schema_conflicts(&messages, &schema_conflicts);
+        partition_schema_conflicts(&expanded_view, &expanded_schema_conflicts);
+    let (wire_schema_conflicts, wire_uncalled_schema_conflicts) =
+        partition_schema_conflicts(&messages, &wire_observed_schema_conflicts);
+    let tools: Vec<Value> = tools_by_name.into_values().collect();
+    let expanded_tools: Vec<Value> = expanded_tools_by_name.into_values().collect();
     annotate_tool_call_statuses(&mut messages);
     let capture_dag = build_capture_dag(&parsed, &messages);
     let runtime_dag = build_runtime_dag(&parsed);
@@ -1008,7 +1018,22 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     );
     meta.insert(
         "code_mode_message_projection".to_owned(),
-        code_mode_message_projection,
+        code_mode_message_projection.clone(),
+    );
+    meta.insert(
+        "quality_projections".to_owned(),
+        json!({
+            "buyer_v7_codex_runtime_expanded": {
+                "schema_version":"chiptrace.session-quality-projection.v1",
+                "profile_version":"buyer-v7-codex-runtime-expanded",
+                "excluded_model_call_ids":code_mode_parent_call_ids,
+                "runtime_messages":expanded_messages,
+                "runtime_tools":expanded_tools,
+                "code_mode_audit":code_mode_message_projection,
+                "wire_schema_conflicts":wire_schema_conflicts,
+                "wire_uncalled_schema_conflicts":wire_uncalled_schema_conflicts,
+            }
+        }),
     );
     meta.insert("merge_divergences".to_owned(), json!(divergences));
     meta.insert(
@@ -5898,6 +5923,7 @@ mod tests {
             "traceContext":{"task_session_id":"task-native"},
             "toolExecution":{
                 "call_id":"inner-call",
+                "parent_call_id":"outer-exec",
                 "name":"exec_command",
                 "initiator":"assistant",
                 "status":"success",
@@ -5922,14 +5948,38 @@ mod tests {
             .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
             .flatten()
             .collect();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0]["id"], "inner-call");
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|call| call["id"] == "outer-exec"));
         let results: Vec<&Value> = messages
             .iter()
             .filter(|message| message["role"] == "tool")
             .collect();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["tool_call_id"], "inner-call");
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .all(|result| result["tool_call_id"] == "outer-exec")
+        );
+        let expanded =
+            crate::score::materialize_profile_session(&session, crate::score::Profile::BuyerV7);
+        let expanded_calls: Vec<&Value> = expanded["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
+            .flatten()
+            .collect();
+        assert_eq!(expanded_calls.len(), 1);
+        assert_eq!(expanded_calls[0]["id"], "inner-call");
+        assert_eq!(expanded_calls[0]["parent_call_id"], "outer-exec");
+        let expanded_results: Vec<&Value> = expanded["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect();
+        assert_eq!(expanded_results.len(), 1);
+        assert_eq!(expanded_results[0]["tool_call_id"], "inner-call");
         assert_eq!(
             session["meta"]["code_mode_message_projection"]["excluded_parent_call_ids"],
             json!(["outer-exec"])
@@ -6643,8 +6693,18 @@ mod tests {
         });
         let (session, _, divergence) = assemble_group(vec![api, tool]).unwrap();
         assert_eq!(divergence, 0);
-        assert_eq!(session["tools"][0]["name"], "run_tests");
-        let result = session["messages"]
+        assert!(session["tools"].as_array().unwrap().is_empty());
+        assert!(
+            session["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| message["role"] != "tool")
+        );
+        let expanded =
+            crate::score::materialize_profile_session(&session, crate::score::Profile::BuyerV7);
+        assert_eq!(expanded["tools"][0]["name"], "run_tests");
+        let result = expanded["messages"]
             .as_array()
             .unwrap()
             .iter()
@@ -6652,7 +6712,7 @@ mod tests {
             .unwrap();
         assert_eq!(result["status"], "error");
         assert_eq!(result["is_error"], true);
-        let call = session["messages"]
+        let call = expanded["messages"]
             .as_array()
             .unwrap()
             .iter()

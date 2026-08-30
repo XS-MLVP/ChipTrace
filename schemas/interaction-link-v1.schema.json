@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/interaction-link-v1.schema.json",
+  "title": "ChipTrace Interaction Link v1",
+  "type": "object",
+  "required": ["schema_version", "link_id", "from", "to", "relation", "evidence"],
+  "properties": {
+    "schema_version": {"const": "chiptrace.interaction-link.v1"},
+    "link_id": {"type": "string", "minLength": 1},
+    "from": {"type": "string", "minLength": 1},
+    "to": {"type": "string", "minLength": 1},
+    "relation": {"type": "string", "minLength": 1},
+    "evidence": {"type": "object", "additionalProperties": true}
+  },
+  "additionalProperties": true
+}

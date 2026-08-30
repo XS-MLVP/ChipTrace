@@ -1,4 +1,4 @@
-.PHONY: check test self-test build benchmark benchmark-store benchmark-http benchmark-compression
+.PHONY: check test self-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
 
 check:
 	cargo fmt --all -- --check
@@ -9,6 +9,9 @@ test:
 
 self-test:
 	cargo run --locked --bin chiptrace -- self-test
+
+m0-test:
+	docker compose -f deploy/docker-compose.yml run --rm --build m0
 
 build:
 	cargo build --release --locked --bin chiptrace

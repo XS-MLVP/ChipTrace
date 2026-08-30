@@ -106,6 +106,62 @@ Tool Registry、模型调用 ID、工具名三者精确映射的 runtime 工具�
 `missing_runtime_registry`，并由 `rollout_unmapped_tools` 阻止严格 Release；不得从
 `source_js`、输出文本或工具名列表重建 Schema。
 
+## ModelInteraction 与 RuntimeSpan
+
+`chiptrace project-interactions` 从 Capture 生成双轨 canonical 投影：
+
+```text
+interactions/
+├── interactions/model-interactions.jsonl.zst
+├── runtime/runtime-spans.jsonl.zst
+├── links/interaction-links.jsonl.zst
+└── manifest.json
+```
+
+字段分别遵循 `model-interaction-v1.schema.json`、`runtime-span-v1.schema.json`、
+`interaction-link-v1.schema.json` 和 `interaction-manifest-v1.schema.json`。核心 Schema
+不包含 Codex、Sub2API、采购 Profile 或具体模型名。
+
+ModelInteraction 以一次 OpenAI-compatible 模型请求/响应为原子，保存全部 choices/items、
+developer role、reasoning、并行调用、未知未来 item、usage、传输错误和 Raw 引用。
+Responses 与 Chat Completions 的流式/非流式适配均按字段存在性判断；生产者版本只写入
+provenance，不驱动 core 分支。Capture v2 的 JSON body 同时保存解析值和原始 UTF-8
+字节，长度与 SHA-256 必须一致。历史 Capture 没有原始请求字节时仍可回放语义结构，
+但 `raw_bytes_complete=false`，不能通过重新序列化补造。
+当前 M0 只有单任务 OpenAI Responses 流式投影可以得到 `delivery_ready=true`；其余适配
+结果仅用于取证回放，不进入 OTLP 或正式交付。
+
+以下事实不能合并为同一消息：
+
+| 事实 | canonical 字段 |
+| --- | --- |
+| 模型真实发出的调用 | `ModelInteraction.model_tool_calls` |
+| 客户端后续提交的结果 | `ModelInteraction.tool_results_submitted` |
+| 执行器真实运行和状态 | `RuntimeSpan(span_kind=tool_execution)` |
+
+Link 只接受同一 `source_namespace + task_session_id` 下的精确 call、request、response 或
+`previous_response_id`，歧义时不关联。RuntimeSpan 必须来自同一批 Capture 中的真实
+runtime producer；OTLP 不作为 canonical 输入，缺失事实不能由外部 span 补齐。
+
+```bash
+chiptrace project-interactions \
+  --input /srv/chiptrace/enriched \
+  --task-session-id task-20260830-001 \
+  --output /srv/chiptrace/interactions
+
+chiptrace verify-interactions \
+  --projection /srv/chiptrace/interactions
+```
+
+投影先用精确请求身份补齐任务关联，再按 `task_session_id` 选择单个任务。输入中存在
+多个任务且未指定 `--task-session-id` 时直接失败。写出前和复验时均使用 Draft 2020-12
+JSON Schema 逐条校验 ModelInteraction、RuntimeSpan 和 InteractionLink；非法记录不会
+进入可交付制品。
+
+`export-otlp` 只接受 `delivery_ready=true` 的 canonical 投影，并根据
+`InteractionLink` 生成单根 OTLP 树。导出必须满足 root=1、missing parent=0、内部父节点
+解析率=100%；OTLP 只含状态、计数、Token、身份和 Raw 引用，不复制大正文或工具载荷。
+
 ## Sub2API 精确关联
 
 Sub2API usage log 与 Capture 使用离线命令关联：
@@ -174,7 +230,7 @@ mapping chain、账号/渠道标识和缓存 Token。Assembly 对每个可证明
 纯 4xx/认证拒绝且没有模型响应、精确 usage 或 provider 报告的尝试仍完整保留在
 Raw/Session，但记录在 `model_evidence.non_attestable_api_snapshots`，不进入证明分母；
 如果 Session 中没有任何可证明的模型调用，模型门槛仍失败。按路径或模型字符串推断
-的 provider 只保存在 `provider_evidence`，authority 为 `derived`，不能通过 buyer-v7
+的 provider 只保存在 `provider_evidence`，authority 为 `derived`，不能通过严格采购
 模型门槛。
 
 Sub2API `usage_logs.input_tokens` 是扣除 `cache_read_tokens` 后的非缓存输入。Enrich
@@ -251,28 +307,33 @@ JSON。来源没有版本时，Assembly
 使用 `sha256:<schema_hash>` 作为内容寻址版本。每次工具调用包含
 `execution_status`，工具返回保留 `status`、`is_error` 与原始内容。
 原生 grammar 会无损保存在 `native_format`，生成的 JSON 包装仅供分析；
-buyer-v7 不把 `generated_adapter=true` 当成采购方要求的原生完整 JSON Schema。
+expanded Profile 不把 `generated_adapter=true` 当成采购方要求的原生完整 JSON Schema。
 Tool Registry 遵循 `schemas/tool-registry-v1.schema.json`，必须绑定实际 Codex CLI
 版本；静态工具名列表或由命令文本生成的 Schema 不接受。
 
 模型字段一致性不等于供应商身份认证。若采集入口不能提供可信 provider
 证明，评分会输出 `model_attestation_missing`，不得宣称已证明模型来源。
 
-## 三类质量结果
+## 完整性硬门槛
 
-每条 Session 同时保留三类独立结果：
+canonical Manifest 固定保存六个不可补偿的布尔结果：
 
-1. `capture_completeness`：身份、时间、usage、层级和闭环是否被采到。
-2. `buyer_acceptance`：采购标准的确定性硬门槛、分数和失败原因。
-3. `semantic_quality`：测试、搜索证据、用户修正和 evaluator reward。
+1. `artifact_valid`：JSONL、记录版本、数量和 SHA-256 均有效。
+2. `raw_bytes_complete`：请求与响应原始字节、长度和 SHA-256 可逐字节复验，且未截断。
+3. `protocol_complete`：Responses 流观察到明确协议终态；`[DONE]` 不作为终态。
+4. `runtime_complete`：模型调用、结果和执行精确关联，span 闭合且无状态冲突。
+5. `root_complete`：每个任务有且只有一个成对的 lifecycle Task Root。
+6. `delivery_ready`：以上五项全部为 true。
 
-采集完整性不能替代采购验收，结构分不能替代任务正确性。
+`project-interactions` 可以为取证生成 `not_ready` 产物；`verify-interactions` 对其严格失败。
+Session Assessment 的采购分数和语义 reward 都不能补偿上述任何门槛。采集完整性不能
+替代采购验收，结构分不能替代任务正确性。
 `semantic_quality` 只接受带来源的 0–1 reward，或对已采集证据中的明确
 pass/fail、0–1 score 求平均；未知状态不参与计算。
 
 ## 版本化验收
 
-| 规则 | buyer-v6 | buyer-v7 |
+| 规则 | buyer-v6 | buyer-v7-codex-runtime-expanded |
 | --- | ---: | ---: |
 | 有效轮次 | ≥2 | ≥10 |
 | 真实 User → Assistant 轮 | ≥2 | ≥2 |
@@ -285,15 +346,17 @@ pass/fail、0–1 score 求平均；未知状态不参与计算。
 | 完整 Tool Schema | 必需 | 必需 |
 | 首消息 role | system/user | system/user |
 
-`buyer-v6` 对应仓库外采购文档 v6.0。`buyer-v7` 对应用户提供的 v7.0：
+`buyer-v6` 对应仓库外采购文档 v6.0。`buyer-v7-codex-runtime-expanded` 对应用户提供
+的 v7.0 在 Codex runtime 数据上的显式投影：
 GPT-5.5+、合格 Claude、DeepSeek v4+、GLM 5.2+、K3+，排除 Gemini 和 Haiku。
 规则以 profile 固化，不能用同一个硬编码版本覆盖不同采购合同。
 ChipTrace 对 v7 的“调用工具不重复”采用严格解释：至少 5 个不同工具名，并且
 每个调用 ID 唯一。若合同只要求 5 个不同调用 ID，应建立独立 profile，不修改
-既有 v7 结果。
+既有 expanded 结果。`buyer-v7` 只作为历史 Manifest 和命令行读取别名，新产物不再
+写入该短名称。expanded Profile 的 100 分不能代表 `delivery_ready=true`。
 
 有效轮次由实质 user→assistant 交互与已配对 assistant→tool→result 相加；两个
-Profile 都要求至少 2 次真实 user→assistant 交互，buyer-v7 另外要求总有效轮次达到 10。
+Profile 都要求至少 2 次真实 user→assistant 交互，expanded Profile 另外要求总有效轮次达到 10。
 `heartbeat`、`cron`、`no_reply` 优先读取显式 `meta.turn_kind`，缺失时使用
 确定性文本规则。最终 assistant 消息中的未返回调用可标记 open tail，但完整
 Release 仍要求 Session 有明确终态且不悬停在工具调用。
@@ -331,7 +394,7 @@ runtime 已存在但该对象缺失的旧 Assembly 直接失败。
 
 `chiptrace score` 的输出文件和 Release 的 `reports/assessments-part-*.jsonl.zst` 使用
 `schemas/assessment-v1.schema.json`，逐条给出 Gate、观测值、期望值、失败原因、
-三类质量结果和 Token。`release_decision=eligible` 仅在全部 hard gate 通过且
+canonical 三类结果、Session 附加观测和 Token。`release_decision=eligible` 仅在全部 hard gate 通过且
 分数达到阈值时产生。
 
 正式 buyer 包还必须携带 `lineage_status=complete`，将 Release 绑定到完整 OSS Raw

@@ -302,7 +302,7 @@ fn normalize_body_fields(object: &mut Map<String, Value>) -> Result<()> {
             _ => bail!("{text_field} must be a string or null"),
         };
         let body = match serde_json::from_str::<Value>(&text) {
-            Ok(value) => json!({"kind": "json", "value": value}),
+            Ok(value) => json!({"kind": "json", "value": value, "raw": text}),
             Err(_) => json!({"kind": "text", "value": text}),
         };
         let bytes = text.len() as u64;
@@ -313,6 +313,60 @@ fn normalize_body_fields(object: &mut Map<String, Value>) -> Result<()> {
             .or_insert_with(|| Value::from(bytes));
         object.insert(sha_field.to_owned(), Value::String(digest));
     }
+    for (body_field, bytes_field, sha_field) in [
+        ("requestBody", "requestBytesCaptured", "requestBodySha256"),
+        (
+            "responseBody",
+            "responseBytesCaptured",
+            "responseBodySha256",
+        ),
+    ] {
+        validate_embedded_raw_body(object, body_field, bytes_field, sha_field)?;
+    }
+    Ok(())
+}
+
+fn validate_embedded_raw_body(
+    object: &mut Map<String, Value>,
+    body_field: &str,
+    bytes_field: &str,
+    sha_field: &str,
+) -> Result<()> {
+    let Some(body) = object.get(body_field).and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let Some(raw) = body.get("raw").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if body.get("kind").and_then(Value::as_str) == Some("json") {
+        let parsed: Value = serde_json::from_str(raw)
+            .with_context(|| format!("{body_field}.raw must contain valid JSON"))?;
+        if body.get("value") != Some(&parsed) {
+            bail!("{body_field}.raw does not match parsed value");
+        }
+    }
+    let raw_len = raw.len() as u64;
+    if object
+        .get(bytes_field)
+        .and_then(Value::as_u64)
+        .is_some_and(|declared| declared != raw_len)
+    {
+        bail!("{bytes_field} does not match {body_field}.raw");
+    }
+    let digest = hex::encode(Sha256::digest(raw.as_bytes()));
+    if object
+        .get(sha_field)
+        .and_then(Value::as_str)
+        .is_some_and(|declared| declared != digest)
+    {
+        bail!("{sha_field} does not match {body_field}.raw");
+    }
+    object
+        .entry(bytes_field.to_owned())
+        .or_insert_with(|| Value::from(raw_len));
+    object
+        .entry(sha_field.to_owned())
+        .or_insert_with(|| Value::String(digest));
     Ok(())
 }
 
@@ -1836,6 +1890,62 @@ mod tests {
             .map(|value| serde_json::to_vec(value).unwrap())
             .collect::<BTreeSet<_>>();
         assert_eq!(unique.len(), evidence.len());
+    }
+
+    #[test]
+    fn native_rollout_unicode_payload_keeps_raw_bytes_and_digest() {
+        let source_line = r#"{"schema_version":1,"seq":1,"payload":{"type":"item_completed"}}"#;
+        let manifest_raw = r#"{"schema_version":1,"trace_id":"trace-unicode"}"#;
+        let payload_raw = "{\n  \"message\": \"后续继续执行，不改写原始字节。\"\n}";
+        let source_digest = hex::encode(Sha256::digest(source_line.as_bytes()));
+        let manifest_digest = hex::encode(Sha256::digest(manifest_raw.as_bytes()));
+        let payload_digest = hex::encode(Sha256::digest(payload_raw.as_bytes()));
+        let value = json!({
+            "version":CAPTURE_SCHEMA_VERSION,
+            "recordType":"rollout_event",
+            "captureId":"cap-native-unicode",
+            "sourceNamespace":"test",
+            "traceContext":{"task_session_id":"task-unicode"},
+            "rolloutEvent":{
+                "schema_version":"chiptrace.codex-rollout.v1",
+                "source":"codex_rollout_trace_bundle",
+                "source_session_id":"rollout-unicode",
+                "source_ordinal":1,
+                "source_line":source_line,
+                "source_line_sha256":source_digest,
+                "raw_event_sha256":source_digest,
+                "classification":"known",
+                "bundle_manifest_raw":manifest_raw,
+                "bundle_manifest_sha256":manifest_digest,
+                "payloads":[{
+                    "raw_payload_id":"raw-payload:1",
+                    "path":"payloads/1.json",
+                    "mirror_path":"trace-unicode/payloads/1.json",
+                    "raw_json":payload_raw,
+                    "sha256":payload_digest,
+                    "bytes":payload_raw.len()
+                }]
+            }
+        });
+
+        let first = normalize_capture(&serde_json::to_vec(&value).unwrap(), 1024 * 1024).unwrap();
+        let normalized: Value = serde_json::from_slice(&first.canonical).unwrap();
+        let stored = normalized["rolloutEvent"]["payloads"][0]["raw_json"]
+            .as_str()
+            .unwrap();
+        assert_eq!(stored.as_bytes(), payload_raw.as_bytes());
+        assert_eq!(
+            normalized["rolloutEvent"]["payloads"][0]["sha256"],
+            payload_digest
+        );
+        assert_eq!(
+            normalized["rolloutEvent"]["payloads"][0]["bytes"],
+            payload_raw.len()
+        );
+
+        let second = normalize_capture(&first.canonical, 1024 * 1024).unwrap();
+        assert_eq!(second.canonical, first.canonical);
+        assert_eq!(second.sha256, first.sha256);
     }
 
     #[test]

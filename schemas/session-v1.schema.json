@@ -465,6 +465,34 @@
           },
           "additionalProperties": false
         },
+        "quality_projections": {
+          "type": "object",
+          "properties": {
+            "buyer_v7_codex_runtime_expanded": {
+              "type": "object",
+              "required": [
+                "schema_version",
+                "profile_version",
+                "excluded_model_call_ids",
+                "runtime_messages",
+                "runtime_tools",
+                "code_mode_audit"
+              ],
+              "properties": {
+                "schema_version": {"const": "chiptrace.session-quality-projection.v1"},
+                "profile_version": {"const": "buyer-v7-codex-runtime-expanded"},
+                "excluded_model_call_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+                "runtime_messages": {"type": "array", "items": {"$ref": "#/$defs/message"}},
+                "runtime_tools": {"type": "array", "items": {"$ref": "#/$defs/toolDefinition"}},
+                "code_mode_audit": {"type": "object"},
+                "wire_schema_conflicts": {"type": "array", "items": {"type": "string"}},
+                "wire_uncalled_schema_conflicts": {"type": "array", "items": {"type": "string"}}
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": true
+        },
         "merge_divergences": {"type": "integer", "minimum": 0},
         "model_evidence": {
           "type": "object",

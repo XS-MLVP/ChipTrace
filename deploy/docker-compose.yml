@@ -1,109 +1,17 @@
-name: chiptrace
+name: chiptrace-m0
 
 services:
-  collector:
+  m0:
     build:
       context: ..
-    image: ${CHIPTRACE_IMAGE:-chiptrace:0.5.1}
-    restart: unless-stopped
+    image: chiptrace:m0-local
     init: true
-    user: "${CHIPTRACE_UID:-10001}:${CHIPTRACE_GID:-10001}"
-    command:
-      - collector
-      - --root
-      - /data/capture
-      - --state-root
-      - /data/state
-      - --host
-      - 0.0.0.0
-      - --port
-      - "3010"
-      - --segment-max-mib
-      - "512"
-      - --max-envelope-mib
-      - "1024"
-      - --max-inflight-body-mib
-      - "4096"
-      - --queue-items
-      - "8192"
-      - --batch-records
-      - "256"
-      - --batch-mib
-      - "64"
-      - --store-shards
-      - "${CHIPTRACE_STORE_SHARDS:-1}"
-      - --max-batch-records
-      - "4096"
-    ports:
-      - "${CHIPTRACE_COLLECTOR_BIND:-127.0.0.1}:${CHIPTRACE_COLLECTOR_PORT:-3010}:3010"
-    volumes:
-      - "${CHIPTRACE_CAPTURE_DATA_ROOT:?请设置 CHIPTRACE_CAPTURE_DATA_ROOT}:/data/capture"
-      - "${CHIPTRACE_CAPTURE_STATE_ROOT:?请设置 CHIPTRACE_CAPTURE_STATE_ROOT}:/data/state"
-    healthcheck:
-      test: ["CMD", "chiptrace", "probe"]
-      interval: 20s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    stop_grace_period: 60s
-    security_opt:
-      - no-new-privileges:true
-
-  relay:
-    image: ${CHIPTRACE_IMAGE:-chiptrace:0.5.1}
-    restart: unless-stopped
-    init: true
-    user: "${CHIPTRACE_UID:-10001}:${CHIPTRACE_GID:-10001}"
-    command:
-      - relay
-      - --root
-      - /data/outbox
-      - --state-root
-      - /data/outbox-state
-      - --delivery-state-root
-      - /data/delivery
-      - --collector-url
-      - http://collector:3010
-      - --host
-      - 0.0.0.0
-      - --port
-      - "3011"
-      - --segment-max-mib
-      - "512"
-      - --max-envelope-mib
-      - "1024"
-      - --max-inflight-body-mib
-      - "4096"
-      - --queue-items
-      - "8192"
-      - --batch-records
-      - "256"
-      - --batch-mib
-      - "64"
-      - --store-shards
-      - "${CHIPTRACE_RELAY_STORE_SHARDS:-1}"
-      - --max-batch-records
-      - "4096"
-      - --delivery-concurrency
-      - "16"
-      - --delivery-batch-records
-      - "128"
-      - --delivery-batch-mib
-      - "16"
-      - --max-delivery-inflight-mib
-      - "4096"
-    ports:
-      - "${CHIPTRACE_RELAY_BIND:-127.0.0.1}:${CHIPTRACE_RELAY_PORT:-3011}:3011"
-    volumes:
-      - "${CHIPTRACE_RELAY_DATA_ROOT:?请设置 CHIPTRACE_RELAY_DATA_ROOT}:/data/outbox"
-      - "${CHIPTRACE_RELAY_STATE_ROOT:?请设置 CHIPTRACE_RELAY_STATE_ROOT}:/data/outbox-state"
-      - "${CHIPTRACE_RELAY_DELIVERY_ROOT:?请设置 CHIPTRACE_RELAY_DELIVERY_ROOT}:/data/delivery"
-    healthcheck:
-      test: ["CMD", "chiptrace", "probe", "--url", "http://127.0.0.1:3011/health"]
-      interval: 20s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    stop_grace_period: 60s
+    command: ["self-test"]
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:size=4g,mode=1777,uid=10001,gid=10001
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true

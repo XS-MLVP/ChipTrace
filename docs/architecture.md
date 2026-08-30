@@ -4,35 +4,63 @@
 
 ```mermaid
 flowchart LR
-    A[API 旁路快照] --> B[Durable Relay]
-    H[Agent Harness 生命周期] --> B
-    X[Codex Native Bundle Exporter] --> B
-    T[Tool Dispatcher 事件] --> B
-    B --> C[Outbox WAL]
-    C -->|NDJSON batch| D[Sharded Collector]
-    D --> E[Capture WAL]
-    D --> F[redb Ledger]
-    E --> R[Raw Segment Archiver]
-    R --> O[OSS Raw + Checkpoint]
-    U[Sub2API usage logs] --> N[Exact request-id Enrich]
-    O --> N
-    N --> G[Session Assembly]
-    G --> H[Quality Profiles]
-    H --> I[内部 JSONL.zst Release]
-    I --> P[采购 tar.gz + JSONL]
-    I --> J[内部 Release Staging]
-    P --> Q[采购包 Staging]
-    J --> K[releases COMMIT]
-    Q --> L[deliveries COMMIT]
+    A[OpenAI-compatible Raw Wire] --> B[Durable Relay / WAL]
+    H[Harness / Runtime / Tool Evidence] --> B
+    R[Routing / Billing Evidence] --> B
+    B --> C[Sharded Collector]
+    C --> D[OSS Raw + Checkpoint]
+    D --> E[Protocol Adapters]
+    E --> F[ModelInteraction]
+    D --> G[Runtime Adapters]
+    G --> I[RuntimeSpan]
+    F --> J[Exact ID Links]
+    I --> J
+    J --> K[六项完整性硬门槛]
+    K --> L[Quality Profiles / Release]
+    K --> M[单一 OTLP 树]
 ```
 
 一个 `captureId` 表示一条不可变采集事件。`api_snapshot` 保存真实 API
 请求/响应；`lifecycle_event`、`tool_execution` 和 `evaluation` 由 Agent 或
 工具执行器产生；`rollout_event` 保存 Codex 原始事件及投影。Codex 0.150+
 优先从原生 `codex-rollout-trace` bundle 导出；普通 rollout JSONL 仅作为兼容入口。
-`task_session_id`
-标识完整任务，`thread_id` 和 `turn_id`
-只表示产品线程与节点。在线阶段不做质量筛选，Session 投影与去重在离线执行。
+`task_session_id` 标识完整任务，`thread_id` 和 `turn_id` 只表示产品线程与节点。
+canonical 原子是单次模型交互，不是 Session。在线阶段不做质量筛选，ModelInteraction、
+Session 和互操作投影均在离线执行。
+
+## Canonical 与版本边界
+
+权威 Raw 保存 OpenAI-compatible 原始请求/响应字节、未知字段和来源 Capture。协议适配器
+按 payload shape 判断 `responses | chat_completions`、`stream | non_stream` 及
+reasoning、parallel call 等能力，不在 canonical core 中判断 Codex、网关或模型版本。
+
+```text
+Trace
+├── ModelInteraction[]
+│   ├── request / response / choices / items
+│   ├── tool_definitions
+│   ├── model_tool_calls
+│   ├── tool_results_submitted
+│   └── usage / timing / error / raw_capture_refs
+├── RuntimeSpan[]
+├── InteractionLink[]
+└── extensions{}
+```
+
+三类工具事实严格分离：
+
+- `model_tool_call` 是模型响应真实发出的调用；
+- `tool_result_submitted` 是客户端在后续请求中回传给模型的结果；
+- `RuntimeSpan(span_kind=tool_execution)` 是执行器真实运行的过程和终态。
+
+Code Mode 外层 `exec` 留在 ModelInteraction，内层 `exec_command/update_plan` 留在
+RuntimeSpan，通过 `parent_call_id` 连接。Session 顶层 `messages` 同样保留 wire 事实；
+`buyer-v7-codex-runtime-expanded` 仅作为显式质量投影读取 runtime 增量，不改写事实层。
+
+版本只分为 `schema_version`、`producer/adapter_version` 和
+`quality_profile_version`。Codex、Sub2API、具体模型门槛和采购规则只允许出现在
+adapter、`extensions` 或 quality profile 中。当前只提供标准 OTLP 导出；查询和评测
+后端从 OTLP 接入，不替代 OSS Raw。
 
 ## 唯一生产架构
 
@@ -45,16 +73,15 @@ flowchart LR
     B --> C[ChipTrace Rust Collector]
     C --> D[封存 Segment]
     D --> O[OSS Raw Segment + Checkpoint]
-    O --> E[Rust Assembly]
-    E --> F[Rust Score]
+    O --> E[Rust Protocol / Runtime Projection]
+    E --> F[Rust Assembly / Score]
     F --> G[Rust Release / Publish]
-    H[open21 Docker 复现环境] -. 仅生成验收场景 .-> A
+    H[Linux M0 隔离测试] -. 仅生成验收场景 .-> A
 ```
 
 18084 是既有业务入口，只负责受限旁路复制和向入口 outbox 投递；outbox 在响应
-完成后原子落盘并异步向 Rust Relay 重试。它不执行 Trace 语义组装。`open21` 的
-Compose 网络与 `router-v2-net` 隔离，属于
-Docker 复现/验收环境，不写入生产 Trace 存储。
+完成后原子落盘并异步向 Rust Relay 重试。它不执行 Trace 语义组装。仓库唯一的
+Compose 环境只执行无网络 M0 验收，不连接或写入生产 Trace 存储。
 
 `collector`、`relay`、`assemble`、`score`、`release` 和 `publish` 均由同一个
 `chiptrace` Rust 二进制提供。Relay 独立启动；Collector 暂停或冷启动失败时，
@@ -265,7 +292,8 @@ release_id 和 Manifest 重试为幂等成功；不同 Manifest 为冲突。`ver
 
 ChipTrace 沿用 OpenTelemetry 的 trace/span/parent 关系和 OpenInference 的
 Agent/Tool 语义边界，但在线格式保持可直接 durable append 的 JSON/NDJSON。
-OTLP 适配属于接入层，canonical Session 和 buyer profile 不依赖特定后端。
+OTLP 适配属于接入与摘要投影层，canonical ModelInteraction、Session 和 buyer
+profile 不依赖特定后端。
 网关路由与 Token 事实参考 Sub2API 的 append-only `usage_logs`，但只通过明确
 `request_id` 离线 Join；网关账单日志不替代 Agent lifecycle/tool span。
 Codex rollout 解析参考观测插件的确定性 Trace 思路，但原始事件、checkpoint、
@@ -277,7 +305,7 @@ unknown 处理和采购 Gate 由 ChipTrace 自己保证。
 | --- | --- | --- |
 | [OpenTelemetry Collector](https://github.com/open-telemetry/opentelemetry-collector) | Receiver、Processor、Exporter 分层和背压 | Relay、Collector、Assembly、Quality、Publish |
 | [Vector](https://github.com/vectordotdev/vector) | 磁盘缓冲、端到端 ACK、批量发送 | WAL outbox、delivery ledger、NDJSON batch |
-| [OpenInference](https://github.com/Arize-ai/openinference) | LLM、Tool、Agent 语义字段 | canonical Session 与 Trace hierarchy |
+| [OpenInference](https://github.com/Arize-ai/openinference) | LLM、Tool、Agent 语义字段 | ModelInteraction、RuntimeSpan 与 Trace hierarchy |
 | [Apache Iceberg](https://github.com/apache/iceberg) | 不可变数据文件与元数据提交 | staging objects + COMMIT.json |
 | [Apache OpenDAL](https://github.com/apache/opendal) | 统一对象存储 API | Rust 依赖接入 OSS、S3 和本地后端 |
 

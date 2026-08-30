@@ -1,0 +1,34 @@
+{
+  "model": "model-family-latest",
+  "previous_response_id": "resp-previous",
+  "reasoning": {"effort": "high"},
+  "parallel_tool_calls": true,
+  "tools": [
+    {
+      "type": "function",
+      "name": "search_docs",
+      "description": "Search project documentation.",
+      "parameters": {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"]
+      }
+    },
+    {
+      "type": "function",
+      "name": "read_file",
+      "description": "Read a project file.",
+      "parameters": {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"]
+      }
+    }
+  ],
+  "input": [
+    {"type": "message", "role": "developer", "content": "Use repository evidence."},
+    {"type": "message", "role": "user", "content": "Inspect the implementation."},
+    {"type": "function_call_output", "call_id": "call-prior", "output": "prior result", "status": "completed"},
+    {"type": "future_input_item", "revision": 2, "payload": {"keep": true}}
+  ]
+}

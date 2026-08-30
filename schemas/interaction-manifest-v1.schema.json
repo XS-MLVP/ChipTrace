@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/interaction-manifest-v1.schema.json",
+  "title": "ChipTrace Interaction Projection Manifest v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "created_at_utc",
+    "task_session_id",
+    "input_records",
+    "duplicate_captures_removed",
+    "api_snapshots",
+    "interactions",
+    "runtime_spans",
+    "links",
+    "protocol_counts",
+    "transport_counts",
+    "distinct_model_tool_names",
+    "integrity",
+    "metrics",
+    "parts",
+    "validation_status"
+  ],
+  "properties": {
+    "schema_version": {"const": "chiptrace.interaction-projection.v1"},
+    "created_at_utc": {"type": "string"},
+    "task_session_id": {"type": ["string", "null"], "minLength": 1},
+    "input_records": {"type": "integer", "minimum": 0},
+    "duplicate_captures_removed": {"type": "integer", "minimum": 0},
+    "api_snapshots": {"type": "integer", "minimum": 0},
+    "interactions": {"type": "integer", "minimum": 0},
+    "runtime_spans": {"type": "integer", "minimum": 0},
+    "links": {"type": "integer", "minimum": 0},
+    "protocol_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+    "transport_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+    "distinct_model_tool_names": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "integrity": {
+      "type": "object",
+      "required": [
+        "artifact_valid",
+        "raw_bytes_complete",
+        "protocol_complete",
+        "runtime_complete",
+        "root_complete",
+        "delivery_ready"
+      ],
+      "properties": {
+        "artifact_valid": {"type": "boolean"},
+        "raw_bytes_complete": {"type": "boolean"},
+        "protocol_complete": {"type": "boolean"},
+        "runtime_complete": {"type": "boolean"},
+        "root_complete": {"type": "boolean"},
+        "delivery_ready": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "metrics": {"type": "object"},
+    "raw_sources": {"type": "array", "items": {"$ref": "raw-lineage-v1.schema.json"}},
+    "parts": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "required": ["file", "sha256", "bytes", "records"],
+        "properties": {
+          "file": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "bytes": {"type": "integer", "minimum": 0},
+          "records": {"type": "integer", "minimum": 0},
+          "uncompressed_bytes": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": true
+      }
+    },
+    "validation_status": {"enum": ["delivery_ready", "not_ready"]}
+  },
+  "additionalProperties": true
+}

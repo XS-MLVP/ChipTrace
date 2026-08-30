@@ -428,7 +428,10 @@ async fn validate_committed_artifact(
                 || manifest.release_id != artifact_id
                 || manifest.validation_status != "pass"
                 || manifest.lineage_status != "complete"
-                || manifest.buyer_profile != "buyer-v7"
+                || !matches!(
+                    manifest.buyer_profile.as_str(),
+                    "buyer-v7" | "buyer-v7-codex-runtime-expanded"
+                )
                 || manifest.minimum_score < 90.0
             {
                 bail!("published buyer package manifest is not an accepted delivery");

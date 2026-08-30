@@ -1,7 +1,9 @@
 use crate::jsonl::{absolute_path, ensure_safe_relative_path, sha256_bytes, sha256_file, utc_now};
 use crate::release::verify_release;
 use crate::schema::{BuyerAssessment, RawSourceLineage, TokenCounts};
-use crate::score::{Profile, assess_session, eligible_assessment_contract_valid};
+use crate::score::{
+    Profile, assess_session, eligible_assessment_contract_valid, normalize_assessment_profile,
+};
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::read::GzDecoder;
@@ -108,7 +110,11 @@ fn package_buyer_release_with_policy(
     if source.parts.is_empty() {
         bail!("verified Release has no eligible Session parts");
     }
-    if source.buyer_profile != Profile::BuyerV7.as_str() || source.minimum_score < 90.0 {
+    if !matches!(
+        source.buyer_profile.as_str(),
+        "buyer-v7" | "buyer-v7-codex-runtime-expanded"
+    ) || source.minimum_score < 90.0
+    {
         bail!("buyer package requires buyer-v7 with minimum_score >= 90");
     }
     if require_raw_lineage && source.raw_sources.is_empty() {
@@ -230,7 +236,10 @@ fn verify_buyer_package_with_policy(
     if manifest.validation_status != "pass"
         || manifest.encoding != "UTF-8"
         || !gzip_level_valid
-        || manifest.buyer_profile != Profile::BuyerV7.as_str()
+        || !matches!(
+            manifest.buyer_profile.as_str(),
+            "buyer-v7" | "buyer-v7-codex-runtime-expanded"
+        )
         || !manifest.minimum_score.is_finite()
         || !(90.0..=100.0).contains(&manifest.minimum_score)
         || manifest.release_id.trim().is_empty()
@@ -635,7 +644,9 @@ fn validate_buyer_record(session: &Value, minimum_score: f64) -> Result<BuyerAss
         bail!("buyer archive contains an inconsistent or ineligible buyer-v7 Session");
     }
     let recomputed = assess_session(session, Profile::BuyerV7, minimum_score).buyer_acceptance;
-    if recomputed != assessment {
+    let mut comparable = assessment.clone();
+    normalize_assessment_profile(&mut comparable, Profile::BuyerV7);
+    if recomputed != comparable {
         bail!("buyer archive Session quality does not match its canonical content");
     }
     Ok(assessment)

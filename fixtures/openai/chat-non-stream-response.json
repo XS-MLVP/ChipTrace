@@ -1,0 +1,26 @@
+{
+  "id": "chatcmpl-non-stream",
+  "object": "chat.completion",
+  "model": "model-family-latest",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "reasoning_content": "Both calls are independent.",
+        "tool_calls": [
+          {"id": "call-search", "type": "function", "function": {"name": "search_docs", "arguments": "{\"query\":\"canonical trace\"}"}},
+          {"id": "call-read", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"src/lib.rs\"}"}}
+        ]
+      },
+      "finish_reason": "tool_calls"
+    },
+    {
+      "index": 1,
+      "message": {"role": "assistant", "content": "Alternative answer."},
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {"prompt_tokens": 70, "completion_tokens": 20, "total_tokens": 90}
+}

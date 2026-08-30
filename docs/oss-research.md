@@ -16,7 +16,7 @@ ChipTrace 采用一条对象存储数据面：
     -> Manifest
     -> CHECKPOINT
     -> Assembly / DAG
-    -> buyer-v7 Score
+    -> buyer-v7-codex-runtime-expanded Score
     -> JSONL Release
     -> buyer tar.gz
     -> OSS COMMIT
@@ -91,16 +91,16 @@ buyer tar.gz files -> deliveries COMMIT
 | --- | --- | --- |
 | 完整原始证据 | Raw Segment | `verify-raw-archive --verify-records` |
 | 唯一 Session 和 DAG | Assembly | `verify-assembly`、`RAW_SOURCE.json` |
-| 工具 schema、call、result、状态 | Agent/tool event + Assembly | buyer-v7 `tool_definitions`、`tool_pairing_after_open_tail` |
-| 10 个有效轮次、5 个工具、2 个有效返回 | canonical Session | buyer-v7 hard gate |
-| 首条 role、机器轮比例、模型限制 | canonical Session | buyer-v7 hard gate |
+| 工具 schema、call、result、状态 | Agent/tool event + Assembly | buyer-v7-codex-runtime-expanded `tool_definitions`、`tool_pairing_after_open_tail` |
+| 10 个有效轮次、5 个工具、2 个有效返回 | canonical Session | buyer-v7-codex-runtime-expanded hard gate |
+| 首条 role、机器轮比例、模型限制 | canonical Session | buyer-v7-codex-runtime-expanded hard gate |
 | 去重和 Token 守恒 | Release | `verify-release --require-pass` |
 | UTF-8 JSONL、Session 原子分包 | Buyer package | `verify-buyer-package` |
 | 传输完整性和来源追溯 | OSS COMMIT + `raw_sources` | `verify-published`、SHA-256 和 lineage 对账 |
 
 OSS 只能证明原始字节没有丢失，不能从 HTTP 快照推断任务结束、工具真实状态或
 用户验收。没有 Agent harness/tool executor 事件的 Session 会保留在 Raw，但在
-buyer-v7 Release 中拒绝，这个边界是数据真实性要求的一部分。
+buyer-v7-codex-runtime-expanded Release 中拒绝，这个边界是数据真实性要求的一部分。
 
 ## 上线验收
 

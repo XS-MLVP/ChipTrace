@@ -1,0 +1,19 @@
+{
+  "model": "model-family-latest",
+  "stream": true,
+  "stream_options": {"include_usage": true},
+  "messages": [
+    {"role": "developer", "content": "Preserve fragmented arguments."},
+    {"role": "user", "content": "Search for the adapter."}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "search_docs",
+        "description": "Search documentation.",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+      }
+    }
+  ]
+}

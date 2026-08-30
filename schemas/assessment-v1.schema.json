@@ -56,7 +56,7 @@
           ],
           "properties": {
             "schema_version": {"const": "chiptrace.assessment.v1"},
-            "profile": {"enum": ["buyer-v6", "buyer-v7"]},
+            "profile": {"enum": ["buyer-v6", "buyer-v7", "buyer-v7-codex-runtime-expanded"]},
             "profile_version": {"type": "string"},
             "score": {"type": "number", "minimum": 0, "maximum": 100},
             "hard_gate_pass": {"type": "boolean"},

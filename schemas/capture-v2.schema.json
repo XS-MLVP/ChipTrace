@@ -199,7 +199,8 @@
           "type": "object",
           "properties": {
             "kind": {"enum": ["json", "text", "binary", "sse"]},
-            "value": {}
+            "value": {},
+            "raw": {"type": "string"}
           },
           "additionalProperties": true
         },

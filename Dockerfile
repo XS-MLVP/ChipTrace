@@ -3,11 +3,13 @@ FROM rust:1.91-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY schemas ./schemas
 ARG CHIPTRACE_CARGO_REGISTRY_INDEX=""
 RUN --mount=type=cache,id=chiptrace-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=chiptrace-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=chiptrace-cargo-target,target=/src/target,sharing=locked \
-    if [ -n "$CHIPTRACE_CARGO_REGISTRY_INDEX" ]; then \
+    find crates schemas -type f -exec touch {} + \
+    && if [ -n "$CHIPTRACE_CARGO_REGISTRY_INDEX" ]; then \
       CARGO_REGISTRIES_CRATES_IO_INDEX="$CHIPTRACE_CARGO_REGISTRY_INDEX" \
         cargo build --release --locked --bin chiptrace; \
     else \

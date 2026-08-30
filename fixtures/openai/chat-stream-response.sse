@@ -1,0 +1,9 @@
+data: {"id":"chatcmpl-stream","object":"chat.completion.chunk","model":"model-family-latest","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Need "},"finish_reason":null},{"index":1,"delta":{"role":"assistant","content":"Alt"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-stream","object":"chat.completion.chunk","model":"model-family-latest","choices":[{"index":0,"delta":{"reasoning_content":"evidence.","tool_calls":[{"index":0,"id":"call-search","type":"function","function":{"name":"search_","arguments":"{\"query\":"}}]},"finish_reason":null},{"index":1,"delta":{"content":"ernative"},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-stream","object":"chat.completion.chunk","model":"model-family-latest","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"docs","arguments":"\"adapter\"}"}}]},"finish_reason":"tool_calls"}],"usage":null}
+
+data: {"id":"chatcmpl-stream","object":"chat.completion.chunk","model":"model-family-latest","choices":[],"usage":{"prompt_tokens":45,"completion_tokens":11,"total_tokens":56}}
+
+data: [DONE]

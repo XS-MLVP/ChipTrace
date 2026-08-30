@@ -37,7 +37,7 @@ static ENVIRONMENT_SIGNAL: LazyLock<Regex> = LazyLock::new(|| {
 pub enum Profile {
     #[value(name = "buyer-v6")]
     BuyerV6,
-    #[value(name = "buyer-v7")]
+    #[value(name = "buyer-v7-codex-runtime-expanded", alias = "buyer-v7")]
     BuyerV7,
 }
 
@@ -172,14 +172,14 @@ impl Profile {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::BuyerV6 => "buyer-v6",
-            Self::BuyerV7 => "buyer-v7",
+            Self::BuyerV7 => "buyer-v7-codex-runtime-expanded",
         }
     }
 
     pub fn version(self) -> &'static str {
         match self {
             Self::BuyerV6 => "buyer-v6.0-2026-05",
-            Self::BuyerV7 => "buyer-v7.0-user-supplied",
+            Self::BuyerV7 => "buyer-v7-codex-runtime-expanded",
         }
     }
 
@@ -230,6 +230,8 @@ enum UserTurnKind {
 }
 
 pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> QualityEnvelope {
+    let projected_session = materialize_profile_session(session, profile);
+    let session = &projected_session;
     let messages = session
         .get("messages")
         .and_then(Value::as_array)
@@ -955,6 +957,179 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         buyer_acceptance: buyer,
         semantic_quality: semantic,
     }
+}
+
+pub fn materialize_profile_session(session: &Value, profile: Profile) -> Value {
+    if profile != Profile::BuyerV7 {
+        return session.clone();
+    }
+    if session
+        .pointer("/meta/active_quality_projection/profile_version")
+        .and_then(Value::as_str)
+        == Some(Profile::BuyerV7.version())
+    {
+        return session.clone();
+    }
+    let Some(projection) =
+        session.pointer("/meta/quality_projections/buyer_v7_codex_runtime_expanded")
+    else {
+        return session.clone();
+    };
+    if projection.get("profile_version").and_then(Value::as_str) != Some(Profile::BuyerV7.version())
+    {
+        return session.clone();
+    }
+
+    let excluded: HashSet<&str> = projection
+        .get("excluded_model_call_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let mut messages = Vec::new();
+    for message in session
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if string_field(message, "role") == Some("tool")
+            && string_field(message, "tool_call_id")
+                .is_some_and(|call_id| excluded.contains(call_id))
+        {
+            continue;
+        }
+        let mut message = message.clone();
+        if string_field(&message, "role") == Some("assistant")
+            && let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut)
+        {
+            calls.retain(|call| {
+                !string_field(call, "id").is_some_and(|call_id| excluded.contains(call_id))
+            });
+            if calls.is_empty() {
+                message
+                    .as_object_mut()
+                    .map(|object| object.remove("tool_calls"));
+            }
+        }
+        let empty = string_field(&message, "role") == Some("assistant")
+            && message.get("tool_calls").is_none()
+            && !assistant_substantive(&message);
+        if !empty {
+            messages.push(message);
+        }
+    }
+    for runtime_message in projection
+        .get("runtime_messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        merge_runtime_projection_message(&mut messages, runtime_message);
+    }
+
+    let mut tools = BTreeMap::new();
+    for tool in session
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(
+            projection
+                .get("runtime_tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        )
+    {
+        let nested = tool.get("function").unwrap_or(tool);
+        let Some(name) = string_field(nested, "name") else {
+            continue;
+        };
+        tools.insert(name.to_owned(), tool.clone());
+    }
+
+    let mut materialized = session.clone();
+    materialized["messages"] = Value::Array(messages);
+    materialized["tools"] = Value::Array(tools.into_values().collect());
+    materialized["meta"]["active_quality_projection"] = json!({
+        "profile_version":Profile::BuyerV7.version(),
+        "source":"meta.quality_projections.buyer_v7_codex_runtime_expanded",
+    });
+    materialized
+}
+
+fn merge_runtime_projection_message(messages: &mut Vec<Value>, runtime: &Value) {
+    if string_field(runtime, "role") == Some("tool")
+        && let Some(call_id) = string_field(runtime, "tool_call_id")
+        && let Some(existing) = messages.iter_mut().find(|message| {
+            string_field(message, "role") == Some("tool")
+                && string_field(message, "tool_call_id") == Some(call_id)
+        })
+    {
+        merge_runtime_result_evidence(existing, runtime);
+        return;
+    }
+
+    if string_field(runtime, "role") == Some("assistant")
+        && let Some(runtime_calls) = runtime.get("tool_calls").and_then(Value::as_array)
+        && runtime_calls.len() == 1
+        && let Some(call_id) = runtime_calls[0].get("id").and_then(Value::as_str)
+    {
+        for existing in messages
+            .iter_mut()
+            .filter(|message| string_field(message, "role") == Some("assistant"))
+        {
+            let Some(calls) = existing.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            if let Some(call) = calls
+                .iter_mut()
+                .find(|call| string_field(call, "id") == Some(call_id))
+            {
+                merge_runtime_call_evidence(call, &runtime_calls[0]);
+                return;
+            }
+        }
+    }
+    messages.push(runtime.clone());
+}
+
+fn merge_runtime_call_evidence(existing: &mut Value, runtime: &Value) {
+    for field in [
+        "execution_status",
+        "result_status",
+        "result_message_index",
+        "parent_call_id",
+    ] {
+        if let Some(value) = runtime.get(field).filter(|value| !value.is_null()) {
+            existing[field] = value.clone();
+        }
+    }
+    existing["runtime_evidence"] = json!({
+        "source":runtime.get("source"),
+        "call_id":runtime.get("id"),
+    });
+}
+
+fn merge_runtime_result_evidence(existing: &mut Value, runtime: &Value) {
+    for field in ["status", "is_error", "status_source", "status_conflict"] {
+        if let Some(value) = runtime.get(field).filter(|value| !value.is_null()) {
+            existing[field] = value.clone();
+        }
+    }
+    if existing
+        .get("content")
+        .is_none_or(|value| !nonempty_value(value))
+        && runtime.get("content").is_some_and(nonempty_value)
+    {
+        existing["content"] = runtime["content"].clone();
+    }
+    existing["runtime_evidence"] = json!({
+        "source":runtime.get("source"),
+        "tool_call_id":runtime.get("tool_call_id"),
+    });
 }
 
 fn push_gate(
@@ -1990,8 +2165,7 @@ pub fn assessment_contract_valid(
         .map(|gate| gate.name.clone())
         .collect();
     assessment.schema_version == ASSESSMENT_SCHEMA_VERSION
-        && assessment.profile == profile.as_str()
-        && assessment.profile_version == profile.version()
+        && profile_metadata_compatible(assessment, profile)
         && minimum_score.is_finite()
         && (0.0..=100.0).contains(&minimum_score)
         && assessment.minimum_score == minimum_score
@@ -2002,6 +2176,31 @@ pub fn assessment_contract_valid(
         && assessment.hard_gate_pass == required_gates_pass
         && assessment.eligible == expected_eligible
         && assessment.failure_reasons == expected_failures
+}
+
+pub fn normalize_assessment_profile(assessment: &mut BuyerAssessment, profile: Profile) {
+    if profile == Profile::BuyerV7
+        && matches!(
+            assessment.profile.as_str(),
+            "buyer-v7" | "buyer-v7-codex-runtime-expanded"
+        )
+        && matches!(
+            assessment.profile_version.as_str(),
+            "buyer-v7.0-user-supplied" | "buyer-v7-codex-runtime-expanded"
+        )
+    {
+        assessment.profile = profile.as_str().to_owned();
+        assessment.profile_version = profile.version().to_owned();
+    }
+}
+
+fn profile_metadata_compatible(assessment: &BuyerAssessment, profile: Profile) -> bool {
+    if assessment.profile == profile.as_str() && assessment.profile_version == profile.version() {
+        return true;
+    }
+    profile == Profile::BuyerV7
+        && assessment.profile == "buyer-v7"
+        && assessment.profile_version == "buyer-v7.0-user-supplied"
 }
 
 fn gate_weight(name: &str) -> f64 {
