@@ -542,7 +542,7 @@ impl Writer {
                 .map(|value| serde_json::from_slice(value.value()))
                 .transpose()?;
             if let Some(locator) = existing {
-                if locator.raw_sha256 == task.record.sha256 {
+                if task.record.matches_persisted_sha256(&locator.raw_sha256) {
                     duplicate_sources.push((index, DuplicateSource::Existing(locator)));
                 } else {
                     conflicts.push(index);
@@ -647,7 +647,7 @@ impl Writer {
                 let task = &batch[*index];
                 let attempt = self.attempt(
                     Some(task.record.capture_id.clone()),
-                    Some(task.record.sha256.clone()),
+                    Some(locator.raw_sha256.clone()),
                     "duplicate",
                     Some("already_committed".to_owned()),
                     Some(locator.segment_id),
@@ -699,7 +699,7 @@ impl Writer {
             } else if conflict_set.contains(&index) {
                 Err(SubmitError {
                     kind: SubmitErrorKind::Conflict,
-                    message: "captureId was reused with different canonical bytes".to_owned(),
+                    message: "captureId was reused with different payload bytes".to_owned(),
                 })
             } else {
                 unreachable!("batch task has no durable outcome")
@@ -1448,7 +1448,7 @@ fn fsync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::normalize_capture;
+    use crate::capture::{normalize_capture, validate_stored_capture};
     use serde_json::json;
 
     fn record(id: &str, status: u64) -> CaptureRecord {
@@ -1492,6 +1492,45 @@ mod tests {
         let reopened = CaptureStore::open(config).await.unwrap();
         assert_eq!(reopened.health().captures, 1);
         assert!(reopened.audit(true).await.unwrap()["ok"].as_bool().unwrap());
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_retry_matches_pre_migration_wal_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = StoreConfig {
+            root: temporary.path().join("capture"),
+            state_root: temporary.path().join("state"),
+            segment_max_bytes: 4096,
+            segment_max_age: Duration::from_secs(60),
+            queue_items: 16,
+            batch_records: 8,
+            batch_bytes: 4096,
+            batch_wait: Duration::from_millis(1),
+            fsync: true,
+        };
+        let legacy_raw =
+            br#"{"version":"chiptrace.capture.v1","captureId":"cap-legacy","responseStatus":200}"#;
+        let store = CaptureStore::open(config.clone()).await.unwrap();
+        store
+            .submit(validate_stored_capture(legacy_raw).unwrap())
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+
+        let reopened = CaptureStore::open(config).await.unwrap();
+        let retry = normalize_capture(legacy_raw, 4096).unwrap();
+        assert!(retry.legacy_raw_sha256.is_some());
+        assert!(reopened.submit(retry).await.unwrap().duplicate);
+
+        let changed =
+            br#"{"version":"chiptrace.capture.v1","captureId":"cap-legacy","responseStatus":503}"#;
+        let conflict = reopened
+            .submit(normalize_capture(changed, 4096).unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.kind, SubmitErrorKind::Conflict);
+        assert_eq!(reopened.health().captures, 1);
         reopened.close().await.unwrap();
     }
 

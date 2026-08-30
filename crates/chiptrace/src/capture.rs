@@ -34,8 +34,15 @@ pub struct CaptureRecord {
     pub capture_id: String,
     pub canonical: Vec<u8>,
     pub sha256: String,
+    pub legacy_raw_sha256: Option<String>,
     pub received_at: Option<String>,
     pub model: Option<String>,
+}
+
+impl CaptureRecord {
+    pub fn matches_persisted_sha256(&self, persisted: &str) -> bool {
+        self.sha256 == persisted || self.legacy_raw_sha256.as_deref() == Some(persisted)
+    }
 }
 
 pub fn normalize_capture(raw: &[u8], max_bytes: usize) -> Result<CaptureRecord> {
@@ -54,6 +61,9 @@ fn normalize_capture_with_policy(
     let object = value
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("capture envelope must be a JSON object"))?;
+    let legacy_raw_sha256 = (object.get("version").and_then(Value::as_str)
+        != Some(CAPTURE_SCHEMA_VERSION))
+    .then(|| hex::encode(Sha256::digest(raw)));
     let capture_id = object
         .get("captureId")
         .and_then(Value::as_str)
@@ -192,6 +202,7 @@ fn normalize_capture_with_policy(
         capture_id,
         canonical,
         sha256,
+        legacy_raw_sha256,
         received_at,
         model,
     })
@@ -253,6 +264,7 @@ pub fn validate_stored_capture(raw: &[u8]) -> Result<CaptureRecord> {
         capture_id,
         canonical: raw.to_vec(),
         sha256: hex::encode(Sha256::digest(raw)),
+        legacy_raw_sha256: None,
         received_at,
         model,
     })

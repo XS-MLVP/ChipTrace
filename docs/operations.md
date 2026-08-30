@@ -398,6 +398,10 @@ chiptrace benchmark-compression \
 5. 对旧 Collector 故障、Relay 重启、重复投递和断网恢复做注入测试。
 6. 达标后再切换采集目标；旧链路只读保留至新链路完成一个 Release 周期。
 
+滚动升级测试必须包含一条生产 v1 WAL 的精确重放：新 Collector 应返回
+`duplicate`，修改同一 `captureId` 的任一原始字段应返回 `409 conflict`。该用例用于
+防止 v1 到 v2 规范化改变幂等摘要，不能以关闭冲突检查规避。
+
 任何 hard-gate 下降、业务延迟回归、attempt 不守恒或事件缺失都会终止切换。
 
 ## 监控

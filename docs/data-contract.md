@@ -203,6 +203,11 @@ Manifest 与全部对象校验完成后写入。`completeness=complete` 才能�
 WAL，Assembly 仅把缺失类型的 v1 记录解释为 `api_snapshot`。Collector 写入的
 规范化记录始终包含 `recordType` 并标记为 `chiptrace.capture.v2`。
 
+滚动升级期间，旧 Relay 可能重放已存在于 Collector ledger 的 v1 原始字节。入口
+仍生成 v2 规范化记录，但同时计算旧输入的原字节 SHA-256；该摘要只用于与既有
+locator 做精确幂等匹配，不写入新 WAL，也不参与语义等价判断。原字节摘要相同返回
+`duplicate`，同一 `captureId` 的不同旧字节仍返回 `conflict`。
+
 ## Canonical Session
 
 Assembly 输出 `schemas/session-v1.schema.json`，一行一个完整 Session。主要
