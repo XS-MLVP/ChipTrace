@@ -19,6 +19,13 @@ RUN --mount=type=cache,id=chiptrace-cargo-registry,target=/usr/local/cargo/regis
 
 FROM debian:bookworm-slim
 
+ARG CHIPTRACE_VERSION=0.5.1
+ARG CHIPTRACE_REVISION=unknown
+
+LABEL org.opencontainers.image.source="https://github.com/XS-MLVP/ChipTrace" \
+      org.opencontainers.image.version="${CHIPTRACE_VERSION}" \
+      org.opencontainers.image.revision="${CHIPTRACE_REVISION}"
+
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 RUN install -d -m 1777 /tmp
 

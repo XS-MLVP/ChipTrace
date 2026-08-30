@@ -1,5 +1,8 @@
 .PHONY: check test self-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
 
+CHIPTRACE_VERSION ?= 0.5.1
+CHIPTRACE_REVISION ?= $(shell git rev-parse HEAD)
+
 check:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -11,7 +14,8 @@ self-test:
 	cargo run --locked --bin chiptrace -- self-test
 
 m0-test:
-	docker compose -f deploy/docker-compose.yml run --rm --build m0
+	CHIPTRACE_VERSION=$(CHIPTRACE_VERSION) CHIPTRACE_REVISION=$(CHIPTRACE_REVISION) \
+		docker compose -f deploy/docker-compose.yml run --rm --build m0
 
 build:
 	cargo build --release --locked --bin chiptrace

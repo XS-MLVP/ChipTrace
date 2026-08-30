@@ -4,7 +4,10 @@ services:
   m0:
     build:
       context: ..
-    image: chiptrace:m0-local
+      args:
+        CHIPTRACE_VERSION: ${CHIPTRACE_VERSION:-0.5.1}
+        CHIPTRACE_REVISION: ${CHIPTRACE_REVISION:-unknown}
+    image: ${CHIPTRACE_IMAGE:-chiptrace:m0-local}
     init: true
     command: ["self-test"]
     network_mode: none
