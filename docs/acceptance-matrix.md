@@ -249,6 +249,12 @@ runtime 结果，并通过六项完整性硬门槛。
 恢复。该 Session 没有带分值的 evaluator evidence，因此 Buyer 100 分仍只代表结构
 验收通过，不代表语义奖励可用。
 
+验收后，生产 Collector/Relay 滚动到 revision `209d2a5`，入口 `18084` 未重启。
+升级后一个真实 API-only Responses 流得到 `raw_bytes_complete=true` 和
+`protocol_complete=true`；由于该探针没有 lifecycle/runtime 生产者，验证器按预期以
+`root_complete=false`、`runtime_complete=false` 拒绝交付，未将 Wire 完整性冒充为
+完整任务 Session。
+
 ## 正式交付门槛
 
 正式 buyer 包必须满足：
