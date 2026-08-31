@@ -48,23 +48,32 @@ paths:
         "503": {description: 背压或存储不可用}
   /producer/event:
     post:
-      summary: 校验并持久化一条 Harness/dispatcher 事件
-      description: Relay 根据 producer 身份与 sequence 生成确定性 Capture ID。
+      summary: 校验并持久化一条 Agent Producer 事件
+      description: >-
+        Relay 根据 producer 身份与 sequence 生成确定性 Capture ID，或复验 Stock Codex
+        原始证据派生的 source-native Capture ID 与 SHA-256。
+      security:
+        - producerBearer: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: ./producer-event-v1.schema.json
+              oneOf:
+                - $ref: ./producer-event-v1.schema.json
+                - $ref: ./capture-v2.schema.json
       responses:
         "202": {description: 已生成 Capture ID 并持久化到本地 outbox}
         "200": {description: 相同事件已持久化}
         "400": {description: producer event 无效}
+        "401": {description: Producer Bearer Token 缺失或无效}
         "409": {description: 确定性 Capture ID 对应不同字节}
         "503": {description: 背压或存储不可用}
   /producer/events:
     post:
-      summary: 批量校验并持久化 Harness/dispatcher NDJSON
+      summary: 批量校验并持久化 Agent Producer NDJSON
+      security:
+        - producerBearer: []
       requestBody:
         required: true
         content:
@@ -79,6 +88,7 @@ paths:
         "200": {description: 全部事件均为幂等重复}
         "207": {description: 部分事件失败，读取 results 获取逐条结果}
         "400": {description: NDJSON 或 producer event 无效}
+        "401": {description: Producer Bearer Token 缺失或无效}
         "503": {description: 背压或存储不可用}
   /health:
     get:
@@ -99,3 +109,9 @@ paths:
       responses:
         "200": {description: 所有分片已执行持久化屏障并封存非空段}
         "503": {description: 封存失败}
+components:
+  securitySchemes:
+    producerBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque

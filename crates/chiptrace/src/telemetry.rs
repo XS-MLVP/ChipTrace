@@ -1,6 +1,6 @@
 use crate::jsonl::{JsonlWriter, absolute_path, ensure_safe_relative_path, sha256_file, utc_now};
 use crate::model_interaction::{
-    INTERACTION_PROJECTION_SCHEMA_VERSION, verify_interaction_projection,
+    INTERACTION_PROJECTION_SCHEMA_VERSION, verify_interaction_artifacts,
 };
 use crate::schema::FileManifest;
 use anyhow::{Context, Result, bail};
@@ -32,6 +32,8 @@ pub struct OtlpExportManifest {
     pub created_at_utc: String,
     pub source_projection_schema_version: String,
     pub source_projection_manifest_sha256: String,
+    #[serde(default)]
+    pub source_delivery_ready: bool,
     pub interactions: u64,
     pub runtime_spans: u64,
     pub links: u64,
@@ -47,7 +49,7 @@ pub struct OtlpExportManifest {
 
 pub fn export_otlp(config: OtlpExportConfig) -> Result<OtlpExportManifest> {
     let projection = config.projection.canonicalize()?;
-    let source = verify_interaction_projection(&projection)?;
+    let source = verify_interaction_artifacts(&projection)?;
     let interactions =
         read_projection_part(&projection.join("interactions/model-interactions.jsonl.zst"))?;
     let runtime_spans = read_projection_part(&projection.join("runtime/runtime-spans.jsonl.zst"))?;
@@ -75,6 +77,7 @@ pub fn export_otlp(config: OtlpExportConfig) -> Result<OtlpExportManifest> {
         created_at_utc: utc_now(),
         source_projection_schema_version: source.schema_version,
         source_projection_manifest_sha256: sha256_file(&projection.join("manifest.json"))?,
+        source_delivery_ready: source.integrity.delivery_ready,
         interactions: interactions.len() as u64,
         runtime_spans: runtime_spans.len() as u64,
         links: links.len() as u64,
@@ -83,8 +86,9 @@ pub fn export_otlp(config: OtlpExportConfig) -> Result<OtlpExportManifest> {
         resolved_internal_parents: hierarchy.resolved_internal_parents,
         resolved_internal_parent_rate: hierarchy.resolved_internal_parent_rate,
         missing_parent_nodes: hierarchy.missing_parent_nodes,
-        body_policy: "summary_and_raw_reference_only; request, response, arguments, and results are not copied"
-            .to_owned(),
+        body_policy:
+            "normalized_io_and_raw_references; raw wire request and response bodies are not copied"
+                .to_owned(),
         parts,
         validation_status: "verified".to_owned(),
     };
@@ -109,7 +113,7 @@ pub fn verify_otlp_export(root: &Path) -> Result<OtlpExportManifest> {
         || manifest.source_projection_schema_version != INTERACTION_PROJECTION_SCHEMA_VERSION
         || manifest.validation_status != "verified"
         || manifest.body_policy
-            != "summary_and_raw_reference_only; request, response, arguments, and results are not copied"
+            != "normalized_io_and_raw_references; raw wire request and response bodies are not copied"
     {
         bail!("unsupported or unsafe OTLP export manifest");
     }
@@ -216,6 +220,9 @@ pub(crate) fn project_otlp_tree(
     let mut node_ids = BTreeMap::new();
     let mut emitted_ids = HashSet::new();
     for interaction in interactions {
+        if session_id(interaction).is_none() {
+            bail!("ModelInteraction is missing session.id context");
+        }
         let id = string_field(interaction, "interaction_id")
             .context("ModelInteraction missing interaction_id")?;
         insert_otlp_node(
@@ -226,6 +233,9 @@ pub(crate) fn project_otlp_tree(
         )?;
     }
     for span in runtime_spans {
+        if session_id(span).is_none() {
+            bail!("RuntimeSpan is missing session.id context");
+        }
         let id = string_field(span, "span_id").context("RuntimeSpan missing span_id")?;
         insert_otlp_node(
             &mut node_ids,
@@ -242,8 +252,39 @@ pub(crate) fn project_otlp_tree(
         let to = string_field(link, "to").unwrap_or("");
         let (parent, child, priority) = match relation {
             "runtime_parent_to_child" => (from, to, 20),
-            "interaction_to_runtime_span" => (to, from, 20),
+            "interaction_to_runtime_span" => (from, to, 25),
             "runtime_parent_to_interaction" => (from, to, 10),
+            "model_call_to_runtime_execution" => {
+                let Some(interaction_id) = from
+                    .strip_prefix("model-call:")
+                    .and_then(|value| value.split_once(':').map(|(interaction, _)| interaction))
+                else {
+                    continue;
+                };
+                let interaction = format!("interaction:{interaction_id}");
+                if !node_ids.contains_key(&interaction) {
+                    continue;
+                }
+                let parent_id = node_ids.get(&interaction).unwrap();
+                let child_id = node_ids
+                    .get(to)
+                    .with_context(|| format!("InteractionLink child node is absent: {to}"))?;
+                if parent_id.0 != child_id.0 {
+                    bail!("InteractionLink crosses OTLP traces: {interaction} -> {to}");
+                }
+                match parent_nodes.get(to) {
+                    Some((existing_priority, _)) if *existing_priority > 30 => {}
+                    Some((existing_priority, existing))
+                        if *existing_priority == 30 && existing != &interaction =>
+                    {
+                        bail!("OTLP node {to} has multiple internal parents");
+                    }
+                    _ => {
+                        parent_nodes.insert(to.to_owned(), (30, interaction));
+                    }
+                }
+                continue;
+            }
             _ => continue,
         };
         let parent_id = node_ids
@@ -274,8 +315,8 @@ pub(crate) fn project_otlp_tree(
         .filter_map(|span| string_field(span, "span_id"))
         .map(|id| format!("runtime-span:{id}"))
         .collect();
-    if root_nodes.len() != 1 {
-        bail!("M0 OTLP export requires exactly one Task Root");
+    if root_nodes.is_empty() {
+        bail!("OTLP export requires at least one canonical root");
     }
     let missing_parent_nodes: Vec<String> = node_ids
         .keys()
@@ -361,6 +402,7 @@ fn verify_otlp_tree(records: &[Value]) -> Result<OtlpHierarchy> {
         }
     }
     let mut root_spans = 0_u64;
+    let mut roots_by_trace: BTreeMap<String, u64> = BTreeMap::new();
     let mut internal_parent_references = 0_u64;
     let mut resolved_internal_parents = 0_u64;
     let mut missing_parent_nodes = Vec::new();
@@ -369,6 +411,7 @@ fn verify_otlp_tree(records: &[Value]) -> Result<OtlpHierarchy> {
         let span_id = string_field(span, "spanId").unwrap_or("");
         let Some(parent_span_id) = string_field(span, "parentSpanId") else {
             root_spans = root_spans.saturating_add(1);
+            *roots_by_trace.entry(trace_id.to_owned()).or_default() += 1;
             continue;
         };
         internal_parent_references = internal_parent_references.saturating_add(1);
@@ -380,16 +423,17 @@ fn verify_otlp_tree(records: &[Value]) -> Result<OtlpHierarchy> {
     }
     missing_parent_nodes.sort();
     let resolved_internal_parent_rate = if internal_parent_references == 0 {
-        if root_spans == 1 { 1.0 } else { 0.0 }
+        if root_spans > 0 { 1.0 } else { 0.0 }
     } else {
         resolved_internal_parents as f64 / internal_parent_references as f64
     };
-    if root_spans != 1
+    if root_spans == 0
+        || roots_by_trace.values().any(|roots| *roots != 1)
         || !missing_parent_nodes.is_empty()
         || resolved_internal_parents != internal_parent_references
         || resolved_internal_parent_rate != 1.0
     {
-        bail!("OTLP export is not a complete single-root internal tree");
+        bail!("OTLP export does not contain exactly one root per trace");
     }
     Ok(OtlpHierarchy {
         root_spans,
@@ -407,7 +451,18 @@ fn interaction_otlp(interaction: &Value, parent_span_id: Option<&str>) -> Value 
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let attributes = vec![
-        otlp_attr("gen_ai.operation.name", json!(endpoint)),
+        otlp_attr("openinference.span.kind", json!("LLM")),
+        otlp_attr("session.id", json!(session_id(interaction))),
+        otlp_attr("gen_ai.conversation.id", json!(session_id(interaction))),
+        otlp_attr("gen_ai.operation.name", json!("chat")),
+        otlp_attr("chiptrace.protocol.endpoint", json!(endpoint)),
+        otlp_attr(
+            "gen_ai.provider.name",
+            interaction
+                .pointer("/extensions/routing/provider_observation")
+                .cloned()
+                .unwrap_or(Value::Null),
+        ),
         otlp_attr(
             "gen_ai.request.model",
             interaction
@@ -434,6 +489,57 @@ fn interaction_otlp(interaction: &Value, parent_span_id: Option<&str>) -> Value 
             json!(array_len(interaction, "/model_tool_calls")),
         ),
         otlp_attr(
+            "gen_ai.usage.input_tokens",
+            interaction
+                .pointer("/usage/input_tokens")
+                .cloned()
+                .unwrap_or(Value::Null),
+        ),
+        otlp_attr(
+            "gen_ai.usage.output_tokens",
+            interaction
+                .pointer("/usage/output_tokens")
+                .cloned()
+                .unwrap_or(Value::Null),
+        ),
+        otlp_attr(
+            "gen_ai.usage.cached_input_tokens",
+            interaction
+                .pointer("/usage/cached_input_tokens")
+                .cloned()
+                .unwrap_or(Value::Null),
+        ),
+        otlp_attr(
+            "gen_ai.usage.reasoning_tokens",
+            interaction
+                .pointer("/usage/reasoning_tokens")
+                .cloned()
+                .unwrap_or(Value::Null),
+        ),
+        otlp_attr(
+            "gen_ai.usage.total_tokens",
+            interaction
+                .pointer("/usage/total_tokens")
+                .cloned()
+                .unwrap_or(Value::Null),
+        ),
+        otlp_attr("input.mime_type", json!("application/json")),
+        otlp_attr(
+            "input.value",
+            interaction
+                .pointer("/request/input_items")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        ),
+        otlp_attr("output.mime_type", json!("application/json")),
+        otlp_attr(
+            "output.value",
+            interaction
+                .pointer("/response/output_items")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        ),
+        otlp_attr(
             "chiptrace.raw_capture_refs",
             json!(compact_refs(interaction)),
         ),
@@ -442,7 +548,7 @@ fn interaction_otlp(interaction: &Value, parent_span_id: Option<&str>) -> Value 
         &trace_id,
         &span_id,
         parent_span_id,
-        &format!("gen_ai.{endpoint}"),
+        "openai.model_interaction",
         (
             interaction
                 .pointer("/timing/started_at")
@@ -462,17 +568,22 @@ fn interaction_otlp(interaction: &Value, parent_span_id: Option<&str>) -> Value 
 
 fn runtime_otlp(span: &Value, parent_span_id: Option<&str>) -> Value {
     let (trace_id, span_id) = projection_ids(span, "span_id");
-    let attributes = vec![
-        otlp_attr(
-            "gen_ai.operation.name",
-            json!(
-                if string_field(span, "span_kind") == Some("tool_execution") {
-                    "execute_tool"
-                } else {
-                    "invoke_agent"
-                }
-            ),
-        ),
+    let span_kind = string_field(span, "span_kind").unwrap_or("runtime");
+    let openinference_kind = match span_kind {
+        "task_root" | "agent" | "turn" | "rollout" => "AGENT",
+        "inference" => "LLM",
+        _ => "TOOL",
+    };
+    let operation = match openinference_kind {
+        "AGENT" => "invoke_agent",
+        "LLM" => "chat",
+        _ => "execute_tool",
+    };
+    let mut attributes = vec![
+        otlp_attr("openinference.span.kind", json!(openinference_kind)),
+        otlp_attr("session.id", json!(session_id(span))),
+        otlp_attr("gen_ai.conversation.id", json!(session_id(span))),
+        otlp_attr("gen_ai.operation.name", json!(operation)),
         otlp_attr(
             "gen_ai.tool.name",
             span.get("name").cloned().unwrap_or(Value::Null),
@@ -480,6 +591,35 @@ fn runtime_otlp(span: &Value, parent_span_id: Option<&str>) -> Value {
         otlp_attr(
             "gen_ai.tool.call.id",
             span.get("call_id").cloned().unwrap_or(Value::Null),
+        ),
+        otlp_attr(
+            "tool.name",
+            span.get("name").cloned().unwrap_or(Value::Null),
+        ),
+        otlp_attr(
+            "tool.id",
+            span.get("call_id").cloned().unwrap_or(Value::Null),
+        ),
+        otlp_attr(
+            "tool.parameters",
+            span.get("arguments").cloned().unwrap_or(Value::Null),
+        ),
+        otlp_attr(
+            "tool.json_schema",
+            span.get("tool_schema").cloned().unwrap_or(Value::Null),
+        ),
+        otlp_attr("input.mime_type", json!("application/json")),
+        otlp_attr(
+            "input.value",
+            span.get("arguments").cloned().unwrap_or(Value::Null),
+        ),
+        otlp_attr("output.mime_type", json!("application/json")),
+        otlp_attr(
+            "output.value",
+            span.get("result")
+                .or_else(|| span.get("error"))
+                .cloned()
+                .unwrap_or(Value::Null),
         ),
         otlp_attr(
             "chiptrace.parent_span_id",
@@ -492,6 +632,13 @@ fn runtime_otlp(span: &Value, parent_span_id: Option<&str>) -> Value {
                 .unwrap_or_else(|| json!([])),
         ),
     ];
+    if openinference_kind != "TOOL" {
+        attributes.retain(|attribute| {
+            attribute["key"]
+                .as_str()
+                .is_none_or(|key| !key.starts_with("tool.") && !key.starts_with("gen_ai.tool."))
+        });
+    }
     otlp_record(
         &trace_id,
         &span_id,
@@ -567,20 +714,36 @@ fn projection_ids(value: &Value, identity_field: &str) -> (String, String) {
             let seed = value
                 .pointer("/trace_context/task_session_id")
                 .and_then(Value::as_str)
+                .or_else(|| {
+                    value
+                        .pointer("/trace_context/root_turn_id")
+                        .and_then(Value::as_str)
+                })
+                .or_else(|| {
+                    value
+                        .pointer("/trace_context/turn_id")
+                        .and_then(Value::as_str)
+                })
                 .or_else(|| string_field(value, identity_field))
                 .unwrap_or("missing");
             sha256(seed.as_bytes())[..32].to_owned()
         });
-    let span_id = value
-        .pointer("/trace_context/span_id")
-        .and_then(Value::as_str)
-        .filter(|value| valid_otel_hex(value, 16))
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_else(|| {
-            let span_seed = string_field(value, identity_field).unwrap_or("missing");
-            sha256(span_seed.as_bytes())[..16].to_owned()
-        });
+    let span_seed = string_field(value, identity_field).unwrap_or("missing");
+    let span_id = sha256(span_seed.as_bytes())[..16].to_owned();
     (trace_id, span_id)
+}
+
+fn session_id(value: &Value) -> Option<&str> {
+    value
+        .pointer("/trace_context/session_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            value
+                .pointer("/trace_context/task_session_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
 }
 
 fn valid_otel_hex(value: &str, length: usize) -> bool {
@@ -694,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn otlp_summary_preserves_native_identity_parent_and_nanosecond_time() {
+    fn otlp_summary_uses_canonical_identity_parent_and_nanosecond_time() {
         let span = json!({
             "span_id":"runtime-imported",
             "trace_context":{
@@ -713,7 +876,7 @@ mod tests {
         let projected = runtime_otlp(&span, Some("1111111111111111"));
         let output = &projected["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
         assert_eq!(output["traceId"], "0123456789abcdef0123456789abcdef");
-        assert_eq!(output["spanId"], "2222222222222222");
+        assert_eq!(output["spanId"], &sha256(b"runtime-imported")[..16]);
         assert_eq!(output["parentSpanId"], "1111111111111111");
         assert_eq!(output["startTimeUnixNano"], "100");
         assert_eq!(output["endTimeUnixNano"], "200");
@@ -725,20 +888,20 @@ mod tests {
         let trace_id = "0123456789abcdef0123456789abcdef";
         let root = json!({
             "span_id":"runtime-root",
-            "trace_context":{"trace_id":trace_id,"span_id":"1111111111111111"},
+            "trace_context":{"trace_id":trace_id,"span_id":"1111111111111111","session_id":"session-1","task_session_id":"task-1"},
             "span_kind":"task_root","name":"task","status":"completed",
             "started_at":"100","finished_at":"400","raw_capture_refs":["root"]
         });
         let child = json!({
             "span_id":"runtime-inference",
-            "trace_context":{"trace_id":trace_id,"span_id":"2222222222222222"},
+            "trace_context":{"trace_id":trace_id,"span_id":"2222222222222222","session_id":"session-1","task_session_id":"task-1"},
             "span_kind":"inference","name":"model_inference","status":"completed",
             "started_at":"200","finished_at":"300","raw_capture_refs":["inference"]
         });
         let interaction = json!({
             "interaction_id":"interaction-1",
             "protocol":{"endpoint":"responses"},
-            "trace_context":{"trace_id":trace_id,"task_session_id":"task-1"},
+            "trace_context":{"trace_id":trace_id,"session_id":"session-1","task_session_id":"task-1"},
             "request":{"model":"model","input_items":[]},
             "response":{"id":"resp-1","model":"model","status":"completed","output_items":[]},
             "model_tool_calls":[],
@@ -748,9 +911,9 @@ mod tests {
         });
         let links = vec![
             json!({
-                "relation":"runtime_parent_to_child",
+                "relation":"runtime_parent_to_interaction",
                 "from":"runtime-span:runtime-root",
-                "to":"runtime-span:runtime-inference"
+                "to":"interaction:interaction-1"
             }),
             json!({
                 "relation":"interaction_to_runtime_span",
@@ -766,6 +929,34 @@ mod tests {
         assert_eq!(hierarchy.resolved_internal_parents, 2);
         assert_eq!(hierarchy.resolved_internal_parent_rate, 1.0);
         assert!(hierarchy.missing_parent_nodes.is_empty());
+        for record in &records {
+            let attributes = record["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+                .as_array()
+                .unwrap();
+            let keys: BTreeSet<&str> = attributes
+                .iter()
+                .filter_map(|attribute| attribute["key"].as_str())
+                .collect();
+            assert!(keys.contains("openinference.span.kind"));
+            assert!(keys.contains("session.id"));
+        }
+    }
+
+    #[test]
+    fn otlp_export_accepts_multiple_turn_traces_with_one_root_each() {
+        let roots = ["turn-a", "turn-b"].map(|turn| {
+            json!({
+                "span_id":format!("root-{turn}"),
+                "trace_context":{"session_id":"session-1","root_turn_id":turn},
+                "span_kind":"task_root","name":"turn","status":"completed",
+                "started_at":"100","finished_at":"200","raw_capture_refs":[turn]
+            })
+        });
+        let (records, hierarchy) = project_otlp_tree(&[], &roots, &[]).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(hierarchy.root_spans, 2);
+        assert_eq!(hierarchy.resolved_internal_parent_rate, 1.0);
+        assert!(verify_otlp_tree(&records).is_ok());
     }
 
     #[test]

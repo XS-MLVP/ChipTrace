@@ -872,13 +872,19 @@ fn validate_record_type(object: &Map<String, Value>) -> Result<()> {
         if source_namespace.is_none() {
             bail!("{record_type} requires a non-empty sourceNamespace");
         }
-        let task_session_id = object
-            .get("traceContext")
-            .and_then(|trace| trace.get("task_session_id"))
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty());
-        if task_session_id.is_none() {
-            bail!("{record_type} requires traceContext.task_session_id");
+        let trace = object.get("traceContext").and_then(Value::as_object);
+        let session_identity = trace.and_then(|trace| {
+            ["task_session_id", "session_id", "thread_id"]
+                .into_iter()
+                .find_map(|field| {
+                    trace
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                })
+        });
+        if session_identity.is_none() {
+            bail!("{record_type} requires traceContext.task_session_id, session_id, or thread_id");
         }
     }
     match record_type {
@@ -1098,6 +1104,7 @@ fn validate_lifecycle_event(object: &Map<String, Value>) -> Result<()> {
                 | "aborted"
                 | "abandoned"
                 | "incomplete"
+                | "unknown"
         ) {
             bail!("unsupported terminal lifecycleEvent.status {status:?}");
         }
@@ -1600,6 +1607,7 @@ fn validate_trace_context(object: &Map<String, Value>) -> Result<()> {
         "task_id",
         "root_session_id",
         "parent_session_id",
+        "parent_thread_id",
         "goal_id",
         "root_turn_id",
         "turn_id",

@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+
+if [ -n "${CHIPTRACE_BIN:-}" ]; then
+  CHIPTRACE_EXECUTABLE="${CHIPTRACE_BIN}"
+elif [ -x "${HOME:-}/.local/bin/chiptrace" ]; then
+  CHIPTRACE_EXECUTABLE="${HOME}/.local/bin/chiptrace"
+else
+  CHIPTRACE_EXECUTABLE="chiptrace"
+fi
+if [ -n "${CHIPTRACE_STATE_ROOT:-}" ]; then
+  CHIPTRACE_LOCAL_STATE="${CHIPTRACE_STATE_ROOT}"
+elif [ -n "${XDG_STATE_HOME:-}" ]; then
+  CHIPTRACE_LOCAL_STATE="${XDG_STATE_HOME}/chiptrace"
+else
+  : "${HOME:?HOME is required when XDG_STATE_HOME is unset}"
+  CHIPTRACE_LOCAL_STATE="${HOME}/.local/state/chiptrace"
+fi
+
+exec "${CHIPTRACE_EXECUTABLE}" codex-hook-spool \
+  --queue-root "${CHIPTRACE_LOCAL_STATE}/outbox"

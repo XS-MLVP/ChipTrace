@@ -1,5 +1,9 @@
 # 交付验收矩阵
 
+> 本文中 `codex-run`、patched Codex、Harness 与 bundle canary 仅记录历史兼容验证，
+> 不代表当前生产接入。当前唯一生产验收路径是 Stock Codex + Plugin + Wire；历史 100 分
+> 不能替代真实 Stock Codex canary。
+
 ChipTrace 将原始采集、轨迹组装、质量评分和采购交付拆成四个可独立复验的层。
 每层只声明自己能证明的事实，不用传输完整性替代轨迹语义，也不用结构分替代任务
 正确性。

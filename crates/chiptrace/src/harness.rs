@@ -8,7 +8,7 @@
 //! after a complete Relay acknowledgement, so a crash or a lost response is
 //! recovered by replaying the same deterministic Capture IDs.
 
-use crate::delivery::{DeliveryConfig, DeliveryTarget, deliver_batch};
+use crate::delivery::{DeliveryConfig, DeliveryTarget, deliver_batch, producer_relay_target};
 use crate::producer::{
     DETERMINISTIC_CAPTURE_IDENTITY, PRODUCER_EVENT_SCHEMA_VERSION, prepare_producer_capture,
 };
@@ -903,7 +903,7 @@ impl Harness {
             bail!("harness delivery requires at least 20 retry attempts");
         }
         let delivery_target = match target {
-            HarnessTarget::Relay(url) => DeliveryTarget::ProducerRelay(url),
+            HarnessTarget::Relay(url) => producer_relay_target(url)?,
             HarnessTarget::Jsonl(path) => DeliveryTarget::Jsonl(path),
         };
         let mut summary = FlushSummary::default();

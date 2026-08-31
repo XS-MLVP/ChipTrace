@@ -1,6 +1,7 @@
 use crate::capture::{extract_body, validate_stored_capture};
 use crate::jsonl::{JsonlWriter, absolute_path, ensure_safe_relative_path, sha256_file, utc_now};
 use crate::schema::{FileManifest, RAW_LINEAGE_SCHEMA_VERSION, RawSourceLineage};
+use crate::tool_registry::canonical_runtime_tool_name;
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -1141,6 +1142,37 @@ fn trace_context(capture: &Value) -> Value {
     context
 }
 
+fn trace_string<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
+    value
+        .pointer(&format!("/traceContext/{field}"))
+        .or_else(|| value.pointer(&format!("/trace_context/{field}")))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn source_namespace(value: &Value) -> &str {
+    string_field(value, "sourceNamespace")
+        .or_else(|| {
+            value
+                .pointer("/trace_context/source_namespace")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .pointer("/provenance/source_namespace")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("default")
+}
+
+fn runtime_thread_key(value: &Value, thread_id: &str) -> String {
+    format!(
+        "{}\0{}\0{thread_id}",
+        source_namespace(value),
+        trace_string(value, "session_id").unwrap_or("")
+    )
+}
+
 fn raw_capture_ref(capture: &Value) -> Value {
     json!({
         "capture_id":string_field(capture, "captureId"),
@@ -1568,8 +1600,8 @@ fn runtime_integrity(
         .collect();
     let root_complete = applicable
         && unscoped_span_ids.is_empty()
-        && task_scopes.len() == 1
-        && root_spans.len() == 1
+        && !task_scopes.is_empty()
+        && root_spans.len() == task_scopes.len()
         && root_task_scopes == task_scopes
         && root_spans.iter().all(|span| {
             span.pointer("/extensions/root_complete")
@@ -2141,23 +2173,89 @@ fn responses_input_items(value: Option<&Value>) -> Vec<Value> {
 }
 
 fn request_tool_definitions(request: &Map<String, Value>) -> Vec<Value> {
-    ["tools", "additional_tools"]
+    let mut definitions = Vec::new();
+    for field in ["tools", "additional_tools"] {
+        for tool in request
+            .get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            collect_request_tool_definitions(tool, None, &mut definitions);
+        }
+    }
+    for item in request
+        .get("input")
+        .and_then(Value::as_array)
         .into_iter()
-        .filter_map(|field| request.get(field).and_then(Value::as_array))
         .flatten()
-        .enumerate()
-        .map(|(index, tool)| {
-            let nested = tool.get("function").unwrap_or(tool);
-            json!({
-                "index":index,
-                "name":nested.get("name"),
-                "description":nested.get("description"),
-                "parameters":nested.get("parameters"),
-                "tool_type":tool.get("type"),
-                "raw":tool,
-            })
-        })
-        .collect()
+        .filter(|item| string_field(item, "type") == Some("additional_tools"))
+    {
+        for field in ["tools", "additional_tools", "definitions"] {
+            for tool in item
+                .get(field)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                collect_request_tool_definitions(tool, None, &mut definitions);
+            }
+        }
+    }
+    for (index, definition) in definitions.iter_mut().enumerate() {
+        definition["index"] = json!(index);
+    }
+    definitions
+}
+
+fn collect_request_tool_definitions(
+    value: &Value,
+    inherited_namespace: Option<&str>,
+    output: &mut Vec<Value>,
+) {
+    let container_namespace = if string_field(value, "type") == Some("namespace") {
+        string_field(value, "name").or(inherited_namespace)
+    } else {
+        string_field(value, "namespace").or(inherited_namespace)
+    };
+    let mut children_found = false;
+    for field in ["tools", "additional_tools", "definitions"] {
+        for child in value
+            .get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            children_found = true;
+            collect_request_tool_definitions(child, container_namespace, output);
+        }
+    }
+    if children_found
+        && (string_field(value, "type") == Some("namespace")
+            || value.get("parameters").is_none()
+                && value.get("input_schema").is_none()
+                && value.get("format").is_none())
+    {
+        return;
+    }
+
+    let nested = value.get("function").unwrap_or(value);
+    let namespace = string_field(nested, "runtime_namespace")
+        .or_else(|| string_field(nested, "namespace"))
+        .or_else(|| string_field(value, "namespace"))
+        .or(inherited_namespace);
+    let name =
+        string_field(nested, "name").map(|name| canonical_runtime_tool_name(namespace, name));
+    output.push(json!({
+        "index":0,
+        "name":name,
+        "description":nested.get("description"),
+        "parameters":nested.get("parameters").or_else(|| nested.get("input_schema")),
+        "format":nested.get("format"),
+        "namespace":namespace,
+        "tool_type":value.get("type"),
+        "raw":value,
+    }));
 }
 
 fn responses_model_tool_calls(items: &[Value]) -> Vec<Value> {
@@ -2171,10 +2269,13 @@ fn responses_model_tool_calls(items: &[Value]) -> Vec<Value> {
             )
         })
         .map(|(index, item)| {
+            let name = item.get("name").and_then(Value::as_str).map(|name| {
+                canonical_runtime_tool_name(item.get("namespace").and_then(Value::as_str), name)
+            });
             json!({
                 "call_id":item.get("call_id").or_else(|| item.get("id")),
                 "item_id":item.get("id"),
-                "name":item.get("name"),
+                "name":name,
                 "arguments":item.get("arguments").or_else(|| item.get("input")),
                 "choice_index":Value::Null,
                 "output_index":index,
@@ -2651,14 +2752,95 @@ fn append_delta(output: &mut String, value: Option<&Value>) {
     }
 }
 
+#[derive(Debug, Default)]
+struct RuntimeScopeIndex {
+    root_turns_by_thread: HashMap<String, BTreeSet<String>>,
+}
+
+impl RuntimeScopeIndex {
+    fn new(captures: &[Value]) -> Self {
+        let mut index = Self::default();
+        for capture in captures {
+            let Some(root_turn_id) = capture
+                .pointer("/traceContext/root_turn_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            let Some(thread_id) = capture
+                .pointer("/traceContext/thread_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            index
+                .root_turns_by_thread
+                .entry(runtime_thread_key(capture, thread_id))
+                .or_default()
+                .insert(root_turn_id.to_owned());
+        }
+        index
+    }
+
+    fn scope(&self, value: &Value) -> Option<(&'static str, String)> {
+        if let Some(task_session_id) = trace_string(value, "task_session_id") {
+            return Some(("task", task_session_id.to_owned()));
+        }
+        if let Some(root_turn_id) = trace_string(value, "root_turn_id") {
+            return Some(("turn", root_turn_id.to_owned()));
+        }
+        if let Some(parent_thread_id) = trace_string(value, "parent_thread_id") {
+            let candidates = self
+                .root_turns_by_thread
+                .get(&runtime_thread_key(value, parent_thread_id))?;
+            if candidates.len() == 1 {
+                return candidates
+                    .iter()
+                    .next()
+                    .cloned()
+                    .map(|value| ("turn", value));
+            }
+            return None;
+        }
+        trace_string(value, "turn_id").map(|value| ("turn", value.to_owned()))
+    }
+
+    fn key(&self, value: &Value) -> Option<String> {
+        let (kind, identity) = self.scope(value)?;
+        Some(format!("{}\0{kind}:{identity}", source_namespace(value)))
+    }
+
+    fn trace_context(&self, capture: &Value, child: bool) -> Value {
+        let mut context = if child {
+            child_trace_context(capture)
+        } else {
+            trace_context(capture)
+        };
+        if let Some(("turn", root_turn_id)) = self.scope(capture)
+            && context
+                .get("root_turn_id")
+                .is_none_or(|value| value.is_null())
+        {
+            context["root_turn_id"] = json!(root_turn_id);
+        }
+        context
+    }
+}
+
 fn build_runtime_spans(captures: &[Value]) -> Result<Vec<Value>> {
-    let mut spans = build_task_root_spans(captures)?;
-    spans.extend(build_tool_runtime_spans(captures)?);
-    spans.extend(build_native_runtime_spans(captures)?);
+    let scope_index = RuntimeScopeIndex::new(captures);
+    let mut spans = build_task_root_spans(captures, &scope_index)?;
+    spans.extend(build_tool_runtime_spans(captures, &scope_index)?);
+    spans.extend(build_native_runtime_spans(captures, &scope_index)?);
     Ok(spans)
 }
 
-fn build_task_root_spans(captures: &[Value]) -> Result<Vec<Value>> {
+fn build_task_root_spans(
+    captures: &[Value],
+    scope_index: &RuntimeScopeIndex,
+) -> Result<Vec<Value>> {
     let mut groups: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
     for capture in captures {
         let Some(event) = capture.get("lifecycleEvent") else {
@@ -2668,18 +2850,17 @@ fn build_task_root_spans(captures: &[Value]) -> Result<Vec<Value>> {
         if !is_task_root_start(event_type) && !is_task_root_terminal(event_type) {
             continue;
         }
-        let Some(task_session_id) = capture
-            .pointer("/traceContext/task_session_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        else {
+        let stock_turn_root = matches!(event_type, "turn_start" | "turn_end")
+            && trace_string(capture, "parent_thread_id").is_none();
+        let explicit_task_root = trace_string(capture, "task_session_id").is_some()
+            && !matches!(event_type, "turn_start" | "turn_end");
+        if !stock_turn_root && !explicit_task_root {
+            continue;
+        }
+        let Some(scope) = scope_index.key(capture) else {
             continue;
         };
-        let namespace = string_field(capture, "sourceNamespace").unwrap_or("default");
-        groups
-            .entry(format!("{namespace}\0{task_session_id}"))
-            .or_default()
-            .push(capture);
+        groups.entry(scope).or_default().push(capture);
     }
 
     let mut spans = Vec::new();
@@ -2710,10 +2891,9 @@ fn build_task_root_spans(captures: &[Value]) -> Result<Vec<Value>> {
             .or_else(|| observations.first().copied())
             .context("task root group is empty")?;
         let selected = terminals.last().copied().unwrap_or(first);
-        let task_session_id = first
-            .pointer("/traceContext/task_session_id")
-            .and_then(Value::as_str)
-            .context("task root has no task_session_id")?;
+        let (scope_kind, scope_id) = scope_index
+            .scope(first)
+            .context("task root has no canonical runtime scope")?;
         let namespace = string_field(first, "sourceNamespace").unwrap_or("default");
         let trace_ids: BTreeSet<&str> = observations
             .iter()
@@ -2744,7 +2924,7 @@ fn build_task_root_spans(captures: &[Value]) -> Result<Vec<Value>> {
         let root_complete = starts.len() == 1
             && terminals.len() == 1
             && trace_ids.len() <= 1
-            && native_span_ids.len() == 1
+            && native_span_ids.len() <= 1
             && terminal_statuses.len() == 1;
         let status = terminals
             .last()
@@ -2761,10 +2941,10 @@ fn build_task_root_spans(captures: &[Value]) -> Result<Vec<Value>> {
             .collect();
         spans.push(json!({
             "schema_version":RUNTIME_SPAN_SCHEMA_VERSION,
-            "span_id":stable_id("runtime-span", &[namespace, task_session_id, "task_root"]),
-            "trace_context":trace_context(selected),
+            "span_id":stable_id("runtime-span", &[namespace, scope_kind, &scope_id, "task_root"]),
+            "trace_context":scope_index.trace_context(selected, false),
             "span_kind":"task_root",
-            "name":"task",
+            "name":if scope_kind == "turn" {"turn"} else {"task"},
             "call_id":Value::Null,
             "parent_call_id":Value::Null,
             "parent_span_id":Value::Null,
@@ -2791,6 +2971,8 @@ fn build_task_root_spans(captures: &[Value]) -> Result<Vec<Value>> {
                 "root_complete":root_complete,
                 "start_observations":starts.len(),
                 "terminal_observations":terminals.len(),
+                "scope_kind":scope_kind,
+                "scope_id":scope_id,
                 "lifecycle":observations.iter().filter_map(|capture| capture.get("lifecycleEvent")).cloned().collect::<Vec<_>>(),
             },
         }));
@@ -2799,7 +2981,7 @@ fn build_task_root_spans(captures: &[Value]) -> Result<Vec<Value>> {
 }
 
 fn is_task_root_start(event_type: &str) -> bool {
-    matches!(event_type, "task_start" | "session_start")
+    matches!(event_type, "task_start" | "session_start" | "turn_start")
 }
 
 fn is_task_root_terminal(event_type: &str) -> bool {
@@ -2814,6 +2996,7 @@ fn is_task_root_terminal(event_type: &str) -> bool {
             | "canceled"
             | "terminated"
             | "aborted"
+            | "turn_end"
     ) || event_type.starts_with("task_cancel")
         || event_type.starts_with("session_cancel")
 }
@@ -2848,7 +3031,10 @@ fn deduplicate_runtime_spans(spans: &mut Vec<Value>) -> Result<()> {
     Ok(())
 }
 
-fn build_tool_runtime_spans(captures: &[Value]) -> Result<Vec<Value>> {
+fn build_tool_runtime_spans(
+    captures: &[Value],
+    scope_index: &RuntimeScopeIndex,
+) -> Result<Vec<Value>> {
     let mut groups: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
     for capture in captures {
         let Some(execution) = capture.get("toolExecution") else {
@@ -2858,12 +3044,16 @@ fn build_tool_runtime_spans(captures: &[Value]) -> Result<Vec<Value>> {
             continue;
         };
         let namespace = string_field(capture, "sourceNamespace").unwrap_or("default");
-        let task = capture
-            .pointer("/traceContext/task_session_id")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let scope = scope_index.key(capture).unwrap_or_else(|| {
+            format!(
+                "{namespace}\0unscoped:{}",
+                trace_string(capture, "thread_id")
+                    .or_else(|| trace_string(capture, "turn_id"))
+                    .unwrap_or_else(|| string_field(capture, "captureId").unwrap_or("missing"))
+            )
+        });
         groups
-            .entry(format!("{namespace}\0{task}\0{call_id}"))
+            .entry(format!("{scope}\0{call_id}"))
             .or_default()
             .push(capture);
     }
@@ -2907,17 +3097,10 @@ fn build_tool_runtime_spans(captures: &[Value]) -> Result<Vec<Value>> {
             .iter()
             .filter_map(|capture| string_field(capture, "captureId").map(str::to_owned))
             .collect();
-        let span_id = stable_id(
-            "runtime-span",
-            &[
-                string_field(first, "sourceNamespace").unwrap_or("default"),
-                first
-                    .pointer("/traceContext/task_session_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or(""),
-                call_id,
-            ],
-        );
+        let scope = scope_index
+            .key(first)
+            .unwrap_or_else(|| "unscoped".to_owned());
+        let span_id = stable_id("runtime-span", &[&scope, call_id]);
         let parent_call_id = (parent_call_ids.len() == 1)
             .then(|| parent_call_ids.iter().next().cloned())
             .flatten();
@@ -2925,7 +3108,7 @@ fn build_tool_runtime_spans(captures: &[Value]) -> Result<Vec<Value>> {
         spans.push(json!({
             "schema_version":RUNTIME_SPAN_SCHEMA_VERSION,
             "span_id":span_id,
-            "trace_context":child_trace_context(selected),
+            "trace_context":scope_index.trace_context(selected, true),
             "span_kind":"tool_execution",
             "name":name,
             "call_id":call_id,
@@ -2950,6 +3133,11 @@ fn build_tool_runtime_spans(captures: &[Value]) -> Result<Vec<Value>> {
                 "state_conflict":conflict,
                 "producer":captures.iter().filter_map(|capture| capture.get("producerEvent")).cloned().collect::<Vec<_>>(),
                 "codex":native_runtime_extension(&captures),
+                "schema_provenance":execution.get("schema_provenance")
+                    .or_else(|| execution.pointer("/schema/schema_provenance")),
+                "buyer_schema_eligible":execution.get("schema").is_some_and(|schema| !schema.is_null())
+                    && execution.pointer("/schema/schema_provenance/source_complete")
+                        .and_then(Value::as_bool) != Some(false),
             },
         }));
     }
@@ -2969,7 +3157,10 @@ struct NativeSpanEvent<'a> {
     correlation_keys: BTreeSet<String>,
 }
 
-fn build_native_runtime_spans(captures: &[Value]) -> Result<Vec<Value>> {
+fn build_native_runtime_spans(
+    captures: &[Value],
+    scope_index: &RuntimeScopeIndex,
+) -> Result<Vec<Value>> {
     let mut groups: BTreeMap<String, Vec<NativeSpanEvent<'_>>> = BTreeMap::new();
     for capture in captures {
         if capture.get("toolExecution").is_some() {
@@ -3029,7 +3220,7 @@ fn build_native_runtime_spans(captures: &[Value]) -> Result<Vec<Value>> {
         spans.push(json!({
             "schema_version":RUNTIME_SPAN_SCHEMA_VERSION,
             "span_id":span_id,
-            "trace_context":child_trace_context(selected.capture),
+            "trace_context":scope_index.trace_context(selected.capture, true),
             "span_kind":first.kind,
             "name":first.name,
             "call_id":if first.kind == "inference" { Some(first.source_id.as_str()) } else { None },
@@ -3467,29 +3658,107 @@ fn build_interaction_links(
             }
         }
     }
+
+    let mut roots_by_scope: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for span in runtime_spans
+        .iter()
+        .filter(|span| string_field(span, "span_kind") == Some("task_root"))
+    {
+        if let (Some(scope), Some(span_id)) =
+            (runtime_task_scope(span), string_field(span, "span_id"))
+        {
+            roots_by_scope
+                .entry(scope)
+                .or_default()
+                .insert(span_id.to_owned());
+        }
+    }
+    let parented_interactions: HashSet<String> = links
+        .iter()
+        .filter(|link| string_field(link, "relation") == Some("runtime_parent_to_interaction"))
+        .filter_map(|link| string_field(link, "to"))
+        .map(str::to_owned)
+        .collect();
+    for interaction in interactions {
+        let Some(interaction_id) = string_field(interaction, "interaction_id") else {
+            continue;
+        };
+        let node = format!("interaction:{interaction_id}");
+        if parented_interactions.contains(&node) {
+            continue;
+        }
+        let Some(scope) = runtime_task_scope(interaction) else {
+            continue;
+        };
+        let Some(roots) = roots_by_scope.get(&scope).filter(|roots| roots.len() == 1) else {
+            continue;
+        };
+        let root = roots.iter().next().cloned().unwrap_or_default();
+        links.push(interaction_link(
+            &format!("runtime-span:{root}"),
+            &node,
+            "runtime_parent_to_interaction",
+            json!({"match":"exact_runtime_scope","scope":scope}),
+        ));
+    }
+    let parented_runtime_spans: HashSet<String> = links
+        .iter()
+        .filter(|link| {
+            matches!(
+                string_field(link, "relation"),
+                Some(
+                    "runtime_parent_to_child"
+                        | "model_call_to_runtime_execution"
+                        | "interaction_to_runtime_span"
+                )
+            )
+        })
+        .filter_map(|link| string_field(link, "to"))
+        .map(str::to_owned)
+        .collect();
+    for span in runtime_spans
+        .iter()
+        .filter(|span| string_field(span, "span_kind") != Some("task_root"))
+    {
+        let Some(span_id) = string_field(span, "span_id") else {
+            continue;
+        };
+        let node = format!("runtime-span:{span_id}");
+        if parented_runtime_spans.contains(&node) {
+            continue;
+        }
+        let Some(scope) = runtime_task_scope(span) else {
+            continue;
+        };
+        let Some(roots) = roots_by_scope.get(&scope).filter(|roots| roots.len() == 1) else {
+            continue;
+        };
+        let root = roots.iter().next().cloned().unwrap_or_default();
+        if root != span_id {
+            links.push(interaction_link(
+                &format!("runtime-span:{root}"),
+                &node,
+                "runtime_parent_to_child",
+                json!({"match":"exact_runtime_scope","scope":scope}),
+            ));
+        }
+    }
     let mut seen = BTreeSet::new();
     links.retain(|link| string_field(link, "link_id").is_some_and(|id| seen.insert(id.to_owned())));
     Ok(links)
 }
 
 fn scoped_identity(value: &Value, identity: &str) -> String {
-    let namespace = value
-        .pointer("/trace_context/source_namespace")
-        .or_else(|| value.pointer("/provenance/source_namespace"))
-        .and_then(Value::as_str)
-        .unwrap_or("default");
-    let task = value
-        .pointer("/trace_context/task_session_id")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    format!("{namespace}\0{task}\0{identity}")
+    let scope = trace_string(value, "task_session_id")
+        .map(|value| format!("task:{value}"))
+        .or_else(|| trace_string(value, "root_turn_id").map(|value| format!("turn:{value}")))
+        .or_else(|| trace_string(value, "turn_id").map(|value| format!("turn:{value}")))
+        .unwrap_or_default();
+    format!("{}\0{scope}\0{identity}", source_namespace(value))
 }
 
 fn runtime_span_identity(value: &Value, identity: &str) -> String {
-    let namespace = value
-        .pointer("/trace_context/source_namespace")
-        .and_then(Value::as_str)
-        .unwrap_or("default");
+    let namespace = source_namespace(value);
     let trace = value
         .pointer("/trace_context/trace_id")
         .and_then(Value::as_str)
@@ -3504,20 +3773,21 @@ fn runtime_span_identity(value: &Value, identity: &str) -> String {
                 .pointer("/trace_context/task_session_id")
                 .and_then(Value::as_str)
         })
+        .or_else(|| trace_string(value, "root_turn_id"))
+        .or_else(|| trace_string(value, "turn_id"))
         .unwrap_or("");
     format!("{namespace}\0{trace}\0{identity}")
 }
 
 fn runtime_task_scope(value: &Value) -> Option<String> {
-    let task = value
-        .pointer("/trace_context/task_session_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())?;
-    let namespace = value
-        .pointer("/trace_context/source_namespace")
-        .and_then(Value::as_str)
-        .unwrap_or("default");
-    Some(format!("{namespace}\0{task}"))
+    let (kind, identity) = if let Some(identity) = trace_string(value, "task_session_id") {
+        ("task", identity)
+    } else if let Some(identity) = trace_string(value, "root_turn_id") {
+        ("turn", identity)
+    } else {
+        return None;
+    };
+    Some(format!("{}\0{kind}:{identity}", source_namespace(value)))
 }
 
 fn interaction_link(from: &str, to: &str, relation: &str, evidence: Value) -> Value {
@@ -3569,6 +3839,8 @@ fn attach_runtime_link_refs(interactions: &mut [Value], links: &[Value]) {
 mod tests {
     use super::*;
     use crate::capture::{CAPTURE_SCHEMA_VERSION, normalize_capture};
+    use crate::codex_rollout::{ExportConfig, ExportTarget, export_codex_rollout};
+    use std::time::Duration;
 
     const RESPONSES_NON_STREAM_REQUEST: &str =
         include_str!("../../../fixtures/openai/responses-non-stream-request.json");
@@ -3588,6 +3860,149 @@ mod tests {
         include_str!("../../../fixtures/openai/chat-stream-response.sse");
     const TRACE_ID: &str = "0123456789abcdef0123456789abcdef";
     const ROOT_SPAN_ID: &str = "1111111111111111";
+
+    fn codex_fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/codex")
+            .join(name)
+    }
+
+    async fn export_stock_fixture(
+        fixture_name: &str,
+        root: &Path,
+        output: &Path,
+    ) -> ExportSummaryForTest {
+        fs::create_dir_all(root).unwrap();
+        fs::copy(codex_fixture(fixture_name), root.join("rollout.jsonl")).unwrap();
+        let summary = export_codex_rollout(ExportConfig {
+            input: root.join("rollout.jsonl"),
+            state_root: root.join("state"),
+            target: ExportTarget::Jsonl(output.to_owned()),
+            source_namespace: "stock-golden".to_owned(),
+            tool_registry: None,
+            batch_records: 2,
+            max_envelope_bytes: 4 * 1024 * 1024,
+            request_timeout: Duration::from_secs(1),
+            retry_max_times: 20,
+            task_session_id: None,
+            root_session_id: None,
+            parent_session_id: None,
+            goal_id: None,
+        })
+        .await
+        .unwrap();
+        ExportSummaryForTest {
+            captures: summary.captures_emitted,
+        }
+    }
+
+    struct ExportSummaryForTest {
+        captures: u64,
+    }
+
+    #[tokio::test]
+    async fn stock_rollout_projects_root_and_child_runtime_without_harness() {
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join("captures.jsonl");
+        let root = export_stock_fixture(
+            "stock-rollout-root.jsonl",
+            &temporary.path().join("root"),
+            &output,
+        )
+        .await;
+        let child = export_stock_fixture(
+            "stock-rollout-child.jsonl",
+            &temporary.path().join("child"),
+            &output,
+        )
+        .await;
+        assert_eq!((root.captures, child.captures), (8, 5));
+
+        let (captures, duplicates) = read_captures(&[output]).unwrap();
+        assert_eq!(duplicates, 0);
+        let spans = build_runtime_spans(&captures).unwrap();
+        assert_eq!(spans.len(), 3);
+        let root_span = spans
+            .iter()
+            .find(|span| span["span_kind"] == "task_root")
+            .unwrap();
+        assert_eq!(root_span["trace_context"]["session_id"], "session-root");
+        assert_eq!(root_span["trace_context"]["root_turn_id"], "turn-root");
+        assert_eq!(root_span["status"], "completed");
+        assert_eq!(root_span["extensions"]["root_complete"], true);
+
+        let tools: Vec<&Value> = spans
+            .iter()
+            .filter(|span| span["span_kind"] == "tool_execution")
+            .collect();
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().all(|span| {
+            span["trace_context"]["root_turn_id"] == "turn-root"
+                && span["extensions"]["buyer_schema_eligible"] == false
+        }));
+        let root_tool = tools
+            .iter()
+            .find(|span| span["call_id"] == "runtime-command-1")
+            .unwrap();
+        assert_eq!(root_tool["parent_call_id"], "call-outer-exec");
+        assert_eq!(root_tool["status"], "failed");
+        let child_tool = tools
+            .iter()
+            .find(|span| span["call_id"] == "runtime-command-child")
+            .unwrap();
+        assert_eq!(
+            child_tool["trace_context"]["parent_thread_id"],
+            "thread-root"
+        );
+
+        let integrity = runtime_integrity(&[], &spans, &[]);
+        assert!(integrity.root_complete);
+        assert_eq!(integrity.metrics["unscoped_span_ids"], json!([]));
+    }
+
+    #[test]
+    fn responses_tools_are_collected_recursively_with_reversible_namespaces() {
+        let request = json!({
+            "tools":[{
+                "type":"function",
+                "namespace":"functions",
+                "name":"plain",
+                "description":"Plain tool.",
+                "parameters":{"type":"object","properties":{}}
+            }],
+            "input":[{
+                "type":"additional_tools",
+                "tools":[{
+                    "type":"namespace",
+                    "name":"catalog",
+                    "tools":[
+                        {"type":"function","name":"lookup","description":"Lookup.",
+                         "parameters":{"type":"object","properties":{}}},
+                        {"type":"custom","name":"query","description":"Query.",
+                         "format":{"type":"grammar","syntax":"lark","definition":"start: WORD"}}
+                    ]
+                }]
+            }]
+        });
+        let definitions = request_tool_definitions(request.as_object().unwrap());
+        assert_eq!(definitions.len(), 3);
+        assert_eq!(definitions[0]["name"], "plain");
+        assert_eq!(definitions[1]["name"], "catalog.lookup");
+        assert_eq!(definitions[2]["name"], "catalog.query");
+        assert_eq!(definitions[2]["format"]["syntax"], "lark");
+        assert_eq!(definitions[2]["raw"]["name"], "query");
+
+        let calls = responses_model_tool_calls(&[json!({
+            "type":"custom_tool_call",
+            "id":"item-1",
+            "call_id":"call-1",
+            "namespace":"catalog",
+            "name":"query",
+            "input":"part-42"
+        })]);
+        assert_eq!(calls[0]["name"], "catalog.query");
+        assert_eq!(calls[0]["arguments"], "part-42");
+    }
 
     fn fixture_capture(
         capture_id: &str,
@@ -4312,7 +4727,9 @@ mod tests {
             "raw_capture_refs":["cap-tool"],
             "extensions":{"state_conflict":false}
         });
-        let mut spans = build_task_root_spans(&[start, end]).unwrap();
+        let captures = [start, end];
+        let scope_index = RuntimeScopeIndex::new(&captures);
+        let mut spans = build_task_root_spans(&captures, &scope_index).unwrap();
         assert_eq!(spans.len(), 1);
         spans.push(child);
         let links = build_interaction_links(&[], &spans, &[]).unwrap();

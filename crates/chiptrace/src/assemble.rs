@@ -841,7 +841,7 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     annotate_tool_call_statuses(&mut expanded_messages);
     let mut expanded_view = messages.clone();
     let code_mode_message_projection =
-        exclude_code_mode_parent_messages(&mut expanded_view, &code_mode_parent_call_ids);
+        preserve_code_mode_parent_messages(&expanded_view, &code_mode_parent_call_ids);
     expanded_view.extend(expanded_messages.iter().cloned());
     let (schema_conflicts, uncalled_schema_conflicts) =
         partition_schema_conflicts(&expanded_view, &expanded_schema_conflicts);
@@ -1026,7 +1026,8 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
             "buyer_v7_codex_runtime_expanded": {
                 "schema_version":"chiptrace.session-quality-projection.v1",
                 "profile_version":"buyer-v7-codex-runtime-expanded",
-                "excluded_model_call_ids":code_mode_parent_call_ids,
+                "excluded_model_call_ids":[],
+                "parent_model_call_ids":code_mode_parent_call_ids,
                 "runtime_messages":expanded_messages,
                 "runtime_tools":expanded_tools,
                 "code_mode_audit":code_mode_message_projection,
@@ -1147,61 +1148,38 @@ fn native_code_mode_parent_call_ids(captures: &[ParsedCapture]) -> BTreeSet<Stri
         .collect()
 }
 
-fn exclude_code_mode_parent_messages(
-    messages: &mut Vec<Value>,
+fn preserve_code_mode_parent_messages(
+    messages: &[Value],
     parent_call_ids: &BTreeSet<String>,
 ) -> Value {
-    let mut excluded_tool_calls = 0_u64;
-    let mut excluded_tool_results = 0_u64;
-    let mut excluded_empty_messages = 0_u64;
-    let mut projected = Vec::with_capacity(messages.len());
-
-    for mut message in messages.drain(..) {
-        let role = string_field(&message, "role").unwrap_or("");
-        if role == "tool"
-            && string_field(&message, "tool_call_id")
+    let observed_parent_tool_calls = messages
+        .iter()
+        .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
+        .flatten()
+        .filter(|call| {
+            string_field(call, "id").is_some_and(|call_id| parent_call_ids.contains(call_id))
+        })
+        .count();
+    let observed_parent_tool_results = messages
+        .iter()
+        .filter(|message| string_field(message, "role") == Some("tool"))
+        .filter(|message| {
+            string_field(message, "tool_call_id")
                 .is_some_and(|call_id| parent_call_ids.contains(call_id))
-        {
-            excluded_tool_results = excluded_tool_results.saturating_add(1);
-            continue;
-        }
-
-        let mut removed_from_message = 0_u64;
-        if role == "assistant"
-            && let Some(object) = message.as_object_mut()
-            && let Some(calls) = object.get_mut("tool_calls").and_then(Value::as_array_mut)
-        {
-            let before = calls.len();
-            calls.retain(|call| {
-                !string_field(call, "id").is_some_and(|call_id| parent_call_ids.contains(call_id))
-            });
-            removed_from_message = before.saturating_sub(calls.len()) as u64;
-            excluded_tool_calls = excluded_tool_calls.saturating_add(removed_from_message);
-            if calls.is_empty() {
-                object.remove("tool_calls");
-            }
-        }
-
-        let became_empty_parent_call = removed_from_message > 0
-            && message.get("content").is_none_or(value_empty)
-            && message.get("reasoning").is_none_or(value_empty)
-            && message.get("thinking").is_none_or(value_empty)
-            && message.get("tool_calls").is_none();
-        if became_empty_parent_call {
-            excluded_empty_messages = excluded_empty_messages.saturating_add(1);
-        } else {
-            projected.push(message);
-        }
-    }
-    *messages = projected;
+        })
+        .count();
 
     json!({
         "schema_version":"chiptrace.code-mode-message-projection.v1",
         "evidence":"codex_rollout_trace_bundle.code_cell_started.model_visible_call_id",
-        "excluded_parent_call_ids":parent_call_ids,
-        "excluded_tool_calls":excluded_tool_calls,
-        "excluded_tool_results":excluded_tool_results,
-        "excluded_empty_messages":excluded_empty_messages,
+        "retained_parent_call_ids":parent_call_ids,
+        "observed_parent_tool_calls":observed_parent_tool_calls,
+        "observed_parent_tool_results":observed_parent_tool_results,
+        "excluded_parent_call_ids":[],
+        "excluded_tool_calls":0,
+        "excluded_tool_results":0,
+        "excluded_empty_messages":0,
+        "model_calls_rewritten":false,
         "raw_runtime_events_retained":true,
     })
 }
@@ -5969,28 +5947,34 @@ mod tests {
             .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
             .flatten()
             .collect();
-        assert_eq!(expanded_calls.len(), 1);
-        assert_eq!(expanded_calls[0]["id"], "inner-call");
-        assert_eq!(expanded_calls[0]["parent_call_id"], "outer-exec");
+        assert_eq!(expanded_calls.len(), 3);
+        assert_eq!(expanded_calls.last().unwrap()["id"], "inner-call");
+        assert_eq!(
+            expanded_calls.last().unwrap()["parent_call_id"],
+            "outer-exec"
+        );
         let expanded_results: Vec<&Value> = expanded["messages"]
             .as_array()
             .unwrap()
             .iter()
             .filter(|message| message["role"] == "tool")
             .collect();
-        assert_eq!(expanded_results.len(), 1);
-        assert_eq!(expanded_results[0]["tool_call_id"], "inner-call");
+        assert_eq!(expanded_results.len(), 3);
         assert_eq!(
-            session["meta"]["code_mode_message_projection"]["excluded_parent_call_ids"],
+            expanded_results.last().unwrap()["tool_call_id"],
+            "inner-call"
+        );
+        assert_eq!(
+            session["meta"]["code_mode_message_projection"]["retained_parent_call_ids"],
             json!(["outer-exec"])
         );
         assert_eq!(
             session["meta"]["code_mode_message_projection"]["excluded_tool_calls"],
-            2
+            0
         );
         assert_eq!(
             session["meta"]["code_mode_message_projection"]["excluded_tool_results"],
-            2
+            0
         );
         assert_eq!(
             session["meta"]["runtime_dag"]["kind_counts"]["code_cell"],
@@ -6000,7 +5984,7 @@ mod tests {
 
     #[test]
     fn custom_tool_call_is_not_filtered_without_native_cell_evidence() {
-        let mut messages = vec![
+        let messages = vec![
             json!({
                 "role":"assistant",
                 "content":"",
@@ -6016,7 +6000,7 @@ mod tests {
                 "content":"observed output"
             }),
         ];
-        let audit = exclude_code_mode_parent_messages(&mut messages, &BTreeSet::new());
+        let audit = preserve_code_mode_parent_messages(&messages, &BTreeSet::new());
         assert_eq!(messages.len(), 2);
         assert_eq!(audit["excluded_tool_calls"], 0);
         assert_eq!(audit["excluded_tool_results"], 0);

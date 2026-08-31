@@ -5,7 +5,7 @@ use crate::sharded::{ShardedCaptureStore, ShardedStoreHealth};
 use crate::store::{CaptureLocator, StoreConfig, SubmitAck, SubmitError, SubmitErrorKind};
 use anyhow::{Context, Result, bail};
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -54,6 +54,9 @@ pub struct RelayConfig {
     pub max_envelope_bytes: usize,
     pub max_inflight_body_bytes: usize,
     pub max_batch_records: usize,
+    /// When set, only producer routes require this bearer token. Raw Wire
+    /// capture routes remain available to the OpenAI-compatible proxy.
+    pub producer_bearer_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +96,7 @@ struct DeliveryCounters {
 #[derive(Debug, Clone, Serialize)]
 pub struct RelayHealth {
     pub ok: bool,
+    pub status: &'static str,
     pub collector_url: String,
     pub local: ShardedStoreHealth,
     pub delivery_records: u64,
@@ -107,6 +111,8 @@ pub struct RelayHealth {
     pub delivery_body_budget_available: usize,
     pub delivery_body_budget_capacity: usize,
     pub conservation_ok: bool,
+    pub backlog_degraded: bool,
+    pub producer_auth_required: bool,
 }
 
 struct DeliveryLedger {
@@ -684,8 +690,13 @@ impl DurableRelay {
             .lock()
             .expect("delivery ledger poisoned")
             .health()?;
+        let conservation_ok = total == pending + inflight + delivered + conflicts + failed;
+        let unsettled = pending.saturating_add(inflight);
+        let backlog_degraded = total >= 32 && unsettled.saturating_mul(10) > total;
+        let ok = local.ok && conservation_ok && conflicts == 0 && failed == 0 && !backlog_degraded;
         Ok(RelayHealth {
-            ok: local.ok && total == pending + inflight + delivered + conflicts + failed,
+            ok,
+            status: if ok { "healthy" } else { "degraded" },
             collector_url: self.inner.config.collector_url.clone(),
             local,
             delivery_records: total,
@@ -699,7 +710,9 @@ impl DurableRelay {
             queue_capacity: self.inner.sender.capacity().unwrap_or(0),
             delivery_body_budget_available: self.inner.delivery_body_budget.available_permits(),
             delivery_body_budget_capacity: self.inner.config.max_delivery_inflight_bytes,
-            conservation_ok: total == pending + inflight + delivered + conflicts + failed,
+            conservation_ok,
+            backlog_degraded,
+            producer_auth_required: self.inner.config.producer_bearer_token.is_some(),
         })
     }
 
@@ -1230,6 +1243,12 @@ async fn relay_captures(State(state): State<RelayAppState>, request: Request) ->
 }
 
 async fn relay_producer_events(State(state): State<RelayAppState>, request: Request) -> Response {
+    if !producer_authorized(&state, &request) {
+        return relay_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"ok":false,"reason":"producer_auth_required"}),
+        );
+    }
     let body = match state.body_budget.read_ndjson(request).await {
         Ok(body) => body,
         Err(error) => return relay_body_error_response(error),
@@ -1336,6 +1355,12 @@ async fn relay_enqueue_batch(state: &RelayAppState, records: Vec<CaptureRecord>)
 }
 
 async fn relay_producer_event(State(state): State<RelayAppState>, request: Request) -> Response {
+    if !producer_authorized(&state, &request) {
+        return relay_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"ok":false,"reason":"producer_auth_required"}),
+        );
+    }
     let body = match state.body_budget.read_json(request).await {
         Ok(body) => body,
         Err(error) => return relay_body_error_response(error),
@@ -1389,7 +1414,16 @@ async fn relay_capture(State(state): State<RelayAppState>, request: Request) -> 
         Ok(body) => body,
         Err(error) => return relay_body_error_response(error),
     };
-    match state.relay.enqueue(&body.bytes).await {
+    let record = match normalize_capture(&body.bytes, state.relay.inner.config.max_envelope_bytes) {
+        Ok(record) => record,
+        Err(error) => {
+            return relay_response(
+                StatusCode::BAD_REQUEST,
+                json!({"ok":false,"reason":"invalid_capture","detail":error.to_string()}),
+            );
+        }
+    };
+    match state.relay.enqueue_record(record).await {
         Ok(ack) => relay_response(
             if ack.duplicate {
                 StatusCode::OK
@@ -1419,6 +1453,33 @@ async fn relay_capture(State(state): State<RelayAppState>, request: Request) -> 
             json!({"ok":false,"reason":"relay_unavailable","detail":error.to_string()}),
         ),
     }
+}
+
+fn producer_authorized(state: &RelayAppState, request: &Request) -> bool {
+    let Some(expected) = state.relay.inner.config.producer_bearer_token.as_deref() else {
+        return true;
+    };
+    let Some(observed) = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    constant_time_equal(expected.as_bytes(), observed.as_bytes())
+}
+
+fn constant_time_equal(expected: &[u8], observed: &[u8]) -> bool {
+    let mut difference = expected.len() ^ observed.len();
+    let length = expected.len().max(observed.len());
+    for index in 0..length {
+        difference |= usize::from(
+            expected.get(index).copied().unwrap_or_default()
+                ^ observed.get(index).copied().unwrap_or_default(),
+        );
+    }
+    difference == 0
 }
 
 async fn relay_health(State(state): State<RelayAppState>) -> Response {
@@ -1505,7 +1566,7 @@ fn relay_body_error_response(error: BodyReadError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
+    use axum::body::{Body, to_bytes};
     use axum::routing::post;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1540,6 +1601,93 @@ mod tests {
             StatusCode::ACCEPTED,
             Json(json!({"ok": true, "durable": true, "results": results})),
         )
+    }
+
+    #[tokio::test]
+    async fn producer_auth_and_invalid_capture_fail_before_retry_queue() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = RelayConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            store: StoreConfig {
+                root: temporary.path().join("outbox"),
+                state_root: temporary.path().join("outbox-state"),
+                segment_max_bytes: 1024 * 1024,
+                segment_max_age: Duration::from_secs(60),
+                queue_items: 64,
+                batch_records: 8,
+                batch_bytes: 1024 * 1024,
+                batch_wait: Duration::from_millis(1),
+                fsync: true,
+            },
+            store_shards: 1,
+            delivery_state_root: temporary.path().join("delivery"),
+            collector_url: "http://127.0.0.1:9".to_owned(),
+            delivery_concurrency: 1,
+            delivery_queue_items: 64,
+            delivery_batch_records: 8,
+            delivery_batch_bytes: 1024 * 1024,
+            delivery_batch_wait: Duration::from_millis(1),
+            max_delivery_inflight_bytes: 4 * 1024 * 1024,
+            request_timeout: Duration::from_millis(50),
+            base_retry_delay: Duration::from_millis(5),
+            max_retry_delay: Duration::from_millis(20),
+            max_connections: 16,
+            max_envelope_bytes: 1024 * 1024,
+            max_inflight_body_bytes: 4 * 1024 * 1024,
+            max_batch_records: 64,
+            producer_bearer_token: Some("test-producer-token-32-bytes-long".to_owned()),
+        };
+        let relay = DurableRelay::open(config).await.unwrap();
+        let state = RelayAppState {
+            relay: relay.clone(),
+            body_budget: InflightBodyBudget::new(4 * 1024 * 1024, 1024 * 1024).unwrap(),
+            max_batch_records: 64,
+        };
+
+        let unauthorized = Request::builder()
+            .header("content-type", "application/x-ndjson")
+            .body(Body::from("{}\n"))
+            .unwrap();
+        assert_eq!(
+            relay_producer_events(State(state.clone()), unauthorized)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let authorized_bad = Request::builder()
+            .header("content-type", "application/x-ndjson")
+            .header(AUTHORIZATION, "Bearer test-producer-token-32-bytes-long")
+            .body(Body::from("{}\n"))
+            .unwrap();
+        assert_eq!(
+            relay_producer_events(State(state.clone()), authorized_bad)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let invalid_capture = Request::builder()
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            relay_capture(State(state), invalid_capture).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let health = relay.health().await.unwrap();
+        assert_eq!(health.delivery_records, 0);
+        assert!(health.producer_auth_required);
+        relay.close().await.unwrap();
+    }
+
+    #[test]
+    fn bearer_comparison_rejects_prefix_suffix_and_length_variants() {
+        assert!(constant_time_equal(b"complete-token", b"complete-token"));
+        assert!(!constant_time_equal(b"complete-token", b"complete"));
+        assert!(!constant_time_equal(
+            b"complete-token",
+            b"complete-token-extra"
+        ));
+        assert!(!constant_time_equal(b"complete-token", b"complete-tokeN"));
     }
 
     #[tokio::test]
@@ -1578,6 +1726,7 @@ mod tests {
             max_envelope_bytes: 1024 * 1024,
             max_inflight_body_bytes: 4 * 1024 * 1024,
             max_batch_records: 32,
+            producer_bearer_token: None,
         };
         let relay = DurableRelay::open(config.clone()).await.unwrap();
         relay

@@ -3,6 +3,7 @@
 *.redb.*
 *.ndjson
 *.jsonl
+!fixtures/codex/*.jsonl
 *.jsonl.zst
 *.tar.gz
 /var/

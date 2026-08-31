@@ -110,6 +110,8 @@ services:
       - "4096"
       - --request-timeout-seconds
       - "30"
+    environment:
+      CHIPTRACE_PRODUCER_TOKEN: ${CHIPTRACE_PRODUCER_TOKEN:?set CHIPTRACE_PRODUCER_TOKEN}
     ports:
       - ${CHIPTRACE_RELAY_BIND:-127.0.0.1:3011}:3012
     volumes:

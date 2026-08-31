@@ -1,5 +1,6 @@
 use crate::capture::normalize_capture;
 use crate::delivery::{DeliveryConfig, DeliveryTarget, deliver_batch};
+use crate::producer::deterministic_codex_rollout_capture_id;
 use crate::tool_registry::{
     LoadedToolRegistry, ToolRegistryEntry, canonical_runtime_tool_name, load_tool_registry,
     registry_entry_identity,
@@ -48,6 +49,7 @@ pub struct ExportConfig {
 pub struct ExportSummary {
     pub input: String,
     pub source_session_id: Option<String>,
+    pub source_thread_id: Option<String>,
     pub source_cli_version: Option<String>,
     pub start_offset: u64,
     pub committed_offset: u64,
@@ -74,26 +76,20 @@ pub struct WatchSummary {
 pub fn resolve_hook_rollout(raw: &[u8], session_root: &Path) -> Result<PathBuf> {
     let input: Value = serde_json::from_slice(raw).context("parse Codex hook input")?;
     if let Some(event) = string(&input, "hook_event_name")
-        && !event.eq_ignore_ascii_case("stop")
+        && !matches!(
+            event,
+            "SessionStart" | "SessionEnd" | "Stop" | "Interrupt" | "SubagentStart" | "SubagentStop"
+        )
     {
-        bail!("Codex rollout hook only accepts Stop events");
+        bail!("unsupported Codex rollout hook event {event}");
+    }
+    if let Some(path) = string(&input, "transcript_path").or_else(|| string(&input, "rollout_path"))
+    {
+        return resolve_rollout_path(Path::new(path), session_root, string(&input, "session_id"));
     }
     let root = session_root
         .canonicalize()
         .with_context(|| format!("resolve Codex session root {}", session_root.display()))?;
-    if let Some(path) = string(&input, "transcript_path").or_else(|| string(&input, "rollout_path"))
-    {
-        let path = PathBuf::from(path)
-            .canonicalize()
-            .with_context(|| format!("resolve hook rollout path {path}"))?;
-        if !path.starts_with(&root) || !path.is_file() {
-            bail!("hook rollout path is outside the configured Codex session root");
-        }
-        if let Some(session_id) = string(&input, "session_id") {
-            verify_rollout_session_id(&path, session_id)?;
-        }
-        return Ok(path);
-    }
     let session_id = string(&input, "session_id")
         .filter(|value| {
             value.len() <= 128
@@ -125,6 +121,26 @@ pub fn resolve_hook_rollout(raw: &[u8], session_root: &Path) -> Result<PathBuf> 
     }
 }
 
+pub fn resolve_rollout_path(
+    path: &Path,
+    session_root: &Path,
+    expected_thread_id: Option<&str>,
+) -> Result<PathBuf> {
+    let root = session_root
+        .canonicalize()
+        .with_context(|| format!("resolve Codex session root {}", session_root.display()))?;
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("resolve hook rollout path {}", path.display()))?;
+    if !path.starts_with(&root) || !path.is_file() {
+        bail!("hook rollout path is outside the configured Codex session root");
+    }
+    if let Some(expected_thread_id) = expected_thread_id {
+        verify_rollout_session_id(&path, expected_thread_id)?;
+    }
+    Ok(path)
+}
+
 fn verify_rollout_session_id(path: &Path, expected: &str) -> Result<()> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut line = String::new();
@@ -132,7 +148,7 @@ fn verify_rollout_session_id(path: &Path, expected: &str) -> Result<()> {
     let value: Value = serde_json::from_str(line.trim_end())?;
     let observed = value
         .get("payload")
-        .and_then(|payload| string(payload, "session_id").or_else(|| string(payload, "id")))
+        .and_then(|payload| string(payload, "id").or_else(|| string(payload, "session_id")))
         .ok_or_else(|| anyhow::anyhow!("Codex rollout first line has no session identity"))?;
     if observed != expected {
         bail!("Codex rollout session identity does not match hook input");
@@ -144,6 +160,7 @@ fn verify_rollout_session_id(path: &Path, expected: &str) -> Result<()> {
 #[serde(default)]
 struct RolloutContext {
     source_session_id: Option<String>,
+    source_thread_id: Option<String>,
     source_cli_version: Option<String>,
     model_provider: Option<String>,
     system_prompt: Option<String>,
@@ -154,6 +171,7 @@ struct RolloutContext {
     agent_path: Option<String>,
     thread_source: Option<String>,
     model_tool_calls: BTreeMap<String, ObservedModelToolCall>,
+    open_code_mode_calls: BTreeMap<String, ObservedModelToolCall>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,15 +281,26 @@ struct ProjectedLine {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeCallCorrelation {
     Matched,
+    CodeModeChild,
+    AmbiguousCodeMode,
     MissingRegistry,
     MissingModelCall,
     ToolNameMismatch,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeProjection<'a> {
+    registry_entry: Option<(&'a LoadedRegistry, &'a ToolRegistryEntry)>,
+    correlation: Option<RuntimeCallCorrelation>,
+    parent_call_id: Option<&'a str>,
 }
 
 impl RuntimeCallCorrelation {
     fn label(self) -> &'static str {
         match self {
             Self::Matched => "matched_model_call",
+            Self::CodeModeChild => "code_mode_child",
+            Self::AmbiguousCodeMode => "ambiguous_code_mode_parent",
             Self::MissingRegistry => "missing_registry",
             Self::MissingModelCall => "missing_model_call",
             Self::ToolNameMismatch => "tool_name_mismatch",
@@ -279,7 +308,7 @@ impl RuntimeCallCorrelation {
     }
 
     fn is_matched(self) -> bool {
-        self == Self::Matched
+        matches!(self, Self::Matched | Self::CodeModeChild)
     }
 }
 
@@ -402,6 +431,7 @@ pub async fn export_codex_rollout(config: ExportConfig) -> Result<ExportSummary>
     checkpoint_store.save(&source_key, &batch_checkpoint)?;
     summary.committed_offset = batch_checkpoint.committed_offset;
     summary.source_session_id = batch_checkpoint.context.source_session_id.clone();
+    summary.source_thread_id = batch_checkpoint.context.source_thread_id.clone();
     summary.source_cli_version = batch_checkpoint.context.source_cli_version.clone();
     if summary.committed_offset > file_len {
         bail!("Codex rollout checkpoint advanced beyond the source file");
@@ -462,6 +492,7 @@ fn merge_export_summary(aggregate: &mut Option<ExportSummary>, cycle: ExportSumm
     };
     output.input = cycle.input;
     output.source_session_id = cycle.source_session_id;
+    output.source_thread_id = cycle.source_thread_id;
     output.source_cli_version = cycle.source_cli_version;
     output.committed_offset = cycle.committed_offset;
     output.lines_read = output.lines_read.saturating_add(cycle.lines_read);
@@ -515,16 +546,30 @@ fn project_event(
     let payload = event.get("payload").unwrap_or(&Value::Null);
     let event_type = string(payload, "type").unwrap_or("");
     if top_type == "session_meta" {
+        context.source_thread_id = string(payload, "id")
+            .or_else(|| string(payload, "session_id"))
+            .map(str::to_owned);
         context.source_session_id = string(payload, "session_id")
-            .or_else(|| string(payload, "id"))
+            .or(context.source_thread_id.as_deref())
             .map(str::to_owned);
         context.source_cli_version = string(payload, "cli_version").map(str::to_owned);
         context.model_provider = string(payload, "model_provider").map(str::to_owned);
-        context.system_prompt = string(payload, "base_instructions").map(str::to_owned);
-        context.parent_agent_thread_id = string(payload, "parent_thread_id").map(str::to_owned);
-        context.agent_path = string(payload, "agent_path").map(str::to_owned);
+        context.system_prompt = instruction_text(payload.get("base_instructions"));
+        context.parent_agent_thread_id = string(payload, "parent_thread_id")
+            .or_else(|| {
+                payload
+                    .pointer("/source/subagent/thread_spawn/parent_thread_id")
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_owned);
+        context.agent_path = string(payload, "agent_path")
+            .or_else(|| {
+                payload
+                    .pointer("/source/subagent/thread_spawn/agent_path")
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_owned);
         context.thread_source = string(payload, "thread_source").map(str::to_owned);
-        return Ok(metadata_projection());
     }
     if top_type == "turn_context" {
         context.producer_model = string(payload, "model").map(str::to_owned);
@@ -555,26 +600,29 @@ fn project_event(
         top_type == "event_msg" && matches!(event_type, "web_search_begin" | "web_search_end");
     let tool_like = completed_runtime_tool || legacy_web_tool;
     let known = known_event(top_type, event_type, item_type);
-    if turn_id.is_none() && known && !tool_like {
-        return Ok(metadata_projection());
-    }
     let session_id = context
         .source_session_id
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Codex rollout event precedes session_meta"))?;
+    let thread_id = context
+        .source_thread_id
+        .clone()
+        .unwrap_or_else(|| session_id.clone());
     if top_type == "response_item" {
         remember_model_tool_call(context, payload, event_type, ordinal, turn_id.as_deref());
     }
     let registry_match = completed_runtime_tool
         .then(|| matching_registry_entry(payload, context, registry))
         .flatten();
-    let runtime_correlation =
-        completed_runtime_tool.then(|| runtime_call_correlation(payload, context, registry_match));
-    let unmapped_tool = tool_like
-        && (registry_match.is_none()
-            || runtime_correlation.is_some_and(|correlation| !correlation.is_matched()));
+    let runtime_correlation = completed_runtime_tool
+        .then(|| runtime_call_correlation(payload, context, registry_match, turn_id.as_deref()));
+    let runtime_parent_call_id = completed_runtime_tool
+        .then(|| runtime_parent_call_id(payload, context, runtime_correlation))
+        .flatten();
+    let unmapped_tool =
+        tool_like && runtime_correlation.is_none_or(|correlation| !correlation.is_matched());
     let source_digest = sha256(source_line.as_bytes());
-    let capture_id = deterministic_capture_id(&session_id, ordinal);
+    let capture_id = deterministic_capture_id(&thread_id, ordinal);
     let timestamp = string(event, "timestamp").unwrap_or("").to_owned();
     let mut field_evidence = Vec::new();
     if let Some(turn_id) = turn_id.as_deref() {
@@ -610,12 +658,13 @@ fn project_event(
         "producerModel":context.producer_model,
         "runtimeProvider":context.model_provider,
         "systemPrompt":context.system_prompt,
-        "traceContext":trace_context(&session_id, turn_id.as_deref(), config),
+        "traceContext":trace_context(context, turn_id.as_deref(), config),
         "fieldEvidence":field_evidence,
         "rolloutEvent":{
             "schema_version":CODEX_ROLLOUT_SCHEMA_VERSION,
             "source":"codex_rollout_jsonl",
             "source_session_id":session_id,
+            "source_thread_id":thread_id,
             "source_ordinal":ordinal,
             "source_cli_version":context.source_cli_version,
             "source_line":source_line,
@@ -633,7 +682,14 @@ fn project_event(
             "thread_source":context.thread_source,
         }
     });
-    let mut kind = ProjectionKind::Raw;
+    let mut kind = if matches!(
+        top_type,
+        "session_meta" | "turn_context" | "world_state" | "inter_agent_communication_metadata"
+    ) {
+        ProjectionKind::Metadata
+    } else {
+        ProjectionKind::Raw
+    };
     let mut clear_active_turn = false;
     if top_type == "event_msg" {
         match event_type {
@@ -693,8 +749,11 @@ fn project_event(
                     &mut capture,
                     payload,
                     item_type,
-                    registry_match,
-                    runtime_correlation,
+                    RuntimeProjection {
+                        registry_entry: registry_match,
+                        correlation: runtime_correlation,
+                        parent_call_id: runtime_parent_call_id.as_deref(),
+                    },
                     &timestamp,
                     ordinal,
                 )?;
@@ -748,6 +807,15 @@ fn project_event(
         );
         kind = ProjectionKind::Lifecycle;
     }
+    if top_type == "response_item"
+        && matches!(
+            event_type,
+            "custom_tool_call_output" | "function_call_output"
+        )
+        && let Some(call_id) = string(payload, "call_id")
+    {
+        context.open_code_mode_calls.remove(call_id);
+    }
     Ok(ProjectedLine {
         capture: Some(capture),
         kind,
@@ -757,28 +825,20 @@ fn project_event(
     })
 }
 
-fn metadata_projection() -> ProjectedLine {
-    ProjectedLine {
-        capture: None,
-        kind: ProjectionKind::Metadata,
-        unknown: false,
-        unmapped_tool: false,
-        clear_active_turn: false,
-    }
-}
-
-fn trace_context(session_id: &str, turn_id: Option<&str>, config: &ExportConfig) -> Value {
+fn trace_context(context: &RolloutContext, turn_id: Option<&str>, config: &ExportConfig) -> Value {
     json!({
         "task_session_id":config.task_session_id,
-        "session_id":session_id,
-        "thread_id":session_id,
+        "session_id":context.source_session_id,
+        "thread_id":context.source_thread_id,
         "root_session_id":config.root_session_id,
         "parent_session_id":config.parent_session_id,
         "goal_id":config.goal_id,
-        "root_turn_id":Value::Null,
+        "root_turn_id":if context.parent_agent_thread_id.is_none() {turn_id} else {None},
         "turn_id":turn_id,
         "agent_id":Value::Null,
+        "agent_path":context.agent_path,
         "branch_id":Value::Null,
+        "parent_thread_id":context.parent_agent_thread_id,
     })
 }
 
@@ -805,8 +865,7 @@ fn project_completed_item(
     capture: &mut Value,
     payload: &Value,
     item_type: &str,
-    registry_entry: Option<(&LoadedRegistry, &ToolRegistryEntry)>,
-    runtime_correlation: Option<RuntimeCallCorrelation>,
+    runtime: RuntimeProjection<'_>,
     timestamp: &str,
     ordinal: u64,
 ) -> Result<ProjectionKind> {
@@ -844,24 +903,27 @@ fn project_completed_item(
         }
         "CommandExecution" | "FileChange" | "ImageView" | "CollabAgentToolCall" | "WebSearch" => {
             capture["runtimeToolObservation"] = item.clone();
-            let Some((registry, entry)) = registry_entry else {
-                capture["rolloutEvent"]["projection"] = json!("runtime_tool_unmapped");
-                return Ok(ProjectionKind::Raw);
+            capture["recordType"] = json!("tool_execution");
+            capture["toolExecution"] = match runtime.registry_entry {
+                Some((registry, entry)) => tool_execution(
+                    payload,
+                    item_type,
+                    registry,
+                    entry,
+                    runtime
+                        .correlation
+                        .is_some_and(RuntimeCallCorrelation::is_matched),
+                    runtime.parent_call_id,
+                )?,
+                None => tool_execution_without_schema(
+                    payload,
+                    item_type,
+                    runtime
+                        .correlation
+                        .is_some_and(RuntimeCallCorrelation::is_matched),
+                    runtime.parent_call_id,
+                )?,
             };
-            if capture
-                .pointer("/traceContext/task_session_id")
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty())
-            {
-                capture["recordType"] = json!("tool_execution");
-            }
-            capture["toolExecution"] = tool_execution(
-                payload,
-                item_type,
-                registry,
-                entry,
-                runtime_correlation.is_some_and(RuntimeCallCorrelation::is_matched),
-            )?;
             capture["rolloutEvent"]["projection"] = json!("tool_execution");
             Ok(ProjectionKind::Tool)
         }
@@ -938,11 +1000,22 @@ fn remember_model_tool_call(
         .model_tool_calls
         .entry(observed.0.to_owned())
         .or_insert_with(|| ObservedModelToolCall {
-            name: observed.1,
+            name: observed.1.clone(),
             event_type: event_type.to_owned(),
             source_ordinal: ordinal,
             turn_id: turn_id.map(str::to_owned),
         });
+    if observed.1 == "exec" {
+        context
+            .open_code_mode_calls
+            .entry(observed.0.to_owned())
+            .or_insert_with(|| ObservedModelToolCall {
+                name: observed.1.clone(),
+                event_type: event_type.to_owned(),
+                source_ordinal: ordinal,
+                turn_id: turn_id.map(str::to_owned),
+            });
+    }
     while context.model_tool_calls.len() > MAX_TRACKED_MODEL_TOOL_CALLS {
         let oldest = context
             .model_tool_calls
@@ -960,22 +1033,70 @@ fn runtime_call_correlation(
     payload: &Value,
     context: &RolloutContext,
     registry_entry: Option<(&LoadedRegistry, &ToolRegistryEntry)>,
+    turn_id: Option<&str>,
 ) -> RuntimeCallCorrelation {
-    let Some((_, registry_entry)) = registry_entry else {
-        return RuntimeCallCorrelation::MissingRegistry;
-    };
-    let Some(call_id) = payload.pointer("/item/id").and_then(Value::as_str) else {
-        return RuntimeCallCorrelation::MissingModelCall;
-    };
-    let Some(model_call) = context.model_tool_calls.get(call_id) else {
-        return RuntimeCallCorrelation::MissingModelCall;
-    };
-    let registry_name = registry_entry_identity(registry_entry).unwrap_or_default();
-    if model_call.name == registry_name {
-        RuntimeCallCorrelation::Matched
-    } else {
-        RuntimeCallCorrelation::ToolNameMismatch
+    if let Some(call_id) = payload.pointer("/item/id").and_then(Value::as_str)
+        && let Some(model_call) = context.model_tool_calls.get(call_id)
+    {
+        if let Some((_, registry_entry)) = registry_entry {
+            let registry_name = registry_entry_identity(registry_entry).unwrap_or_default();
+            return if model_call.name == registry_name {
+                RuntimeCallCorrelation::Matched
+            } else {
+                RuntimeCallCorrelation::ToolNameMismatch
+            };
+        }
+        return RuntimeCallCorrelation::Matched;
     }
+    let candidates = open_code_mode_candidates(context, turn_id);
+    match candidates.len() {
+        1 => RuntimeCallCorrelation::CodeModeChild,
+        value if value > 1 => RuntimeCallCorrelation::AmbiguousCodeMode,
+        _ if registry_entry.is_none() => RuntimeCallCorrelation::MissingRegistry,
+        _ => RuntimeCallCorrelation::MissingModelCall,
+    }
+}
+
+fn runtime_parent_call_id(
+    payload: &Value,
+    context: &RolloutContext,
+    correlation: Option<RuntimeCallCorrelation>,
+) -> Option<String> {
+    match correlation? {
+        RuntimeCallCorrelation::Matched => payload
+            .pointer("/item/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        RuntimeCallCorrelation::CodeModeChild => open_code_mode_candidates(
+            context,
+            payload
+                .get("turn_id")
+                .or_else(|| payload.pointer("/item/turn_id"))
+                .and_then(Value::as_str)
+                .or(context.active_turn_id.as_deref()),
+        )
+        .into_iter()
+        .next()
+        .map(|(call_id, _)| call_id.clone()),
+        _ => None,
+    }
+}
+
+fn open_code_mode_candidates<'a>(
+    context: &'a RolloutContext,
+    turn_id: Option<&str>,
+) -> Vec<(&'a String, &'a ObservedModelToolCall)> {
+    context
+        .open_code_mode_calls
+        .iter()
+        .filter(|(_, call)| {
+            turn_id.is_none()
+                || call
+                    .turn_id
+                    .as_deref()
+                    .is_none_or(|value| Some(value) == turn_id)
+        })
+        .collect()
 }
 
 fn tool_execution(
@@ -984,6 +1105,7 @@ fn tool_execution(
     registry: &LoadedRegistry,
     entry: &ToolRegistryEntry,
     model_call_matched: bool,
+    parent_call_id: Option<&str>,
 ) -> Result<Value> {
     let item = payload
         .get("item")
@@ -1067,6 +1189,7 @@ fn tool_execution(
     });
     let mut execution = json!({
         "call_id":string(item, "id").unwrap_or(""),
+        "parent_call_id":parent_call_id,
         "name":name,
         "status":status,
         "initiator":if model_call_matched {"assistant"} else {"runtime"},
@@ -1090,6 +1213,95 @@ fn tool_execution(
         });
     }
     Ok(execution)
+}
+
+fn tool_execution_without_schema(
+    payload: &Value,
+    item_type: &str,
+    model_call_matched: bool,
+    parent_call_id: Option<&str>,
+) -> Result<Value> {
+    let item = payload
+        .get("item")
+        .ok_or_else(|| anyhow::anyhow!("item_completed is missing item"))?;
+    let runtime_tool = string(item, "tool").unwrap_or(item_type);
+    let runtime_namespace = string(item, "namespace");
+    let name = canonical_runtime_tool_name(runtime_namespace, runtime_tool);
+    let status = normalize_runtime_status(string(item, "status"));
+    let (arguments, result) = runtime_arguments_and_result(item, item_type);
+    let mut execution = json!({
+        "call_id":string(item, "id").unwrap_or(""),
+        "parent_call_id":parent_call_id,
+        "name":name,
+        "status":status,
+        "initiator":if model_call_matched {"assistant"} else {"runtime"},
+        "arguments":arguments,
+        "schema_provenance":{
+            "source":"codex_rollout_item_completed",
+            "source_complete":false,
+            "reason":"runtime event does not contain the registered tool schema"
+        },
+        "started_at":milliseconds_timestamp(payload.get("started_at_ms"))
+            .or_else(|| string(payload, "started_at").map(str::to_owned)),
+        "finished_at":milliseconds_timestamp(payload.get("completed_at_ms"))
+            .or_else(|| string(payload, "completed_at").map(str::to_owned)),
+        "runtime_item_type":item_type,
+        "runtime_tool":runtime_tool,
+        "runtime_namespace":runtime_namespace,
+        "runtime_status":item.get("status"),
+        "model_call_matched":model_call_matched,
+        "result_content_captured":item_type != "WebSearch",
+        "result":result,
+    });
+    if matches!(status, "error" | "cancelled" | "timeout") {
+        execution["error"] = json!({
+            "stderr":item.get("stderr"),
+            "exit_code":item.get("exit_code"),
+            "runtime_status":item.get("status"),
+        });
+    }
+    Ok(execution)
+}
+
+fn runtime_arguments_and_result(item: &Value, item_type: &str) -> (Value, Value) {
+    let arguments = match item_type {
+        "CommandExecution" => json!({
+            "command":item.get("command"),
+            "cwd":item.get("cwd"),
+            "parsed_cmd":item.get("parsed_cmd"),
+            "source":item.get("source"),
+        }),
+        "FileChange" => json!({"changes":item.get("changes")}),
+        "ImageView" => json!({"path":item.get("path")}),
+        "CollabAgentToolCall" => json!({
+            "tool":item.get("tool"),
+            "sender_thread_id":item.get("sender_thread_id"),
+            "receiver_thread_ids":item.get("receiver_thread_ids"),
+            "receiver_agents":item.get("receiver_agents"),
+        }),
+        "WebSearch" => json!({
+            "query":item.get("query"),
+            "action":item.get("action"),
+        }),
+        _ => Value::Null,
+    };
+    let result = match item_type {
+        "CommandExecution" => json!({
+            "stdout":item.get("stdout"),
+            "stderr":item.get("stderr"),
+            "aggregated_output":item.get("aggregated_output"),
+            "formatted_output":item.get("formatted_output"),
+            "exit_code":item.get("exit_code"),
+            "process_id":item.get("process_id"),
+            "duration":item.get("duration"),
+        }),
+        "FileChange" => json!({"stdout":item.get("stdout"),"stderr":item.get("stderr")}),
+        "ImageView" => json!({"path":item.get("path")}),
+        "CollabAgentToolCall" => json!({"agents_states":item.get("agents_states")}),
+        "WebSearch" => Value::Null,
+        _ => Value::Null,
+    };
+    (arguments, result)
 }
 
 fn normalize_runtime_status(status: Option<&str>) -> &'static str {
@@ -1243,8 +1455,7 @@ fn milliseconds_timestamp(value: Option<&Value>) -> Option<String> {
 }
 
 fn deterministic_capture_id(session_id: &str, ordinal: u64) -> String {
-    let digest = hex::encode(Sha256::digest(session_id.as_bytes()));
-    format!("cap-rollout-{}-{ordinal:020}", &digest[..24])
+    deterministic_codex_rollout_capture_id(session_id, ordinal)
 }
 
 fn string<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
@@ -1252,6 +1463,18 @@ fn string<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
         .get(field)
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
+}
+
+fn instruction_text(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+        Value::Object(object) => object
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned),
+        _ => None,
+    }
 }
 
 fn sha256(bytes: impl AsRef<[u8]>) -> String {
@@ -1298,6 +1521,20 @@ async fn deliver_rollout_batch(config: &ExportConfig, records: &[Vec<u8>]) -> Re
 mod tests {
     use super::*;
 
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/codex")
+            .join(name)
+    }
+
+    fn read_jsonl(path: &Path) -> Vec<Value> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
     fn config(root: &Path, output: &Path) -> ExportConfig {
         ExportConfig {
             input: root.join("rollout.jsonl"),
@@ -1324,6 +1561,108 @@ mod tests {
             "payload":event["payload"],
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stock_root_golden_preserves_every_line_and_runtime_facts() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::copy(
+            fixture("stock-rollout-root.jsonl"),
+            temporary.path().join("rollout.jsonl"),
+        )
+        .unwrap();
+        let output = temporary.path().join("captures.jsonl");
+
+        let summary = export_codex_rollout(config(temporary.path(), &output))
+            .await
+            .unwrap();
+        assert_eq!(summary.lines_read, 8);
+        assert_eq!(summary.captures_emitted, 8);
+        assert_eq!(summary.source_session_id.as_deref(), Some("session-root"));
+        assert_eq!(summary.source_thread_id.as_deref(), Some("thread-root"));
+        assert_eq!(summary.tool_executions, 1);
+        assert_eq!(summary.unmapped_tool_events, 0);
+
+        let source_lines: Vec<String> = fs::read_to_string(fixture("stock-rollout-root.jsonl"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let records = read_jsonl(&output);
+        assert_eq!(records.len(), source_lines.len());
+        for (record, source_line) in records.iter().zip(&source_lines) {
+            assert_eq!(record["rolloutEvent"]["source_line"], *source_line);
+            assert_eq!(
+                record["rolloutEvent"]["source_line_sha256"],
+                sha256(source_line.as_bytes())
+            );
+            assert_eq!(record["traceContext"]["session_id"], "session-root");
+            assert_eq!(record["traceContext"]["thread_id"], "thread-root");
+        }
+        assert_eq!(records[0]["systemPrompt"], "You are a coding agent.");
+        let execution = records
+            .iter()
+            .find(|record| record.get("toolExecution").is_some())
+            .unwrap();
+        assert_eq!(execution["recordType"], "tool_execution");
+        assert_eq!(execution["toolExecution"]["name"], "CommandExecution");
+        assert_eq!(execution["toolExecution"]["status"], "error");
+        assert_eq!(
+            execution["toolExecution"]["parent_call_id"],
+            "call-outer-exec"
+        );
+        assert_eq!(
+            execution["toolExecution"]["schema_provenance"]["source_complete"],
+            false
+        );
+        assert_eq!(
+            execution["rolloutEvent"]["runtime_call_correlation"],
+            "code_mode_child"
+        );
+        assert!(records.iter().any(|record| {
+            record
+                .pointer("/rolloutMessages/0/tool_calls/0/function/name")
+                .and_then(Value::as_str)
+                == Some("exec")
+        }));
+    }
+
+    #[tokio::test]
+    async fn stock_child_golden_keeps_session_thread_and_parent_distinct() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::copy(
+            fixture("stock-rollout-child.jsonl"),
+            temporary.path().join("rollout.jsonl"),
+        )
+        .unwrap();
+        let output = temporary.path().join("captures.jsonl");
+
+        let summary = export_codex_rollout(config(temporary.path(), &output))
+            .await
+            .unwrap();
+        assert_eq!(summary.lines_read, 5);
+        assert_eq!(summary.captures_emitted, 5);
+        assert_eq!(summary.source_session_id.as_deref(), Some("session-root"));
+        assert_eq!(summary.source_thread_id.as_deref(), Some("thread-child"));
+        let records = read_jsonl(&output);
+        assert!(records.iter().all(|record| {
+            record["traceContext"]["session_id"] == "session-root"
+                && record["traceContext"]["thread_id"] == "thread-child"
+                && record["traceContext"]["parent_thread_id"] == "thread-root"
+        }));
+        assert!(
+            records
+                .iter()
+                .all(|record| { record["traceContext"]["root_turn_id"].is_null() })
+        );
+        assert_eq!(records[0]["traceContext"]["agent_path"], "/root/reviewer");
+
+        let root_digest = &sha256(b"thread-root")[..24];
+        assert!(
+            records
+                .iter()
+                .all(|record| { !record["captureId"].as_str().unwrap().contains(root_digest) })
+        );
     }
 
     #[tokio::test]
@@ -1364,7 +1703,7 @@ mod tests {
         let first = export_codex_rollout(config(temporary.path(), &output))
             .await
             .unwrap();
-        assert_eq!(first.captures_emitted, 3);
+        assert_eq!(first.captures_emitted, 4);
         assert_eq!(first.lifecycle_events, 2);
         assert_eq!(first.message_events, 1);
         let bytes = fs::read(&output).unwrap();
@@ -1378,7 +1717,7 @@ mod tests {
                 .pointer("/traceContext/task_session_id")
                 .is_some_and(Value::is_null)
         }));
-        assert!(records.iter().all(|record| {
+        assert!(records.iter().skip(1).all(|record| {
             record
                 .pointer("/traceContext/turn_id")
                 .and_then(Value::as_str)
@@ -1427,12 +1766,12 @@ mod tests {
         assert_eq!(summary.stop_reason, "idle_exit");
         assert!(summary.cycles >= 2);
         assert_eq!(summary.export.lines_read, 2);
-        assert_eq!(summary.export.captures_emitted, 1);
-        assert_eq!(fs::read_to_string(output).unwrap().lines().count(), 1);
+        assert_eq!(summary.export.captures_emitted, 2);
+        assert_eq!(fs::read_to_string(output).unwrap().lines().count(), 2);
     }
 
     #[tokio::test]
-    async fn tool_event_without_real_registry_is_preserved_but_not_promoted() {
+    async fn tool_event_without_real_registry_keeps_execution_with_incomplete_schema() {
         let temporary = tempfile::tempdir().unwrap();
         let output = temporary.path().join("captures.jsonl");
         let lines = [
@@ -1466,16 +1805,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(summary.unmapped_tool_events, 1);
-        assert_eq!(summary.tool_executions, 0);
+        assert_eq!(summary.tool_executions, 1);
         let last = fs::read_to_string(output)
             .unwrap()
             .lines()
             .last()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .unwrap();
-        assert_eq!(last["recordType"], "rollout_event");
+        assert_eq!(last["recordType"], "tool_execution");
         assert_eq!(last["rolloutEvent"]["unmapped_tool"], true);
-        assert!(last.get("toolExecution").is_none());
+        assert_eq!(last["toolExecution"]["name"], "CommandExecution");
+        assert_eq!(last["toolExecution"]["status"], "error");
+        assert_eq!(
+            last["toolExecution"]["schema_provenance"]["source_complete"],
+            false
+        );
     }
 
     #[tokio::test]
@@ -1767,11 +2111,10 @@ mod tests {
             .unwrap();
         assert_eq!(summary.lines_read, 2);
         assert_eq!(summary.metadata_lines, 1);
-        assert_eq!(summary.captures_emitted, 1);
+        assert_eq!(summary.captures_emitted, 2);
         assert_eq!(summary.unknown_events, 1);
 
-        let capture: Value =
-            serde_json::from_str(fs::read_to_string(output).unwrap().trim_end()).unwrap();
+        let capture = read_jsonl(&output).pop().unwrap();
         assert_eq!(capture["rolloutEvent"]["classification"], "unknown");
         assert_eq!(capture["rolloutEvent"]["source_line"], unknown);
         assert_eq!(capture["rolloutEvent"]["source_session_id"], "thread-1");

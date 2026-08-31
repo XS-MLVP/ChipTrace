@@ -5,6 +5,7 @@ use chiptrace::buyer::{
     verify_buyer_package_legacy,
 };
 use chiptrace::capture::{CAPTURE_SCHEMA_VERSION, normalize_capture};
+use chiptrace::codex_hook::{CodexAgentConfig, HookSpoolConfig, run_codex_agent, spool_hook_event};
 use chiptrace::codex_rollout::{
     ExportConfig as CodexRolloutExportConfig, ExportTarget as CodexRolloutTarget,
     export_codex_rollout, resolve_hook_rollout, watch_codex_rollout,
@@ -15,6 +16,7 @@ use chiptrace::codex_trace_bundle::{
     BundleExportTarget as CodexTraceBundleTarget, export_codex_trace_bundle,
 };
 use chiptrace::collector::{CollectorConfig, serve};
+use chiptrace::delivery::producer_relay_target;
 use chiptrace::enrich::{EnrichConfig, enrich_captures, verify_enrichment};
 use chiptrace::harness::{
     EvaluationInput, Harness, HarnessConfig, HarnessTarget, LifecycleEventInput, ToolEndInput,
@@ -84,23 +86,34 @@ enum Command {
     /// 按显式 request_id 将 Sub2API usage log 精确关联到 Capture。
     Enrich(EnrichArgs),
     /// 从 Codex rollout JSONL 可靠导出任务、工具和生命周期事实。
+    #[command(hide = true)]
     ExportCodexRollout(ExportCodexRolloutArgs),
     /// 持续增量导出活动 Codex rollout；用于实时 sidecar。
+    #[command(hide = true)]
     WatchCodexRollout(WatchCodexRolloutArgs),
     /// 从 Codex Stop hook stdin 定位 rollout 并可靠导出。
+    #[command(hide = true)]
     CodexHook(CodexHookArgs),
+    /// 将 Stock Codex Hook 原子写入本地 durable outbox；不访问网络。
+    #[command(hide = true)]
+    CodexHookSpool(CodexHookSpoolArgs),
+    /// 恢复 Hook outbox 和 rollout，获得 durable ACK 后推进本地队列。
+    CodexAgent(CodexAgentArgs),
     /// 从 Codex 原生 rollout-trace bundle 校验并导出完整运行时事实。
     #[command(
         name = "export-codex-trace-bundle",
+        hide = true,
         visible_alias = "import-codex-trace-bundle",
         visible_alias = "export-codex-bundle"
     )]
     ExportCodexTraceBundle(ExportCodexTraceBundleArgs),
     /// 在明确任务边界内运行 Codex 并持续导出原生 runtime Trace。
+    #[command(hide = true)]
     CodexRun(CodexRunArgs),
-    /// 校验 harness/dispatcher 事件并等待 Relay durable ACK。
+    /// 校验版本化 Agent Producer 事件并等待 Relay durable ACK。
     Produce(ProduceArgs),
     /// 由真实任务运行器创建边界并记录生命周期、工具和评估证据。
+    #[command(hide = true)]
     Harness(HarnessArgs),
     /// 只读验证 Enrich 产物、记录数、SHA-256 和 Raw lineage。
     VerifyEnrichment(VerifyEnrichmentArgs),
@@ -129,6 +142,7 @@ enum Command {
     /// 运行隔离的采集到交付闭环自测。
     SelfTest,
     /// 执行五个真实工具并验证 runtime-full 生产者通路。
+    #[command(hide = true)]
     RuntimeCanary(RuntimeCanaryArgs),
     /// 测量本地 WAL/ledger 持久化吞吐。
     BenchmarkStore(BenchmarkStoreArgs),
@@ -224,6 +238,9 @@ struct RelayArgs {
     max_delivery_inflight_mib: usize,
     #[arg(long, default_value_t = 30)]
     request_timeout_seconds: u64,
+    /// 仅用于隔离开发；生产 producer 路由默认要求 CHIPTRACE_PRODUCER_TOKEN。
+    #[arg(long)]
+    allow_unauthenticated_producer: bool,
 }
 
 #[derive(Debug, Args)]
@@ -405,6 +422,46 @@ struct CodexHookArgs {
     parent_session_id: Option<String>,
     #[arg(long)]
     goal_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct CodexHookSpoolArgs {
+    /// 插件私有数据目录中的本地 outbox 根目录。
+    #[arg(long)]
+    queue_root: PathBuf,
+    #[arg(long, default_value_t = 4)]
+    max_input_mib: usize,
+}
+
+#[derive(Debug, Args)]
+struct CodexAgentArgs {
+    /// Hook 写入的本地 outbox 根目录。
+    #[arg(long)]
+    queue_root: PathBuf,
+    /// Stock Codex rollout sessions 根目录；所有 transcript 必须位于其中。
+    #[arg(long)]
+    session_root: PathBuf,
+    /// rollout byte checkpoint 状态目录。
+    #[arg(long)]
+    state_root: PathBuf,
+    /// 提供 `/producer/events` 的 Relay 基础 URL。
+    #[arg(long, default_value = "http://127.0.0.1:3011")]
+    relay_url: String,
+    #[arg(long)]
+    source_namespace: String,
+    #[arg(long, default_value_t = 128)]
+    batch_records: usize,
+    #[arg(long, default_value_t = 1024)]
+    max_envelope_mib: usize,
+    #[arg(long, default_value_t = 30)]
+    request_timeout_seconds: u64,
+    #[arg(long, default_value_t = 25)]
+    retry_max_times: usize,
+    #[arg(long, default_value_t = 1000)]
+    poll_ms: u64,
+    /// 处理一次当前 pending 集合后退出，用于自测和定时任务。
+    #[arg(long)]
+    once: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1086,6 +1143,20 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Command::Relay(args) => {
+            let producer_bearer_token = std::env::var("CHIPTRACE_PRODUCER_TOKEN")
+                .ok()
+                .filter(|value| !value.trim().is_empty());
+            if producer_bearer_token.is_none() && !args.allow_unauthenticated_producer {
+                bail!(
+                    "CHIPTRACE_PRODUCER_TOKEN is required; use --allow-unauthenticated-producer only in isolated development"
+                );
+            }
+            if producer_bearer_token
+                .as_deref()
+                .is_some_and(|value| value.trim().len() < 32)
+            {
+                bail!("CHIPTRACE_PRODUCER_TOKEN must contain at least 32 bytes after trimming");
+            }
             serve_relay(
                 RelayConfig {
                     bind: SocketAddr::new(args.host, args.port),
@@ -1116,6 +1187,7 @@ async fn main() -> Result<()> {
                     max_envelope_bytes: checked_mib(args.max_envelope_mib)?,
                     max_inflight_body_bytes: checked_mib(args.max_inflight_body_mib)?,
                     max_batch_records: args.max_batch_records,
+                    producer_bearer_token,
                 },
                 shutdown_signal(),
             )
@@ -1254,6 +1326,41 @@ async fn main() -> Result<()> {
                 .await?,
             )?
         }
+        Command::CodexHookSpool(args) => {
+            let max_input_bytes = checked_mib(args.max_input_mib)?;
+            let mut hook_input = Vec::new();
+            std::io::stdin()
+                .take(max_input_bytes.saturating_add(1) as u64)
+                .read_to_end(&mut hook_input)?;
+            spool_hook_event(
+                &hook_input,
+                &HookSpoolConfig {
+                    queue_root: args.queue_root,
+                    max_input_bytes,
+                },
+            )?;
+            // Command hooks must not print the regular CLI JSON summary to stdout.
+            return Ok(());
+        }
+        Command::CodexAgent(args) => serde_json::to_value(
+            run_codex_agent(
+                CodexAgentConfig {
+                    queue_root: args.queue_root,
+                    session_root: args.session_root,
+                    state_root: args.state_root,
+                    target: producer_relay_target(args.relay_url)?,
+                    source_namespace: args.source_namespace,
+                    batch_records: args.batch_records,
+                    max_envelope_bytes: checked_mib(args.max_envelope_mib)?,
+                    request_timeout: Duration::from_secs(args.request_timeout_seconds),
+                    retry_max_times: args.retry_max_times,
+                    poll_interval: Duration::from_millis(args.poll_ms),
+                    once: args.once,
+                },
+                shutdown_signal(),
+            )
+            .await?,
+        )?,
         Command::ExportCodexTraceBundle(args) => {
             let target = match (args.relay_url, args.output) {
                 (Some(url), None) => CodexTraceBundleTarget::Relay(url),
@@ -1327,7 +1434,7 @@ async fn main() -> Result<()> {
         }
         Command::Produce(args) => {
             let target = match (args.relay_url, args.output) {
-                (Some(url), None) => ProducerTarget::ProducerRelay(url),
+                (Some(url), None) => producer_relay_target(url)?,
                 (None, Some(path)) => ProducerTarget::Jsonl(path),
                 _ => bail!("exactly one of --relay-url or --output is required"),
             };
@@ -1650,6 +1757,7 @@ async fn self_test() -> Result<Value> {
             max_envelope_bytes: 4 * 1024 * 1024,
             max_inflight_body_bytes: 16 * 1024 * 1024,
             max_batch_records: 64,
+            producer_bearer_token: None,
         },
         async move {
             let _ = relay_shutdown_rx.await;
@@ -3015,6 +3123,7 @@ async fn benchmark_http(args: BenchmarkHttpArgs) -> Result<Value> {
                 max_envelope_bytes: max_body_bytes,
                 max_inflight_body_bytes,
                 max_batch_records: args.batch_records,
+                producer_bearer_token: None,
             },
             async move {
                 let _ = shutdown_rx.await;
@@ -3322,4 +3431,32 @@ fn deterministic_text(bytes: usize, seed: u64) -> String {
         output.push(ALPHABET[state as usize % ALPHABET.len()]);
     }
     String::from_utf8(output).expect("benchmark alphabet is UTF-8")
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn public_help_exposes_only_the_stock_codex_ingest_path() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("codex-agent"));
+        for hidden in [
+            "codex-hook-spool",
+            "codex-run",
+            "export-codex-rollout",
+            "watch-codex-rollout",
+            "export-codex-trace-bundle",
+            "harness",
+            "runtime-canary",
+        ] {
+            assert!(
+                !help
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&format!("{hidden} "))),
+                "public help exposed {hidden}"
+            );
+        }
+    }
 }

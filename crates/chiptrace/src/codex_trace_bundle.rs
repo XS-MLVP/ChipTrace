@@ -2619,8 +2619,8 @@ fn config_fingerprint(
 ) -> String {
     let target = match &config.target {
         DeliveryTarget::Relay(url) => json!({"kind":"relay","value":url}),
-        DeliveryTarget::ProducerRelay(url) => {
-            json!({"kind":"producer-relay","value":url})
+        DeliveryTarget::ProducerRelay { base, .. } => {
+            json!({"kind":"producer-relay","value":base})
         }
         DeliveryTarget::Jsonl(path) => {
             json!({"kind":"jsonl","value":path.to_string_lossy()})

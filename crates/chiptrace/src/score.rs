@@ -448,8 +448,17 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         .or_else(|| session.pointer("/trace/task_session_id"))
         .and_then(Value::as_str)
         .is_some_and(|value| !value.trim().is_empty());
-    let task_boundary_attested =
-        task_session_id_present && task_start_event_present && task_terminal_event_present;
+    let session_id_present = session
+        .pointer("/meta/trace/session_id")
+        .or_else(|| session.pointer("/trace/session_id"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let task_boundary_attested = (task_session_id_present
+        && session_has_task_start_event(session)
+        && session_has_task_terminal_event(session))
+        || (session_id_present
+            && session_has_session_start_event(session)
+            && session_has_session_terminal_event(session));
     let model_evidence_consistent = session
         .pointer("/meta/model_evidence/consistent")
         .and_then(Value::as_bool)
@@ -711,7 +720,6 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
             && assembly_tool_execution_conflicts == 0
             && assembly_producer_event_conflicts == 0
             && rollout_unknown_events == 0
-            && rollout_unmapped_tools == 0
             && capture_dag_present
             && task_dag_present
             && !response_dag_cycle
@@ -926,6 +934,9 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
     }
     if lifecycle_retries == 0 && failed_results == 0 && corrections == 0 {
         warnings.push("no_realism_recovery_signal".to_owned());
+    }
+    if rollout_unmapped_tools > 0 {
+        warnings.push("unmapped_runtime_tools_present".to_owned());
     }
 
     let tokens = count_tokens(session, &called_names);
@@ -1732,6 +1743,87 @@ fn is_start_lifecycle_event(event: &str) -> bool {
     )
 }
 
+fn session_has_task_start_event(session: &Value) -> bool {
+    session_has_lifecycle_event(session, |event| {
+        matches!(
+            normalize_lifecycle_event(event).as_str(),
+            "task_start" | "task_started"
+        )
+    })
+}
+
+fn session_has_task_terminal_event(session: &Value) -> bool {
+    session_has_lifecycle_event(session, |event| {
+        let event = normalize_lifecycle_event(event);
+        matches!(
+            event.as_str(),
+            "task_end"
+                | "task_ended"
+                | "task_completed"
+                | "cancel"
+                | "cancelled"
+                | "canceled"
+                | "terminated"
+                | "abort"
+                | "aborted"
+                | "abandoned"
+        ) || event.starts_with("task_cancel")
+            || event.starts_with("task_fail")
+    })
+}
+
+fn session_has_session_start_event(session: &Value) -> bool {
+    session_has_lifecycle_event(session, |event| {
+        matches!(
+            normalize_lifecycle_event(event).as_str(),
+            "session_start" | "session_started"
+        )
+    })
+}
+
+fn session_has_session_terminal_event(session: &Value) -> bool {
+    session_has_lifecycle_event(session, |event| {
+        let event = normalize_lifecycle_event(event);
+        matches!(
+            event.as_str(),
+            "session_end"
+                | "session_ended"
+                | "cancel"
+                | "cancelled"
+                | "canceled"
+                | "terminated"
+                | "abort"
+                | "aborted"
+                | "abandoned"
+        ) || event.starts_with("session_cancel")
+            || event.starts_with("session_fail")
+    })
+}
+
+fn session_has_lifecycle_event(session: &Value, predicate: impl Fn(&str) -> bool) -> bool {
+    let string_events = session
+        .pointer("/meta/lifecycle_events")
+        .or_else(|| session.pointer("/trace/lifecycle_events"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    let object_events = session
+        .pointer("/meta/lifecycle_event_records")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|event| event.get("type").and_then(Value::as_str));
+    string_events.chain(object_events).any(predicate)
+}
+
+fn normalize_lifecycle_event(event: &str) -> String {
+    event
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '.', ' ', ':'], "_")
+}
+
 fn lifecycle_retry_count(session: &Value) -> u64 {
     let string_count = session
         .pointer("/meta/lifecycle_events")
@@ -2245,6 +2337,60 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn stock_codex_session_hooks_attest_boundary_without_harness() {
+        let mut session = json!({
+            "trajectory_id":"stock-boundary",
+            "session_id":"session-stock",
+            "provider":"OpenAI",
+            "model":"gpt-5.6-sol",
+            "created_at":"2026-09-01T00:00:00Z",
+            "status":"completed",
+            "is_final_snapshot":true,
+            "source_request_count":1,
+            "system_prompt":"system",
+            "tools":[],
+            "messages":[{"role":"system","content":"system"}],
+            "usage":{},
+            "meta":{
+                "trace":{"session_id":"session-stock"},
+                "lifecycle_events":["session_start","session_end"],
+                "merge_divergences":0,
+                "schema_conflicts":[],
+                "trace_conflicts":[],
+                "system_prompt_conflicts":[],
+                "usage_conflicts":[],
+                "tool_execution_conflicts":[],
+                "producer_event_conflicts":[],
+                "rollout_unknown_events":[],
+                "rollout_unmapped_tools":["cap-runtime-unlinked"],
+                "capture_dag":{},
+                "task_dag":{"complete":true}
+            }
+        });
+        let quality = assess_session(&session, Profile::BuyerV7, 90.0);
+        assert!(quality.buyer_acceptance.metrics.task_boundary_attested);
+        assert!(
+            quality
+                .buyer_acceptance
+                .gates
+                .iter()
+                .find(|gate| gate.name == "assembly_integrity")
+                .unwrap()
+                .pass
+        );
+        assert!(
+            quality
+                .buyer_acceptance
+                .warnings
+                .contains(&"unmapped_runtime_tools_present".to_owned())
+        );
+
+        session["meta"]["lifecycle_events"] = json!(["turn_start", "turn_end"]);
+        let turn_only = assess_session(&session, Profile::BuyerV7, 90.0);
+        assert!(!turn_only.buyer_acceptance.metrics.task_boundary_attested);
     }
 
     #[test]

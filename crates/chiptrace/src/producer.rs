@@ -37,6 +37,7 @@ pub struct ProducerSummary {
     pub lifecycle_events: u64,
     pub tool_executions: u64,
     pub evaluations: u64,
+    pub source_native_events: u64,
 }
 
 pub async fn submit_producer_events(config: ProducerConfig) -> Result<ProducerSummary> {
@@ -134,6 +135,10 @@ pub fn prepare_producer_capture(raw: &[u8], max_envelope_bytes: usize) -> Result
     let object = value
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("producer event must be a JSON object"))?;
+    if object.get("producerEvent").is_none() {
+        validate_source_native_codex_capture(object)?;
+        return normalize_capture(&serde_json::to_vec(&value)?, max_envelope_bytes);
+    }
     let (record_type, expected_capture_id) = producer_capture_identity(object)?;
     if let Some(observed) = object.get("captureId").and_then(Value::as_str)
         && observed != expected_capture_id
@@ -163,6 +168,142 @@ pub fn prepare_producer_capture(raw: &[u8], max_envelope_bytes: usize) -> Result
         .entry("receivedAt".to_owned())
         .or_insert_with(|| json!(timestamp));
     normalize_capture(&serde_json::to_vec(&value)?, max_envelope_bytes)
+}
+
+fn validate_source_native_codex_capture(object: &Map<String, Value>) -> Result<()> {
+    let capture_id = required_string(object, "captureId")?;
+    required_string(object, "sourceNamespace")?;
+    let received_at = required_string(object, "receivedAt")?;
+    validate_timestamp(received_at, "source-native receivedAt")?;
+
+    if let Some(rollout) = object.get("rolloutEvent").and_then(Value::as_object) {
+        let source = required_string(rollout, "source")?;
+        if source != "codex_rollout_jsonl" {
+            bail!("source-native producer accepts only Stock Codex rollout JSONL");
+        }
+        let source_line = required_string(rollout, "source_line")?;
+        let source_line_sha256 = required_string(rollout, "source_line_sha256")?;
+        if source_line_sha256 != sha256(source_line.as_bytes()) {
+            bail!("source-native rollout source line SHA-256 mismatch");
+        }
+        let source_event: Value =
+            serde_json::from_str(source_line).context("parse source-native rollout source line")?;
+        if source_event
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .is_some_and(|timestamp| timestamp != received_at)
+        {
+            bail!("source-native rollout receivedAt does not match the source line");
+        }
+        for (projected_field, source_pointer) in [
+            ("top_level_type", "/type"),
+            ("event_type", "/payload/type"),
+            ("item_type", "/payload/item/type"),
+        ] {
+            let projected = rollout.get(projected_field).and_then(Value::as_str);
+            let source = source_event.pointer(source_pointer).and_then(Value::as_str);
+            if projected.is_some() && projected != source {
+                bail!("source-native rollout {projected_field} does not match the source line");
+            }
+        }
+        let thread_id = rollout
+            .get("source_thread_id")
+            .or_else(|| rollout.get("source_session_id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("rolloutEvent source thread identity is required"))?;
+        let ordinal = rollout
+            .get("source_ordinal")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("rolloutEvent.source_ordinal is required"))?;
+        if capture_id != deterministic_codex_rollout_capture_id(thread_id, ordinal) {
+            bail!("source-native rollout captureId does not match thread and ordinal");
+        }
+        if !matches!(
+            required_string(object, "recordType")?,
+            "rollout_event" | "tool_execution"
+        ) {
+            bail!("source-native rollout has an unsupported recordType");
+        }
+        return Ok(());
+    }
+
+    if let Some(hook) = object.get("codexHook").and_then(Value::as_object) {
+        if required_string(hook, "schema_version")? != "chiptrace.codex-hook-spool.v1" {
+            bail!("unsupported source-native Codex Hook schema");
+        }
+        let raw_input = required_string(hook, "raw_input")?;
+        let digest = required_string(hook, "raw_input_sha256")?;
+        if digest != sha256(raw_input.as_bytes()) {
+            bail!("Codex Hook raw_input SHA-256 mismatch");
+        }
+        let source_event: Value =
+            serde_json::from_str(raw_input).context("parse source-native Codex Hook input")?;
+        let event_name = source_event
+            .get("hook_event_name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Codex Hook input is missing hook_event_name"))?;
+        let (expected_type, expected_status) = match event_name {
+            "SessionStart" => ("session_start", "started"),
+            "SessionEnd" => ("session_end", "unknown"),
+            "Stop" => ("turn_stop", "completed"),
+            "Interrupt" => ("turn_interrupt", "cancelled"),
+            "SubagentStart" => ("subagent_start", "started"),
+            "SubagentStop" => ("subagent_stop", "unknown"),
+            _ => bail!("unsupported source-native Codex Hook event {event_name}"),
+        };
+        if capture_id != deterministic_codex_hook_capture_id(digest) {
+            bail!("source-native Hook captureId does not match Raw input");
+        }
+        if required_string(object, "recordType")? != "lifecycle_event" {
+            bail!("source-native Hook must be a lifecycle_event");
+        }
+        let lifecycle = object
+            .get("lifecycleEvent")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("source-native Hook lifecycleEvent is required"))?;
+        let event_id = lifecycle
+            .get("event_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if event_id != format!("hook-{digest}") {
+            bail!("source-native Hook lifecycle event_id does not match Raw input");
+        }
+        if required_string(lifecycle, "type")? != expected_type
+            || required_string(lifecycle, "status")? != expected_status
+        {
+            bail!("source-native Hook lifecycle type or status does not match Raw input");
+        }
+        if required_string(lifecycle, "occurred_at")? != received_at
+            || lifecycle.get("source_event") != Some(&source_event)
+        {
+            bail!("source-native Hook lifecycle evidence does not match Raw input");
+        }
+        let hook_session_id = source_event
+            .get("session_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Codex Hook input is missing session_id"))?;
+        if object
+            .get("traceContext")
+            .and_then(|trace| trace.get("thread_id"))
+            .and_then(Value::as_str)
+            != Some(hook_session_id)
+        {
+            bail!("source-native Hook thread_id does not match Raw input");
+        }
+        return Ok(());
+    }
+
+    bail!("producer event requires producerEvent or verifiable Stock Codex evidence")
+}
+
+pub fn deterministic_codex_rollout_capture_id(thread_id: &str, ordinal: u64) -> String {
+    let digest = sha256(thread_id.as_bytes());
+    format!("cap-rollout-{}-{ordinal:020}", &digest[..24])
+}
+
+pub fn deterministic_codex_hook_capture_id(raw_input_sha256: &str) -> String {
+    format!("cap-codex-hook-{raw_input_sha256}")
 }
 
 pub(crate) fn validate_stored_producer_capture(
@@ -447,14 +588,100 @@ fn update_summary_for_record(summary: &mut ProducerSummary, record: &CaptureReco
             summary.tool_executions = summary.tool_executions.saturating_add(1)
         }
         Some("evaluation") => summary.evaluations = summary.evaluations.saturating_add(1),
+        Some("rollout_event") => {
+            summary.source_native_events = summary.source_native_events.saturating_add(1)
+        }
+        _ if value.get("codexHook").is_some() || value.get("rolloutEvent").is_some() => {
+            summary.source_native_events = summary.source_native_events.saturating_add(1)
+        }
         _ => unreachable!(),
     }
     Ok(())
 }
 
+fn sha256(bytes: impl AsRef<[u8]>) -> String {
+    hex::encode(Sha256::digest(bytes.as_ref()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_native_codex_hook_is_accepted_but_forgery_is_rejected() {
+        let raw_input = r#"{"hook_event_name":"SessionStart","session_id":"thread-1"}"#;
+        let digest = sha256(raw_input.as_bytes());
+        let value = json!({
+            "recordType":"lifecycle_event",
+            "captureId":deterministic_codex_hook_capture_id(&digest),
+            "sourceNamespace":"stock-codex",
+            "receivedAt":"2026-09-01T00:00:00Z",
+            "traceContext":{"thread_id":"thread-1"},
+            "lifecycleEvent":{
+                "event_id":format!("hook-{digest}"),
+                "type":"session_start","status":"started",
+                "occurred_at":"2026-09-01T00:00:00Z",
+                "source_event":serde_json::from_str::<Value>(raw_input).unwrap()
+            },
+            "codexHook":{
+                "schema_version":"chiptrace.codex-hook-spool.v1",
+                "raw_input":raw_input,
+                "raw_input_sha256":digest,
+            }
+        });
+        prepare_producer_capture(&serde_json::to_vec(&value).unwrap(), 4096).unwrap();
+        let mut forged = value;
+        forged["captureId"] = json!("cap-codex-hook-forged");
+        assert!(prepare_producer_capture(&serde_json::to_vec(&forged).unwrap(), 4096).is_err());
+    }
+
+    #[test]
+    fn source_native_rollout_identity_is_recomputed() {
+        let source_line = r#"{"ordinal":7,"type":"event_msg","payload":{"type":"task_started"}}"#;
+        let value = json!({
+            "recordType":"rollout_event",
+            "captureId":deterministic_codex_rollout_capture_id("thread-1", 7),
+            "sourceNamespace":"stock-codex",
+            "receivedAt":"2026-09-01T00:00:00Z",
+            "traceContext":{"session_id":"session-1","thread_id":"thread-1"},
+            "rolloutEvent":{
+                "schema_version":"chiptrace.codex-rollout.v1",
+                "source":"codex_rollout_jsonl",
+                "source_session_id":"session-1",
+                "source_thread_id":"thread-1",
+                "source_ordinal":7,
+                "source_line":source_line,
+                "source_line_sha256":sha256(source_line.as_bytes()),
+                "classification":"known"
+            }
+        });
+        prepare_producer_capture(&serde_json::to_vec(&value).unwrap(), 4096).unwrap();
+        let mut forged = value;
+        forged["rolloutEvent"]["source_ordinal"] = json!(8);
+        assert!(prepare_producer_capture(&serde_json::to_vec(&forged).unwrap(), 4096).is_err());
+
+        let mut forged_line = json!({
+            "recordType":"rollout_event",
+            "captureId":deterministic_codex_rollout_capture_id("thread-1", 7),
+            "sourceNamespace":"stock-codex",
+            "receivedAt":"2026-09-01T00:00:00Z",
+            "traceContext":{"session_id":"session-1","thread_id":"thread-1"},
+            "rolloutEvent":{
+                "schema_version":"chiptrace.codex-rollout.v1",
+                "source":"codex_rollout_jsonl",
+                "source_session_id":"session-1",
+                "source_thread_id":"thread-1",
+                "source_ordinal":7,
+                "source_line":source_line,
+                "source_line_sha256":sha256(source_line.as_bytes()),
+                "classification":"known"
+            }
+        });
+        forged_line["rolloutEvent"]["source_line"] = json!("{}");
+        assert!(
+            prepare_producer_capture(&serde_json::to_vec(&forged_line).unwrap(), 4096).is_err()
+        );
+    }
 
     fn lifecycle(event_id: &str, status: &str) -> Value {
         json!({

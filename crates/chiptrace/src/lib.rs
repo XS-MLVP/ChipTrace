@@ -1,6 +1,7 @@
 pub mod assemble;
 pub mod buyer;
 pub mod capture;
+pub mod codex_hook;
 pub mod codex_rollout;
 pub mod codex_run;
 pub mod codex_trace_bundle;

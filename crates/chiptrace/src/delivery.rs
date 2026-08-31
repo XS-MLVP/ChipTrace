@@ -15,7 +15,10 @@ pub enum DeliveryTarget {
     /// Relay's producer contract endpoint. The payload is still a validated
     /// Capture envelope, but keeping this target explicit prevents producer
     /// clients from silently bypassing the producer route.
-    ProducerRelay(String),
+    ProducerRelay {
+        base: String,
+        bearer_token: String,
+    },
     Jsonl(PathBuf),
 }
 
@@ -38,6 +41,15 @@ enum RelayAck {
     Conflict(String),
 }
 
+pub fn producer_relay_target(base: String) -> Result<DeliveryTarget> {
+    let bearer_token = std::env::var("CHIPTRACE_PRODUCER_TOKEN")
+        .context("CHIPTRACE_PRODUCER_TOKEN is required for /producer/events")?;
+    if bearer_token.trim().len() < 32 {
+        bail!("CHIPTRACE_PRODUCER_TOKEN must contain at least 32 non-whitespace bytes");
+    }
+    Ok(DeliveryTarget::ProducerRelay { base, bearer_token })
+}
+
 pub async fn deliver_batch(
     config: &DeliveryConfig,
     records: &[Vec<u8>],
@@ -50,9 +62,11 @@ pub async fn deliver_batch(
     }
     match &config.target {
         DeliveryTarget::Jsonl(path) => deliver_to_jsonl(path, records),
-        DeliveryTarget::Relay(base) => deliver_to_relay(config, base, "captures", records).await,
-        DeliveryTarget::ProducerRelay(base) => {
-            deliver_to_relay(config, base, "producer/events", records).await
+        DeliveryTarget::Relay(base) => {
+            deliver_to_relay(config, base, "captures", None, records).await
+        }
+        DeliveryTarget::ProducerRelay { base, bearer_token } => {
+            deliver_to_relay(config, base, "producer/events", Some(bearer_token), records).await
         }
     }
 }
@@ -163,6 +177,7 @@ async fn deliver_to_relay(
     config: &DeliveryConfig,
     base: &str,
     route: &str,
+    bearer_token: Option<&str>,
     records: &[Vec<u8>],
 ) -> Result<DeliveryReceipt> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -177,13 +192,14 @@ async fn deliver_to_relay(
     let url = format!("{}/{}", base.trim_end_matches('/'), route);
     let mut last_error = String::new();
     for attempt in 1..=config.retry_max_times {
-        match client
+        let mut request = client
             .post(&url)
             .header("content-type", "application/x-ndjson")
-            .body(body.clone())
-            .send()
-            .await
-        {
+            .body(body.clone());
+        if let Some(token) = bearer_token {
+            request = request.bearer_auth(token);
+        }
+        match request.send().await {
             Ok(response) if response.status() == StatusCode::CONFLICT => {
                 bail!("Relay rejected a deterministic Capture ID with conflicting bytes");
             }
@@ -485,7 +501,15 @@ mod tests {
 
     #[tokio::test]
     async fn producer_target_uses_the_producer_contract_route() {
-        async fn handler() -> Response {
+        async fn handler(request: axum::extract::Request) -> Response {
+            if request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                != Some("Bearer producer-test-token-at-least-32-bytes")
+            {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
             (StatusCode::ACCEPTED, Json(complete_ack())).into_response()
         }
 
@@ -493,7 +517,10 @@ mod tests {
         let (base, server) = spawn_server(router).await;
         let receipt = deliver_batch(
             &DeliveryConfig {
-                target: DeliveryTarget::ProducerRelay(base),
+                target: DeliveryTarget::ProducerRelay {
+                    base,
+                    bearer_token: "producer-test-token-at-least-32-bytes".to_owned(),
+                },
                 request_timeout: Duration::from_secs(1),
                 retry_max_times: 20,
             },

@@ -8,9 +8,9 @@ Collector 新写入的数据遵循 `schemas/capture-v2.schema.json`。每条记�
 | `recordType` | 必要证据 |
 | --- | --- |
 | `api_snapshot` | 完整 request/response、HTTP 状态、截断/错误标记 |
-| `lifecycle_event` | `sourceNamespace`、`task_session_id`、事件类型、终态事件的真实状态 |
-| `tool_execution` | `sourceNamespace`、`task_session_id`、call ID、initiator、参数、完整 schema、真实状态/结果 |
-| `evaluation` | `sourceNamespace`、`task_session_id`、带来源的测试/构建/搜索/验收结果 |
+| `lifecycle_event` | `sourceNamespace`、Session/Turn 身份、事件类型、终态事件的真实状态 |
+| `tool_execution` | `sourceNamespace`、Session/Turn 身份、call ID、initiator、参数、真实状态/结果 |
+| `evaluation` | `sourceNamespace`、Session 身份、带来源的测试/构建/搜索/验收结果 |
 | `rollout_event` | Codex 源 Session/ordinal、原始 JSONL、源行 SHA-256、事件分类与投影结果；原生 bundle 另含 manifest/payload SHA-256 和镜像引用 |
 
 完整采集还应提供：
@@ -19,7 +19,7 @@ Collector 新写入的数据遵循 `schemas/capture-v2.schema.json`。每条记�
 - `clientRequestAborted`、`clientResponseClosedBeforeFinish` 和
   `upstreamResponseCompleted` 传输事实，取消不能由正文或状态码推断；
 - `sourceNamespace` 和实际 provider/model；
-- `task_session_id`、`session_id/thread_id`、`root_session_id`、
+- `session_id/thread_id`、可选 `task_session_id/root_session_id`、
   `parent_session_id`、`goal_id`、`turn_id`、`agent_id`、`branch_id`、
   `previous_response_id` 和 span parent；
 - Session start/end、cancel、retry、compaction、subagent spawn/join 等事件；
@@ -27,16 +27,16 @@ Collector 新写入的数据遵循 `schemas/capture-v2.schema.json`。每条记�
 - 原生 usage 与缓存 Token；
 - 测试、构建、搜索、用户修正、最终验收和 evaluator 的真实证据。
 
-Collector 保存所有响应状态。认证头和 Cookie 在进入 WAL 前删除；18084 入口 outbox
-在首次落盘前只替换明确的凭据字段、Bearer/token-like 值，并保存脱敏字段列表、版本和
-脱敏前正文 SHA-256。普通交互正文保持原样，Collector 不做语义改写。actor 查询不阻塞
+Collector 保存所有响应状态。认证头和 Cookie 在进入 WAL 前删除；请求与响应正文按原始
+字节保存，不在入口执行会改变正文长度或 SHA-256 的替换。普通交互正文保持原样，Collector
+不做语义改写。actor 查询不阻塞
 Capture 落盘，`actorMetadataStatus` 显式区分 resolved、missing、pending 和 error。
-缺失工具状态记录为 unknown；不得默认 success。只有 Agent/工具执行器能提供任务 lifecycle 与内部工具 span，API
-网关不得根据响应文本补造。
+缺失工具状态记录为 unknown；不得默认 success。Stock Codex rollout 提供 Session/Turn
+lifecycle 与内部工具 span，API 网关不得根据响应文本补造。
 
 同一任务的 API snapshot、lifecycle、tool 和 evaluation Capture 必须使用相同的
-`sourceNamespace` 与 `task_session_id`。命名空间参与隔离键；不同命名空间即使
-任务 ID 相同也不会被拼成一个 Session。
+`sourceNamespace`，并通过真实 request/response/call/session ID 关联。命名空间参与
+隔离键；不同命名空间即使身份相同也不会被拼成一个 Session。
 
 Relay producer 入口和 `chiptrace produce` 要求 `producerEvent` 包含版本、稳定
 event ID、生产者、生产者版本、`stream_id` 和单调 `sequence`，所有事件携带
@@ -47,64 +47,38 @@ dispatcher 必须分别发送 started 与 terminal；Assembly 将它们归并为
 `toolRegistry`；其规范化内容 SHA-256、生产者版本和工具数量进入 Session
 `meta.tool_registry_evidence`。
 
-### Harness 生产者
+### Stock Codex 生产者
 
-`chiptrace harness` 是生产者侧的参考实现，状态文件和 `events.ndjson` 位于同一
-任务目录，格式由 `schemas/harness-session-v1.schema.json` 固定。启动命令原子创建
-任务身份并先写入 `task_start`；之后只能由 dispatcher 写入真实的工具 started/
-terminal，任务结束必须显式写入 `task_end`、`cancel` 或其他终态。Harness 同时
-导出以下可直接注入 HTTP 请求的关联头：
+Stock Codex Plugin 将 Hook 原始 JSON 先原子写入本地 outbox；`codex-agent` 再读取 Hook
+引用的 rollout 完整行，并在 Relay durable ACK 后推进 checkpoint。生产者不要求 patched
+Codex、Harness、Runtime Registry 或自定义启动命令。
 
-- `x-chiptrace-task-session-id`
-- `x-chiptrace-root-session-id`
-- `x-chiptrace-parent-session-id`
-- `x-chiptrace-goal-id`
-- `x-chiptrace-agent-id`
-- `x-chiptrace-branch-id`
-- `x-chiptrace-session-id`
-- `x-chiptrace-thread-id`
-- `x-chiptrace-previous-response-id`
-- W3C `traceparent`
+身份按源字段解释：
 
-每次事件先以规范化 JSONL 原子追加并 `fsync`，再由 `harness flush` 投递到
-`/producer/events`。checkpoint 只有在整批收到 Relay 的逐条 durable ACK 后推进；
-Relay 重试返回的 duplicate 不会增加唯一事件计数。恢复时会校验每个 producer stream
-从序号 0 连续、checkpoint 落在换行边界，并截去未完成的最后一行；状态、序列或终态
-不一致会显式失败。Harness 不会从 thread、response `completed`、工具名或返回文本
-推断任务边界、工具 Schema 或成功状态。
+- `session_meta.session_id` 是采购聚合使用的 Session 身份；
+- `session_meta.id` 是当前 root/subagent thread 身份；
+- 根线程 `root_turn_id` 是一次 OTLP Trace；
+- `parent_thread_id` 与 `agent_path` 组成子代理 DAG；
+- Hook 的 `SessionStart/SessionEnd` 是 Session 边界，rollout 的
+  `task_started/task_complete` 只表示 Turn 边界。
 
-Harness/dispatcher 使用 `identity_scheme=chiptrace.deterministic-capture.v1`。Codex
-原生 bundle 使用 `identity_scheme=source-native`，保留源 Capture 身份；两种方案显式
-区分，不能根据 producer 名称猜测。
+因此 `session.id + SessionStart + SessionEnd/cancel` 可以得到
+`task_boundary_attested=true`；只有 Turn start/end 或只有 thread ID 不能证明完整
+Session。显式上层任务系统仍可提供 `task_session_id + task start/end`，两种边界证据
+不会互相伪装。
 
-升级后的在线入口只接受当前 producer 契约。历史 WAL 仍按原字节恢复，不重写 hash；
-缺少 `stream_id`、identity scheme 或状态机事件的历史记录会在 Assembly 中保持
-partial 并拒绝严格 Release，不会阻止 Collector 启动。
+每条 rollout Capture 保存源 JSONL 原文及 SHA-256。解析器未知事件进入
+`rollout_unknown_events` 并使完整性 Gate 失败。真实 Runtime 执行无法关联模型调用时仍
+保存并进入 `rollout_unmapped_tools` warning，挂到 Turn 根，不猜测父调用，也不自动投影
+为 Buyer 工具调用。
 
-`traceContext` 的字段按来源保留在 `fieldEvidence`：显式 Capture、
-`x-chiptrace-*`、W3C `traceparent`、Codex `client_metadata`/
-`x-codex-turn-metadata` 和请求正文不会被混成无来源字段。值不一致时写入
-`fieldEvidenceConflicts` 并使严格 Assembly Gate 失败。`thread_id`、
-`session_id` 和 `prompt_cache_key` 只用于关联，不会提升为 `task_session_id`。
-Codex `agent_name` 规范化为 `agent_path`；只有 harness/dispatcher 分配的稳定实例
-标识写入 `agent_id`，两者不作为同一字段比较。
+工具定义以 18084 Wire 中模型实际收到的 `tools`/`additional_tools` 为权威来源。Runtime
+执行未携带 schema 时保持 `source_complete=false`；只有被调用名称存在完整真实定义时，
+Buyer `tool_definitions` Gate 才通过。不得从 `source_js`、输出文本、工具名列表或固定模板
+重建 schema。
 
-原生 `codex-rollout-trace` bundle 的 `trace.jsonl` 是运行时权威事件源；导出器
-校验 manifest、连续 seq、payload ref 和原始字节 SHA-256，并在 durable ACK 后推进
-checkpoint。缺失或改写的 bundle 前缀直接失败。`rollout_ended/thread_ended` 只表示
-运行时生命周期。Codex `task_started/task_complete` 只表示 turn start/end。rollout exporter 不把
-`turn_id` 或 thread/session ID 提升为采购任务边界。只有 harness 明确创建并注入
-`task_session_id`，再发送任务 start/end/cancel，`task_boundary_attested` 才能通过。
-每条 rollout Capture 保存源 JSONL 原文及 SHA-256；解析器未知类型和无法用真实
-Tool Registry、模型调用 ID、工具名三者精确映射的 runtime 工具不会丢弃，分别进入
-`rollout_unknown_events` 和 `rollout_unmapped_tools`。Codex 0.150 的 `WebSearch`
-可识别，但源文件没有搜索结果正文时不生成有效工具返回。
-
-新 Codex producer 必须把 dispatcher 在任务开始时导出的实际 Registry 快照内联到
-原生 bundle；`--tool-registry` 只作为旧 bundle 的显式兼容输入。缺 Registry 时仍保存
-真实工具参数、结果和状态，工具 Schema 为 null、provenance 为
-`missing_runtime_registry`，并由 `rollout_unmapped_tools` 阻止严格 Release；不得从
-`source_js`、输出文本或工具名列表重建 Schema。
+历史 Harness、原生 bundle 和 Runtime Registry 契约仍按原字节读取，用于旧数据重放，
+但不属于当前生产主链，也不是 Buyer 通过条件。
 
 ## ModelInteraction 与 RuntimeSpan
 
@@ -139,9 +113,10 @@ provenance，不驱动 core 分支。Capture v2 的 JSON body 同时保存解析
 | 客户端后续提交的结果 | `ModelInteraction.tool_results_submitted` |
 | 执行器真实运行和状态 | `RuntimeSpan(span_kind=tool_execution)` |
 
-Link 只接受同一 `source_namespace + task_session_id` 下的精确 call、request、response 或
-`previous_response_id`，歧义时不关联。RuntimeSpan 必须来自同一批 Capture 中的真实
-runtime producer；OTLP 不作为 canonical 输入，缺失事实不能由外部 span 补齐。
+Link 只接受同一 `source_namespace` 与 canonical runtime scope 下的精确 call、request、
+response 或 `previous_response_id`，歧义时不关联。scope 优先使用显式
+`task_session_id`，否则使用 Stock Codex 的 Session/root Turn。RuntimeSpan 必须来自同一
+批 Capture 中的真实 rollout；OTLP 不作为 canonical 输入，缺失事实不能由外部 span 补齐。
 
 ```bash
 chiptrace project-interactions \
@@ -153,14 +128,14 @@ chiptrace verify-interactions \
   --projection /srv/chiptrace/interactions
 ```
 
-投影先用精确请求身份补齐任务关联，再按 `task_session_id` 选择单个任务。输入中存在
-多个任务且未指定 `--task-session-id` 时直接失败。写出前和复验时均使用 Draft 2020-12
-JSON Schema 逐条校验 ModelInteraction、RuntimeSpan 和 InteractionLink；非法记录不会
-进入可交付制品。
+投影先用精确请求身份补齐关联，再选择单个 canonical scope。显式任务系统可以用
+`--task-session-id` 选择任务；Stock Codex 使用 Session/root Turn 自动分组。输入包含多个
+不可判定 scope 时直接失败。写出前和复验时均使用 Draft 2020-12 JSON Schema 逐条校验
+ModelInteraction、RuntimeSpan 和 InteractionLink；非法记录不会进入可交付制品。
 
-`export-otlp` 只接受 `delivery_ready=true` 的 canonical 投影，并根据
-`InteractionLink` 生成单根 OTLP 树。导出必须满足 root=1、missing parent=0、内部父节点
-解析率=100%；OTLP 只含状态、计数、Token、身份和 Raw 引用，不复制大正文或工具载荷。
+`export-otlp` 根据 `InteractionLink` 生成单根 OTLP 树。取证投影可以导出，但 Manifest
+必须保留 `source_delivery_ready=false`；只有 ready cohort 可进入正式评测。每条 Trace
+必须满足 root=1、missing parent=0、内部父节点解析率=100%。
 
 ## Sub2API 精确关联
 
@@ -299,7 +274,7 @@ Assembly 输出 `schemas/session-v1.schema.json`，一行一个完整 Session。
 | `meta.usage_settlement_evidence` | 按精确调用 ID 组件执行一次结算的 Capture 集合、选择值和来源 |
 | `meta.rollout_events` | Codex 原始事件 lineage 与投影分类 |
 | `meta.rollout_unknown_events` | 当前解析器不认识的源事件，非空即拒绝严格 Release |
-| `meta.rollout_unmapped_tools` | 缺 Registry 或模型调用精确关联的 runtime 工具，非空即拒绝严格 Release |
+| `meta.rollout_unmapped_tools` | 无法精确关联模型调用的 runtime 工具；保留为 warning，不自动投影为 Buyer 调用 |
 
 每个工具定义包含 `schema_hash` 和 `schema_version`。`parameters` 中的
 `required` 名称必须引用已定义属性；每个结构化调用的 `arguments` 必须是可解析
@@ -308,8 +283,8 @@ JSON。来源没有版本时，Assembly
 `execution_status`，工具返回保留 `status`、`is_error` 与原始内容。
 原生 grammar 会无损保存在 `native_format`，生成的 JSON 包装仅供分析；
 expanded Profile 不把 `generated_adapter=true` 当成采购方要求的原生完整 JSON Schema。
-Tool Registry 遵循 `schemas/tool-registry-v1.schema.json`，必须绑定实际 Codex CLI
-版本；静态工具名列表或由命令文本生成的 Schema 不接受。
+历史 Tool Registry 遵循 `schemas/tool-registry-v1.schema.json`；静态工具名列表或由命令
+文本生成的 Schema 不接受，当前生产以 Wire 原始工具定义为准。
 
 模型字段一致性不等于供应商身份认证。若采集入口不能提供可信 provider
 证明，评分会输出 `model_attestation_missing`，不得宣称已证明模型来源。
@@ -322,7 +297,7 @@ canonical Manifest 固定保存六个不可补偿的布尔结果：
 2. `raw_bytes_complete`：请求与响应原始字节、长度和 SHA-256 可逐字节复验，且未截断。
 3. `protocol_complete`：Responses 流观察到明确协议终态；`[DONE]` 不作为终态。
 4. `runtime_complete`：模型调用、结果和执行精确关联，span 闭合且无状态冲突。
-5. `root_complete`：每个任务有且只有一个成对的 lifecycle Task Root。
+5. `root_complete`：每个 Turn 有且只有一个成对的 lifecycle Root，Session 边界另行验收。
 6. `delivery_ready`：以上五项全部为 true。
 
 `project-interactions` 可以为取证生成 `not_ready` 产物；`verify-interactions` 对其严格失败。
