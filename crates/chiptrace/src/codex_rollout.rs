@@ -146,11 +146,15 @@ fn verify_rollout_session_id(path: &Path, expected: &str) -> Result<()> {
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let value: Value = serde_json::from_str(line.trim_end())?;
-    let observed = value
+    let payload = value
         .get("payload")
-        .and_then(|payload| string(payload, "id").or_else(|| string(payload, "session_id")))
-        .ok_or_else(|| anyhow::anyhow!("Codex rollout first line has no session identity"))?;
-    if observed != expected {
+        .ok_or_else(|| anyhow::anyhow!("Codex rollout first line has no payload"))?;
+    let session_id = string(payload, "session_id");
+    let thread_id = string(payload, "id");
+    if session_id.is_none() && thread_id.is_none() {
+        bail!("Codex rollout first line has no session identity");
+    }
+    if session_id != Some(expected) && thread_id != Some(expected) {
         bail!("Codex rollout session identity does not match hook input");
     }
     Ok(())
@@ -546,30 +550,38 @@ fn project_event(
     let payload = event.get("payload").unwrap_or(&Value::Null);
     let event_type = string(payload, "type").unwrap_or("");
     if top_type == "session_meta" {
-        context.source_thread_id = string(payload, "id")
-            .or_else(|| string(payload, "session_id"))
-            .map(str::to_owned);
-        context.source_session_id = string(payload, "session_id")
-            .or(context.source_thread_id.as_deref())
-            .map(str::to_owned);
-        context.source_cli_version = string(payload, "cli_version").map(str::to_owned);
-        context.model_provider = string(payload, "model_provider").map(str::to_owned);
-        context.system_prompt = instruction_text(payload.get("base_instructions"));
-        context.parent_agent_thread_id = string(payload, "parent_thread_id")
-            .or_else(|| {
-                payload
-                    .pointer("/source/subagent/thread_spawn/parent_thread_id")
-                    .and_then(Value::as_str)
-            })
-            .map(str::to_owned);
-        context.agent_path = string(payload, "agent_path")
-            .or_else(|| {
-                payload
-                    .pointer("/source/subagent/thread_spawn/agent_path")
-                    .and_then(Value::as_str)
-            })
-            .map(str::to_owned);
-        context.thread_source = string(payload, "thread_source").map(str::to_owned);
+        if context.source_thread_id.is_none() {
+            context.source_thread_id = string(payload, "id")
+                .or_else(|| string(payload, "session_id"))
+                .map(str::to_owned);
+            context.source_session_id = string(payload, "session_id")
+                .or(context.source_thread_id.as_deref())
+                .map(str::to_owned);
+            context.parent_agent_thread_id = string(payload, "parent_thread_id")
+                .or_else(|| {
+                    payload
+                        .pointer("/source/subagent/thread_spawn/parent_thread_id")
+                        .and_then(Value::as_str)
+                })
+                .map(str::to_owned);
+            context.agent_path = string(payload, "agent_path")
+                .or_else(|| {
+                    payload
+                        .pointer("/source/subagent/thread_spawn/agent_path")
+                        .and_then(Value::as_str)
+                })
+                .map(str::to_owned);
+            context.thread_source = string(payload, "thread_source").map(str::to_owned);
+        }
+        if context.source_cli_version.is_none() {
+            context.source_cli_version = string(payload, "cli_version").map(str::to_owned);
+        }
+        if context.model_provider.is_none() {
+            context.model_provider = string(payload, "model_provider").map(str::to_owned);
+        }
+        if context.system_prompt.is_none() {
+            context.system_prompt = instruction_text(payload.get("base_instructions"));
+        }
     }
     if top_type == "turn_context" {
         context.producer_model = string(payload, "model").map(str::to_owned);
@@ -1666,6 +1678,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_history_session_meta_does_not_replace_rollout_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join("captures.jsonl");
+        let lines = [
+            line(
+                0,
+                json!({"type":"session_meta","payload":{
+                    "session_id":"session-root",
+                    "id":"thread-child",
+                    "parent_thread_id":"thread-root",
+                    "agent_path":"/root/reviewer"
+                }}),
+            ),
+            line(
+                1,
+                json!({"type":"session_meta","payload":{
+                    "session_id":"session-root",
+                    "id":"thread-root"
+                }}),
+            ),
+            line(
+                2,
+                json!({"type":"event_msg","payload":{
+                    "type":"task_started","turn_id":"turn-child"
+                }}),
+            ),
+        ];
+        fs::write(
+            temporary.path().join("rollout.jsonl"),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+
+        let summary = export_codex_rollout(config(temporary.path(), &output))
+            .await
+            .unwrap();
+        assert_eq!(summary.source_session_id.as_deref(), Some("session-root"));
+        assert_eq!(summary.source_thread_id.as_deref(), Some("thread-child"));
+        let child_digest = &sha256(b"thread-child")[..24];
+        let records = read_jsonl(&output);
+        assert!(records.iter().all(|record| {
+            record["traceContext"]["session_id"] == "session-root"
+                && record["traceContext"]["thread_id"] == "thread-child"
+                && record["traceContext"]["parent_thread_id"] == "thread-root"
+                && record["captureId"]
+                    .as_str()
+                    .is_some_and(|capture_id| capture_id.contains(child_digest))
+        }));
+    }
+
+    #[tokio::test]
     async fn turn_lifecycle_does_not_fabricate_task_boundary_and_resume_is_idempotent() {
         let temporary = tempfile::tempdir().unwrap();
         let output = temporary.path().join("captures.jsonl");
@@ -2222,5 +2285,48 @@ mod tests {
         }))
         .unwrap();
         assert!(resolve_hook_rollout(&wrong, &temporary.path().join("sessions")).is_err());
+
+        let child = sessions.join("rollout-child.jsonl");
+        fs::write(
+            &child,
+            format!(
+                "{}\n",
+                line(
+                    0,
+                    json!({"type":"session_meta","payload":{
+                        "session_id":"session-root",
+                        "id":"thread-child",
+                        "parent_thread_id":"thread-root"
+                    }})
+                )
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_rollout_path(
+                &child,
+                &temporary.path().join("sessions"),
+                Some("session-root")
+            )
+            .unwrap(),
+            child.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_rollout_path(
+                &child,
+                &temporary.path().join("sessions"),
+                Some("thread-child")
+            )
+            .unwrap(),
+            child.canonicalize().unwrap()
+        );
+        assert!(
+            resolve_rollout_path(
+                &child,
+                &temporary.path().join("sessions"),
+                Some("different")
+            )
+            .is_err()
+        );
     }
 }

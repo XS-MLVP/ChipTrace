@@ -25,6 +25,7 @@ pub struct InteractionProjectConfig {
     pub inputs: Vec<PathBuf>,
     pub output: PathBuf,
     pub task_session_id: Option<String>,
+    pub session_id: Option<String>,
     pub zstd_level: i32,
     pub replace: bool,
 }
@@ -34,6 +35,8 @@ pub struct InteractionProjectionManifest {
     pub schema_version: String,
     pub created_at_utc: String,
     pub task_session_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub input_records: u64,
     pub duplicate_captures_removed: u64,
     pub api_snapshots: u64,
@@ -221,8 +224,11 @@ pub fn project_interactions(
 
     let (mut captures, duplicate_captures_removed) = read_captures(&inputs)?;
     apply_exact_task_links(&mut captures)?;
-    let (mut captures, task_session_id) =
-        select_task_captures(captures, config.task_session_id.as_deref())?;
+    let (mut captures, task_session_id, session_id) = select_projection_captures(
+        captures,
+        config.task_session_id.as_deref(),
+        config.session_id.as_deref(),
+    )?;
     captures.sort_by_key(capture_order_key);
     let capture_records = captures.len() as u64;
 
@@ -244,6 +250,7 @@ pub fn project_interactions(
         .sort_by(|left, right| string_field(left, "span_id").cmp(&string_field(right, "span_id")));
     let mut links = build_interaction_links(&interactions, &runtime_spans, &captures)?;
     links.sort_by(|left, right| string_field(left, "link_id").cmp(&string_field(right, "link_id")));
+    attach_captured_tool_schemas(&mut runtime_spans, &interactions, &links)?;
     attach_runtime_link_refs(&mut interactions, &links);
     let validators = CanonicalValidators::new()?;
     validate_canonical_records(
@@ -340,6 +347,7 @@ pub fn project_interactions(
         schema_version: INTERACTION_PROJECTION_SCHEMA_VERSION.to_owned(),
         created_at_utc: utc_now(),
         task_session_id,
+        session_id,
         input_records: capture_records,
         duplicate_captures_removed,
         api_snapshots: api_captures.len() as u64,
@@ -488,6 +496,13 @@ pub(crate) fn verify_interaction_artifacts(root: &Path) -> Result<InteractionPro
     if manifest.task_session_id != projected_task_session_id {
         bail!("interaction projection task_session_id does not match its records");
     }
+    if let Some(expected_session_id) = manifest.session_id.as_deref() {
+        let projected_session_ids = canonical_session_ids(&interactions, &runtime_spans);
+        if projected_session_ids.len() != 1 || !projected_session_ids.contains(expected_session_id)
+        {
+            bail!("interaction projection session_id does not match its records");
+        }
+    }
     let (raw_bytes_complete, protocol_complete, interaction_metrics) =
         aggregate_interaction_integrity(&interactions);
     let runtime = runtime_integrity(&interactions, &runtime_spans, &links);
@@ -540,6 +555,20 @@ fn canonical_task_session_ids(interactions: &[Value], runtime_spans: &[Value]) -
         .filter_map(|record| {
             record
                 .pointer("/trace_context/task_session_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn canonical_session_ids(interactions: &[Value], runtime_spans: &[Value]) -> BTreeSet<String> {
+    interactions
+        .iter()
+        .chain(runtime_spans)
+        .filter_map(|record| {
+            record
+                .pointer("/trace_context/session_id")
                 .and_then(Value::as_str)
                 .filter(|value| !value.trim().is_empty())
                 .map(str::to_owned)
@@ -609,11 +638,15 @@ fn read_captures(inputs: &[PathBuf]) -> Result<(Vec<Value>, u64)> {
     Ok((captures, duplicates))
 }
 
-fn select_task_captures(
+fn select_projection_captures(
     mut captures: Vec<Value>,
-    requested: Option<&str>,
-) -> Result<(Vec<Value>, Option<String>)> {
-    let available: BTreeSet<String> = captures
+    requested_task: Option<&str>,
+    requested_session: Option<&str>,
+) -> Result<(Vec<Value>, Option<String>, Option<String>)> {
+    if requested_task.is_some() && requested_session.is_some() {
+        bail!("--task-session-id and --session-id cannot be used together");
+    }
+    let available_tasks: BTreeSet<String> = captures
         .iter()
         .filter_map(|capture| {
             capture
@@ -623,33 +656,84 @@ fn select_task_captures(
                 .map(str::to_owned)
         })
         .collect();
-    let selected = if let Some(requested) = requested {
+    let available_sessions: BTreeSet<String> = captures
+        .iter()
+        .filter_map(|capture| {
+            capture
+                .pointer("/traceContext/session_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .collect();
+
+    if let Some(requested) = requested_task {
         let requested = requested.trim();
         if requested.is_empty() {
             bail!("--task-session-id cannot be empty");
         }
-        if !available.contains(requested) {
+        if !available_tasks.contains(requested) {
             bail!("task_session_id {requested:?} was not found in Capture inputs");
         }
-        Some(requested.to_owned())
-    } else {
-        match available.len() {
-            0 => None,
-            1 => available.into_iter().next(),
-            count => bail!(
-                "Capture inputs contain {count} task Sessions; select one with --task-session-id"
-            ),
-        }
-    };
-    if let Some(selected) = &selected {
         captures.retain(|capture| {
             capture
                 .pointer("/traceContext/task_session_id")
                 .and_then(Value::as_str)
-                == Some(selected.as_str())
+                == Some(requested)
         });
+        return Ok((captures, Some(requested.to_owned()), None));
     }
-    Ok((captures, selected))
+
+    if let Some(requested) = requested_session {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            bail!("--session-id cannot be empty");
+        }
+        if !available_sessions.contains(requested) {
+            bail!("session_id {requested:?} was not found in Capture inputs");
+        }
+        captures.retain(|capture| {
+            capture
+                .pointer("/traceContext/session_id")
+                .and_then(Value::as_str)
+                == Some(requested)
+        });
+        return Ok((captures, None, Some(requested.to_owned())));
+    }
+
+    match available_tasks.len() {
+        0 => {}
+        1 => {
+            let selected = available_tasks.into_iter().next().unwrap_or_default();
+            captures.retain(|capture| {
+                capture
+                    .pointer("/traceContext/task_session_id")
+                    .and_then(Value::as_str)
+                    == Some(selected.as_str())
+            });
+            return Ok((captures, Some(selected), None));
+        }
+        count => {
+            bail!("Capture inputs contain {count} task Sessions; select one with --task-session-id")
+        }
+    }
+
+    match available_sessions.len() {
+        0 => Ok((captures, None, None)),
+        1 => {
+            let selected = available_sessions.into_iter().next().unwrap_or_default();
+            captures.retain(|capture| {
+                capture
+                    .pointer("/traceContext/session_id")
+                    .and_then(Value::as_str)
+                    == Some(selected.as_str())
+            });
+            Ok((captures, None, Some(selected)))
+        }
+        count => bail!(
+            "Capture inputs contain {count} Stock Codex Sessions; select one with --session-id"
+        ),
+    }
 }
 
 fn model_interaction_from_capture(capture: &Value) -> Result<Value> {
@@ -836,7 +920,6 @@ fn apply_exact_task_links(captures: &mut [Value]) -> Result<()> {
             continue;
         };
         for key in correlation_keys(capture) {
-            let key = namespaced_key(capture, &key);
             if let Some(existing) = links.get(&key)
                 && existing != task_session_id
             {
@@ -855,7 +938,7 @@ fn apply_exact_task_links(captures: &mut [Value]) -> Result<()> {
         }
         let matched: BTreeSet<String> = correlation_keys(capture)
             .into_iter()
-            .filter_map(|key| links.get(&namespaced_key(capture, &key)).cloned())
+            .filter_map(|key| links.get(&key).cloned())
             .collect();
         if matched.len() > 1 {
             bail!("Capture exact IDs link to multiple task Sessions");
@@ -873,11 +956,10 @@ fn apply_exact_task_links(captures: &mut [Value]) -> Result<()> {
     Ok(())
 }
 
-fn namespaced_key(capture: &Value, key: &str) -> String {
-    format!(
-        "{}\0{key}",
-        string_field(capture, "sourceNamespace").unwrap_or("default")
-    )
+fn scoped_correlation_key(capture: &Value, key: &str) -> String {
+    let scope = canonical_identity_scope(capture)
+        .unwrap_or_else(|| format!("source:{}", source_namespace(capture)));
+    format!("{scope}\0{key}")
 }
 
 fn correlation_keys(capture: &Value) -> BTreeSet<String> {
@@ -1166,10 +1248,9 @@ fn source_namespace(value: &Value) -> &str {
 }
 
 fn runtime_thread_key(value: &Value, thread_id: &str) -> String {
-    format!(
-        "{}\0{}\0{thread_id}",
-        source_namespace(value),
-        trace_string(value, "session_id").unwrap_or("")
+    trace_string(value, "session_id").map_or_else(
+        || format!("source:{}\0thread:{thread_id}", source_namespace(value)),
+        |session_id| format!("session:{session_id}\0thread:{thread_id}"),
     )
 }
 
@@ -2809,7 +2890,7 @@ impl RuntimeScopeIndex {
 
     fn key(&self, value: &Value) -> Option<String> {
         let (kind, identity) = self.scope(value)?;
-        Some(format!("{}\0{kind}:{identity}", source_namespace(value)))
+        Some(runtime_scope_key(value, kind, &identity))
     }
 
     fn trace_context(&self, capture: &Value, child: bool) -> Value {
@@ -2832,7 +2913,9 @@ impl RuntimeScopeIndex {
 fn build_runtime_spans(captures: &[Value]) -> Result<Vec<Value>> {
     let scope_index = RuntimeScopeIndex::new(captures);
     let mut spans = build_task_root_spans(captures, &scope_index)?;
+    spans.extend(build_dispatcher_runtime_spans(captures, &scope_index)?);
     spans.extend(build_tool_runtime_spans(captures, &scope_index)?);
+    spans.extend(build_subagent_runtime_spans(captures, &scope_index)?);
     spans.extend(build_native_runtime_spans(captures, &scope_index)?);
     Ok(spans)
 }
@@ -3031,10 +3114,227 @@ fn deduplicate_runtime_spans(spans: &mut Vec<Value>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct DispatcherCall<'a> {
+    capture: &'a Value,
+    name: String,
+    arguments: Value,
+}
+
+#[derive(Debug)]
+struct DispatcherResult<'a> {
+    capture: &'a Value,
+    content: Value,
+}
+
+#[derive(Debug, Default)]
+struct DispatcherObservations<'a> {
+    calls: Vec<DispatcherCall<'a>>,
+    results: Vec<DispatcherResult<'a>>,
+}
+
+fn build_dispatcher_runtime_spans(
+    captures: &[Value],
+    scope_index: &RuntimeScopeIndex,
+) -> Result<Vec<Value>> {
+    let exact_runtime_calls: HashSet<String> = captures
+        .iter()
+        .filter_map(|capture| {
+            let call_id = capture
+                .pointer("/toolExecution/call_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())?;
+            Some(scoped_runtime_call(scope_index, capture, call_id))
+        })
+        .collect();
+    let mut groups: BTreeMap<String, (String, DispatcherObservations<'_>)> = BTreeMap::new();
+
+    for capture in captures {
+        let Some(messages) = capture.get("rolloutMessages").and_then(Value::as_array) else {
+            continue;
+        };
+        for message in messages {
+            if string_field(message, "role") == Some("assistant") {
+                for call in message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let Some(call_id) =
+                        string_field(call, "id").filter(|value| !value.trim().is_empty())
+                    else {
+                        continue;
+                    };
+                    let function = call.get("function").unwrap_or(call);
+                    let Some(name) =
+                        string_field(function, "name").filter(|value| !value.trim().is_empty())
+                    else {
+                        continue;
+                    };
+                    let key = scoped_runtime_call(scope_index, capture, call_id);
+                    if exact_runtime_calls.contains(&key) {
+                        continue;
+                    }
+                    let arguments = parse_json_string_or_clone(function.get("arguments"));
+                    groups
+                        .entry(key)
+                        .or_insert_with(|| (call_id.to_owned(), DispatcherObservations::default()))
+                        .1
+                        .calls
+                        .push(DispatcherCall {
+                            capture,
+                            name: name.to_owned(),
+                            arguments,
+                        });
+                }
+            } else if string_field(message, "role") == Some("tool") {
+                let Some(call_id) =
+                    string_field(message, "tool_call_id").filter(|value| !value.trim().is_empty())
+                else {
+                    continue;
+                };
+                let key = scoped_runtime_call(scope_index, capture, call_id);
+                if exact_runtime_calls.contains(&key) {
+                    continue;
+                }
+                groups
+                    .entry(key)
+                    .or_insert_with(|| (call_id.to_owned(), DispatcherObservations::default()))
+                    .1
+                    .results
+                    .push(DispatcherResult {
+                        capture,
+                        content: message.get("content").cloned().unwrap_or(Value::Null),
+                    });
+            }
+        }
+    }
+
+    let mut spans = Vec::new();
+    for (scope, (call_id, observations)) in groups {
+        let Some(first) = observations.calls.first() else {
+            continue;
+        };
+        let selected = observations
+            .results
+            .last()
+            .map(|result| result.capture)
+            .unwrap_or(first.capture);
+        let names: BTreeSet<&str> = observations
+            .calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect();
+        let arguments: BTreeSet<String> = observations
+            .calls
+            .iter()
+            .map(|call| canonical_json(&call.arguments))
+            .collect::<Result<_>>()?;
+        let results: BTreeSet<String> = observations
+            .results
+            .iter()
+            .map(|result| canonical_json(&result.content))
+            .collect::<Result<_>>()?;
+        let terminal = observations.results.len() == 1;
+        let state_conflict = observations.calls.len() != 1
+            || observations.results.len() > 1
+            || names.len() != 1
+            || arguments.len() != 1
+            || results.len() > 1;
+        let capture_ids: Vec<&str> = observations
+            .calls
+            .iter()
+            .map(|call| call.capture)
+            .chain(observations.results.iter().map(|result| result.capture))
+            .filter_map(|capture| string_field(capture, "captureId"))
+            .collect();
+        let evidence: Vec<Value> = observations
+            .calls
+            .iter()
+            .map(|call| native_event_evidence(call.capture))
+            .chain(
+                observations
+                    .results
+                    .iter()
+                    .map(|result| native_event_evidence(result.capture)),
+            )
+            .collect();
+        spans.push(json!({
+            "schema_version":RUNTIME_SPAN_SCHEMA_VERSION,
+            "span_id":dispatcher_span_id(&scope),
+            "trace_context":scope_index.trace_context(selected, true),
+            "span_kind":"tool_execution",
+            "name":first.name,
+            "call_id":call_id,
+            "parent_call_id":Value::Null,
+            "parent_span_id":Value::Null,
+            "status":if terminal {"completed"} else {"running"},
+            "started_at":observations.calls.iter()
+                .filter_map(|call| string_field(call.capture, "receivedAt")).min(),
+            "finished_at":observations.results.iter()
+                .filter_map(|result| string_field(result.capture, "receivedAt")).max(),
+            "arguments":first.arguments,
+            "result":observations.results.last().map(|result| &result.content),
+            "error":Value::Null,
+            "tool_schema":Value::Null,
+            "raw_capture_refs":capture_ids,
+            "extensions":{
+                "state_observations":if terminal {json!(["started", "completed"])} else {json!(["started"])},
+                "state_conflict":state_conflict,
+                "lifecycle_terminal":terminal,
+                "semantic_status":"unknown",
+                "semantic_status_provenance":"not_reported_by_codex_rollout_response_item",
+                "evidence_type":"codex_dispatcher_call_output_pair",
+                "schema_provenance":{
+                    "source":"codex_rollout_response_item",
+                    "source_complete":false,
+                    "reason":"rollout response items do not contain the registered tool schema"
+                },
+                "buyer_schema_eligible":false,
+                "codex":evidence,
+            },
+        }));
+    }
+    Ok(spans)
+}
+
+fn scoped_runtime_call(scope_index: &RuntimeScopeIndex, capture: &Value, call_id: &str) -> String {
+    let scope = scope_index.key(capture).unwrap_or_else(|| {
+        format!(
+            "source:{}\0unscoped:{}",
+            source_namespace(capture),
+            trace_string(capture, "thread_id")
+                .or_else(|| trace_string(capture, "turn_id"))
+                .unwrap_or_else(|| string_field(capture, "captureId").unwrap_or("missing"))
+        )
+    });
+    format!("{scope}\0{call_id}")
+}
+
+fn dispatcher_span_id(scoped_call: &str) -> String {
+    stable_id("runtime-span", &["dispatcher", scoped_call])
+}
+
+fn parse_json_string_or_clone(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(value)) => {
+            serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.clone()))
+        }
+        Some(value) => value.clone(),
+        None => Value::Null,
+    }
+}
+
+fn canonical_json(value: &Value) -> Result<String> {
+    Ok(serde_json::to_string(value)?)
+}
+
 fn build_tool_runtime_spans(
     captures: &[Value],
     scope_index: &RuntimeScopeIndex,
 ) -> Result<Vec<Value>> {
+    let model_call_names = rollout_model_call_names(captures, scope_index);
     let mut groups: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
     for capture in captures {
         let Some(execution) = capture.get("toolExecution") else {
@@ -3058,11 +3358,26 @@ fn build_tool_runtime_spans(
             .push(capture);
     }
     let mut spans = Vec::new();
-    for captures in groups.into_values() {
+    for (group_key, captures) in groups {
         let first = captures[0];
         let first_execution = &first["toolExecution"];
         let call_id = string_field(first_execution, "call_id").unwrap_or("missing");
-        let name = string_field(first_execution, "name").unwrap_or("unknown");
+        let runtime_name = string_field(first_execution, "name").unwrap_or("unknown");
+        let exact_model_match = captures.iter().any(|capture| {
+            capture
+                .pointer("/toolExecution/model_call_matched")
+                .and_then(Value::as_bool)
+                == Some(true)
+        });
+        let model_names = model_call_names.get(&group_key);
+        let name = if exact_model_match && model_names.is_some_and(|names| names.len() == 1) {
+            model_names
+                .and_then(|names| names.iter().next())
+                .map(String::as_str)
+                .unwrap_or(runtime_name)
+        } else {
+            runtime_name
+        };
         let terminal: Vec<&Value> = captures
             .iter()
             .copied()
@@ -3070,10 +3385,19 @@ fn build_tool_runtime_spans(
             .collect();
         let selected = terminal.last().copied().unwrap_or(first);
         let execution = &selected["toolExecution"];
+        let lifecycle_terminal = terminal.iter().any(|capture| {
+            capture
+                .pointer("/rolloutEvent/event_type")
+                .and_then(Value::as_str)
+                == Some("item_completed")
+        });
+        let semantic_status = string_field(execution, "status").unwrap_or("unknown");
         let status = if terminal.is_empty() {
             "running".to_owned()
+        } else if semantic_status == "unknown" && lifecycle_terminal {
+            "completed".to_owned()
         } else {
-            normalize_runtime_status(string_field(execution, "status"))
+            normalize_runtime_status(Some(semantic_status))
         };
         let parent_call_ids: BTreeSet<String> = captures
             .iter()
@@ -3138,10 +3462,208 @@ fn build_tool_runtime_spans(
                 "buyer_schema_eligible":execution.get("schema").is_some_and(|schema| !schema.is_null())
                     && execution.pointer("/schema/schema_provenance/source_complete")
                         .and_then(Value::as_bool) != Some(false),
+                "lifecycle_terminal":lifecycle_terminal,
+                "semantic_status":semantic_status,
+                "semantic_status_provenance":if semantic_status == "unknown" {
+                    "not_reported_by_runtime_item"
+                } else {
+                    "codex_rollout_runtime_item.status"
+                },
+                "runtime_tool_name":runtime_name,
             },
         }));
     }
     Ok(spans)
+}
+
+fn build_subagent_runtime_spans(
+    captures: &[Value],
+    scope_index: &RuntimeScopeIndex,
+) -> Result<Vec<Value>> {
+    let model_calls = rollout_model_call_keys(captures, scope_index);
+    let exact_runtime_calls: HashSet<String> = captures
+        .iter()
+        .filter_map(|capture| {
+            let call_id = capture
+                .pointer("/toolExecution/call_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())?;
+            Some(scoped_runtime_call(scope_index, capture, call_id))
+        })
+        .collect();
+    let mut groups: BTreeMap<String, (String, String, Vec<&Value>)> = BTreeMap::new();
+    for capture in captures {
+        let Some(event) = capture.get("lifecycleEvent") else {
+            continue;
+        };
+        if !matches!(
+            string_field(event, "type"),
+            Some("subagent_spawn" | "subagent_join" | "subagent_interaction")
+        ) {
+            continue;
+        }
+        let Some(agent_thread_id) = event
+            .pointer("/source_event/agent_thread_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let scope = scope_index
+            .key(capture)
+            .unwrap_or_else(|| format!("source:{}\0unscoped", source_namespace(capture)));
+        groups
+            .entry(format!("{scope}\0{agent_thread_id}"))
+            .or_insert_with(|| (scope, agent_thread_id.to_owned(), Vec::new()))
+            .2
+            .push(capture);
+    }
+
+    let mut spans = Vec::new();
+    for (_, (scope, agent_thread_id, observations)) in groups {
+        let starts: Vec<&Value> = observations
+            .iter()
+            .copied()
+            .filter(|capture| {
+                capture
+                    .pointer("/lifecycleEvent/type")
+                    .and_then(Value::as_str)
+                    == Some("subagent_spawn")
+            })
+            .collect();
+        let terminals: Vec<&Value> = observations
+            .iter()
+            .copied()
+            .filter(|capture| {
+                capture
+                    .pointer("/lifecycleEvent/type")
+                    .and_then(Value::as_str)
+                    == Some("subagent_join")
+            })
+            .collect();
+        let first = starts
+            .first()
+            .copied()
+            .or_else(|| observations.first().copied())
+            .context("subagent activity group is empty")?;
+        let selected = terminals.last().copied().unwrap_or(first);
+        let parent_calls: BTreeSet<String> = starts
+            .iter()
+            .filter_map(|capture| {
+                capture
+                    .pointer("/lifecycleEvent/source_event/id")
+                    .and_then(Value::as_str)
+            })
+            .filter(|call_id| model_calls.contains(&format!("{scope}\0{call_id}")))
+            .map(str::to_owned)
+            .collect();
+        let parent_span_id = (parent_calls.len() == 1)
+            .then(|| parent_calls.iter().next())
+            .flatten()
+            .map(|call_id| {
+                let scoped_call = format!("{scope}\0{call_id}");
+                if exact_runtime_calls.contains(&scoped_call) {
+                    stable_id("runtime-span", &[&scope, call_id])
+                } else {
+                    dispatcher_span_id(&scoped_call)
+                }
+            });
+        let agent_paths: BTreeSet<&str> = observations
+            .iter()
+            .filter_map(|capture| {
+                capture
+                    .pointer("/lifecycleEvent/source_event/agent_path")
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        let capture_ids: Vec<&str> = observations
+            .iter()
+            .filter_map(|capture| string_field(capture, "captureId"))
+            .collect();
+        spans.push(json!({
+            "schema_version":RUNTIME_SPAN_SCHEMA_VERSION,
+            "span_id":stable_id("runtime-span", &[&scope, "subagent", &agent_thread_id]),
+            "trace_context":scope_index.trace_context(selected, true),
+            "span_kind":"agent",
+            "name":agent_paths.iter().next().copied().unwrap_or("subagent"),
+            "call_id":agent_thread_id,
+            "parent_call_id":Value::Null,
+            "parent_span_id":parent_span_id,
+            "status":if terminals.is_empty() {"running"} else {"completed"},
+            "started_at":starts.iter().filter_map(|capture| {
+                capture.pointer("/lifecycleEvent/occurred_at").and_then(Value::as_str)
+                    .or_else(|| string_field(capture, "receivedAt"))
+            }).min(),
+            "finished_at":terminals.iter().filter_map(|capture| {
+                capture.pointer("/lifecycleEvent/occurred_at").and_then(Value::as_str)
+                    .or_else(|| string_field(capture, "receivedAt"))
+            }).max(),
+            "arguments":starts.first().and_then(|capture| capture.get("lifecycleEvent")),
+            "result":terminals.last().and_then(|capture| capture.get("lifecycleEvent")),
+            "error":Value::Null,
+            "tool_schema":Value::Null,
+            "raw_capture_refs":capture_ids,
+            "extensions":{
+                "state_conflict":starts.len() != 1 || terminals.len() != 1
+                    || parent_calls.len() > 1 || agent_paths.len() > 1,
+                "parent_span_required":parent_span_id.is_some(),
+                "agent_thread_id":agent_thread_id,
+                "agent_path":agent_paths.iter().next(),
+                "spawn_call_id":parent_calls.iter().next(),
+                "start_observations":starts.len(),
+                "terminal_observations":terminals.len(),
+                "codex":observations.iter()
+                    .map(|capture| native_event_evidence(capture)).collect::<Vec<_>>(),
+            },
+        }));
+    }
+    Ok(spans)
+}
+
+fn rollout_model_call_keys(captures: &[Value], scope_index: &RuntimeScopeIndex) -> HashSet<String> {
+    rollout_model_call_names(captures, scope_index)
+        .into_keys()
+        .collect()
+}
+
+fn rollout_model_call_names(
+    captures: &[Value],
+    scope_index: &RuntimeScopeIndex,
+) -> HashMap<String, BTreeSet<String>> {
+    let mut calls = HashMap::new();
+    for capture in captures {
+        for call in capture
+            .get("rolloutMessages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|message| string_field(message, "role") == Some("assistant"))
+            .flat_map(|message| {
+                message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+        {
+            let Some(call_id) = string_field(call, "id").filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            let Some(name) = call
+                .get("function")
+                .and_then(|function| string_field(function, "name"))
+                .filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            calls
+                .entry(scoped_runtime_call(scope_index, capture, call_id))
+                .or_insert_with(BTreeSet::new)
+                .insert(name.to_owned());
+        }
+    }
+    calls
 }
 
 #[derive(Debug, Clone)]
@@ -3486,7 +4008,7 @@ fn build_interaction_links(
             if let Some(capture) = captures_by_id.get(capture_id) {
                 for key in correlation_keys(capture) {
                     exact_interactions
-                        .entry(namespaced_key(capture, &key))
+                        .entry(scoped_correlation_key(capture, &key))
                         .or_default()
                         .insert(interaction_id.to_owned());
                 }
@@ -3494,10 +4016,19 @@ fn build_interaction_links(
         }
     }
     let mut runtime_span_identities: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut runtime_call_spans: HashMap<String, BTreeSet<String>> = HashMap::new();
     for span in runtime_spans {
         let Some(span_id) = string_field(span, "span_id") else {
             continue;
         };
+        if let Some(call_id) =
+            string_field(span, "call_id").filter(|value| !value.trim().is_empty())
+        {
+            runtime_call_spans
+                .entry(scoped_identity(span, call_id))
+                .or_default()
+                .insert(span_id.to_owned());
+        }
         for identity in [
             Some(span_id),
             span.pointer("/trace_context/span_id")
@@ -3583,6 +4114,24 @@ fn build_interaction_links(
     }
     for span in runtime_spans {
         let span_id = string_field(span, "span_id").unwrap_or("missing");
+        if let Some(parent_call_id) =
+            string_field(span, "parent_call_id").filter(|value| !value.trim().is_empty())
+            && let Some(targets) = runtime_call_spans.get(&scoped_identity(span, parent_call_id))
+            && targets.len() == 1
+        {
+            let parent = targets.iter().next().cloned().unwrap_or_default();
+            if parent != span_id {
+                links.push(interaction_link(
+                    &format!("runtime-span:{parent}"),
+                    &format!("runtime-span:{span_id}"),
+                    "runtime_parent_to_child",
+                    json!({
+                        "match":"exact_runtime_call_id",
+                        "parent_call_id":parent_call_id,
+                    }),
+                ));
+            }
+        }
         if let Some(parent_span_id) =
             string_field(span, "parent_span_id").filter(|value| !value.trim().is_empty())
             && let Some(targets) =
@@ -3640,12 +4189,8 @@ fn build_interaction_links(
             .flatten()
             .filter_map(Value::as_str)
         {
-            let namespace = span
-                .pointer("/trace_context/source_namespace")
-                .and_then(Value::as_str)
-                .unwrap_or("default");
-            let namespaced = format!("{namespace}\0{key}");
-            if let Some(targets) = exact_interactions.get(&namespaced)
+            let scoped = scoped_correlation_key(span, key);
+            if let Some(targets) = exact_interactions.get(&scoped)
                 && targets.len() == 1
             {
                 let interaction = targets.iter().next().cloned().unwrap_or_default();
@@ -3749,16 +4294,12 @@ fn build_interaction_links(
 }
 
 fn scoped_identity(value: &Value, identity: &str) -> String {
-    let scope = trace_string(value, "task_session_id")
-        .map(|value| format!("task:{value}"))
-        .or_else(|| trace_string(value, "root_turn_id").map(|value| format!("turn:{value}")))
-        .or_else(|| trace_string(value, "turn_id").map(|value| format!("turn:{value}")))
-        .unwrap_or_default();
-    format!("{}\0{scope}\0{identity}", source_namespace(value))
+    let scope = canonical_identity_scope(value)
+        .unwrap_or_else(|| format!("source:{}", source_namespace(value)));
+    format!("{scope}\0{identity}")
 }
 
 fn runtime_span_identity(value: &Value, identity: &str) -> String {
-    let namespace = source_namespace(value);
     let trace = value
         .pointer("/trace_context/trace_id")
         .and_then(Value::as_str)
@@ -3768,15 +4309,10 @@ fn runtime_span_identity(value: &Value, identity: &str) -> String {
                 .and_then(Value::as_str)
                 .and_then(|traceparent| traceparent.split('-').nth(1))
         })
-        .or_else(|| {
-            value
-                .pointer("/trace_context/task_session_id")
-                .and_then(Value::as_str)
-        })
-        .or_else(|| trace_string(value, "root_turn_id"))
-        .or_else(|| trace_string(value, "turn_id"))
-        .unwrap_or("");
-    format!("{namespace}\0{trace}\0{identity}")
+        .map(|trace_id| format!("trace:{trace_id}"))
+        .or_else(|| canonical_identity_scope(value))
+        .unwrap_or_else(|| format!("source:{}", source_namespace(value)));
+    format!("{trace}\0{identity}")
 }
 
 fn runtime_task_scope(value: &Value) -> Option<String> {
@@ -3787,7 +4323,31 @@ fn runtime_task_scope(value: &Value) -> Option<String> {
     } else {
         return None;
     };
-    Some(format!("{}\0{kind}:{identity}", source_namespace(value)))
+    Some(runtime_scope_key(value, kind, identity))
+}
+
+fn runtime_scope_key(value: &Value, kind: &str, identity: &str) -> String {
+    if kind == "task" {
+        return format!("task:{identity}");
+    }
+    trace_string(value, "session_id").map_or_else(
+        || format!("turn:{identity}"),
+        |session_id| format!("session:{session_id}\0turn:{identity}"),
+    )
+}
+
+fn canonical_identity_scope(value: &Value) -> Option<String> {
+    if let Some(task_session_id) = trace_string(value, "task_session_id") {
+        return Some(format!("task:{task_session_id}"));
+    }
+    let session_id = trace_string(value, "session_id");
+    let turn_id = trace_string(value, "root_turn_id").or_else(|| trace_string(value, "turn_id"));
+    match (session_id, turn_id) {
+        (Some(session_id), Some(turn_id)) => Some(format!("session:{session_id}\0turn:{turn_id}")),
+        (Some(session_id), None) => Some(format!("session:{session_id}")),
+        (None, Some(turn_id)) => Some(format!("turn:{turn_id}")),
+        (None, None) => None,
+    }
 }
 
 fn interaction_link(from: &str, to: &str, relation: &str, evidence: Value) -> Value {
@@ -3799,6 +4359,114 @@ fn interaction_link(from: &str, to: &str, relation: &str, evidence: Value) -> Va
         "relation":relation,
         "evidence":evidence,
     })
+}
+
+fn attach_captured_tool_schemas(
+    runtime_spans: &mut [Value],
+    interactions: &[Value],
+    links: &[Value],
+) -> Result<()> {
+    let interactions_by_id: HashMap<&str, &Value> = interactions
+        .iter()
+        .filter_map(|interaction| {
+            string_field(interaction, "interaction_id").map(|id| (id, interaction))
+        })
+        .collect();
+    let spans_by_id: HashMap<&str, usize> = runtime_spans
+        .iter()
+        .enumerate()
+        .filter_map(|(index, span)| string_field(span, "span_id").map(|id| (id, index)))
+        .collect();
+    let mut candidates: HashMap<usize, BTreeMap<String, (&Value, &str, &str)>> = HashMap::new();
+
+    for link in links {
+        if string_field(link, "relation") != Some("model_call_to_runtime_execution") {
+            continue;
+        }
+        let Some(source) =
+            string_field(link, "from").and_then(|value| value.strip_prefix("model-call:"))
+        else {
+            continue;
+        };
+        let Some((interaction_id, call_id)) = source.rsplit_once(':') else {
+            continue;
+        };
+        let Some(span_id) =
+            string_field(link, "to").and_then(|value| value.strip_prefix("runtime-span:"))
+        else {
+            continue;
+        };
+        let Some(&span_index) = spans_by_id.get(span_id) else {
+            continue;
+        };
+        if string_field(&runtime_spans[span_index], "call_id") != Some(call_id) {
+            continue;
+        }
+        let Some(interaction) = interactions_by_id.get(interaction_id).copied() else {
+            continue;
+        };
+        let call_names: BTreeSet<&str> = interaction
+            .get("model_tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|call| string_field(call, "call_id") == Some(call_id))
+            .filter_map(|call| string_field(call, "name"))
+            .collect();
+        if call_names.len() != 1 {
+            continue;
+        }
+        let name = call_names.iter().next().copied().unwrap_or_default();
+        if string_field(&runtime_spans[span_index], "name") != Some(name) {
+            continue;
+        }
+        for definition in interaction
+            .get("tool_definitions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|definition| string_field(definition, "name") == Some(name))
+        {
+            let digest = sha256(&serde_json::to_vec(definition)?);
+            candidates
+                .entry(span_index)
+                .or_default()
+                .insert(digest, (definition, interaction_id, call_id));
+        }
+    }
+
+    for (span_index, definitions) in candidates {
+        if definitions.len() > 1 {
+            bail!(
+                "runtime execution has conflicting captured tool definitions: {}",
+                string_field(&runtime_spans[span_index], "span_id").unwrap_or("missing")
+            );
+        }
+        let Some((_, (definition, interaction_id, call_id))) = definitions.into_iter().next()
+        else {
+            continue;
+        };
+        if runtime_spans[span_index]
+            .get("tool_schema")
+            .is_none_or(Value::is_null)
+        {
+            runtime_spans[span_index]["tool_schema"] = definition.clone();
+            runtime_spans[span_index]["extensions"]["schema_provenance"] = json!({
+                "source":"openai_request.tools",
+                "source_complete":true,
+                "interaction_id":interaction_id,
+                "call_id":call_id,
+            });
+            let eligible = definition
+                .get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+                && (definition.get("parameters").is_some_and(Value::is_object)
+                    || definition.get("format").is_some_and(Value::is_object));
+            runtime_spans[span_index]["extensions"]["buyer_schema_eligible"] = json!(eligible);
+        }
+    }
+    Ok(())
 }
 
 fn attach_runtime_link_refs(interactions: &mut [Value], links: &[Value]) {
@@ -3921,7 +4589,7 @@ mod tests {
         let (captures, duplicates) = read_captures(&[output]).unwrap();
         assert_eq!(duplicates, 0);
         let spans = build_runtime_spans(&captures).unwrap();
-        assert_eq!(spans.len(), 3);
+        assert_eq!(spans.len(), 4);
         let root_span = spans
             .iter()
             .find(|span| span["span_kind"] == "task_root")
@@ -3935,7 +4603,7 @@ mod tests {
             .iter()
             .filter(|span| span["span_kind"] == "tool_execution")
             .collect();
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
         assert!(tools.iter().all(|span| {
             span["trace_context"]["root_turn_id"] == "turn-root"
                 && span["extensions"]["buyer_schema_eligible"] == false
@@ -3946,6 +4614,14 @@ mod tests {
             .unwrap();
         assert_eq!(root_tool["parent_call_id"], "call-outer-exec");
         assert_eq!(root_tool["status"], "failed");
+        let dispatcher = tools
+            .iter()
+            .find(|span| span["call_id"] == "call-outer-exec")
+            .unwrap();
+        assert_eq!(dispatcher["name"], "exec");
+        assert_eq!(dispatcher["status"], "completed");
+        assert_eq!(dispatcher["extensions"]["semantic_status"], "unknown");
+        assert_eq!(dispatcher["extensions"]["lifecycle_terminal"], true);
         let child_tool = tools
             .iter()
             .find(|span| span["call_id"] == "runtime-command-child")
@@ -3958,6 +4634,139 @@ mod tests {
         let integrity = runtime_integrity(&[], &spans, &[]);
         assert!(integrity.root_complete);
         assert_eq!(integrity.metrics["unscoped_span_ids"], json!([]));
+    }
+
+    #[test]
+    fn stock_dispatcher_subagent_and_statusless_item_keep_separate_status_facts() {
+        let context = json!({
+            "session_id":"session-stock",
+            "thread_id":"thread-root",
+            "root_turn_id":"turn-root",
+            "turn_id":"turn-root"
+        });
+        let rollout = |ordinal: u64, event_type: &str| {
+            json!({
+                "schema_version":"chiptrace.codex-rollout.v1",
+                "source":"codex_rollout_jsonl",
+                "source_session_id":"session-stock",
+                "source_ordinal":ordinal,
+                "classification":"known",
+                "event_type":event_type,
+                "source_line":"{}",
+                "source_line_sha256":sha256(b"{}")
+            })
+        };
+        let call = json!({
+            "captureId":"cap-dispatch-call","sourceNamespace":"stock",
+            "receivedAt":"2026-09-01T00:00:01Z","traceContext":context,
+            "rolloutEvent":rollout(1, "function_call"),
+            "rolloutMessages":[{
+                "role":"assistant","content":"","tool_calls":[{
+                    "id":"call-spawn","type":"function",
+                    "function":{"name":"collaboration.spawn_agent","arguments":"{\"task_name\":\"review\"}"}
+                }]
+            }]
+        });
+        let result = json!({
+            "captureId":"cap-dispatch-result","sourceNamespace":"stock",
+            "receivedAt":"2026-09-01T00:00:02Z","traceContext":context,
+            "rolloutEvent":rollout(2, "function_call_output"),
+            "rolloutMessages":[{
+                "role":"tool","content":"{\"task_name\":\"/root/review\"}",
+                "tool_call_id":"call-spawn","status":"unknown"
+            }]
+        });
+        let spawn = json!({
+            "captureId":"cap-subagent-start","sourceNamespace":"stock",
+            "receivedAt":"2026-09-01T00:00:02Z","traceContext":context,
+            "rolloutEvent":rollout(3, "item_completed"),
+            "lifecycleEvent":{
+                "type":"subagent_spawn","status":"started",
+                "occurred_at":"2026-09-01T00:00:02Z",
+                "source_event":{
+                    "type":"SubAgentActivity","id":"call-spawn","kind":"started",
+                    "agent_thread_id":"thread-child","agent_path":"/root/review"
+                }
+            }
+        });
+        let join = json!({
+            "captureId":"cap-subagent-end","sourceNamespace":"stock",
+            "receivedAt":"2026-09-01T00:00:04Z","traceContext":context,
+            "rolloutEvent":rollout(4, "item_completed"),
+            "lifecycleEvent":{
+                "type":"subagent_join","status":"completed",
+                "occurred_at":"2026-09-01T00:00:04Z",
+                "source_event":{
+                    "type":"SubAgentActivity","id":"subagent-completed","kind":"completed",
+                    "agent_thread_id":"thread-child","agent_path":"/root/review"
+                }
+            }
+        });
+        let image = json!({
+            "captureId":"cap-image","sourceNamespace":"stock",
+            "receivedAt":"2026-09-01T00:00:03Z","traceContext":context,
+            "rolloutEvent":rollout(5, "item_completed"),
+            "toolExecution":{
+                "call_id":"runtime-image","parent_call_id":"call-spawn",
+                "name":"ImageView","status":"unknown","initiator":"runtime",
+                "arguments":{"path":"file:///tmp/image.png"},
+                "result":{"path":"file:///tmp/image.png"},
+                "schema_provenance":{"source":"codex_rollout_item_completed","source_complete":false}
+            }
+        });
+        let captures = vec![call, result, spawn, image, join];
+        let spans = build_runtime_spans(&captures).unwrap();
+        let dispatcher = spans
+            .iter()
+            .find(|span| span["call_id"] == "call-spawn")
+            .unwrap();
+        assert_eq!(dispatcher["status"], "completed");
+        assert_eq!(dispatcher["extensions"]["semantic_status"], "unknown");
+        let subagent = spans
+            .iter()
+            .find(|span| span["span_kind"] == "agent")
+            .unwrap();
+        assert_eq!(subagent["status"], "completed");
+        assert_eq!(subagent["parent_span_id"], dispatcher["span_id"]);
+        assert_eq!(subagent["extensions"]["state_conflict"], false);
+        let image = spans
+            .iter()
+            .find(|span| span["call_id"] == "runtime-image")
+            .unwrap();
+        assert_eq!(image["status"], "completed");
+        assert_eq!(image["extensions"]["semantic_status"], "unknown");
+        assert_eq!(image["extensions"]["lifecycle_terminal"], true);
+
+        let links = build_interaction_links(&[], &spans, &captures).unwrap();
+        assert!(links.iter().any(|link| {
+            link["relation"] == "runtime_parent_to_child"
+                && link["from"]
+                    == format!("runtime-span:{}", dispatcher["span_id"].as_str().unwrap())
+                && link["to"] == format!("runtime-span:{}", subagent["span_id"].as_str().unwrap())
+        }));
+    }
+
+    #[test]
+    fn dispatcher_without_output_remains_open() {
+        let capture = json!({
+            "captureId":"cap-dispatch-open","sourceNamespace":"stock",
+            "receivedAt":"2026-09-01T00:00:01Z",
+            "traceContext":{
+                "session_id":"session-stock","thread_id":"thread-root",
+                "root_turn_id":"turn-root","turn_id":"turn-root"
+            },
+            "rolloutMessages":[{
+                "role":"assistant","content":"","tool_calls":[{
+                    "id":"call-open","type":"function",
+                    "function":{"name":"wait","arguments":"{}"}
+                }]
+            }]
+        });
+        let scope_index = RuntimeScopeIndex::new(std::slice::from_ref(&capture));
+        let spans = build_dispatcher_runtime_spans(&[capture], &scope_index).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["status"], "running");
+        assert_eq!(spans[0]["extensions"]["lifecycle_terminal"], false);
     }
 
     #[test]
@@ -4446,6 +5255,7 @@ mod tests {
             inputs: vec![input],
             output: projection.clone(),
             task_session_id: Some("task-golden".to_owned()),
+            session_id: None,
             zstd_level: 1,
             replace: false,
         })
@@ -4572,17 +5382,23 @@ mod tests {
     }
 
     #[test]
-    fn exact_parent_call_link_is_scoped_and_runtime_integrity_fails_closed() {
-        let wire_a = fixture_capture(
+    fn exact_parent_call_link_crosses_producers_but_not_sessions() {
+        let mut wire_a = fixture_capture(
             "wire-a",
             "/v1/responses",
             false,
             RESPONSES_NON_STREAM_REQUEST,
             RESPONSES_NON_STREAM_RESPONSE,
         );
+        wire_a["sourceNamespace"] = json!("wire-gateway");
+        wire_a["traceContext"] = json!({
+            "session_id":"session-golden",
+            "root_turn_id":"turn-golden",
+            "turn_id":"turn-golden"
+        });
         let mut wire_b = wire_a.clone();
         wire_b["captureId"] = json!("cap-wire-b");
-        wire_b["sourceNamespace"] = json!("other");
+        wire_b["traceContext"]["session_id"] = json!("session-other");
         let mut interaction_a = model_interaction_from_capture(&wire_a).unwrap();
         let mut interaction_b = model_interaction_from_capture(&wire_b).unwrap();
         interaction_a["model_tool_calls"] = json!([{
@@ -4592,7 +5408,12 @@ mod tests {
         let span = json!({
             "schema_version":RUNTIME_SPAN_SCHEMA_VERSION,
             "span_id":"runtime-inner",
-            "trace_context":{"source_namespace":"golden","task_session_id":"task-golden"},
+            "trace_context":{
+                "source_namespace":"stock-codex-rollout",
+                "session_id":"session-golden",
+                "root_turn_id":"turn-golden",
+                "turn_id":"turn-golden"
+            },
             "span_kind":"tool_execution",
             "name":"exec_command",
             "call_id":"inner-call",
@@ -4834,6 +5655,7 @@ mod tests {
             inputs: vec![input],
             output: projection.clone(),
             task_session_id: Some("task-golden".to_owned()),
+            session_id: None,
             zstd_level: 1,
             replace: false,
         })
@@ -4907,6 +5729,7 @@ mod tests {
             inputs: vec![input.clone()],
             output: temp.path().join("ambiguous"),
             task_session_id: None,
+            session_id: None,
             zstd_level: 1,
             replace: false,
         })
@@ -4918,11 +5741,76 @@ mod tests {
             inputs: vec![input],
             output: projection.clone(),
             task_session_id: Some("task-other".to_owned()),
+            session_id: None,
             zstd_level: 1,
             replace: false,
         })
         .unwrap();
         assert_eq!(manifest.task_session_id.as_deref(), Some("task-other"));
+        assert_eq!(manifest.input_records, 1);
+        assert_eq!(manifest.interactions, 1);
+        assert_eq!(verify_interaction_artifacts(&projection).unwrap(), manifest);
+    }
+
+    #[test]
+    fn mixed_stock_sessions_require_session_selection_and_keep_task_null() {
+        let mut first = fixture_capture(
+            "stock-session-a",
+            "/v1/responses",
+            true,
+            RESPONSES_STREAM_REQUEST,
+            RESPONSES_STREAM_RESPONSE,
+        );
+        first["sourceNamespace"] = json!("wire-gateway");
+        first["traceContext"] = json!({
+            "session_id":"session-a",
+            "thread_id":"thread-a",
+            "root_turn_id":"turn-a",
+            "turn_id":"turn-a"
+        });
+        let mut second = first.clone();
+        second["captureId"] = json!("cap-stock-session-b");
+        second["traceContext"] = json!({
+            "session_id":"session-b",
+            "thread_id":"thread-b",
+            "root_turn_id":"turn-b",
+            "turn_id":"turn-b"
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("mixed-stock.jsonl");
+        fs::write(
+            &input,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&first).unwrap(),
+                serde_json::to_string(&second).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let error = project_interactions(InteractionProjectConfig {
+            inputs: vec![input.clone()],
+            output: temp.path().join("ambiguous-stock"),
+            task_session_id: None,
+            session_id: None,
+            zstd_level: 1,
+            replace: false,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("--session-id"));
+
+        let projection = temp.path().join("selected-stock");
+        let manifest = project_interactions(InteractionProjectConfig {
+            inputs: vec![input],
+            output: projection.clone(),
+            task_session_id: None,
+            session_id: Some("session-b".to_owned()),
+            zstd_level: 1,
+            replace: false,
+        })
+        .unwrap();
+        assert_eq!(manifest.task_session_id, None);
+        assert_eq!(manifest.session_id.as_deref(), Some("session-b"));
         assert_eq!(manifest.input_records, 1);
         assert_eq!(manifest.interactions, 1);
         assert_eq!(verify_interaction_artifacts(&projection).unwrap(), manifest);

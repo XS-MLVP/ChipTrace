@@ -279,6 +279,9 @@ struct ProjectInteractionsArgs {
     /// 仅投影这一完整任务；混合输入中存在多个任务时必须指定。
     #[arg(long)]
     task_session_id: Option<String>,
+    /// 仅投影这一 Stock Codex Session；与 --task-session-id 互斥。
+    #[arg(long, conflicts_with = "task_session_id")]
+    session_id: Option<String>,
     #[arg(long, default_value_t = 1)]
     zstd_level: i32,
     #[arg(long)]
@@ -1212,6 +1215,7 @@ async fn main() -> Result<()> {
                 inputs: args.input,
                 output: args.output,
                 task_session_id: args.task_session_id,
+                session_id: args.session_id,
                 zstd_level: args.zstd_level,
                 replace: args.replace,
             })?)?
@@ -1953,6 +1957,7 @@ async fn self_test() -> Result<Value> {
         inputs: vec![enriched_root.clone()],
         output: interaction_root.clone(),
         task_session_id: Some("task-self-test-v7".to_owned()),
+        session_id: None,
         zstd_level: 1,
         replace: false,
     })?;

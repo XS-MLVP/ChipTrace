@@ -3,7 +3,7 @@ use crate::codex_rollout::{
     ExportConfig, ExportSummary, export_codex_rollout, resolve_rollout_path,
 };
 use crate::delivery::{DeliveryConfig, DeliveryTarget, deliver_batch};
-use crate::producer::deterministic_codex_hook_capture_id;
+use crate::producer::{codex_hook_occurrence_digest, deterministic_codex_hook_capture_id};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,7 +19,8 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-pub const HOOK_SPOOL_SCHEMA_VERSION: &str = "chiptrace.codex-hook-spool.v1";
+pub const HOOK_SPOOL_SCHEMA_VERSION: &str = "chiptrace.codex-hook-spool.v2";
+const LEGACY_HOOK_SPOOL_SCHEMA_VERSION: &str = "chiptrace.codex-hook-spool.v1";
 const MAX_HOOK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -110,7 +111,9 @@ pub fn spool_hook_event(raw: &[u8], config: &HookSpoolConfig) -> Result<HookSpoo
     }
 
     let digest = sha256(raw);
-    let event_id = format!("hook-{digest}");
+    let received_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    let identity_digest = codex_hook_occurrence_digest(&digest, &received_at);
+    let event_id = format!("hook-{identity_digest}");
     let pending = config.queue_root.join("pending");
     let temporary = config.queue_root.join("tmp");
     create_queue_directory(&config.queue_root)?;
@@ -118,7 +121,7 @@ pub fn spool_hook_event(raw: &[u8], config: &HookSpoolConfig) -> Result<HookSpoo
     create_queue_directory(&temporary)?;
     let destination = pending.join(format!("{event_id}.json"));
     if destination.exists() {
-        verify_spooled_file(&destination, &digest)?;
+        verify_spooled_file(&destination, &event_id)?;
         return Ok(HookSpoolSummary {
             event_id,
             event_name: event_name.clone(),
@@ -127,7 +130,6 @@ pub fn spool_hook_event(raw: &[u8], config: &HookSpoolConfig) -> Result<HookSpoo
             duplicate: true,
         });
     }
-    let received_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
     let record = SpooledHookEvent {
         schema_version: HOOK_SPOOL_SCHEMA_VERSION.to_owned(),
         event_id: event_id.clone(),
@@ -150,7 +152,7 @@ pub fn spool_hook_event(raw: &[u8], config: &HookSpoolConfig) -> Result<HookSpoo
     match fs::hard_link(&temporary_path, &destination) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            verify_spooled_file(&destination, &digest)?;
+            verify_spooled_file(&destination, &event_id)?;
         }
         Err(error) => return Err(error.into()),
     }
@@ -231,10 +233,7 @@ async fn process_pending(config: &CodexAgentConfig, summary: &mut CodexAgentSumm
 async fn process_one(config: &CodexAgentConfig, path: &Path) -> Result<(u64, u64)> {
     let spooled = load_spooled_event(path)?;
     let rollouts = resolve_event_rollouts(&spooled.event, &config.session_root)?;
-    let identity = rollouts
-        .first()
-        .and_then(|path| read_rollout_identity(path).ok())
-        .unwrap_or_default();
+    let identity = select_hook_identity(&spooled.event, &rollouts)?;
     let capture = hook_capture(&spooled, &identity, &config.source_namespace)?;
     let receipt = deliver_batch(
         &DeliveryConfig {
@@ -293,6 +292,28 @@ fn resolve_event_rollouts(event: &Value, session_root: &Path) -> Result<Vec<Path
     Ok(paths.into_iter().collect())
 }
 
+fn select_hook_identity(event: &Value, rollouts: &[PathBuf]) -> Result<RolloutIdentity> {
+    let identities: Vec<RolloutIdentity> = rollouts
+        .iter()
+        .map(|path| read_rollout_identity(path))
+        .collect::<Result<_>>()?;
+    let event_name = required_string(event, "hook_event_name")?;
+    if matches!(event_name, "SubagentStart" | "SubagentStop") {
+        let agent_id = required_string(event, "agent_id")?;
+        return identities
+            .into_iter()
+            .find(|identity| identity.thread_id.as_deref() == Some(agent_id))
+            .ok_or_else(|| {
+                anyhow::anyhow!("Codex subagent Hook has no rollout matching agent_id")
+            });
+    }
+    match identities.len() {
+        0 => Ok(RolloutIdentity::default()),
+        1 => Ok(identities.into_iter().next().unwrap_or_default()),
+        _ => bail!("Codex Hook resolves to multiple rollout identities"),
+    }
+}
+
 fn hook_capture(
     spooled: &SpooledHookEvent,
     identity: &RolloutIdentity,
@@ -309,16 +330,19 @@ fn hook_capture(
         "SubagentStop" => ("subagent_stop", "unknown"),
         _ => unreachable!(),
     };
-    let raw_digest = &spooled.raw_input_sha256;
+    let identity_digest = spooled
+        .event_id
+        .strip_prefix("hook-")
+        .context("Codex Hook event_id has an invalid prefix")?;
     let value = json!({
         "recordType":"lifecycle_event",
-        "captureId":deterministic_codex_hook_capture_id(raw_digest),
+        "captureId":deterministic_codex_hook_capture_id(identity_digest),
         "captureStage":"event",
         "sourceNamespace":source_namespace,
         "receivedAt":spooled.received_at,
         "producerModel":spooled.event.get("model"),
         "traceContext":{
-            "session_id":identity.session_id,
+            "session_id":identity.session_id.as_deref().unwrap_or(hook_session_id),
             "thread_id":identity.thread_id.as_deref().unwrap_or(hook_session_id),
             "parent_thread_id":identity.parent_thread_id,
             "turn_id":spooled.event.get("turn_id"),
@@ -334,7 +358,7 @@ fn hook_capture(
             "source_event":spooled.event,
         },
         "codexHook":{
-            "schema_version":HOOK_SPOOL_SCHEMA_VERSION,
+            "schema_version":spooled.schema_version,
             "raw_input":spooled.raw_input,
             "raw_input_sha256":spooled.raw_input_sha256,
         }
@@ -381,9 +405,15 @@ fn ensure_complete_tail(summary: &ExportSummary) -> Result<()> {
 fn load_spooled_event(path: &Path) -> Result<SpooledHookEvent> {
     let bytes = fs::read(path)?;
     let spooled: SpooledHookEvent = serde_json::from_slice(&bytes)?;
-    if spooled.schema_version != HOOK_SPOOL_SCHEMA_VERSION
-        || spooled.raw_input_sha256 != sha256(spooled.raw_input.as_bytes())
-        || spooled.event_id != format!("hook-{}", spooled.raw_input_sha256)
+    let expected_identity = match spooled.schema_version.as_str() {
+        LEGACY_HOOK_SPOOL_SCHEMA_VERSION => spooled.raw_input_sha256.clone(),
+        HOOK_SPOOL_SCHEMA_VERSION => {
+            codex_hook_occurrence_digest(&spooled.raw_input_sha256, &spooled.received_at)
+        }
+        _ => bail!("unsupported Codex hook spool schema"),
+    };
+    if spooled.raw_input_sha256 != sha256(spooled.raw_input.as_bytes())
+        || spooled.event_id != format!("hook-{expected_identity}")
         || serde_json::from_str::<Value>(&spooled.raw_input)? != spooled.event
     {
         bail!("invalid or modified Codex hook spool record");
@@ -391,9 +421,9 @@ fn load_spooled_event(path: &Path) -> Result<SpooledHookEvent> {
     Ok(spooled)
 }
 
-fn verify_spooled_file(path: &Path, expected_digest: &str) -> Result<()> {
+fn verify_spooled_file(path: &Path, expected_event_id: &str) -> Result<()> {
     let spooled = load_spooled_event(path)?;
-    if spooled.raw_input_sha256 != expected_digest {
+    if spooled.event_id != expected_event_id {
         bail!("Codex hook event ID conflicts with existing bytes");
     }
     Ok(())
@@ -437,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn hook_spool_is_atomic_and_idempotent() {
+    fn hook_spool_is_atomic_and_distinguishes_occurrences() {
         let temporary = tempfile::tempdir().unwrap();
         let raw = br#"{"hook_event_name":"SessionStart","session_id":"thread-root","source":"startup","transcript_path":null,"cwd":"/workspace","model":"gpt-5.6-sol","permission_mode":"default"}"#;
         let config = HookSpoolConfig {
@@ -447,18 +477,45 @@ mod tests {
         let first = spool_hook_event(raw, &config).unwrap();
         let second = spool_hook_event(raw, &config).unwrap();
         assert!(!first.duplicate);
-        assert!(second.duplicate);
-        assert_eq!(first.event_id, second.event_id);
+        assert!(!second.duplicate);
+        assert_ne!(first.event_id, second.event_id);
         assert_eq!(
             fs::read_dir(config.queue_root.join("pending"))
                 .unwrap()
                 .count(),
-            1
+            2
         );
         assert_eq!(
             fs::read_dir(config.queue_root.join("tmp")).unwrap().count(),
             0
         );
+        let spooled = load_spooled_event(Path::new(&first.path)).unwrap();
+        let identity = RolloutIdentity::default();
+        assert_eq!(
+            hook_capture(&spooled, &identity, "test-stock-codex").unwrap(),
+            hook_capture(&spooled, &identity, "test-stock-codex").unwrap()
+        );
+    }
+
+    #[test]
+    fn subagent_hook_selects_the_agent_rollout_identity() {
+        let event = json!({
+            "hook_event_name":"SubagentStop",
+            "session_id":"session-root",
+            "agent_id":"thread-child"
+        });
+        let identity = select_hook_identity(
+            &event,
+            &[
+                fixture("stock-rollout-root.jsonl"),
+                fixture("stock-rollout-child.jsonl"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(identity.session_id.as_deref(), Some("session-root"));
+        assert_eq!(identity.thread_id.as_deref(), Some("thread-child"));
+        assert_eq!(identity.parent_thread_id.as_deref(), Some("thread-root"));
+        assert_eq!(identity.agent_path.as_deref(), Some("/root/reviewer"));
     }
 
     #[tokio::test]
@@ -560,7 +617,7 @@ mod tests {
         let capture: Value =
             serde_json::from_str(fs::read_to_string(output).unwrap().trim()).unwrap();
         assert_eq!(capture["traceContext"]["thread_id"], "thread-start");
-        assert!(capture["traceContext"]["session_id"].is_null());
+        assert_eq!(capture["traceContext"]["session_id"], "thread-start");
         assert_eq!(capture["lifecycleEvent"]["type"], "session_start");
     }
 }

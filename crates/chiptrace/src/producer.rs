@@ -229,7 +229,11 @@ fn validate_source_native_codex_capture(object: &Map<String, Value>) -> Result<(
     }
 
     if let Some(hook) = object.get("codexHook").and_then(Value::as_object) {
-        if required_string(hook, "schema_version")? != "chiptrace.codex-hook-spool.v1" {
+        let hook_schema = required_string(hook, "schema_version")?;
+        if !matches!(
+            hook_schema,
+            "chiptrace.codex-hook-spool.v1" | "chiptrace.codex-hook-spool.v2"
+        ) {
             bail!("unsupported source-native Codex Hook schema");
         }
         let raw_input = required_string(hook, "raw_input")?;
@@ -252,9 +256,6 @@ fn validate_source_native_codex_capture(object: &Map<String, Value>) -> Result<(
             "SubagentStop" => ("subagent_stop", "unknown"),
             _ => bail!("unsupported source-native Codex Hook event {event_name}"),
         };
-        if capture_id != deterministic_codex_hook_capture_id(digest) {
-            bail!("source-native Hook captureId does not match Raw input");
-        }
         if required_string(object, "recordType")? != "lifecycle_event" {
             bail!("source-native Hook must be a lifecycle_event");
         }
@@ -266,8 +267,16 @@ fn validate_source_native_codex_capture(object: &Map<String, Value>) -> Result<(
             .get("event_id")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if event_id != format!("hook-{digest}") {
+        let identity_digest = if hook_schema == "chiptrace.codex-hook-spool.v1" {
+            digest.to_owned()
+        } else {
+            codex_hook_occurrence_digest(digest, received_at)
+        };
+        if event_id != format!("hook-{identity_digest}") {
             bail!("source-native Hook lifecycle event_id does not match Raw input");
+        }
+        if capture_id != deterministic_codex_hook_capture_id(&identity_digest) {
+            bail!("source-native Hook captureId does not match Raw input");
         }
         if required_string(lifecycle, "type")? != expected_type
             || required_string(lifecycle, "status")? != expected_status
@@ -283,13 +292,27 @@ fn validate_source_native_codex_capture(object: &Map<String, Value>) -> Result<(
             .get("session_id")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("Codex Hook input is missing session_id"))?;
-        if object
+        let trace = object
             .get("traceContext")
-            .and_then(|trace| trace.get("thread_id"))
-            .and_then(Value::as_str)
-            != Some(hook_session_id)
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("source-native Hook traceContext is required"))?;
+        let trace_session_id = trace.get("session_id").and_then(Value::as_str);
+        let trace_thread_id = trace.get("thread_id").and_then(Value::as_str);
+        if matches!(event_name, "SubagentStart" | "SubagentStop") {
+            if trace_session_id != Some(hook_session_id) {
+                bail!("source-native subagent Hook session_id does not match Raw input");
+            }
+            let expected_thread_id = source_event
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("Codex subagent Hook input is missing agent_id"))?;
+            if trace_thread_id != Some(expected_thread_id) {
+                bail!("source-native subagent Hook thread_id does not match Raw input");
+            }
+        } else if trace_session_id != Some(hook_session_id)
+            && trace_thread_id != Some(hook_session_id)
         {
-            bail!("source-native Hook thread_id does not match Raw input");
+            bail!("source-native Hook identity does not match Raw input");
         }
         return Ok(());
     }
@@ -302,8 +325,17 @@ pub fn deterministic_codex_rollout_capture_id(thread_id: &str, ordinal: u64) -> 
     format!("cap-rollout-{}-{ordinal:020}", &digest[..24])
 }
 
-pub fn deterministic_codex_hook_capture_id(raw_input_sha256: &str) -> String {
-    format!("cap-codex-hook-{raw_input_sha256}")
+pub fn deterministic_codex_hook_capture_id(identity_digest: &str) -> String {
+    format!("cap-codex-hook-{identity_digest}")
+}
+
+pub fn codex_hook_occurrence_digest(raw_input_sha256: &str, occurred_at: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update((raw_input_sha256.len() as u64).to_be_bytes());
+    digest.update(raw_input_sha256.as_bytes());
+    digest.update((occurred_at.len() as u64).to_be_bytes());
+    digest.update(occurred_at.as_bytes());
+    hex::encode(digest.finalize())
 }
 
 pub(crate) fn validate_stored_producer_capture(
@@ -632,6 +664,40 @@ mod tests {
         prepare_producer_capture(&serde_json::to_vec(&value).unwrap(), 4096).unwrap();
         let mut forged = value;
         forged["captureId"] = json!("cap-codex-hook-forged");
+        assert!(prepare_producer_capture(&serde_json::to_vec(&forged).unwrap(), 4096).is_err());
+    }
+
+    #[test]
+    fn source_native_v2_subagent_hook_uses_occurrence_and_agent_identity() {
+        let raw_input = r#"{"hook_event_name":"SubagentStart","session_id":"session-root","agent_id":"thread-child"}"#;
+        let raw_digest = sha256(raw_input.as_bytes());
+        let occurred_at = "2026-09-01T00:00:00Z";
+        let identity_digest = codex_hook_occurrence_digest(&raw_digest, occurred_at);
+        let value = json!({
+            "recordType":"lifecycle_event",
+            "captureId":deterministic_codex_hook_capture_id(&identity_digest),
+            "sourceNamespace":"stock-codex",
+            "receivedAt":occurred_at,
+            "traceContext":{
+                "session_id":"session-root",
+                "thread_id":"thread-child"
+            },
+            "lifecycleEvent":{
+                "event_id":format!("hook-{identity_digest}"),
+                "type":"subagent_start","status":"started",
+                "occurred_at":occurred_at,
+                "source_event":serde_json::from_str::<Value>(raw_input).unwrap()
+            },
+            "codexHook":{
+                "schema_version":"chiptrace.codex-hook-spool.v2",
+                "raw_input":raw_input,
+                "raw_input_sha256":raw_digest,
+            }
+        });
+        prepare_producer_capture(&serde_json::to_vec(&value).unwrap(), 4096).unwrap();
+
+        let mut forged = value;
+        forged["traceContext"]["thread_id"] = json!("session-root");
         assert!(prepare_producer_capture(&serde_json::to_vec(&forged).unwrap(), 4096).is_err());
     }
 

@@ -251,7 +251,7 @@ pub(crate) fn project_otlp_tree(
         let from = string_field(link, "from").unwrap_or("");
         let to = string_field(link, "to").unwrap_or("");
         let (parent, child, priority) = match relation {
-            "runtime_parent_to_child" => (from, to, 20),
+            "runtime_parent_to_child" => (from, to, 40),
             "interaction_to_runtime_span" => (from, to, 25),
             "runtime_parent_to_interaction" => (from, to, 10),
             "model_call_to_runtime_execution" => {
@@ -631,6 +631,16 @@ fn runtime_otlp(span: &Value, parent_span_id: Option<&str>) -> Value {
                 .cloned()
                 .unwrap_or_else(|| json!([])),
         ),
+        otlp_attr(
+            "chiptrace.runtime.lifecycle_status",
+            span.get("status").cloned().unwrap_or(Value::Null),
+        ),
+        otlp_attr(
+            "chiptrace.runtime.semantic_status",
+            span.pointer("/extensions/semantic_status")
+                .cloned()
+                .unwrap_or(Value::Null),
+        ),
     ];
     if openinference_kind != "TOOL" {
         attributes.retain(|attribute| {
@@ -639,6 +649,18 @@ fn runtime_otlp(span: &Value, parent_span_id: Option<&str>) -> Value {
                 .is_none_or(|key| !key.starts_with("tool.") && !key.starts_with("gen_ai.tool."))
         });
     }
+    let lifecycle_status = string_field(span, "status").unwrap_or("unknown");
+    let otlp_status = if openinference_kind == "TOOL"
+        && lifecycle_status == "completed"
+        && span
+            .pointer("/extensions/semantic_status")
+            .and_then(Value::as_str)
+            == Some("unknown")
+    {
+        "unknown"
+    } else {
+        lifecycle_status
+    };
     otlp_record(
         &trace_id,
         &span_id,
@@ -648,7 +670,7 @@ fn runtime_otlp(span: &Value, parent_span_id: Option<&str>) -> Value {
             string_field(span, "started_at"),
             string_field(span, "finished_at"),
         ),
-        string_field(span, "status").unwrap_or("unknown"),
+        otlp_status,
         attributes,
     )
 }
@@ -711,26 +733,39 @@ fn projection_ids(value: &Value, identity_field: &str) -> (String, String) {
         })
         .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| {
-            let seed = value
-                .pointer("/trace_context/task_session_id")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    value
-                        .pointer("/trace_context/root_turn_id")
-                        .and_then(Value::as_str)
-                })
-                .or_else(|| {
-                    value
-                        .pointer("/trace_context/turn_id")
-                        .and_then(Value::as_str)
-                })
-                .or_else(|| string_field(value, identity_field))
-                .unwrap_or("missing");
+            let seed = projection_trace_scope(value, identity_field);
             sha256(seed.as_bytes())[..32].to_owned()
         });
     let span_seed = string_field(value, identity_field).unwrap_or("missing");
     let span_id = sha256(span_seed.as_bytes())[..16].to_owned();
     (trace_id, span_id)
+}
+
+fn projection_trace_scope(value: &Value, identity_field: &str) -> String {
+    if let Some(task_session_id) = value
+        .pointer("/trace_context/task_session_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return format!("task:{task_session_id}");
+    }
+    let session_id = value
+        .pointer("/trace_context/session_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let turn_id = value
+        .pointer("/trace_context/root_turn_id")
+        .or_else(|| value.pointer("/trace_context/turn_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    match (session_id, turn_id) {
+        (Some(session_id), Some(turn_id)) => format!("session:{session_id}\0turn:{turn_id}"),
+        (Some(session_id), None) => format!("session:{session_id}"),
+        (None, Some(turn_id)) => format!("turn:{turn_id}"),
+        (None, None) => string_field(value, identity_field)
+            .unwrap_or("missing")
+            .to_owned(),
+    }
 }
 
 fn session_id(value: &Value) -> Option<&str> {

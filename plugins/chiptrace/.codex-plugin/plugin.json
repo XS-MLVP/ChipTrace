@@ -1,6 +1,6 @@
 {
   "name": "chiptrace",
-  "version": "0.5.1",
+  "version": "0.5.1+codex.20260831181453",
   "description": "将 Stock Codex rollout 可靠写入 ChipTrace 本地 outbox。",
   "author": {
     "name": "万众一芯团队",

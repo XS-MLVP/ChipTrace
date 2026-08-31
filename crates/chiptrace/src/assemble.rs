@@ -475,14 +475,27 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
         .first()
         .ok_or_else(|| anyhow::anyhow!("empty capture group"))?;
     let code_mode_parent_call_ids = native_code_mode_parent_call_ids(&parsed);
-    let source_namespace = first.source_namespace.clone();
     let session_identity = first.session_identity.clone();
     let identity_source = first.session_identity_source.clone();
     if parsed.iter().any(|capture| {
-        capture.source_namespace != source_namespace || capture.session_identity != session_identity
+        capture.session_identity != session_identity
+            || capture.session_identity_source != identity_source
     }) {
         bail!("capture partition mixed different session identities");
     }
+    let source_namespaces: BTreeSet<String> = parsed
+        .iter()
+        .map(|capture| capture.source_namespace.clone())
+        .collect();
+    let source_namespace = if source_namespaces.len() == 1 {
+        source_namespaces
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "default".to_owned())
+    } else {
+        "multi-source".to_owned()
+    };
     let orphan = identity_source == "capture_id_fallback";
     let mut messages = Vec::new();
     let mut tools_by_name: BTreeMap<String, Value> = BTreeMap::new();
@@ -504,6 +517,8 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     let mut trace_conflicts = BTreeSet::new();
     let mut trace_session_ids = BTreeSet::new();
     let mut trace_thread_ids = BTreeSet::new();
+    let mut trace_agent_ids = BTreeSet::new();
+    let mut trace_agent_paths = BTreeSet::new();
     let mut turn_ids = BTreeSet::new();
     let mut previous_response_ids = BTreeSet::new();
     let mut span_ids = BTreeSet::new();
@@ -613,12 +628,25 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
         }
         for (key, value) in &capture.trace_context {
             if !value.is_null() {
-                if matches!(key.as_str(), "session_id" | "thread_id") {
+                if matches!(
+                    key.as_str(),
+                    "session_id" | "thread_id" | "agent_id" | "agent_path"
+                ) {
                     if let Some(value) = value.as_str().filter(|value| !value.trim().is_empty()) {
-                        if key == "session_id" {
-                            trace_session_ids.insert(value.to_owned());
-                        } else {
-                            trace_thread_ids.insert(value.to_owned());
+                        match key.as_str() {
+                            "session_id" => {
+                                trace_session_ids.insert(value.to_owned());
+                            }
+                            "thread_id" => {
+                                trace_thread_ids.insert(value.to_owned());
+                            }
+                            "agent_id" => {
+                                trace_agent_ids.insert(value.to_owned());
+                            }
+                            "agent_path" => {
+                                trace_agent_paths.insert(value.to_owned());
+                            }
+                            _ => unreachable!(),
                         }
                     }
                     continue;
@@ -816,7 +844,7 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     let trajectory_id = format!(
         "traj-{}",
         hex::encode(Sha256::digest(
-            format!("{source_namespace}\0{session_identity}").as_bytes()
+            format!("{identity_source}\0{session_identity}").as_bytes()
         ))
     );
     let created_at = parsed
@@ -855,6 +883,8 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     let inference_api_conservation = build_inference_api_conservation(&parsed);
     insert_scoped_trace_values(&mut trace, "session_id", "session_ids", &trace_session_ids);
     insert_scoped_trace_values(&mut trace, "thread_id", "thread_ids", &trace_thread_ids);
+    insert_scoped_trace_values(&mut trace, "agent_id", "agent_ids", &trace_agent_ids);
+    insert_scoped_trace_values(&mut trace, "agent_path", "agent_paths", &trace_agent_paths);
     if turn_ids.len() == 1 {
         trace.insert(
             "turn_id".to_owned(),
@@ -933,6 +963,7 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     meta.insert("response_ids".to_owned(), json!(response_ids));
     meta.insert("session_identity_source".to_owned(), json!(identity_source));
     meta.insert("source_namespace".to_owned(), json!(source_namespace));
+    meta.insert("source_namespaces".to_owned(), json!(source_namespaces));
     meta.insert("trace_contexts".to_owned(), json!(trace_contexts));
     meta.insert("capture_dag".to_owned(), capture_dag);
     meta.insert("runtime_dag".to_owned(), runtime_dag);
@@ -3244,9 +3275,6 @@ fn reconcile_tool_executions(captures: &[ParsedCapture]) -> (Vec<Value>, Vec<Str
 
         if let Some(finished) = terminal.first() {
             let execution = finished.tool_execution.as_ref().unwrap();
-            if string_field(execution, "status") == Some("unknown") {
-                conflicts.insert(format!("{call_id}:unknown_terminal_status"));
-            }
             if !producer_state_machine
                 && (string_field(execution, "started_at").is_none()
                     || string_field(execution, "finished_at").is_none())
@@ -3950,11 +3978,15 @@ fn session_group_key(value: &Value) -> String {
         .unwrap_or_default();
     let trace = collect_trace_context(value, &request);
     let capture_id = string_field(value, "captureId").unwrap_or("missing");
-    let (identity, _) = session_identity(capture_id, &request, &trace);
+    let (identity, identity_source) = session_identity(capture_id, &request, &trace);
     let namespace = string_field(value, "sourceNamespace")
         .or_else(|| string_field(value, "apiKeyFingerprint"))
         .unwrap_or("default");
-    format!("{namespace}\0{identity}")
+    if is_global_session_identity(&identity_source) {
+        format!("session\0{identity}")
+    } else {
+        format!("{namespace}\0{identity_source}\0{identity}")
+    }
 }
 
 fn task_partition_key(value: &Value) -> String {
@@ -3964,7 +3996,7 @@ fn task_partition_key(value: &Value) -> String {
         .unwrap_or_default();
     let trace = collect_trace_context(value, &request);
     let capture_id = string_field(value, "captureId").unwrap_or("missing");
-    let (session_identity, _) = session_identity(capture_id, &request, &trace);
+    let (session_identity, identity_source) = session_identity(capture_id, &request, &trace);
     let task_identity = trace
         .get("root_session_id")
         .or_else(|| trace.get("parent_session_id"))
@@ -3974,7 +4006,24 @@ fn task_partition_key(value: &Value) -> String {
     let namespace = string_field(value, "sourceNamespace")
         .or_else(|| string_field(value, "apiKeyFingerprint"))
         .unwrap_or("default");
-    format!("{namespace}\0{task_identity}")
+    if is_global_session_identity(&identity_source)
+        || trace
+            .get("root_session_id")
+            .or_else(|| trace.get("parent_session_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        format!("task\0{task_identity}")
+    } else {
+        format!("{namespace}\0{identity_source}\0{task_identity}")
+    }
+}
+
+fn is_global_session_identity(source: &str) -> bool {
+    matches!(
+        source,
+        "task_session_id" | "task_id" | "session_id" | "conversation_id" | "trace_id"
+    )
 }
 
 fn infer_provider(
@@ -4825,6 +4874,13 @@ fn merge_value(existing: &mut Value, candidate: &Value, field: Option<&str>) -> 
     if existing == candidate {
         return false;
     }
+    if field == Some("arguments")
+        && let (Value::String(left), Value::String(right)) = (&*existing, candidate)
+        && let Some(preferred) = equivalent_tool_arguments(left, right)
+    {
+        *existing = Value::String(preferred);
+        return false;
+    }
     if value_empty(existing) && !value_empty(candidate) {
         *existing = candidate.clone();
         return false;
@@ -4855,6 +4911,36 @@ fn merge_value(existing: &mut Value, candidate: &Value, field: Option<&str>) -> 
         }
         _ => true,
     }
+}
+
+fn equivalent_tool_arguments(left: &str, right: &str) -> Option<String> {
+    let left_json = serde_json::from_str::<Value>(left).ok();
+    let right_json = serde_json::from_str::<Value>(right).ok();
+    if left_json.is_some() && left_json == right_json {
+        return Some(left.to_owned());
+    }
+    if left_json
+        .as_ref()
+        .and_then(custom_tool_input)
+        .is_some_and(|input| input == right)
+    {
+        return Some(left.to_owned());
+    }
+    if right_json
+        .as_ref()
+        .and_then(custom_tool_input)
+        .is_some_and(|input| input == left)
+    {
+        return Some(right.to_owned());
+    }
+    None
+}
+
+fn custom_tool_input(value: &Value) -> Option<&str> {
+    let object = value.as_object()?;
+    (object.len() == 1)
+        .then(|| object.get("input").and_then(Value::as_str))
+        .flatten()
 }
 
 fn value_empty(value: &Value) -> bool {
@@ -5568,7 +5654,7 @@ mod tests {
             api.pointer("/traceContext/task_session_id"),
             Some(&json!("task-1"))
         );
-        assert_eq!(session_group_key(&api), "default\0task-1");
+        assert_eq!(session_group_key(&api), "session\0task-1");
         let evidence = api["fieldEvidence"].as_array().unwrap();
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0]["authority"], "derived");
@@ -6961,6 +7047,28 @@ mod tests {
     }
 
     #[test]
+    fn custom_tool_wire_wrapper_and_rollout_input_are_equivalent() {
+        let code = "await tools.exec_command({cmd: \"cargo test\"});";
+        let mut current = vec![json!({
+            "role":"assistant","content":"","tool_calls":[{
+                "id":"call-exec","type":"function",
+                "function":{"name":"exec","arguments":json!({"input":code}).to_string()}
+            }]
+        })];
+        let candidate = vec![json!({
+            "role":"assistant","content":"","tool_calls":[{
+                "id":"call-exec","type":"function",
+                "function":{"name":"exec","arguments":code}
+            }]
+        })];
+        assert_eq!(merge_messages(&mut current, &candidate), 0);
+        assert_eq!(
+            current[0]["tool_calls"][0]["function"]["arguments"],
+            json!({"input":code}).to_string()
+        );
+    }
+
+    #[test]
     fn explicit_session_id_wins_over_thread_id() {
         let capture = json!({
             "captureId": "cap-identity",
@@ -6968,8 +7076,11 @@ mod tests {
             "traceContext": {"session_id": "codex-session", "thread_id": "thread"},
             "requestBody": {"kind": "json", "value": {}}
         });
-        assert_eq!(session_group_key(&capture), "fixture\0codex-session");
-        assert_eq!(task_partition_key(&capture), "fixture\0codex-session");
+        assert_eq!(session_group_key(&capture), "session\0codex-session");
+        assert_eq!(task_partition_key(&capture), "task\0codex-session");
+        let mut wire = capture.clone();
+        wire["sourceNamespace"] = json!("wire-gateway");
+        assert_eq!(session_group_key(&wire), session_group_key(&capture));
     }
 
     #[test]
@@ -6984,7 +7095,7 @@ mod tests {
             },
             "requestBody":{"kind":"json","value":{}}
         });
-        assert_eq!(session_group_key(&capture), "fixture\0task-one");
+        assert_eq!(session_group_key(&capture), "session\0task-one");
     }
 
     #[test]
@@ -7011,7 +7122,7 @@ mod tests {
                 "data: {\"type\":\"response.in_progress\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"response-current\",\"status\":\"completed\"}}\n\n"
             }
         });
-        assert_eq!(session_group_key(&capture), "fixture\0session-camel");
+        assert_eq!(session_group_key(&capture), "session\0session-camel");
         let parsed = parse_capture(capture).unwrap();
         assert_eq!(parsed.trace_context["root_session_id"], "root-camel");
         assert_eq!(parsed.trace_context["root_turn_id"], "root-turn");
@@ -7142,8 +7253,8 @@ mod tests {
             },
             "requestBody":{"kind":"json","value":{}}
         });
-        assert_eq!(task_partition_key(&root_capture), "fixture\0root");
-        assert_eq!(task_partition_key(&child_capture), "fixture\0root");
+        assert_eq!(task_partition_key(&root_capture), "task\0root");
+        assert_eq!(task_partition_key(&child_capture), "task\0root");
         let (root, _, _) = assemble_group(vec![root_capture]).unwrap();
         let (child, _, _) = assemble_group(vec![child_capture]).unwrap();
         let mut sessions = vec![root, child];

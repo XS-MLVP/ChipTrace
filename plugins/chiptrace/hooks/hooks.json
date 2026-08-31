@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "${PLUGIN_ROOT}/scripts/chiptrace-hook",
-            "timeout_sec": 10
+            "timeout": 10
           }
         ]
       }
@@ -18,7 +18,7 @@
           {
             "type": "command",
             "command": "${PLUGIN_ROOT}/scripts/chiptrace-hook",
-            "timeout_sec": 10
+            "timeout": 3
           }
         ]
       }
@@ -29,7 +29,7 @@
           {
             "type": "command",
             "command": "${PLUGIN_ROOT}/scripts/chiptrace-hook",
-            "timeout_sec": 10
+            "timeout": 10
           }
         ]
       }
@@ -40,7 +40,7 @@
           {
             "type": "command",
             "command": "${PLUGIN_ROOT}/scripts/chiptrace-hook",
-            "timeout_sec": 10
+            "timeout": 3
           }
         ]
       }
@@ -51,7 +51,7 @@
           {
             "type": "command",
             "command": "${PLUGIN_ROOT}/scripts/chiptrace-hook",
-            "timeout_sec": 10
+            "timeout": 10
           }
         ]
       }
@@ -62,7 +62,7 @@
           {
             "type": "command",
             "command": "${PLUGIN_ROOT}/scripts/chiptrace-hook",
-            "timeout_sec": 10
+            "timeout": 10
           }
         ]
       }
