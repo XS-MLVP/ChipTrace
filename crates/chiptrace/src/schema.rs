@@ -347,6 +347,24 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    struct LocalSchemaRetriever {
+        tool_registry: Value,
+    }
+
+    impl jsonschema::Retrieve for LocalSchemaRetriever {
+        fn retrieve(
+            &self,
+            uri: &jsonschema::Uri<String>,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            if uri.as_str()
+                == "https://github.com/XS-MLVP/ChipTrace/schemas/tool-registry-v1.schema.json"
+            {
+                return Ok(self.tool_registry.clone());
+            }
+            Err(format!("unexpected schema URI: {uri}").into())
+        }
+    }
+
     #[test]
     fn public_json_schemas_are_valid_json_documents() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas");
@@ -380,5 +398,76 @@ mod tests {
                 Some("https://json-schema.org/draft/2020-12/schema")
             );
         }
+    }
+
+    #[test]
+    fn capture_v2_accepts_stock_session_identity_without_task_session_id() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas");
+        let schema: Value =
+            serde_json::from_slice(&fs::read(root.join("capture-v2.schema.json")).unwrap())
+                .unwrap();
+        let tool_registry: Value =
+            serde_json::from_slice(&fs::read(root.join("tool-registry-v1.schema.json")).unwrap())
+                .unwrap();
+        let validator = jsonschema::options()
+            .with_retriever(LocalSchemaRetriever { tool_registry })
+            .build(&schema)
+            .unwrap();
+        let record = |trace_context: Value| {
+            serde_json::json!({
+                "version":"chiptrace.capture.v2",
+                "recordType":"lifecycle_event",
+                "captureId":"cap-stock-session",
+                "sourceNamespace":"stock-codex",
+                "traceContext":trace_context,
+                "lifecycleEvent":{"type":"turn_start","status":"started"}
+            })
+        };
+
+        assert!(validator.is_valid(&record(serde_json::json!({"session_id":"session-1"}))));
+        assert!(validator.is_valid(&record(serde_json::json!({"thread_id":"thread-1"}))));
+        assert!(!validator.is_valid(&record(serde_json::json!({}))));
+    }
+
+    #[test]
+    fn session_v1_runtime_contract_uses_canonical_summary_for_stock_rollout() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas");
+        let schema: Value =
+            serde_json::from_slice(&fs::read(root.join("session-v1.schema.json")).unwrap())
+                .unwrap();
+        let runtime_schema = schema.pointer("/$defs/runtimeDag").unwrap();
+        let validator = jsonschema::draft202012::new(runtime_schema).unwrap();
+        let stock = serde_json::json!({
+            "schema_version":"chiptrace.runtime-dag.v1",
+            "source":"canonical_model_interaction:codex_rollout_jsonl",
+            "native_event_count":12,
+            "roots":["root-1"],
+            "root_mode":"single_turn",
+            "task_session_ids":[],
+            "session_ids":["session-1"],
+            "open_node_ids":[],
+            "unresolved_node_ids":[],
+            "status_conflict_node_ids":[],
+            "terminal_rollout_ids":["root-1"],
+            "canonical_metrics":{},
+            "root_complete":true,
+            "complete":true,
+            "applicable":true
+        });
+        assert!(validator.is_valid(&stock));
+
+        let legacy_without_graph = serde_json::json!({
+            "schema_version":"chiptrace.runtime-dag.v1",
+            "source":"codex_rollout_trace_bundle",
+            "native_event_count":2,
+            "roots":["root-1"],
+            "open_node_ids":[],
+            "unresolved_node_ids":[],
+            "status_conflict_node_ids":[],
+            "terminal_rollout_ids":["root-1"],
+            "complete":true,
+            "applicable":true
+        });
+        assert!(!validator.is_valid(&legacy_without_graph));
     }
 }

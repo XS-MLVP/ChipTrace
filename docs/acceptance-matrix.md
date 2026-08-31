@@ -58,10 +58,32 @@ all_required_gates_pass && score >= minimum_score
 任何 Assembly 冲突、producer sequence 缺口/重复、工具状态机不闭合、DAG 环、
 未解析父节点、工具 schema 缺失、非法工具参数或未配对结果都不能由高分抵消。工具
 执行状态只从真实事件或返回字段读取；缺失状态为 `unknown`，不会被清洗为成功。
-存在原生 runtime 时，`runtime_dag_integrity` 和 `inference_api_conservation` 也是独立
-hard gate：前者拒绝 open/unresolved 节点，后者拒绝任一完成推理没有精确 API Capture。
+存在 Stock rollout 时启用 `runtime_dag_integrity`；来源另有显式 inference ID 时再启用
+`inference_api_conservation`。前者拒绝 open/unresolved 节点，后者拒绝任一完成推理没有
+精确 API Capture。
 
-## 当前线上样本复核
+## Stock Codex 主链 canary（2026-09-01）
+
+使用未修改的 Stock Codex、普通 `codex` 命令、Plugin 本地 outbox 和隔离 Wire 入口完成
+真实代码任务。该结果验证当前源码，不表示生产 `18084` 已升级：
+
+| 项目 | 结果 |
+| --- | --- |
+| Raw | 194 条 Capture，18 次 Responses 交互；原始字节、协议终态和 SHA-256 完整 |
+| Canonical | 18 个 ModelInteraction、43 个 RuntimeSpan、182 个 Link；16/16 模型调用有结果且有真实执行 |
+| Runtime Gate | 171 个 Stock rollout 源事件；1 个 Root，open/unresolved/conflict 均为 0 |
+| OTLP | 61 个节点，60/60 内部父引用解析，单根树验证通过 |
+| Assembly | 1 个 Session，`merge_divergences=0`，去尾工具配对率 100% |
+| Buyer v7 | 65 分，`eligible=false` |
+
+Buyer 只剩三项真实失败：只有 1 次人类 User -> Assistant 交互；expanded 内层 Runtime
+工具没有采购级完整 Schema；网关没有提供可验证的上游 provider evidence。模型可见工具
+只有 4 种，也不满足采购方 5 种工具要求。这些缺口不能通过清洗或改名补造。
+
+Stock rollout 的 Buyer Runtime Gate 直接读取 Canonical ModelInteraction/RuntimeSpan/Link
+完整性结果，评分器同时校验摘要来源；旧 bundle DAG 不能冒充 Stock Canonical 结果。
+
+## 历史线上样本复核（2026-08-28）
 
 2026-08-28 的内部只读复核固定了 11 个 sealed Segment，共 699 条 Capture、
 523,568,134 字节（约 499 MiB）。临时 FS 对象后端生成 `complete` Raw Checkpoint，
@@ -75,16 +97,9 @@ Token 为 0。13/13 未达到结构化工具门槛且缺少合格的真实结果
 因此主要缺口不是 WAL/OSS 拼接。完整证据见仓库外同级报告
 `reports/oss-raw-archive-and-online-quality-20260828.md`。
 
-这说明当前主要缺口在 Agent harness 和工具执行器事件，而不是 OSS 传输：
-
-1. 任务开始时创建并贯穿 `task_session_id`，结束时发送 task/session end、cancel 或
-   terminate；
-2. 每次工具执行发送 call ID、完整 schema、参数、开始/结束、真实 success/error/
-   cancelled/timeout 状态和返回；
-3. 发送 compaction、retry、subagent spawn/join、用户修正和 evaluator evidence；生命周期
-   事件必须保留 type、status、reason、occurred_at 和 event_id 等原始字段；
-4. 用同一 reliable submitter 投递这些事件，和 18084 API snapshot 共享
-   `sourceNamespace` 与 `task_session_id`。
+该批数据形成于 Stock Plugin 主链上线前，只包含代理可见的模型 Wire。若原生产主机仍
+保留 rollout，可以用当前 importer 精确回填；否则只能保留为 API-only 历史数据，不能
+补造 Session、工具执行、Schema 或 provider 身份。
 
 隔离 v2 闭环使用 21 条 Capture 生成 1 条完整 Session，其中 15 条 Harness/
 dispatcher 事件通过 Relay producer 入口提交并幂等重放。两条 producer stream
@@ -98,19 +113,8 @@ Sub2API 401 请求通过该适配器进入 Rust Relay/Collector 后，Capture v2
 `task_session_id/root_session_id/goal_id/turn_id/agent_id` 和响应 request ID 均按来源
 保留，`fieldEvidenceConflicts=[]`，Relay/Collector 记录数增加 1 且 pending 回到 0。
 
-补齐事件后，现有 Raw/Assembly/Score/Release 链路可以直接复用；不需要重导出或把
-历史字节拼成一个无限增长的 OSS 对象。
-
-Codex 0.150+ 的生产者接入优先读取原生 `codex-rollout-trace` bundle。该入口能
-直接保存模型 inference、dispatcher 工具、Code Mode、Terminal、compaction 和
-子代理关系，避免从普通 rollout 的外层 `exec/wait` 反推内层工具。bundle 仍不能
-替代 harness 的业务任务 start/end，也不能替代 18084/Sub2API 的 provider 路由证明；
-三类证据共享 `task_session_id` 后才构成 `runtime-full` 采购候选。
-
-固定版本 producer 补丁已在 Codex `rust-v0.150.0-alpha.9` 的精确 commit 上通过
-应用校验。真实 `ToolRouter` 调用点测试证明 Registry 在 turn bundle 中落盘，
-`codex-rollout-trace` 的 62 项测试全部通过。该验证证明 producer 代码路径可用，
-不表示补丁已经部署到 18084 热服务。
+现有 Raw/Assembly/Score/Release 链路可以直接复用，不需要重新导出 Wire 或把历史字节
+拼成一个无限增长的对象。patched bundle 只用于历史兼容回放，不是当前生产依赖。
 
 ## Codex 0.150 原生 canary
 

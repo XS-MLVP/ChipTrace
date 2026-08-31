@@ -504,10 +504,26 @@
         "properties": {
           "sourceNamespace": {"type": "string", "minLength": 1, "maxLength": 256},
           "traceContext": {
-            "required": ["task_session_id"],
-            "properties": {
-              "task_session_id": {"type": "string", "minLength": 1}
-            }
+            "anyOf": [
+              {
+                "required": ["task_session_id"],
+                "properties": {
+                  "task_session_id": {"type": "string", "minLength": 1}
+                }
+              },
+              {
+                "required": ["session_id"],
+                "properties": {
+                  "session_id": {"type": "string", "minLength": 1}
+                }
+              },
+              {
+                "required": ["thread_id"],
+                "properties": {
+                  "thread_id": {"type": "string", "minLength": 1}
+                }
+              }
+            ]
           }
         }
       }

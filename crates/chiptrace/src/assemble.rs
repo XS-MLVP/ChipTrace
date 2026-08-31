@@ -2,6 +2,7 @@ use crate::capture::{extract_body, gateway_evidence_fingerprint};
 use crate::jsonl::{
     JsonlWriter, absolute_path, ensure_safe_relative_path, sha256_file, string_field, utc_now,
 };
+use crate::model_interaction::stock_runtime_dag_summary;
 use crate::schema::{
     FileManifest, RAW_LINEAGE_SCHEMA_VERSION, RawSourceLineage, SESSION_SCHEMA_VERSION,
 };
@@ -466,6 +467,7 @@ fn process_partition(
 }
 
 fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
+    let stock_runtime_dag = stock_runtime_dag_summary(&captures)?;
     let mut parsed: Vec<ParsedCapture> = captures
         .into_iter()
         .map(parse_capture)
@@ -879,7 +881,7 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     let expanded_tools: Vec<Value> = expanded_tools_by_name.into_values().collect();
     annotate_tool_call_statuses(&mut messages);
     let capture_dag = build_capture_dag(&parsed, &messages);
-    let runtime_dag = build_runtime_dag(&parsed);
+    let runtime_dag = stock_runtime_dag.unwrap_or_else(|| build_runtime_dag(&parsed));
     let inference_api_conservation = build_inference_api_conservation(&parsed);
     insert_scoped_trace_values(&mut trace, "session_id", "session_ids", &trace_session_ids);
     insert_scoped_trace_values(&mut trace, "thread_id", "thread_ids", &trace_thread_ids);

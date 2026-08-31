@@ -357,7 +357,15 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
     let runtime_dag_present = session
         .pointer("/meta/runtime_dag")
         .is_some_and(Value::is_object);
-    let native_runtime_events_present = session
+    let stock_runtime_events_present = session
+        .pointer("/meta/rollout_events")
+        .and_then(Value::as_array)
+        .is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| string_field(event, "source") == Some("codex_rollout_jsonl"))
+        });
+    let legacy_runtime_events_present = session
         .pointer("/meta/rollout_events")
         .and_then(Value::as_array)
         .is_some_and(|events| {
@@ -365,6 +373,8 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
                 .iter()
                 .any(|event| string_field(event, "source") == Some("codex_rollout_trace_bundle"))
         });
+    let native_runtime_events_present =
+        stock_runtime_events_present || legacy_runtime_events_present;
     let runtime_dag_applicable = session
         .pointer("/meta/runtime_dag/applicable")
         .and_then(Value::as_bool)
@@ -390,6 +400,13 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         .pointer("/meta/runtime_dag/status_conflict_node_ids")
         .and_then(Value::as_array)
         .map_or(0, |nodes| nodes.len() as u64);
+    let runtime_dag_source = session
+        .pointer("/meta/runtime_dag/source")
+        .and_then(Value::as_str);
+    let runtime_dag_source_matches = (!stock_runtime_events_present
+        || runtime_dag_source == Some("canonical_model_interaction:codex_rollout_jsonl"))
+        && (!legacy_runtime_events_present
+            || runtime_dag_source == Some("codex_rollout_trace_bundle"));
     let inference_api_conservation_applicable = session
         .pointer("/meta/inference_api_conservation/applicable")
         .and_then(Value::as_bool)
@@ -755,6 +772,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
     );
     let runtime_dag_pass = !runtime_dag_applicable
         || (runtime_dag_present
+            && runtime_dag_source_matches
             && runtime_dag_complete
             && runtime_dag_native_events > 0
             && runtime_dag_open_nodes == 0
@@ -768,15 +786,17 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         json!({
             "present": runtime_dag_present,
             "applicable": runtime_dag_applicable,
+            "source": runtime_dag_source,
+            "source_matches_evidence": runtime_dag_source_matches,
             "native_events": runtime_dag_native_events,
             "complete": runtime_dag_complete,
             "open_nodes": runtime_dag_open_nodes,
             "unresolved_nodes": runtime_dag_unresolved_nodes,
             "status_conflicts": runtime_dag_status_conflicts,
         }),
-        "when native Codex bundle evidence is present, runtime DAG complete=true with at least one native event and zero open, unresolved, or terminal-status-conflict nodes",
+        "when native Codex rollout evidence is present, the canonical runtime DAG must be complete with at least one native event and zero open, unresolved, or terminal-status-conflict nodes",
         Some(
-            "API-only Sessions are not reclassified as runtime-complete; native runtime evidence cannot be omitted to bypass this gate",
+            "API-only Sessions are not reclassified as runtime-complete; Stock rollout and legacy bundle evidence cannot be omitted to bypass this gate",
         ),
     );
     let inference_api_conservation_pass = !inference_api_conservation_applicable
@@ -2394,7 +2414,7 @@ mod tests {
     }
 
     #[test]
-    fn native_runtime_evidence_requires_a_complete_runtime_dag() {
+    fn stock_runtime_evidence_requires_a_complete_runtime_dag() {
         let mut session = json!({
             "trajectory_id":"runtime-gate",
             "session_id":"runtime-gate",
@@ -2409,9 +2429,10 @@ mod tests {
             "messages":[{"role":"system","content":"system"}],
             "usage":{},
             "meta":{
-                "rollout_events":[{"source":"codex_rollout_trace_bundle"}],
+                "rollout_events":[{"source":"codex_rollout_jsonl"}],
                 "runtime_dag":{
                     "applicable":true,
+                    "source":"canonical_model_interaction:codex_rollout_jsonl",
                     "native_event_count":4,
                     "complete":false,
                     "open_node_ids":["trace:tool:open"],
@@ -2448,6 +2469,19 @@ mod tests {
             .find(|gate| gate.name == "runtime_dag_integrity")
             .unwrap();
         assert!(gate.pass);
+
+        session["meta"]["runtime_dag"]["source"] = json!("codex_rollout_trace_bundle");
+        let mismatched = assess_session(&session, Profile::BuyerV7, 90.0);
+        let gate = mismatched
+            .buyer_acceptance
+            .gates
+            .iter()
+            .find(|gate| gate.name == "runtime_dag_integrity")
+            .unwrap();
+        assert!(!gate.pass);
+        assert_eq!(gate.observed["source_matches_evidence"], false);
+        session["meta"]["runtime_dag"]["source"] =
+            json!("canonical_model_interaction:codex_rollout_jsonl");
 
         session["meta"]["runtime_dag"]["complete"] = json!(false);
         session["meta"]["runtime_dag"]["status_conflict_node_ids"] = json!(["tool-1"]);

@@ -71,6 +71,12 @@ struct RuntimeIntegrity {
     metrics: Value,
 }
 
+struct CanonicalRecords {
+    interactions: Vec<Value>,
+    runtime_spans: Vec<Value>,
+    links: Vec<Value>,
+}
+
 #[derive(Debug, Clone)]
 struct WireBody {
     captured: Value,
@@ -232,45 +238,11 @@ pub fn project_interactions(
     captures.sort_by_key(capture_order_key);
     let capture_records = captures.len() as u64;
 
-    let api_captures: Vec<&Value> = captures
-        .iter()
-        .filter(|capture| record_type(capture) == "api_snapshot")
-        .collect();
-    let mut interactions: Vec<Value> = api_captures
-        .par_iter()
-        .map(|capture| model_interaction_from_capture(capture))
-        .collect::<Result<Vec<_>>>()?;
-    interactions.sort_by(|left, right| {
-        string_field(left, "interaction_id").cmp(&string_field(right, "interaction_id"))
-    });
-
-    let mut runtime_spans = build_runtime_spans(&captures)?;
-    deduplicate_runtime_spans(&mut runtime_spans)?;
-    runtime_spans
-        .sort_by(|left, right| string_field(left, "span_id").cmp(&string_field(right, "span_id")));
-    let mut links = build_interaction_links(&interactions, &runtime_spans, &captures)?;
-    links.sort_by(|left, right| string_field(left, "link_id").cmp(&string_field(right, "link_id")));
-    attach_captured_tool_schemas(&mut runtime_spans, &interactions, &links)?;
-    attach_runtime_link_refs(&mut interactions, &links);
-    let validators = CanonicalValidators::new()?;
-    validate_canonical_records(
-        &validators.model_interaction,
-        MODEL_INTERACTION_SCHEMA_VERSION,
-        &interactions,
-        "generated interactions",
-    )?;
-    validate_canonical_records(
-        &validators.runtime_span,
-        RUNTIME_SPAN_SCHEMA_VERSION,
-        &runtime_spans,
-        "generated runtime spans",
-    )?;
-    validate_canonical_records(
-        &validators.interaction_link,
-        INTERACTION_LINK_SCHEMA_VERSION,
-        &links,
-        "generated interaction links",
-    )?;
+    let CanonicalRecords {
+        interactions,
+        runtime_spans,
+        links,
+    } = build_canonical_records(&captures)?;
     let (raw_bytes_complete, protocol_complete, interaction_metrics) =
         aggregate_interaction_integrity(&interactions);
     let runtime = runtime_integrity(&interactions, &runtime_spans, &links);
@@ -350,7 +322,7 @@ pub fn project_interactions(
         session_id,
         input_records: capture_records,
         duplicate_captures_removed,
-        api_snapshots: api_captures.len() as u64,
+        api_snapshots: interactions.len() as u64,
         interactions: interactions.len() as u64,
         runtime_spans: runtime_spans.len() as u64,
         links: links.len() as u64,
@@ -379,6 +351,133 @@ pub fn project_interactions(
     File::open(parent)?.sync_all()?;
     verify_interaction_artifacts(&output)?;
     Ok(manifest)
+}
+
+fn build_canonical_records(captures: &[Value]) -> Result<CanonicalRecords> {
+    let api_captures: Vec<&Value> = captures
+        .iter()
+        .filter(|capture| record_type(capture) == "api_snapshot")
+        .collect();
+    let mut interactions: Vec<Value> = api_captures
+        .par_iter()
+        .map(|capture| model_interaction_from_capture(capture))
+        .collect::<Result<Vec<_>>>()?;
+    interactions.sort_by(|left, right| {
+        string_field(left, "interaction_id").cmp(&string_field(right, "interaction_id"))
+    });
+
+    let mut runtime_spans = build_runtime_spans(captures)?;
+    deduplicate_runtime_spans(&mut runtime_spans)?;
+    runtime_spans
+        .sort_by(|left, right| string_field(left, "span_id").cmp(&string_field(right, "span_id")));
+    let mut links = build_interaction_links(&interactions, &runtime_spans, captures)?;
+    links.sort_by(|left, right| string_field(left, "link_id").cmp(&string_field(right, "link_id")));
+    attach_captured_tool_schemas(&mut runtime_spans, &interactions, &links)?;
+    attach_runtime_link_refs(&mut interactions, &links);
+
+    let validators = CanonicalValidators::new()?;
+    validate_canonical_records(
+        &validators.model_interaction,
+        MODEL_INTERACTION_SCHEMA_VERSION,
+        &interactions,
+        "generated interactions",
+    )?;
+    validate_canonical_records(
+        &validators.runtime_span,
+        RUNTIME_SPAN_SCHEMA_VERSION,
+        &runtime_spans,
+        "generated runtime spans",
+    )?;
+    validate_canonical_records(
+        &validators.interaction_link,
+        INTERACTION_LINK_SCHEMA_VERSION,
+        &links,
+        "generated interaction links",
+    )?;
+    Ok(CanonicalRecords {
+        interactions,
+        runtime_spans,
+        links,
+    })
+}
+
+pub(crate) fn stock_runtime_dag_summary(captures: &[Value]) -> Result<Option<Value>> {
+    let source_event_count = captures
+        .iter()
+        .filter(|capture| {
+            capture
+                .pointer("/rolloutEvent/source")
+                .and_then(Value::as_str)
+                == Some("codex_rollout_jsonl")
+        })
+        .count();
+    if source_event_count == 0 {
+        return Ok(None);
+    }
+
+    let CanonicalRecords {
+        interactions,
+        runtime_spans,
+        links,
+    } = build_canonical_records(captures)?;
+    let integrity = runtime_integrity(&interactions, &runtime_spans, &links);
+    let metrics = &integrity.metrics;
+    let roots: BTreeSet<String> = runtime_spans
+        .iter()
+        .filter(|span| string_field(span, "span_kind") == Some("task_root"))
+        .filter_map(|span| string_field(span, "span_id").map(str::to_owned))
+        .collect();
+    let terminal_roots: BTreeSet<String> = runtime_spans
+        .iter()
+        .filter(|span| string_field(span, "span_kind") == Some("task_root"))
+        .filter(|span| runtime_span_is_terminal(span))
+        .filter_map(|span| string_field(span, "span_id").map(str::to_owned))
+        .collect();
+    let open_nodes = metric_string_set(metrics, "/open_span_ids");
+    let status_conflicts = metric_string_set(metrics, "/conflicting_span_ids");
+    let mut unresolved = BTreeSet::new();
+    for path in [
+        "/unscoped_span_ids",
+        "/unresolved_parent_call_span_ids",
+        "/unresolved_parent_span_ids",
+        "/calls_without_results",
+        "/calls_without_execution",
+        "/unlinked_interaction_ids",
+        "/invalid_link_ids",
+    ] {
+        unresolved.extend(metric_string_set(metrics, path));
+    }
+    let task_session_ids = canonical_task_session_ids(&interactions, &runtime_spans);
+    let session_ids = canonical_session_ids(&interactions, &runtime_spans);
+    let complete = integrity.runtime_complete && integrity.root_complete;
+    Ok(Some(json!({
+        "schema_version":"chiptrace.runtime-dag.v1",
+        "source":"canonical_model_interaction:codex_rollout_jsonl",
+        "native_event_count":source_event_count,
+        "roots":roots,
+        "root_mode":if roots.len() > 1 { "session_scoped_turn_forest" } else { "single_turn" },
+        "task_session_ids":task_session_ids,
+        "session_ids":session_ids,
+        "open_node_ids":open_nodes,
+        "unresolved_node_ids":unresolved,
+        "status_conflict_node_ids":status_conflicts,
+        "terminal_rollout_ids":terminal_roots,
+        "canonical_metrics":metrics,
+        "root_complete":integrity.root_complete,
+        "complete":complete,
+        "applicable":true,
+    })))
+}
+
+fn metric_string_set(metrics: &Value, path: &str) -> BTreeSet<String> {
+    metrics
+        .pointer(path)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
 }
 
 pub fn verify_interaction_projection(root: &Path) -> Result<InteractionProjectionManifest> {
@@ -4634,6 +4733,21 @@ mod tests {
         let integrity = runtime_integrity(&[], &spans, &[]);
         assert!(integrity.root_complete);
         assert_eq!(integrity.metrics["unscoped_span_ids"], json!([]));
+
+        let summary = stock_runtime_dag_summary(&captures).unwrap().unwrap();
+        assert_eq!(summary["applicable"], true);
+        assert_eq!(
+            summary["source"],
+            "canonical_model_interaction:codex_rollout_jsonl"
+        );
+        assert_eq!(summary["native_event_count"], 13);
+        assert_eq!(summary["root_complete"], true);
+        assert_eq!(summary["complete"], false);
+        assert!(
+            summary["unresolved_node_ids"]
+                .as_array()
+                .is_some_and(|nodes| !nodes.is_empty())
+        );
     }
 
     #[test]
