@@ -25,6 +25,7 @@ use chiptrace::harness::{
 use chiptrace::model_interaction::{
     InteractionProjectConfig, project_interactions, verify_interaction_projection,
 };
+use chiptrace::otlp_delivery::{OtlpDeliveryConfig, send_otlp};
 use chiptrace::producer::{ProducerConfig, ProducerTarget, submit_producer_events};
 use chiptrace::publish::{
     ArtifactKind, Backend, PublishConfig, PublishSource, VerifyPublishedConfig, publish,
@@ -81,6 +82,8 @@ enum Command {
     ExportOtlp(ExportOtlpArgs),
     /// 只读验证 OTLP 文件、SHA-256 和内部父子关系。
     VerifyOtlp(VerifyOtlpArgs),
+    /// 将已验证的 OTLP 树可靠发送到 Langfuse。
+    SendOtlp(SendOtlpArgs),
     /// 对 canonical Session JSONL 输出逐条验收结果。
     Score(ScoreArgs),
     /// 按显式 request_id 将 Sub2API usage log 精确关联到 Capture。
@@ -310,6 +313,26 @@ struct ExportOtlpArgs {
 struct VerifyOtlpArgs {
     #[arg(long, required = true)]
     projection: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct SendOtlpArgs {
+    #[arg(long, required = true)]
+    projection: PathBuf,
+    /// Langfuse OTLP traces API，例如 http://127.0.0.1:8990/api/public/otel/v1/traces。
+    #[arg(long, required = true)]
+    endpoint: String,
+    #[arg(long, default_value_t = 30)]
+    request_timeout_seconds: u64,
+    #[arg(long, default_value_t = 25)]
+    retry_max_times: usize,
+    #[arg(long, default_value_t = 256)]
+    batch_spans: usize,
+    #[arg(long, default_value_t = 4)]
+    max_batch_mib: usize,
+    /// 仅用于观测：显式允许发送 delivery_ready=false 的投影。
+    #[arg(long)]
+    allow_incomplete: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1230,6 +1253,26 @@ async fn main() -> Result<()> {
             replace: args.replace,
         })?)?,
         Command::VerifyOtlp(args) => serde_json::to_value(verify_otlp_export(&args.projection)?)?,
+        Command::SendOtlp(args) => {
+            let public_key = std::env::var("LANGFUSE_PUBLIC_KEY")
+                .context("LANGFUSE_PUBLIC_KEY is required for send-otlp")?;
+            let secret_key = std::env::var("LANGFUSE_SECRET_KEY")
+                .context("LANGFUSE_SECRET_KEY is required for send-otlp")?;
+            serde_json::to_value(
+                send_otlp(OtlpDeliveryConfig {
+                    projection: args.projection,
+                    endpoint: args.endpoint,
+                    public_key,
+                    secret_key,
+                    request_timeout: Duration::from_secs(args.request_timeout_seconds),
+                    retry_max_times: args.retry_max_times,
+                    batch_spans: args.batch_spans,
+                    max_batch_bytes: checked_mib(args.max_batch_mib)?,
+                    allow_incomplete: args.allow_incomplete,
+                })
+                .await?,
+            )?
+        }
         Command::Score(args) => serde_json::to_value(score_jsonl(
             &args.input,
             &args.output,

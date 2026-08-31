@@ -13,6 +13,7 @@ pub mod ingest;
 pub mod jsonl;
 pub mod model_interaction;
 pub mod object_store;
+pub mod otlp_delivery;
 pub mod producer;
 pub mod publish;
 pub mod raw_archive;

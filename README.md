@@ -101,6 +101,13 @@ chiptrace export-otlp \
   --projection /srv/chiptrace/interactions \
   --output /srv/chiptrace/otlp
 chiptrace verify-otlp --projection /srv/chiptrace/otlp
+
+export LANGFUSE_PUBLIC_KEY='<public-key>'
+export LANGFUSE_SECRET_KEY='<secret-key>'
+export LANGFUSE_BASE_URL='<langfuse-base-url>'
+chiptrace send-otlp \
+  --projection /srv/chiptrace/otlp \
+  --endpoint "$LANGFUSE_BASE_URL/api/public/otel/v1/traces"
 ```
 
 `delivery_ready` 由 Raw 字节、协议终态、Runtime、根节点和制品校验共同决定。Buyer 分数

@@ -142,7 +142,17 @@ chiptrace export-otlp \
   --projection /srv/chiptrace/interactions \
   --output /srv/chiptrace/otlp
 chiptrace verify-otlp --projection /srv/chiptrace/otlp
+export LANGFUSE_PUBLIC_KEY='<public-key>'
+export LANGFUSE_SECRET_KEY='<secret-key>'
+export LANGFUSE_BASE_URL='<langfuse-base-url>'
+chiptrace send-otlp \
+  --projection /srv/chiptrace/otlp \
+  --endpoint "$LANGFUSE_BASE_URL/api/public/otel/v1/traces"
 ```
+
+`send-otlp` 在发送前重复验证文件、SHA-256 和单根树，默认拒绝
+`delivery_ready=false`。瞬时网络错误、408、429 与 5xx 至少重试 20 次；其他 4xx
+立即失败。同一投影重放保持确定性的 Trace ID 和 Span ID。
 
 只有 `delivery_ready=true` 的 Trace 进入采购候选。Release 继续执行精确去重、连续子序列
 去重、Buyer Profile 评分、Session 原子分包和全对象 SHA-256。具体命令见
