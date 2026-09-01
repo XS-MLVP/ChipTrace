@@ -13,6 +13,8 @@ use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -81,6 +83,50 @@ struct RolloutIdentity {
     thread_id: Option<String>,
     parent_thread_id: Option<String>,
     agent_path: Option<String>,
+}
+
+struct AgentStateLock {
+    _file: File,
+}
+
+impl AgentStateLock {
+    fn acquire(state_root: &Path) -> Result<Self> {
+        create_queue_directory(state_root)?;
+        let path = state_root.join("codex-agent.lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&path)?;
+
+        #[cfg(unix)]
+        {
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error
+                    .raw_os_error()
+                    .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK)
+                {
+                    bail!(
+                        "another Codex agent already owns state root {}",
+                        state_root.display()
+                    );
+                }
+                return Err(error).with_context(|| {
+                    format!("lock Codex agent state root {}", state_root.display())
+                });
+            }
+        }
+
+        #[cfg(not(unix))]
+        bail!("Codex agent state locking is supported only on Unix");
+
+        file.set_len(0)?;
+        writeln!(file, "{}", std::process::id())?;
+        file.sync_all()?;
+        Ok(Self { _file: file })
+    }
 }
 
 pub fn spool_hook_event(raw: &[u8], config: &HookSpoolConfig) -> Result<HookSpoolSummary> {
@@ -179,6 +225,7 @@ where
     }
     create_queue_directory(&config.queue_root)?;
     create_queue_directory(&config.queue_root.join("pending"))?;
+    let _state_lock = AgentStateLock::acquire(&config.state_root)?;
     let mut summary = CodexAgentSummary::default();
     tokio::pin!(shutdown);
     loop {
@@ -516,6 +563,19 @@ mod tests {
         assert_eq!(identity.thread_id.as_deref(), Some("thread-child"));
         assert_eq!(identity.parent_thread_id.as_deref(), Some("thread-root"));
         assert_eq!(identity.agent_path.as_deref(), Some("/root/reviewer"));
+    }
+
+    #[test]
+    fn agent_state_root_has_exactly_one_writer() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state_root = temporary.path().join("state");
+        let first = AgentStateLock::acquire(&state_root).unwrap();
+        let error = AgentStateLock::acquire(&state_root)
+            .err()
+            .expect("second agent unexpectedly acquired the state root");
+        assert!(error.to_string().contains("another Codex agent"));
+        drop(first);
+        AgentStateLock::acquire(&state_root).unwrap();
     }
 
     #[tokio::test]

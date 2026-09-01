@@ -352,7 +352,6 @@ pub async fn export_codex_rollout(config: ExportConfig) -> Result<ExportSummary>
         ..ExportSummary::default()
     };
     let mut file = File::open(&input)?;
-    let file_len = file.metadata()?.len();
     file.seek(SeekFrom::Start(checkpoint.committed_offset))?;
     let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
     let mut batch = Vec::with_capacity(config.batch_records);
@@ -422,6 +421,7 @@ pub async fn export_codex_rollout(config: ExportConfig) -> Result<ExportSummary>
             summary.duplicate_captures = summary
                 .duplicate_captures
                 .saturating_add(deliver_rollout_batch(&config, &batch).await?);
+            verify_checkpoint(&input, &batch_checkpoint)?;
             checkpoint_store.save(&source_key, &batch_checkpoint)?;
             summary.committed_offset = batch_checkpoint.committed_offset;
             batch.clear();
@@ -432,14 +432,12 @@ pub async fn export_codex_rollout(config: ExportConfig) -> Result<ExportSummary>
             .duplicate_captures
             .saturating_add(deliver_rollout_batch(&config, &batch).await?);
     }
+    verify_checkpoint(&input, &batch_checkpoint)?;
     checkpoint_store.save(&source_key, &batch_checkpoint)?;
     summary.committed_offset = batch_checkpoint.committed_offset;
     summary.source_session_id = batch_checkpoint.context.source_session_id.clone();
     summary.source_thread_id = batch_checkpoint.context.source_thread_id.clone();
     summary.source_cli_version = batch_checkpoint.context.source_cli_version.clone();
-    if summary.committed_offset > file_len {
-        bail!("Codex rollout checkpoint advanced beyond the source file");
-    }
     Ok(summary)
 }
 
@@ -1532,6 +1530,7 @@ async fn deliver_rollout_batch(config: &ExportConfig, records: &[Vec<u8>]) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1795,6 +1794,47 @@ mod tests {
             .unwrap();
         assert_eq!(second.captures_emitted, 0);
         assert_eq!(fs::read(&output).unwrap(), bytes);
+    }
+
+    #[test]
+    fn checkpoint_validation_uses_current_source_length_after_append() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("rollout.jsonl");
+        let first = format!(
+            "{}\n",
+            line(
+                0,
+                json!({"type":"session_meta","payload":{"session_id":"thread-grow"}}),
+            )
+        );
+        fs::write(&path, &first).unwrap();
+        let initial_length = fs::metadata(&path).unwrap().len();
+        let second = format!(
+            "{}\n",
+            line(
+                1,
+                json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-grow"}}),
+            )
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(second.as_bytes())
+            .unwrap();
+
+        let checkpoint = Checkpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION.to_owned(),
+            source_path: path.display().to_string(),
+            committed_offset: initial_length + second.len() as u64,
+            last_line_start: initial_length,
+            last_line_bytes: second.len() as u64,
+            last_line_sha256: sha256(second.as_bytes()),
+            last_ordinal: Some(1),
+            context: RolloutContext::default(),
+        };
+        assert!(checkpoint.committed_offset > initial_length);
+        verify_checkpoint(&path, &checkpoint).unwrap();
     }
 
     #[tokio::test]

@@ -266,25 +266,29 @@ runtime 结果，并通过六项完整性硬门槛。
 
 ## Stock Codex 生产闭环（2026-09-01）
 
-生产 `18084`、Relay 和 Collector 滚动到 revision `68ab122` 后，使用未修改的
-`codex-cli 0.150.0-alpha.9` 和普通 `codex exec` 完成真实 canary。Session ID 为
-`01a05a4f-df66-79f1-90de-b7d55d269852`，Langfuse Trace ID 为
-`fe4c27d756e68ff8b41179792ee0fff4`。
+生产 `18084`、Relay 和 Collector 保持 revision `68ab122`，使用未修改的
+`codex-cli 0.152.0-alpha.7.2`、普通 `codex exec`、`0.6.0` Plugin 和常驻
+`codex-agent` 完成真实只读 canary。未使用 Harness、Registry、patched Codex、bundle
+或自定义启动器。Session ID 为 `01a05b3e-71bf-7d30-9df7-8b06441d21b1`，Langfuse
+Trace ID 为 `073f59de062830b6bebfbb14d4b1e0c9`。
 
 | 阶段 | 结果 |
 | --- | --- |
-| Raw | 37 条 Capture：3 条 Wire、31 条 rollout 原行、3 条生命周期事件；Relay 与 Collector 增量守恒，pending 为 0 |
-| Wire | 3/3 Responses streaming 交互保留原始请求/响应字节、长度和 SHA-256；Raw 与协议终态均完整 |
-| Runtime | 6 个 span、1 个 Turn Root；2/2 模型 `exec` 同时有回传结果和真实执行；3 个 CommandExecution 中 1 个真实失败、2 个成功 |
+| Raw | 57 条 Capture：6 条 Wire、48 条 rollout 原行、3 条生命周期事件；Hook 与入口 outbox 均清空，Relay/Collector 守恒，重试、冲突和永久失败增量均为 0 |
+| Wire | 6/6 Responses streaming 交互保留原始请求/响应字节、长度和 SHA-256；Raw 与协议终态均完整 |
+| Runtime | 11 个 span、1 个 Turn Root；5/5 模型 `exec` 同时有回传结果和真实执行；5 个 CommandExecution 中 1 个真实失败、4 个成功 |
 | 完整性 | `artifact_valid`、`raw_bytes_complete`、`protocol_complete`、`runtime_complete`、`root_complete`、`delivery_ready` 全部为 true |
-| OTLP | 9 个 span、1 个根、8/8 内部父引用解析；AGENT、GENERATION、TOOL 均已落入 Langfuse |
-| Token | 输入 46,758、缓存输入 22,784、输出 648、总计 47,406；Langfuse 与 rollout 逐项一致 |
-| Buyer | 该 canary 只有 1 个真实 User 轮且模型工具名只有 `exec`，不满足 10 轮和 5 种工具门槛，不进入采购候选 |
+| OTLP | 17 个 span、1 个根、16/16 内部父引用解析；1 个 AGENT、6 个 GENERATION、10 个 TOOL 已落入 Langfuse，失败命令保持 `failed` |
+| Token | 输入 97,388、缓存输入 56,832、输出 776、reasoning 344、API 总计 98,164；Langfuse 与 rollout 逐项一致 |
+| 训练口径 | Session 闭合并包含真实 User -> Assistant 交互，`delivery_ready=true`、`training_ready=true` |
+| Buyer | 50 分，`eligible=false`；6 个有效轮、1 种模型工具、Stock `exec` custom grammar 缺 JSON parameters schema，且该样本未做 Sub2API provider 富化 |
 
 入口升级时关闭正文脱敏，并将历史队列分为 1,790 条可持久化记录和 287 条永久失败证据；
-永久失败记录保留在 `failed`，没有重新序列化或伪造 Raw。该 canary 证明普通 Stock Codex
-已经自动形成可交付完整 Trace；Buyer 准入仍由真实长任务自身的轮次、工具多样性和验收
-结果决定。
+永久失败记录保留在 `failed`，没有重新序列化或伪造 Raw。该 canary 同时验证
+`codex-agent` 同一 state root 单写和 rollout 追加期间 checkpoint 推进：运行日志没有
+`Database already open`、越界或截断误报。普通 Stock Codex 已经自动形成可训练完整
+Trace；Buyer 准入仍由真实长任务自身的轮次、工具多样性、provider 证据和采购 schema
+要求决定。
 
 ## Stock Codex 多轮真实审计（2026-09-01）
 

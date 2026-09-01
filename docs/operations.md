@@ -117,7 +117,10 @@ journalctl --user -u chiptrace-codex-agent.service -n 100 --no-pager
 
 主机需要无人登录持续采集时，由系统管理员为该账号启用 user manager linger。自定义
 `XDG_STATE_HOME` 时，同步修改 unit 中的 `queue-root` 和插件环境
-`CHIPTRACE_STATE_ROOT`，两者必须指向同一目录。
+`CHIPTRACE_STATE_ROOT`，两者必须指向同一目录。`codex-agent` 对同一 `state-root` 持有
+进程级独占锁，第二个实例直接失败，禁止两个 writer 同时推进 rollout checkpoint。
+每批 Capture 获得 Relay durable ACK 后，Agent 以源文件当前长度和最后一行 SHA-256
+重新校验再提交 checkpoint；Codex 正常追加 rollout 不会被误判为越界或截断。
 
 手动诊断只处理当前 pending 集合：
 
