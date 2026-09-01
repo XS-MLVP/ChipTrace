@@ -1956,10 +1956,56 @@ fn runtime_integrity(
         .filter_map(|link| string_field(link, "from"))
         .map(str::to_owned)
         .collect();
-    let calls_without_results: BTreeSet<&String> =
-        model_call_nodes.difference(&calls_with_results).collect();
-    let calls_without_execution: BTreeSet<&String> =
-        model_call_nodes.difference(&calls_with_execution).collect();
+    let cancelled_delivery_call_candidates: BTreeSet<String> = interactions
+        .iter()
+        .filter(|interaction| {
+            interaction
+                .pointer("/integrity/protocol_complete")
+                .and_then(Value::as_bool)
+                == Some(true)
+                && interaction
+                    .pointer("/response/model_status")
+                    .and_then(Value::as_str)
+                    == Some("completed")
+                && interaction
+                    .pointer("/response/upstream_transport_status")
+                    .and_then(Value::as_str)
+                    == Some("completed")
+                && interaction
+                    .pointer("/response/client_delivery_status")
+                    .and_then(Value::as_str)
+                    == Some("cancelled")
+        })
+        .flat_map(|interaction| {
+            let interaction_id = string_field(interaction, "interaction_id").unwrap_or("missing");
+            interaction
+                .get("model_tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(move |call| {
+                    call.get("call_id")
+                        .and_then(Value::as_str)
+                        .filter(|call_id| !call_id.trim().is_empty())
+                        .map(|call_id| format!("model-call:{interaction_id}:{call_id}"))
+                })
+        })
+        .collect();
+    let abandoned_model_call_nodes: BTreeSet<String> = cancelled_delivery_call_candidates
+        .difference(&calls_with_results)
+        .filter(|node| !calls_with_execution.contains(node.as_str()))
+        .cloned()
+        .collect();
+    let required_model_call_nodes: BTreeSet<String> = model_call_nodes
+        .difference(&abandoned_model_call_nodes)
+        .cloned()
+        .collect();
+    let calls_without_results: BTreeSet<&String> = required_model_call_nodes
+        .difference(&calls_with_results)
+        .collect();
+    let calls_without_execution: BTreeSet<&String> = required_model_call_nodes
+        .difference(&calls_with_execution)
+        .collect();
     let linked_interactions: BTreeSet<&str> = links
         .iter()
         .filter_map(|link| match string_field(link, "relation") {
@@ -2010,6 +2056,9 @@ fn runtime_integrity(
             "resolved_internal_parents":resolved_internal_parents,
             "resolved_internal_parent_rate":resolved_internal_parent_rate,
             "model_tool_calls":model_call_nodes.len(),
+            "required_model_tool_calls":required_model_call_nodes.len(),
+            "abandoned_model_tool_calls":abandoned_model_call_nodes.len(),
+            "abandoned_model_call_nodes":abandoned_model_call_nodes,
             "model_tool_calls_with_results":model_call_nodes.intersection(&calls_with_results).count(),
             "model_tool_calls_with_execution":model_call_nodes.intersection(&calls_with_execution).count(),
             "calls_without_results":calls_without_results,
@@ -3031,10 +3080,15 @@ fn build_task_root_spans(
         if !is_task_root_start(event_type) && !is_task_root_terminal(event_type) {
             continue;
         }
-        let stock_turn_root = matches!(event_type, "turn_start" | "turn_end")
-            && trace_string(capture, "parent_thread_id").is_none();
+        let stock_turn_root = matches!(
+            event_type,
+            "turn_start" | "turn_end" | "turn_stop" | "turn_interrupt" | "turn_aborted"
+        ) && trace_string(capture, "parent_thread_id").is_none();
         let explicit_task_root = trace_string(capture, "task_session_id").is_some()
-            && !matches!(event_type, "turn_start" | "turn_end");
+            && !matches!(
+                event_type,
+                "turn_start" | "turn_end" | "turn_stop" | "turn_interrupt" | "turn_aborted"
+            );
         if !stock_turn_root && !explicit_task_root {
             continue;
         }
@@ -3103,7 +3157,7 @@ fn build_task_root_spans(
             })
             .collect();
         let root_complete = starts.len() == 1
-            && terminals.len() == 1
+            && !terminals.is_empty()
             && trace_ids.len() <= 1
             && native_span_ids.len() <= 1
             && terminal_statuses.len() == 1;
@@ -3148,7 +3202,7 @@ fn build_task_root_spans(
             "tool_schema":Value::Null,
             "raw_capture_refs":capture_ids,
             "extensions":{
-                "state_conflict":!root_complete && (starts.len() > 1 || terminals.len() > 1 || trace_ids.len() > 1 || native_span_ids.len() > 1 || terminal_statuses.len() > 1),
+                "state_conflict":!root_complete && (starts.len() > 1 || trace_ids.len() > 1 || native_span_ids.len() > 1 || terminal_statuses.len() > 1),
                 "root_complete":root_complete,
                 "start_observations":starts.len(),
                 "terminal_observations":terminals.len(),
@@ -3178,6 +3232,9 @@ fn is_task_root_terminal(event_type: &str) -> bool {
             | "terminated"
             | "aborted"
             | "turn_end"
+            | "turn_stop"
+            | "turn_interrupt"
+            | "turn_aborted"
     ) || event_type.starts_with("task_cancel")
         || event_type.starts_with("session_cancel")
 }
@@ -3596,7 +3653,7 @@ fn build_subagent_runtime_spans(
         };
         if !matches!(
             string_field(event, "type"),
-            Some("subagent_spawn" | "subagent_join" | "subagent_interaction")
+            Some("subagent_spawn" | "subagent_join")
         ) {
             continue;
         }
@@ -4806,7 +4863,7 @@ mod tests {
         let join = json!({
             "captureId":"cap-subagent-end","sourceNamespace":"stock",
             "receivedAt":"2026-09-01T00:00:04Z","traceContext":context,
-            "rolloutEvent":rollout(4, "item_completed"),
+            "rolloutEvent":rollout(5, "item_completed"),
             "lifecycleEvent":{
                 "type":"subagent_join","status":"completed",
                 "occurred_at":"2026-09-01T00:00:04Z",
@@ -4816,10 +4873,23 @@ mod tests {
                 }
             }
         });
+        let interaction = json!({
+            "captureId":"cap-subagent-interaction","sourceNamespace":"stock",
+            "receivedAt":"2026-09-01T00:00:03Z","traceContext":context,
+            "rolloutEvent":rollout(4, "item_completed"),
+            "lifecycleEvent":{
+                "type":"subagent_interaction","status":"completed",
+                "occurred_at":"2026-09-01T00:00:03Z",
+                "source_event":{
+                    "type":"SubAgentActivity","id":"subagent-message", "kind":"interacted",
+                    "agent_thread_id":"thread-child","agent_path":"/root/review"
+                }
+            }
+        });
         let image = json!({
             "captureId":"cap-image","sourceNamespace":"stock",
             "receivedAt":"2026-09-01T00:00:03Z","traceContext":context,
-            "rolloutEvent":rollout(5, "item_completed"),
+            "rolloutEvent":rollout(6, "item_completed"),
             "toolExecution":{
                 "call_id":"runtime-image","parent_call_id":"call-spawn",
                 "name":"ImageView","status":"unknown","initiator":"runtime",
@@ -4828,7 +4898,7 @@ mod tests {
                 "schema_provenance":{"source":"codex_rollout_item_completed","source_complete":false}
             }
         });
-        let captures = vec![call, result, spawn, image, join];
+        let captures = vec![call, result, spawn, interaction, image, join];
         let spans = build_runtime_spans(&captures).unwrap();
         let dispatcher = spans
             .iter()
@@ -4836,10 +4906,12 @@ mod tests {
             .unwrap();
         assert_eq!(dispatcher["status"], "completed");
         assert_eq!(dispatcher["extensions"]["semantic_status"], "unknown");
-        let subagent = spans
+        let subagents: Vec<&Value> = spans
             .iter()
-            .find(|span| span["span_kind"] == "agent")
-            .unwrap();
+            .filter(|span| span["span_kind"] == "agent")
+            .collect();
+        assert_eq!(subagents.len(), 1);
+        let subagent = subagents[0];
         assert_eq!(subagent["status"], "completed");
         assert_eq!(subagent["parent_span_id"], dispatcher["span_id"]);
         assert_eq!(subagent["extensions"]["state_conflict"], false);
@@ -4858,6 +4930,100 @@ mod tests {
                     == format!("runtime-span:{}", dispatcher["span_id"].as_str().unwrap())
                 && link["to"] == format!("runtime-span:{}", subagent["span_id"].as_str().unwrap())
         }));
+    }
+
+    #[test]
+    fn cancelled_delivery_without_execution_is_abandoned_but_partial_evidence_is_required() {
+        let interaction = |interaction_id: &str, delivery: &str, with_result: bool| {
+            json!({
+                "interaction_id":interaction_id,
+                "trace_context":{
+                    "task_session_id":"task-runtime-integrity"
+                },
+                "response":{
+                    "model_status":"completed",
+                    "upstream_transport_status":"completed",
+                    "client_delivery_status":delivery
+                },
+                "integrity":{"protocol_complete":true},
+                "model_tool_calls":[{
+                    "call_id":"call-runtime-integrity",
+                    "name":"exec",
+                    "arguments":{},
+                    "raw":{}
+                }],
+                "tool_results_submitted":if with_result {
+                    json!([{"call_id":"call-runtime-integrity","output":"observed"}])
+                } else {
+                    json!([])
+                }
+            })
+        };
+        let root = json!({
+            "span_id":"runtime-root",
+            "trace_context":{"task_session_id":"task-runtime-integrity"},
+            "span_kind":"task_root",
+            "status":"completed",
+            "extensions":{"root_complete":true,"state_conflict":false}
+        });
+        let interaction_to_root = |interaction_id: &str| {
+            interaction_link(
+                &format!("interaction:{interaction_id}"),
+                "runtime-span:runtime-root",
+                "interaction_to_runtime_span",
+                json!({"match":"test"}),
+            )
+        };
+
+        let abandoned = interaction("interaction-abandoned", "cancelled", false);
+        let integrity = runtime_integrity(
+            std::slice::from_ref(&abandoned),
+            std::slice::from_ref(&root),
+            &[interaction_to_root("interaction-abandoned")],
+        );
+        assert!(integrity.runtime_complete);
+        assert!(integrity.root_complete);
+        assert_eq!(integrity.metrics["model_tool_calls"], 1);
+        assert_eq!(integrity.metrics["required_model_tool_calls"], 0);
+        assert_eq!(integrity.metrics["abandoned_model_tool_calls"], 1);
+        assert_eq!(
+            integrity.metrics["abandoned_model_call_nodes"],
+            json!(["model-call:interaction-abandoned:call-runtime-integrity"])
+        );
+
+        let delivered = interaction("interaction-delivered", "completed", false);
+        let integrity = runtime_integrity(
+            std::slice::from_ref(&delivered),
+            std::slice::from_ref(&root),
+            &[interaction_to_root("interaction-delivered")],
+        );
+        assert!(!integrity.runtime_complete);
+        assert_eq!(integrity.metrics["required_model_tool_calls"], 1);
+        assert_eq!(integrity.metrics["abandoned_model_tool_calls"], 0);
+
+        let partial = interaction("interaction-partial", "cancelled", true);
+        let links = [
+            interaction_to_root("interaction-partial"),
+            interaction_link(
+                "model-call:interaction-partial:call-runtime-integrity",
+                "submitted-result:interaction-partial:0",
+                "model_call_to_submitted_result",
+                json!({"match":"test"}),
+            ),
+        ];
+        let integrity = runtime_integrity(
+            std::slice::from_ref(&partial),
+            std::slice::from_ref(&root),
+            &links,
+        );
+        assert!(!integrity.runtime_complete);
+        assert_eq!(integrity.metrics["required_model_tool_calls"], 1);
+        assert_eq!(integrity.metrics["abandoned_model_tool_calls"], 0);
+        assert_eq!(integrity.metrics["calls_without_results"], json!([]));
+        assert_eq!(
+            integrity.metrics["calls_without_execution"],
+            json!(["model-call:interaction-partial:call-runtime-integrity"])
+        );
     }
 
     #[test]
@@ -5691,6 +5857,75 @@ mod tests {
         assert_eq!(integrity.metrics["internal_parent_references"], 1);
         assert_eq!(integrity.metrics["resolved_internal_parents"], 1);
         assert_eq!(integrity.metrics["resolved_internal_parent_rate"], 1.0);
+    }
+
+    #[test]
+    fn stock_turn_root_merges_consistent_cancel_evidence_and_rejects_status_conflicts() {
+        let lifecycle = |capture_id: &str, event_type: &str, status: &str, occurred_at: &str| {
+            json!({
+                "recordType":"lifecycle_event",
+                "captureId":capture_id,
+                "sourceNamespace":"stock",
+                "receivedAt":occurred_at,
+                "traceContext":{
+                    "session_id":"session-interrupt",
+                    "thread_id":"session-interrupt",
+                    "root_turn_id":"turn-interrupt",
+                    "turn_id":"turn-interrupt"
+                },
+                "lifecycleEvent":{
+                    "type":event_type,
+                    "status":status,
+                    "occurred_at":occurred_at
+                }
+            })
+        };
+        let start = lifecycle(
+            "cap-turn-start",
+            "turn_start",
+            "started",
+            "2026-09-01T00:00:00Z",
+        );
+        let interrupt = lifecycle(
+            "cap-turn-interrupt",
+            "turn_interrupt",
+            "cancelled",
+            "2026-09-01T00:00:01Z",
+        );
+        let aborted = lifecycle(
+            "cap-turn-aborted",
+            "turn_aborted",
+            "cancelled",
+            "2026-09-01T00:00:02Z",
+        );
+        let captures = [start.clone(), interrupt, aborted];
+        let scope_index = RuntimeScopeIndex::new(&captures);
+        let spans = build_task_root_spans(&captures, &scope_index).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["status"], "cancelled");
+        assert_eq!(spans[0]["extensions"]["root_complete"], true);
+        assert_eq!(spans[0]["extensions"]["state_conflict"], false);
+        assert_eq!(spans[0]["extensions"]["terminal_observations"], 2);
+        let integrity = runtime_integrity(&[], &spans, &[]);
+        assert!(integrity.root_complete);
+        assert!(integrity.runtime_complete);
+
+        let completed = lifecycle(
+            "cap-turn-stop",
+            "turn_stop",
+            "completed",
+            "2026-09-01T00:00:03Z",
+        );
+        let captures = [start, captures[1].clone(), captures[2].clone(), completed];
+        let scope_index = RuntimeScopeIndex::new(&captures);
+        let spans = build_task_root_spans(&captures, &scope_index).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["extensions"]["root_complete"], false);
+        assert_eq!(spans[0]["extensions"]["state_conflict"], true);
+        assert_eq!(spans[0]["extensions"]["terminal_observations"], 3);
+        let integrity = runtime_integrity(&[], &spans, &[]);
+        assert!(!integrity.root_complete);
+        assert!(!integrity.runtime_complete);
     }
 
     #[test]

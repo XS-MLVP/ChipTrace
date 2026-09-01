@@ -290,6 +290,21 @@ Trace ID 为 `073f59de062830b6bebfbb14d4b1e0c9`。
 Trace；Buyer 准入仍由真实长任务自身的轮次、工具多样性、provider 证据和采购 schema
 要求决定。
 
+### 多代理与中断回归
+
+普通 `codex exec` 多代理 Session `01a05b64-fbb2-7191-8afe-717899ec8633` 产生 185 条
+Capture、22 次 Responses 交互和 21 个 RuntimeSpan。20 个模型工具调用中，16 个 required
+调用均有真实结果与执行；另 4 个来自上游已完成但客户端取消的响应，且结果与执行证据均
+不存在，因此明确标记为 abandoned。投影 `delivery_ready=true`；OTLP 共 43 个 span、1 个
+根、42/42 父引用解析，Langfuse Trace `38180e47744305573b58addeff9fbe95` 中包含 2 个
+AGENT、22 个 GENERATION 和 19 个 TOOL。
+
+显式中断 Session `01a05b81-b998-75a1-934d-87c7d140876a` 同时保留 Hook
+`turn_interrupt`、rollout `turn_aborted` 和失败的真实 CommandExecution。两个一致的取消
+终态合并为一个 `cancelled` Turn Root，`root_complete=true`；工具已执行但结果未回传给
+模型，因此 `runtime_complete=false`、`delivery_ready=false`。只有结果与执行证据同时
+不存在的客户端取消调用可以标记 abandoned；存在任一侧证据时继续严格验收。
+
 ## Stock Codex 多轮真实审计（2026-09-01）
 
 使用当前 `0.6.0` 源码只读回放生产 sealed Raw 中 Session
