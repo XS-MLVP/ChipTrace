@@ -17,9 +17,13 @@ jobs:
           toolchain: "1.91"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked
+      - run: node --test integrations/openai-gateway/durable-outbox.test.js
       - run: cargo run --locked --bin chiptrace -- self-test
       - name: Verify Relay producer benchmark path
         run: |

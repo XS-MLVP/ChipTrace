@@ -1,4 +1,4 @@
-.PHONY: check test self-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
+.PHONY: check test gateway-test self-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
 
 CHIPTRACE_VERSION ?= 0.5.1
 CHIPTRACE_REVISION ?= $(shell git rev-parse HEAD)
@@ -9,6 +9,10 @@ check:
 
 test:
 	cargo test --workspace --all-targets --locked
+	$(MAKE) gateway-test
+
+gateway-test:
+	node --test integrations/openai-gateway/durable-outbox.test.js
 
 self-test:
 	cargo run --locked --bin chiptrace -- self-test

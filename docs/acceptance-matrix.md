@@ -263,6 +263,28 @@ runtime 结果，并通过六项完整性硬门槛。
 `root_complete=false`、`runtime_complete=false` 拒绝交付，未将 Wire 完整性冒充为
 完整任务 Session。
 
+## Stock Codex 生产闭环（2026-09-01）
+
+生产 `18084`、Relay 和 Collector 滚动到 revision `68ab122` 后，使用未修改的
+`codex-cli 0.150.0-alpha.9` 和普通 `codex exec` 完成真实 canary。Session ID 为
+`01a05a4f-df66-79f1-90de-b7d55d269852`，Langfuse Trace ID 为
+`fe4c27d756e68ff8b41179792ee0fff4`。
+
+| 阶段 | 结果 |
+| --- | --- |
+| Raw | 37 条 Capture：3 条 Wire、31 条 rollout 原行、3 条生命周期事件；Relay 与 Collector 增量守恒，pending 为 0 |
+| Wire | 3/3 Responses streaming 交互保留原始请求/响应字节、长度和 SHA-256；Raw 与协议终态均完整 |
+| Runtime | 6 个 span、1 个 Turn Root；2/2 模型 `exec` 同时有回传结果和真实执行；3 个 CommandExecution 中 1 个真实失败、2 个成功 |
+| 完整性 | `artifact_valid`、`raw_bytes_complete`、`protocol_complete`、`runtime_complete`、`root_complete`、`delivery_ready` 全部为 true |
+| OTLP | 9 个 span、1 个根、8/8 内部父引用解析；AGENT、GENERATION、TOOL 均已落入 Langfuse |
+| Token | 输入 46,758、缓存输入 22,784、输出 648、总计 47,406；Langfuse 与 rollout 逐项一致 |
+| Buyer | 该 canary 只有 1 个真实 User 轮且模型工具名只有 `exec`，不满足 10 轮和 5 种工具门槛，不进入采购候选 |
+
+入口升级时关闭正文脱敏，并将历史队列分为 1,790 条可持久化记录和 287 条永久失败证据；
+永久失败记录保留在 `failed`，没有重新序列化或伪造 Raw。该 canary 证明普通 Stock Codex
+已经自动形成可交付完整 Trace；Buyer 准入仍由真实长任务自身的轮次、工具多样性和验收
+结果决定。
+
 ## 正式交付门槛
 
 正式 buyer 包必须满足：

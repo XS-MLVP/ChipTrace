@@ -63,6 +63,9 @@ canary 的健康状态。
 - 同一 `captureId` 重试幂等，Relay durable ACK 后才删除入口 pending 文件。
 - `/producer/events` 使用 Bearer Token；Wire Capture 与 Producer 路由权限分离。
 
+网关侧的最小可靠投递实现和接入约束见
+[OpenAI 网关接入](../integrations/openai-gateway/README.md)。业务代理本体不属于 ChipTrace。
+
 入口只能证明模型 Wire，不能单独证明本地工具已经执行。完整 Trace 必须同时收到 Stock
 Codex rollout 与 Hook 生命周期。
 
