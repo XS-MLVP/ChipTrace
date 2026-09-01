@@ -99,7 +99,14 @@ root_complete
 delivery_ready
 ```
 
-Buyer 分数是独立结果。`score >= 90` 仍需全部采购 hard gate 通过。
+Assembly 将同一结果写入 `meta.trace_readiness`。评分依次区分：
+
+```text
+delivery_ready -> training_ready -> buyer_eligible
+```
+
+`training_ready` 还要求闭合 Session 和真实 User → Assistant 训练交互；
+`buyer_eligible` 再叠加指定采购 Profile。`score >= 90` 仍需全部采购 hard gate 通过。
 
 ## 可靠投递
 
@@ -123,7 +130,9 @@ OTLP 投影读取 Canonical 与 `InteractionLink`，输出：
 - 工具名称、ID、参数、结果和真实 schema
 - 每个 Turn 一个根，内部父引用解析率 100%
 
-Langfuse 接收裁剪后的标准 OTLP。完整正文和大对象留在 Raw，只通过 hash 与引用回查。
+Langfuse 接收裁剪后的标准 OTLP。输入、输出、工具参数、结果和 schema 单属性最多保留
+20 KiB UTF-8 预览；超限值附原长度与 SHA-256。完整正文和大对象留在 Canonical/Raw，
+通过 hash 与引用回查。
 
 ## 性能边界
 

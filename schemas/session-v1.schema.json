@@ -397,6 +397,70 @@
         "trace_contexts": {"type": "array", "items": {"type": "object"}},
         "capture_dag": {"$ref": "#/$defs/captureDag"},
         "runtime_dag": {"$ref": "#/$defs/runtimeDag"},
+        "trace_readiness": {
+          "type": "object",
+          "required": [
+            "schema_version",
+            "artifact_valid",
+            "raw_bytes_complete",
+            "protocol_complete",
+            "runtime_complete",
+            "root_complete",
+            "wire_ready",
+            "runtime_ready",
+            "delivery_ready"
+          ],
+          "properties": {
+            "schema_version": {"const": "chiptrace.trace-readiness.v1"},
+            "artifact_valid": {"type": "boolean"},
+            "raw_bytes_complete": {"type": "boolean"},
+            "protocol_complete": {"type": "boolean"},
+            "runtime_complete": {"type": "boolean"},
+            "root_complete": {"type": "boolean"},
+            "wire_ready": {"type": "boolean"},
+            "runtime_ready": {"type": "boolean"},
+            "delivery_ready": {"type": "boolean"},
+            "interaction_metrics": {"type": "object"},
+            "runtime_metrics": {"type": "object"}
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "artifact_valid": {"const": true},
+                  "raw_bytes_complete": {"const": true},
+                  "protocol_complete": {"const": true}
+                },
+                "required": ["artifact_valid", "raw_bytes_complete", "protocol_complete"]
+              },
+              "then": {"properties": {"wire_ready": {"const": true}}},
+              "else": {"properties": {"wire_ready": {"const": false}}}
+            },
+            {
+              "if": {
+                "properties": {
+                  "runtime_complete": {"const": true},
+                  "root_complete": {"const": true}
+                },
+                "required": ["runtime_complete", "root_complete"]
+              },
+              "then": {"properties": {"runtime_ready": {"const": true}}},
+              "else": {"properties": {"runtime_ready": {"const": false}}}
+            },
+            {
+              "if": {
+                "properties": {
+                  "wire_ready": {"const": true},
+                  "runtime_ready": {"const": true}
+                },
+                "required": ["wire_ready", "runtime_ready"]
+              },
+              "then": {"properties": {"delivery_ready": {"const": true}}},
+              "else": {"properties": {"delivery_ready": {"const": false}}}
+            }
+          ],
+          "additionalProperties": false
+        },
         "inference_api_conservation": {"$ref": "#/$defs/inferenceApiConservation"},
         "task_dag": {"$ref": "#/$defs/taskDag"},
         "task_role": {"enum": ["root", "subagent"]},

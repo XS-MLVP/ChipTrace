@@ -2,13 +2,16 @@ use crate::capture::{extract_body, gateway_evidence_fingerprint};
 use crate::jsonl::{
     JsonlWriter, absolute_path, ensure_safe_relative_path, sha256_file, string_field, utc_now,
 };
-use crate::model_interaction::stock_runtime_dag_summary;
+use crate::model_interaction::canonical_trace_summary;
 use crate::schema::{
     FileManifest, RAW_LINEAGE_SCHEMA_VERSION, RawSourceLineage, SESSION_SCHEMA_VERSION,
 };
 use crate::tool_registry::{
     canonical_runtime_tool_name, canonical_tool_registry_sha256, canonical_tool_schema_sha256,
     tool_definition_source_complete,
+};
+use crate::wire_tools::{
+    projected_tool_definition_key, request_tool_definitions as captured_request_tool_definitions,
 };
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
@@ -467,7 +470,13 @@ fn process_partition(
 }
 
 fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
-    let stock_runtime_dag = stock_runtime_dag_summary(&captures)?;
+    let canonical_trace = canonical_trace_summary(&captures)?;
+    let canonical_runtime_dag = canonical_trace
+        .as_ref()
+        .filter(|summary| {
+            string_field(&summary.runtime_dag, "source") != Some("codex_rollout_trace_bundle")
+        })
+        .map(|summary| summary.runtime_dag.clone());
     let mut parsed: Vec<ParsedCapture> = captures
         .into_iter()
         .map(parse_capture)
@@ -500,7 +509,7 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     };
     let orphan = identity_source == "capture_id_fallback";
     let mut messages = Vec::new();
-    let mut tools_by_name: BTreeMap<String, Value> = BTreeMap::new();
+    let mut tools_by_identity: BTreeMap<String, Value> = BTreeMap::new();
     let mut schema_conflicts: BTreeSet<String> = BTreeSet::new();
     let mut rollout_events = Vec::new();
     let mut rollout_usage_evidence = Vec::new();
@@ -547,15 +556,11 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
         candidate.extend(capture.response_messages.clone());
         divergences += merge_messages(&mut messages, &candidate);
         for tool in &capture.tools {
-            let Some(name) = tool_name(tool) else {
-                continue;
-            };
-            if let Some(existing) = tools_by_name.get(name)
-                && !tool_schemas_semantically_equal(existing, tool)
-            {
-                schema_conflicts.insert(name.to_owned());
-            }
-            tools_by_name.insert(name.to_owned(), tool.clone());
+            insert_observed_tool_schema(
+                &mut tools_by_identity,
+                &mut schema_conflicts,
+                tool.clone(),
+            );
         }
         if let Some(registry) = &capture.tool_registry_evidence {
             tool_registry_evidence.push(registry.clone());
@@ -857,17 +862,27 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
         .then(|| parsed.last().map(|capture| capture.timestamp.clone()))
         .flatten();
     let mut expanded_messages = Vec::new();
-    let mut expanded_tools_by_name = tools_by_name.clone();
+    let mut expanded_tools_by_identity = tools_by_identity.clone();
     let wire_observed_schema_conflicts = schema_conflicts.clone();
     let mut expanded_schema_conflicts = schema_conflicts.clone();
+    let mut runtime_only_child_execution_ids = Vec::new();
     for execution in &tool_executions {
+        if !runtime_execution_is_model_visible(execution) {
+            if let Some(call_id) = string_field(execution, "call_id") {
+                runtime_only_child_execution_ids.push(call_id.to_owned());
+            }
+            continue;
+        }
         divergences += project_tool_execution(
             &mut expanded_messages,
-            &mut expanded_tools_by_name,
+            &mut expanded_tools_by_identity,
             &mut expanded_schema_conflicts,
             execution,
         );
     }
+    let lifecycle_result_messages =
+        exact_lifecycle_tool_result_messages(&messages, &lifecycle_event_records);
+    expanded_messages.extend(lifecycle_result_messages.iter().cloned());
     annotate_tool_call_statuses(&mut expanded_messages);
     let mut expanded_view = messages.clone();
     let code_mode_message_projection =
@@ -877,11 +892,11 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
         partition_schema_conflicts(&expanded_view, &expanded_schema_conflicts);
     let (wire_schema_conflicts, wire_uncalled_schema_conflicts) =
         partition_schema_conflicts(&messages, &wire_observed_schema_conflicts);
-    let tools: Vec<Value> = tools_by_name.into_values().collect();
-    let expanded_tools: Vec<Value> = expanded_tools_by_name.into_values().collect();
+    let tools: Vec<Value> = tools_by_identity.into_values().collect();
+    let expanded_tools: Vec<Value> = expanded_tools_by_identity.into_values().collect();
     annotate_tool_call_statuses(&mut messages);
     let capture_dag = build_capture_dag(&parsed, &messages);
-    let runtime_dag = stock_runtime_dag.unwrap_or_else(|| build_runtime_dag(&parsed));
+    let runtime_dag = canonical_runtime_dag.unwrap_or_else(|| build_runtime_dag(&parsed));
     let inference_api_conservation = build_inference_api_conservation(&parsed);
     insert_scoped_trace_values(&mut trace, "session_id", "session_ids", &trace_session_ids);
     insert_scoped_trace_values(&mut trace, "thread_id", "thread_ids", &trace_thread_ids);
@@ -969,6 +984,9 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     meta.insert("trace_contexts".to_owned(), json!(trace_contexts));
     meta.insert("capture_dag".to_owned(), capture_dag);
     meta.insert("runtime_dag".to_owned(), runtime_dag);
+    if let Some(summary) = canonical_trace {
+        meta.insert("trace_readiness".to_owned(), summary.readiness);
+    }
     meta.insert(
         "inference_api_conservation".to_owned(),
         inference_api_conservation,
@@ -1063,6 +1081,8 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
                 "parent_model_call_ids":code_mode_parent_call_ids,
                 "runtime_messages":expanded_messages,
                 "runtime_tools":expanded_tools,
+                "runtime_only_child_execution_ids":runtime_only_child_execution_ids,
+                "lifecycle_result_evidence_count":lifecycle_result_messages.len(),
                 "code_mode_audit":code_mode_message_projection,
                 "wire_schema_conflicts":wire_schema_conflicts,
                 "wire_uncalled_schema_conflicts":wire_uncalled_schema_conflicts,
@@ -2429,7 +2449,17 @@ fn parse_request(
     provider: &str,
 ) -> (Vec<Value>, Vec<Value>, Option<String>, Vec<Value>) {
     let mut messages = Vec::new();
-    let mut tools = Vec::new();
+    let tools = captured_request_tool_definitions(&Value::Object(request.clone()))
+        .into_iter()
+        .filter_map(|captured| {
+            let namespace = captured.namespace();
+            let mut tool =
+                normalize_tool_definition_with_namespace(&captured.raw, namespace.as_deref())?;
+            tool["runtime_namespace_path"] = json!(captured.namespace_path);
+            tool["definition_key"] = json!(captured.definition_key());
+            Some(tool)
+        })
+        .collect();
     let mut system_prompt = None;
     let mut prompt_evidence = Vec::new();
     for field in ["instructions", "system"] {
@@ -2446,13 +2476,6 @@ fn parse_request(
                 "content":prompt,
                 "selected":true,
             }));
-        }
-    }
-    for field in ["tools", "additional_tools"] {
-        if let Some(values) = request.get(field).and_then(Value::as_array) {
-            for value in values {
-                collect_tool_definitions(value, &mut tools);
-            }
         }
     }
     let input = if provider == "Anthropic" {
@@ -2491,7 +2514,7 @@ fn parse_request(
                     }
                     continue;
                 }
-                parse_input_item(item, &mut messages, &mut tools);
+                parse_input_item(item, &mut messages);
             }
         }
         _ => {}
@@ -2500,19 +2523,12 @@ fn parse_request(
     (messages, tools, system_prompt, prompt_evidence)
 }
 
-fn parse_input_item(item: &Value, messages: &mut Vec<Value>, tools: &mut Vec<Value>) {
+fn parse_input_item(item: &Value, messages: &mut Vec<Value>) {
     let Some(object) = item.as_object() else {
         return;
     };
     let kind = object.get("type").and_then(Value::as_str).unwrap_or("");
     if kind == "additional_tools" {
-        for field in ["tools", "additional_tools", "definitions"] {
-            if let Some(definitions) = object.get(field).and_then(Value::as_array) {
-                for definition in definitions {
-                    collect_tool_definitions(definition, tools);
-                }
-            }
-        }
         return;
     }
     if matches!(kind, "function_call" | "custom_tool_call" | "tool_use") {
@@ -2923,7 +2939,7 @@ fn parse_response_messages(response: &Value, provider: &str) -> Vec<Value> {
         .or_else(|| response.pointer("/choices/0/delta"))
     {
         let mut output = Vec::new();
-        parse_input_item(message, &mut output, &mut Vec::new());
+        parse_input_item(message, &mut output);
         return output;
     }
     if provider == "Anthropic" {
@@ -2999,34 +3015,6 @@ fn parse_response_messages(response: &Value, provider: &str) -> Vec<Value> {
     output
 }
 
-fn collect_tool_definitions(value: &Value, output: &mut Vec<Value>) {
-    collect_tool_definitions_in_namespace(value, output, None);
-}
-
-fn collect_tool_definitions_in_namespace(
-    value: &Value,
-    output: &mut Vec<Value>,
-    inherited_namespace: Option<&str>,
-) {
-    if let Some(children) = value.get("tools").and_then(Value::as_array)
-        && (string_field(value, "type") == Some("namespace")
-            || value.get("parameters").is_none() && value.get("format").is_none())
-    {
-        let namespace = if string_field(value, "type") == Some("namespace") {
-            string_field(value, "name").or(inherited_namespace)
-        } else {
-            inherited_namespace
-        };
-        for child in children {
-            collect_tool_definitions_in_namespace(child, output, namespace);
-        }
-        return;
-    }
-    if let Some(tool) = normalize_tool_definition_with_namespace(value, inherited_namespace) {
-        output.push(tool);
-    }
-}
-
 fn normalize_tool_definition(value: &Value) -> Option<Value> {
     normalize_tool_definition_with_namespace(value, None)
 }
@@ -3049,10 +3037,10 @@ fn normalize_tool_definition_with_namespace(
     let nested = value.get("function").unwrap_or(value);
     let definition_name = string_field(nested, "name")?;
     let runtime_tool = string_field(nested, "runtime_tool").unwrap_or(definition_name);
-    let runtime_namespace = string_field(nested, "runtime_namespace")
+    let runtime_namespace = inherited_namespace
+        .or_else(|| string_field(nested, "runtime_namespace"))
         .or_else(|| string_field(nested, "namespace"))
-        .or_else(|| string_field(value, "namespace"))
-        .or(inherited_namespace);
+        .or_else(|| string_field(value, "namespace"));
     let name = canonical_runtime_tool_name(runtime_namespace, runtime_tool);
     let description = nested
         .get("description")
@@ -3082,7 +3070,10 @@ fn normalize_tool_definition_with_namespace(
             Some("chiptrace.custom-input-object.v1"),
         )
     } else {
-        (json!({"type": "object", "properties": {}}), None)
+        (
+            json!({"type": "object", "properties": {}}),
+            Some("chiptrace.missing-schema-placeholder.v1"),
+        )
     };
     let hash = canonical_tool_schema_sha256(&json!({
         "name":name,
@@ -3119,6 +3110,7 @@ fn normalize_tool_definition_with_namespace(
     }
     if let Some(namespace) = runtime_namespace {
         output["runtime_namespace"] = json!(namespace);
+        output["runtime_namespace_path"] = json!([namespace]);
     }
     Some(output)
 }
@@ -3137,6 +3129,31 @@ fn tool_schemas_semantically_equal(left: &Value, right: &Value) -> bool {
     let left_hash = string_field(left, "schema_hash");
     let right_hash = string_field(right, "schema_hash");
     left_hash.is_some() && left_hash == right_hash
+}
+
+fn insert_observed_tool_schema(
+    tools_by_identity: &mut BTreeMap<String, Value>,
+    schema_conflicts: &mut BTreeSet<String>,
+    tool: Value,
+) {
+    let Some(name) = tool_name(&tool).map(str::to_owned) else {
+        return;
+    };
+    let identity = projected_tool_definition_key(&tool).unwrap_or_else(|| name.clone());
+    if tools_by_identity
+        .iter()
+        .any(|(existing_identity, existing)| {
+            existing_identity != &identity && tool_name(existing) == Some(name.as_str())
+        })
+    {
+        schema_conflicts.insert(name.clone());
+    }
+    if let Some(existing) = tools_by_identity.get(&identity)
+        && !tool_schemas_semantically_equal(existing, &tool)
+    {
+        schema_conflicts.insert(name);
+    }
+    tools_by_identity.insert(identity, tool);
 }
 
 fn normalize_tool_calls(value: &Value) -> Value {
@@ -3484,7 +3501,7 @@ fn audit_producer_streams(captures: &[ParsedCapture]) -> (Vec<Value>, Vec<String
 
 fn project_tool_execution(
     messages: &mut Vec<Value>,
-    tools_by_name: &mut BTreeMap<String, Value>,
+    tools_by_identity: &mut BTreeMap<String, Value>,
     schema_conflicts: &mut BTreeSet<String>,
     execution: &Value,
 ) -> u64 {
@@ -3497,12 +3514,8 @@ fn project_tool_execution(
     if let Some(schema) = execution.get("schema").and_then(normalize_tool_definition) {
         if tool_name(&schema) != Some(name) {
             schema_conflicts.insert(name.to_owned());
-        } else if let Some(existing) = tools_by_name.get(name)
-            && !tool_schemas_semantically_equal(existing, &schema)
-        {
-            schema_conflicts.insert(name.to_owned());
         } else {
-            tools_by_name.insert(name.to_owned(), schema);
+            insert_observed_tool_schema(tools_by_identity, schema_conflicts, schema);
         }
     }
 
@@ -3548,6 +3561,57 @@ fn project_tool_execution(
         candidate.push(result);
     }
     merge_messages(messages, &candidate)
+}
+
+fn runtime_execution_is_model_visible(execution: &Value) -> bool {
+    let Some(parent_call_id) = string_field(execution, "parent_call_id") else {
+        return true;
+    };
+    string_field(execution, "call_id") == Some(parent_call_id)
+}
+
+fn exact_lifecycle_tool_result_messages(messages: &[Value], events: &[Value]) -> Vec<Value> {
+    let model_call_ids: BTreeSet<&str> = messages
+        .iter()
+        .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|call| string_field(call, "id"))
+        .collect();
+    let result_ids: BTreeSet<&str> = messages
+        .iter()
+        .filter(|message| string_field(message, "role") == Some("tool"))
+        .filter_map(|message| string_field(message, "tool_call_id"))
+        .collect();
+    let mut projected = BTreeMap::new();
+    for event in events {
+        if string_field(event, "type") != Some("subagent_spawn")
+            || string_field(event, "status") != Some("started")
+        {
+            continue;
+        }
+        let Some(call_id) = event
+            .pointer("/source_event/id")
+            .and_then(Value::as_str)
+            .filter(|call_id| model_call_ids.contains(*call_id) && result_ids.contains(*call_id))
+        else {
+            continue;
+        };
+        projected.insert(
+            call_id.to_owned(),
+            json!({
+                "role":"tool",
+                "tool_call_id":call_id,
+                "content":Value::Null,
+                "status":"success",
+                "is_error":false,
+                "status_source":"codex_subagent_activity.started",
+                "status_conflict":false,
+                "status_evidence":event,
+                "source":"lifecycle_event",
+            }),
+        );
+    }
+    projected.into_values().collect()
 }
 
 fn normalize_tool_status(status: &str) -> &'static str {
@@ -6035,22 +6099,23 @@ mod tests {
             .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
             .flatten()
             .collect();
-        assert_eq!(expanded_calls.len(), 3);
-        assert_eq!(expanded_calls.last().unwrap()["id"], "inner-call");
-        assert_eq!(
-            expanded_calls.last().unwrap()["parent_call_id"],
-            "outer-exec"
-        );
+        assert_eq!(expanded_calls.len(), 2);
+        assert!(expanded_calls.iter().all(|call| call["id"] == "outer-exec"));
         let expanded_results: Vec<&Value> = expanded["messages"]
             .as_array()
             .unwrap()
             .iter()
             .filter(|message| message["role"] == "tool")
             .collect();
-        assert_eq!(expanded_results.len(), 3);
+        assert_eq!(expanded_results.len(), 2);
+        assert!(
+            expanded_results
+                .iter()
+                .all(|result| result["tool_call_id"] == "outer-exec")
+        );
         assert_eq!(
-            expanded_results.last().unwrap()["tool_call_id"],
-            "inner-call"
+            session["meta"]["quality_projections"]["buyer_v7_codex_runtime_expanded"]["runtime_only_child_execution_ids"],
+            json!(["inner-call"])
         );
         assert_eq!(
             session["meta"]["code_mode_message_projection"]["retained_parent_call_ids"],
@@ -6068,6 +6133,39 @@ mod tests {
             session["meta"]["runtime_dag"]["kind_counts"]["code_cell"],
             1
         );
+    }
+
+    #[test]
+    fn subagent_started_is_exact_status_evidence_for_the_spawn_result() {
+        let messages = vec![
+            json!({
+                "role":"assistant","content":"",
+                "tool_calls":[{"id":"call-spawn","type":"function",
+                    "function":{"name":"collaboration.spawn_agent","arguments":"{}"}}]
+            }),
+            json!({"role":"tool","tool_call_id":"call-spawn","content":"child-thread"}),
+        ];
+        let events = vec![json!({
+            "type":"subagent_spawn","status":"started",
+            "source_event":{"type":"SubAgentActivity","id":"call-spawn","kind":"started"}
+        })];
+        let projected = exact_lifecycle_tool_result_messages(&messages, &events);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0]["tool_call_id"], "call-spawn");
+        assert_eq!(projected[0]["status"], "success");
+        assert_eq!(
+            projected[0]["status_source"],
+            "codex_subagent_activity.started"
+        );
+
+        let unmatched = exact_lifecycle_tool_result_messages(
+            &messages,
+            &[json!({
+                "type":"subagent_spawn","status":"started",
+                "source_event":{"id":"another-call","kind":"started"}
+            })],
+        );
+        assert!(unmatched.is_empty());
     }
 
     #[test]
@@ -6604,7 +6702,6 @@ mod tests {
     #[test]
     fn ordinary_json_tool_output_does_not_acquire_a_status() {
         let mut messages = Vec::new();
-        let mut tools = Vec::new();
         parse_input_item(
             &json!({
                 "type":"function_call_output",
@@ -6612,7 +6709,6 @@ mod tests {
                 "output":"{\"ok\":true,\"exit_code\":0}"
             }),
             &mut messages,
-            &mut tools,
         );
         let result = &messages[0];
         assert_eq!(result["role"], "tool");
@@ -6624,7 +6720,6 @@ mod tests {
     #[test]
     fn codex_runtime_result_envelope_supplies_only_its_explicit_status() {
         let mut messages = Vec::new();
-        let mut tools = Vec::new();
         parse_input_item(
             &json!({
                 "type":"custom_tool_call_output",
@@ -6632,7 +6727,6 @@ mod tests {
                 "output":[{"type":"text","text":"{\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"isError\":false}"}]
             }),
             &mut messages,
-            &mut tools,
         );
         let result = &messages[0];
         assert_eq!(result["status"], "success");
@@ -6644,7 +6738,6 @@ mod tests {
     #[test]
     fn conflicting_direct_and_runtime_tool_status_is_unknown() {
         let mut messages = Vec::new();
-        let mut tools = Vec::new();
         parse_input_item(
             &json!({
                 "type":"function_call_output",
@@ -6653,7 +6746,6 @@ mod tests {
                 "output":"{\"content\":[{\"type\":\"text\",\"text\":\"failed\"}],\"isError\":true}"
             }),
             &mut messages,
-            &mut tools,
         );
         let result = &messages[0];
         assert_eq!(result["status"], "unknown");
@@ -6945,8 +7037,19 @@ mod tests {
             "tools":[{"type":"function","name":"lookup","description":"Look up one value.",
                 "parameters":{"type":"object","properties":{}}}]
         });
-        let mut definitions = Vec::new();
-        collect_tool_definitions(&namespace, &mut definitions);
+        let definitions: Vec<Value> =
+            captured_request_tool_definitions(&json!({"tools":[namespace]}))
+                .into_iter()
+                .filter_map(|captured| {
+                    let namespace = captured.namespace();
+                    let mut tool = normalize_tool_definition_with_namespace(
+                        &captured.raw,
+                        namespace.as_deref(),
+                    )?;
+                    tool["runtime_namespace_path"] = json!(captured.namespace_path);
+                    Some(tool)
+                })
+                .collect();
         assert_eq!(definitions[0]["name"], "catalog.lookup");
         assert_eq!(definitions[0]["runtime_tool"], "lookup");
         assert_eq!(definitions[0]["runtime_namespace"], "catalog");
@@ -6961,7 +7064,6 @@ mod tests {
                 "arguments":"{}"
             }),
             &mut messages,
-            &mut Vec::new(),
         );
         assert_eq!(
             messages[0]["tool_calls"][0]["function"]["name"],
@@ -6994,12 +7096,79 @@ mod tests {
     }
 
     #[test]
+    fn missing_schema_placeholder_is_explicitly_generated_and_ineligible() {
+        let tool = normalize_tool_definition(&json!({
+            "type":"function","name":"opaque","description":"Opaque runtime tool."
+        }))
+        .unwrap();
+        assert_eq!(tool["parameters"], json!({"type":"object","properties":{}}));
+        assert_eq!(tool["schema_provenance"]["source"], "missing");
+        assert_eq!(tool["schema_provenance"]["source_complete"], false);
+        assert_eq!(tool["schema_provenance"]["generated_adapter"], true);
+        assert_eq!(
+            tool["schema_provenance"]["adapter_version"],
+            "chiptrace.missing-schema-placeholder.v1"
+        );
+    }
+
+    #[test]
+    fn assembly_preserves_exact_nested_namespace_segments() {
+        let request = json!({"tools":[{
+            "type":"namespace","name":"same","tools":[{
+                "type":"namespace","name":"same","tools":[{
+                    "type":"namespace","name":"segment.with.dot","tools":[{
+                        "type":"function","name":"lookup","description":"Lookup.",
+                        "parameters":{"type":"object","properties":{}}
+                    }]
+                }]
+            }]
+        }]});
+        let (_, tools, _, _) = parse_request(request.as_object().unwrap(), "OpenAI");
+        assert_eq!(
+            tools[0]["runtime_namespace_path"],
+            json!(["same", "same", "segment.with.dot"])
+        );
+        assert_eq!(tools[0]["name"], "same.same.segment.with.dot.lookup");
+    }
+
+    #[test]
+    fn assembly_preserves_dotted_display_collisions_and_marks_them_ambiguous() {
+        let first = json!({"tools":[{
+            "type":"namespace","name":"a.b","tools":[{
+                "type":"function","name":"c.lookup","description":"First.",
+                "parameters":{"type":"object","properties":{}}
+            }]
+        }]});
+        let second = json!({"tools":[{
+            "type":"namespace","name":"a","tools":[{
+                "type":"namespace","name":"b.c","tools":[{
+                    "type":"function","name":"lookup","description":"Second.",
+                    "parameters":{"type":"object","properties":{}}
+                }]
+            }]
+        }]});
+        let (_, first_tools, _, _) = parse_request(first.as_object().unwrap(), "OpenAI");
+        let (_, second_tools, _, _) = parse_request(second.as_object().unwrap(), "OpenAI");
+        assert_eq!(first_tools[0]["name"], second_tools[0]["name"]);
+        assert_ne!(
+            first_tools[0]["definition_key"],
+            second_tools[0]["definition_key"]
+        );
+
+        let mut tools = BTreeMap::new();
+        let mut conflicts = BTreeSet::new();
+        insert_observed_tool_schema(&mut tools, &mut conflicts, first_tools[0].clone());
+        insert_observed_tool_schema(&mut tools, &mut conflicts, second_tools[0].clone());
+        assert_eq!(tools.len(), 2);
+        assert!(conflicts.contains("a.b.c.lookup"));
+    }
+
+    #[test]
     fn missing_tool_result_status_is_not_fabricated() {
         let mut messages = Vec::new();
         parse_input_item(
             &json!({"type":"function_call_output","call_id":"call-unknown","output":"real output"}),
             &mut messages,
-            &mut Vec::new(),
         );
         assert_eq!(messages[0]["role"], "tool");
         assert!(messages[0].get("status").is_none());

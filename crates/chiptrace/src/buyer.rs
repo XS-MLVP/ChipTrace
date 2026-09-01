@@ -1,8 +1,12 @@
 use crate::jsonl::{absolute_path, ensure_safe_relative_path, sha256_bytes, sha256_file, utc_now};
 use crate::release::verify_release;
-use crate::schema::{BuyerAssessment, RawSourceLineage, TokenCounts};
+use crate::schema::{
+    ASSESSMENT_SCHEMA_VERSION, BuyerAssessment, RawSourceLineage, ReleaseManifest, TokenCounts,
+};
 use crate::score::{
-    Profile, assess_session, eligible_assessment_contract_valid, normalize_assessment_profile,
+    AssessmentSchemaValidators, Profile, assessment_record_from_session,
+    eligible_assessment_contract_valid, normalize_assessment_profile,
+    recompute_assessment_for_version,
 };
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
@@ -107,6 +111,7 @@ fn package_buyer_release_with_policy(
     }
     let release = config.release.canonicalize()?;
     let source = verify_release(&release, true)?;
+    require_current_assessments(&release, &source)?;
     if source.parts.is_empty() {
         bail!("verified Release has no eligible Session parts");
     }
@@ -209,6 +214,35 @@ fn package_buyer_release_with_policy(
     Ok(verified)
 }
 
+fn require_current_assessments(release: &Path, manifest: &ReleaseManifest) -> Result<()> {
+    for report in manifest.reports.iter().filter(|report| {
+        report.file.starts_with("reports/assessments-part-") && report.file.ends_with(".jsonl.zst")
+    }) {
+        let mut reader = crate::jsonl::open_jsonl_reader(&release.join(&report.file))?;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let record: Value = serde_json::from_slice(&line)?;
+            if record
+                .pointer("/quality/buyer_acceptance/schema_version")
+                .and_then(Value::as_str)
+                != Some(ASSESSMENT_SCHEMA_VERSION)
+            {
+                bail!(
+                    "new buyer packages require {ASSESSMENT_SCHEMA_VERSION}; legacy assessments are read-only"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn verify_buyer_package(root: &Path) -> Result<BuyerPackageManifest> {
     verify_buyer_package_with_policy(root, true)
 }
@@ -263,6 +297,7 @@ fn verify_buyer_package_with_policy(
     let mut expected_files = HashSet::from(["manifest.json".to_owned(), "SHA256SUMS".to_owned()]);
     let mut records = 0_u64;
     let mut tokens = TokenCounts::default();
+    let assessment_schemas = AssessmentSchemaValidators::new()?;
     for (index, package) in manifest.packages.iter().enumerate() {
         ensure_safe_relative_path(&package.file)?;
         let expected_name = format!("packages/sessions-part-{:05}.tar.gz", index + 1);
@@ -291,6 +326,7 @@ fn verify_buyer_package_with_policy(
             manifest.minimum_score,
             &manifest.lineage_status,
             package,
+            &assessment_schemas,
         )?;
         tokens.add_assign(&archive_tokens);
         records = records.saturating_add(package.records);
@@ -513,6 +549,7 @@ fn verify_archive(
     minimum_score: f64,
     lineage_status: &str,
     expected: &BuyerArchiveManifest,
+    assessment_schemas: &AssessmentSchemaValidators,
 ) -> Result<TokenCounts> {
     let compressed = DigestReader::new(File::open(path)?);
     let decoder = GzDecoder::new(compressed);
@@ -557,7 +594,8 @@ fn verify_archive(
                     jsonl_digest.update(&line);
                     jsonl_bytes = jsonl_bytes.saturating_add(line.len() as u64);
                     let value: Value = serde_json::from_slice(&line)?;
-                    let assessment = validate_buyer_record(&value, minimum_score)?;
+                    let assessment =
+                        validate_buyer_record(&value, minimum_score, assessment_schemas)?;
                     tokens.add_assign(&assessment.tokens);
                     records += 1;
                     if records > expected.records {
@@ -633,7 +671,11 @@ fn verify_archive(
     Ok(tokens)
 }
 
-fn validate_buyer_record(session: &Value, minimum_score: f64) -> Result<BuyerAssessment> {
+fn validate_buyer_record(
+    session: &Value,
+    minimum_score: f64,
+    assessment_schemas: &AssessmentSchemaValidators,
+) -> Result<BuyerAssessment> {
     let assessment: BuyerAssessment = serde_json::from_value(
         session
             .pointer("/quality/buyer_acceptance")
@@ -643,7 +685,14 @@ fn validate_buyer_record(session: &Value, minimum_score: f64) -> Result<BuyerAss
     if !eligible_assessment_contract_valid(&assessment, Profile::BuyerV7, minimum_score) {
         bail!("buyer archive contains an inconsistent or ineligible buyer-v7 Session");
     }
-    let recomputed = assess_session(session, Profile::BuyerV7, minimum_score).buyer_acceptance;
+    assessment_schemas.validate(&assessment_record_from_session(session, "eligible"))?;
+    let recomputed = recompute_assessment_for_version(
+        session,
+        Profile::BuyerV7,
+        minimum_score,
+        &assessment.schema_version,
+    )
+    .context("buyer Session uses an unsupported assessment schema")?;
     let mut comparable = assessment.clone();
     normalize_assessment_profile(&mut comparable, Profile::BuyerV7);
     if recomputed != comparable {
@@ -736,4 +785,68 @@ fn sync_tree(root: &Path) -> Result<()> {
 fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jsonl::JsonlWriter;
+    use crate::schema::{
+        FileManifest, LEGACY_ASSESSMENT_SCHEMA_VERSION, RELEASE_SCHEMA_VERSION, ReleaseCounts,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn new_buyer_package_rejects_legacy_v1_assessment_reports() {
+        let temporary = tempfile::tempdir().unwrap();
+        let report_path = temporary
+            .path()
+            .join("reports/assessments-part-00001.jsonl.zst");
+        let mut writer = JsonlWriter::create(&report_path, 1).unwrap();
+        writer
+            .write_value(&json!({
+                "quality":{"buyer_acceptance":{
+                    "schema_version":LEGACY_ASSESSMENT_SCHEMA_VERSION
+                }}
+            }))
+            .unwrap();
+        writer.finish().unwrap();
+        let report = FileManifest {
+            file: "reports/assessments-part-00001.jsonl.zst".to_owned(),
+            sha256: sha256_file(&report_path).unwrap(),
+            bytes: report_path.metadata().unwrap().len(),
+            records: Some(1),
+            uncompressed_bytes: None,
+            oversized_session: None,
+        };
+        let manifest = ReleaseManifest {
+            schema_version: RELEASE_SCHEMA_VERSION.to_owned(),
+            release_id: "legacy-assessment".to_owned(),
+            created_at_utc: "2026-09-01T00:00:00Z".to_owned(),
+            format: "jsonl".to_owned(),
+            session_atomic: true,
+            session_split_count: 0,
+            buyer_profile: "buyer-v7-codex-runtime-expanded".to_owned(),
+            minimum_score: 90.0,
+            tokenizer: String::new(),
+            compression: "zstd".to_owned(),
+            processing_workers: 1,
+            target_part_bytes: 1,
+            raw_sources: Vec::new(),
+            counts: ReleaseCounts::default(),
+            eligible_tokens: TokenCounts::default(),
+            assessed_tokens: TokenCounts::default(),
+            failure_reason_counts: BTreeMap::new(),
+            parts: Vec::new(),
+            reports: vec![report],
+            validation_status: "pass".to_owned(),
+        };
+
+        let error = require_current_assessments(temporary.path(), &manifest).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("legacy assessments are read-only")
+        );
+    }
 }

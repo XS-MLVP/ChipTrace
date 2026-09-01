@@ -13,6 +13,10 @@ use crate::tool_registry::{
     LoadedToolRegistry, ToolRegistryEntry, canonical_runtime_tool_name, load_tool_registry,
     load_tool_registry_value, registry_entry_identity, tool_definition_source_complete,
 };
+use crate::wire_tools::{
+    CapturedToolDefinition, projected_tool_definition_key, request_tool_definitions,
+    tool_definition_key,
+};
 use anyhow::{Context, Result, bail};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -1983,72 +1987,22 @@ fn observe_model_calls(value: Option<&Value>, source_seq: u64, context: &mut Bun
 }
 
 fn collect_request_tool_schemas(request: &Value, context: &mut BundleContext) -> Result<()> {
-    let mut definitions = Vec::new();
-    for field in ["tools", "additional_tools"] {
-        if let Some(values) = request.get(field).and_then(Value::as_array) {
-            for value in values {
-                collect_tool_definitions(value, &mut definitions);
-            }
+    for captured in request_tool_definitions(request) {
+        if let Some(definition) = normalize_captured_tool_definition(&captured) {
+            insert_tool_schema(context, definition)?;
         }
-    }
-    if let Some(input) = request.get("input").and_then(Value::as_array) {
-        for item in input {
-            if item.get("type").and_then(Value::as_str) == Some("additional_tools") {
-                for field in ["tools", "additional_tools", "definitions"] {
-                    if let Some(values) = item.get(field).and_then(Value::as_array) {
-                        for value in values {
-                            collect_tool_definitions(value, &mut definitions);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    for definition in definitions {
-        insert_tool_schema(context, definition)?;
     }
     trim_context(context);
     Ok(())
 }
 
-fn collect_tool_definitions(value: &Value, output: &mut Vec<Value>) {
-    collect_tool_definitions_with_namespace(value, None, output);
-}
-
-fn collect_tool_definitions_with_namespace(
-    value: &Value,
-    inherited_namespace: Option<&str>,
-    output: &mut Vec<Value>,
-) {
-    if let Some(children) = value.get("tools").and_then(Value::as_array)
-        && (value.get("parameters").is_none() && value.get("format").is_none())
-    {
-        let namespace = if value.get("type").and_then(Value::as_str) == Some("namespace") {
-            value
-                .get("name")
-                .and_then(Value::as_str)
-                .or(inherited_namespace)
-        } else {
-            value
-                .get("namespace")
-                .and_then(Value::as_str)
-                .or(inherited_namespace)
-        };
-        for child in children {
-            collect_tool_definitions_with_namespace(child, namespace, output);
-        }
-        return;
-    }
-    let nested = value.get("function").unwrap_or(value);
-    let Some(runtime_tool) = nested.get("name").and_then(Value::as_str) else {
-        return;
-    };
-    let runtime_namespace = nested
-        .get("namespace")
-        .or_else(|| value.get("namespace"))
-        .and_then(Value::as_str)
-        .or(inherited_namespace);
-    let name = canonical_runtime_tool_name(runtime_namespace, runtime_tool);
+fn normalize_captured_tool_definition(captured: &CapturedToolDefinition) -> Option<Value> {
+    let nested = captured.nested();
+    let runtime_tool = captured.source_name()?;
+    let runtime_namespace = captured.namespace();
+    let runtime_namespace_path = captured.namespace_path.clone();
+    let name = captured.canonical_name()?;
+    let definition_key = captured.definition_key()?;
     let description = nested
         .get("description")
         .and_then(Value::as_str)
@@ -2060,8 +2014,9 @@ fn collect_tool_definitions_with_namespace(
     let native_format = nested.get("format").cloned();
     let mut captured = json!({
         "name":name.as_str(),
+        "definition_key":definition_key,
         "description":description,
-        "type":value.get("type").and_then(Value::as_str).unwrap_or("function"),
+        "type":captured.raw.get("type").and_then(Value::as_str).unwrap_or("function"),
     });
     if let Some(parameters) = captured_parameters.as_ref() {
         captured["parameters"] = parameters.clone();
@@ -2069,18 +2024,23 @@ fn collect_tool_definitions_with_namespace(
     if let Some(format) = native_format.as_ref() {
         captured["format"] = format.clone();
     }
+    if captured_parameters.is_none() && native_format.is_none() {
+        captured["parameters"] = json!({"type":"object","properties":{}});
+    }
     if runtime_tool != name {
         captured["runtime_tool"] = json!(runtime_tool);
     }
-    if let Some(namespace) = runtime_namespace {
+    if let Some(namespace) = runtime_namespace.as_deref() {
         captured["runtime_namespace"] = json!(namespace);
+        captured["runtime_namespace_path"] = json!(runtime_namespace_path);
     }
     let hash = sha256(serde_json::to_vec(&captured).unwrap_or_default());
     let mut normalized = captured;
     normalized["schema_hash"] = json!(hash);
     normalized["schema_version"] = json!(format!("sha256:{hash}"));
     let generated_adapter = captured_parameters.is_none() && native_format.is_none();
-    let source_complete = complete_tool_contract(&normalized, &name);
+    let source_complete = (captured_parameters.is_some() || native_format.is_some())
+        && complete_tool_contract(&normalized, &name);
     normalized["schema_provenance"] = json!({
         "source":if captured_parameters.is_some() {
             "captured_json_schema"
@@ -2091,8 +2051,9 @@ fn collect_tool_definitions_with_namespace(
         },
         "source_complete":source_complete,
         "generated_adapter":generated_adapter,
+        "adapter_version":generated_adapter.then_some("chiptrace.missing-schema-placeholder.v1"),
     });
-    output.push(normalized);
+    Some(normalized)
 }
 
 fn install_tool_registry(
@@ -2117,7 +2078,11 @@ fn install_tool_registry(
     for entry in &registry.registry.tools {
         let (name, schema) = projected_registry_schema(registry, entry)?;
         insert_tool_schema(context, schema)?;
-        if !context.tool_schemas.contains_key(&name) {
+        if !context
+            .tool_schemas
+            .values()
+            .any(|schema| schema.get("name").and_then(Value::as_str) == Some(name.as_str()))
+        {
             bail!("failed to install runtime Tool Registry schema {name}");
         }
     }
@@ -2140,7 +2105,9 @@ fn projected_registry_schema(
     schema["runtime_tool"] = json!(runtime_tool);
     if let Some(namespace) = entry.runtime_namespace.as_deref() {
         schema["runtime_namespace"] = json!(namespace);
+        schema["runtime_namespace_path"] = json!([namespace]);
     }
+    schema["definition_key"] = json!(projected_tool_definition_key(&schema));
     let schema_hash = sha256(serde_json::to_vec(&schema)?);
     let source_complete = complete_tool_contract(&schema, &name);
     schema["schema_hash"] = json!(schema_hash);
@@ -2172,7 +2139,9 @@ fn insert_tool_schema(context: &mut BundleContext, schema: Value) -> Result<()> 
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("observed tool schema has no name"))?
         .to_owned();
-    if let Some(existing) = context.tool_schemas.get(&name) {
+    let identity = projected_tool_definition_key(&schema)
+        .ok_or_else(|| anyhow::anyhow!("observed tool schema {name} has no identity"))?;
+    if let Some(existing) = context.tool_schemas.get(&identity) {
         let contract = |value: &Value| {
             json!({
                 "name":value.get("name"),
@@ -2192,8 +2161,37 @@ fn insert_tool_schema(context: &mut BundleContext, schema: Value) -> Result<()> 
             return Ok(());
         }
     }
-    context.tool_schemas.insert(name, schema);
+    context.tool_schemas.insert(identity, schema);
     Ok(())
+}
+
+fn resolve_tool_schema(
+    context: &BundleContext,
+    name: &str,
+    runtime_namespace: Option<&str>,
+    runtime_tool: &str,
+) -> (Option<Value>, bool) {
+    let namespace_path = runtime_namespace
+        .filter(|namespace| !namespace.trim().is_empty())
+        .map(|namespace| vec![namespace.to_owned()])
+        .unwrap_or_default();
+    let exact_identity = tool_definition_key(&namespace_path, runtime_tool);
+    if let Some(schema) = context.tool_schemas.get(&exact_identity)
+        && schema.get("name").and_then(Value::as_str) == Some(name)
+    {
+        return (Some(schema.clone()), false);
+    }
+    let mut candidates = context
+        .tool_schemas
+        .values()
+        .filter(|schema| schema.get("name").and_then(Value::as_str) == Some(name));
+    let first = candidates.next().cloned();
+    let ambiguous = first.is_some() && candidates.next().is_some();
+    if ambiguous {
+        (None, true)
+    } else {
+        (first, false)
+    }
 }
 
 fn start_tool_context(
@@ -2261,9 +2259,14 @@ fn start_tool_context(
         .and_then(Value::as_str)
         .and_then(|cell_id| context.code_cells.get(cell_id))
         .map(|cell| cell.model_visible_call_id.clone());
-    let schema = name
-        .as_deref()
-        .and_then(|name| context.tool_schemas.get(name).cloned());
+    let (schema, ambiguous_schema) = name.as_deref().map_or((None, false), |name| {
+        resolve_tool_schema(
+            context,
+            name,
+            runtime_namespace.as_deref(),
+            runtime_tool.as_deref().unwrap_or(name),
+        )
+    });
     let kind_matches = expected_kind_name
         .zip(runtime_tool.as_deref())
         .is_none_or(|(expected, observed)| tool_kind_matches(expected, observed));
@@ -2274,6 +2277,8 @@ fn start_tool_context(
     };
     let correlation = if name.is_none() || !kind_matches {
         RuntimeCorrelation::ToolNameMismatch
+    } else if ambiguous_schema {
+        RuntimeCorrelation::AmbiguousRegistry
     } else if schema.is_none() {
         RuntimeCorrelation::MissingRegistry
     } else if !lineage_matched {
@@ -2374,6 +2379,7 @@ fn tool_result_content(result: &Value) -> Value {
 enum RuntimeCorrelation {
     Matched,
     MissingRegistry,
+    AmbiguousRegistry,
     MissingModelCall,
     ToolNameMismatch,
     MissingCallId,
@@ -2384,6 +2390,7 @@ impl RuntimeCorrelation {
         match self {
             Self::Matched => "matched_model_call",
             Self::MissingRegistry => "missing_registry",
+            Self::AmbiguousRegistry => "ambiguous_registry",
             Self::MissingModelCall => "missing_model_call",
             Self::ToolNameMismatch => "tool_name_mismatch",
             Self::MissingCallId => "missing_call_id",
@@ -3735,6 +3742,61 @@ mod tests {
     }
 
     #[test]
+    fn bundle_placeholder_and_namespace_path_match_shared_wire_contract() {
+        let request = json!({"tools":[{
+            "type":"namespace","name":"same","tools":[{
+                "type":"namespace","name":"same","tools":[{
+                    "type":"namespace","name":"segment.with.dot","tools":[{
+                        "type":"function","name":"opaque","description":"Opaque tool."
+                    }]
+                }]
+            }]
+        }]});
+        let mut context = BundleContext::default();
+        collect_request_tool_schemas(&request, &mut context).unwrap();
+        let schema = context.tool_schemas.values().next().unwrap();
+        assert_eq!(
+            schema["runtime_namespace_path"],
+            json!(["same", "same", "segment.with.dot"])
+        );
+        assert_eq!(
+            schema["parameters"],
+            json!({"type":"object","properties":{}})
+        );
+        assert_eq!(schema["schema_provenance"]["source"], "missing");
+        assert_eq!(schema["schema_provenance"]["source_complete"], false);
+        assert_eq!(schema["schema_provenance"]["generated_adapter"], true);
+        assert_eq!(
+            schema["schema_provenance"]["adapter_version"],
+            "chiptrace.missing-schema-placeholder.v1"
+        );
+    }
+
+    #[test]
+    fn bundle_refuses_to_guess_between_colliding_display_names() {
+        let request = json!({"tools":[
+            {"type":"namespace","name":"a.b","tools":[{
+                "type":"function","name":"c.lookup","description":"First.",
+                "parameters":{"type":"object","properties":{}}
+            }]},
+            {"type":"namespace","name":"a","tools":[{
+                "type":"namespace","name":"b.c","tools":[{
+                    "type":"function","name":"lookup","description":"Second.",
+                    "parameters":{"type":"object","properties":{}}
+                }]
+            }]}
+        ]});
+        let mut context = BundleContext::default();
+        collect_request_tool_schemas(&request, &mut context).unwrap();
+        assert_eq!(context.tool_schemas.len(), 2);
+
+        let (schema, ambiguous) =
+            resolve_tool_schema(&context, "a.b.c.lookup", None, "a.b.c.lookup");
+        assert!(schema.is_none());
+        assert!(ambiguous);
+    }
+
+    #[test]
     fn request_native_format_matches_runtime_registry_without_fabrication() {
         let format = json!({
             "type":"grammar",
@@ -3777,7 +3839,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(context.tool_schemas.len(), 1);
-        let schema = &context.tool_schemas["exec"];
+        let schema = context.tool_schemas.values().next().unwrap();
         assert!(schema.get("parameters").is_none());
         assert_eq!(schema["format"], format);
         assert_eq!(
@@ -3825,17 +3887,21 @@ mod tests {
         install_tool_registry(&mut context, Some(&first)).unwrap();
         assert_eq!(
             context.tool_schemas.keys().cloned().collect::<Vec<_>>(),
-            vec!["catalog.lookup", "symbols.lookup"]
+            vec![
+                tool_definition_key(&["catalog".to_owned()], "lookup"),
+                tool_definition_key(&["symbols".to_owned()], "lookup")
+            ]
         );
+        let catalog_key = tool_definition_key(&["catalog".to_owned()], "lookup");
         assert_eq!(
-            context.tool_schemas["catalog.lookup"]["runtime_namespace"],
+            context.tool_schemas[&catalog_key]["runtime_namespace"],
             "catalog"
         );
 
         install_tool_registry(&mut context, Some(&second)).unwrap();
         assert_eq!(
             context.tool_schemas.keys().cloned().collect::<Vec<_>>(),
-            vec!["compile"]
+            vec![tool_definition_key(&[], "compile")]
         );
 
         context.pending_tools.insert(

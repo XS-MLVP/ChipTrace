@@ -574,6 +574,17 @@ mod tests {
                     "unresolved_parent_response_ids": [],
                     "unresolved_parent_span_ids": []
                 },
+                "trace_readiness": {
+                    "schema_version": "chiptrace.trace-readiness.v1",
+                    "artifact_valid": true,
+                    "raw_bytes_complete": true,
+                    "protocol_complete": true,
+                    "runtime_complete": true,
+                    "root_complete": true,
+                    "wire_ready": true,
+                    "runtime_ready": true,
+                    "delivery_ready": true
+                },
                 "task_dag": {"complete": true},
                 "task_type": "code",
                 "model_evidence": {

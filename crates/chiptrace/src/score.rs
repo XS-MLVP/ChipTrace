@@ -1,8 +1,10 @@
 use crate::jsonl::{canonical_bytes, string_field, u64_field};
 use crate::schema::{
     ASSESSMENT_SCHEMA_VERSION, AcceptanceMetrics, BuyerAssessment, CaptureCompleteness, GateResult,
-    QualityEnvelope, SemanticQuality, TokenCounts,
+    LEGACY_ASSESSMENT_SCHEMA_VERSION, QualityEnvelope, SemanticQuality, TokenCounts,
+    TrainingReadiness,
 };
+use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -47,12 +49,73 @@ pub struct ScoreSummary {
     pub minimum_score: f64,
     pub records: u64,
     pub parse_failures: u64,
+    pub delivery_ready: u64,
+    pub training_ready: u64,
+    pub buyer_eligible: u64,
     pub eligible: u64,
     pub rejected: u64,
     pub average_score: f64,
     pub failure_reason_counts: BTreeMap<String, u64>,
     pub tokens: TokenCounts,
     pub eligible_tokens: TokenCounts,
+}
+
+pub struct AssessmentSchemaValidators {
+    legacy: jsonschema::Validator,
+    current: jsonschema::Validator,
+}
+
+impl AssessmentSchemaValidators {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            legacy: compile_assessment_schema(
+                "assessment-v1.schema.json",
+                include_str!("../../../schemas/assessment-v1.schema.json"),
+            )?,
+            current: compile_assessment_schema(
+                "assessment-v2.schema.json",
+                include_str!("../../../schemas/assessment-v2.schema.json"),
+            )?,
+        })
+    }
+
+    pub fn validate(&self, record: &Value) -> Result<()> {
+        let schema_version = record
+            .pointer("/quality/buyer_acceptance/schema_version")
+            .and_then(Value::as_str)
+            .context("assessment record has no quality.buyer_acceptance.schema_version")?;
+        let validator = match schema_version {
+            LEGACY_ASSESSMENT_SCHEMA_VERSION => &self.legacy,
+            ASSESSMENT_SCHEMA_VERSION => &self.current,
+            _ => bail!("unsupported assessment schema {schema_version}"),
+        };
+        if let Err(error) = validator.validate(record) {
+            bail!(
+                "{schema_version} validation failed at {}: {error}",
+                error.instance_path()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn compile_assessment_schema(name: &str, source: &str) -> Result<jsonschema::Validator> {
+    let schema: Value =
+        serde_json::from_str(source).with_context(|| format!("parse JSON Schema {name}"))?;
+    jsonschema::draft202012::new(&schema)
+        .map_err(|error| anyhow::anyhow!("compile JSON Schema {name}: {error}"))
+}
+
+pub fn assessment_record_from_session(session: &Value, release_decision: &str) -> Value {
+    json!({
+        "trajectory_id":session.get("trajectory_id"),
+        "session_id":session.get("session_id"),
+        "provider":session.get("provider"),
+        "model":session.get("model"),
+        "quality":session.get("quality"),
+        "release_decision":release_decision,
+        "content_fingerprint":exact_content_fingerprint(session),
+    })
 }
 
 pub fn score_jsonl(
@@ -70,11 +133,15 @@ pub fn score_jsonl(
         anyhow::bail!("no Session JSONL inputs found");
     }
     let mut writer = crate::jsonl::JsonlWriter::create(output, zstd_level)?;
+    let assessment_schemas = AssessmentSchemaValidators::new()?;
     let mut summary = ScoreSummary {
         profile: profile.as_str().to_owned(),
         minimum_score,
         records: 0,
         parse_failures: 0,
+        delivery_ready: 0,
+        training_ready: 0,
+        buyer_eligible: 0,
         eligible: 0,
         rejected: 0,
         average_score: 0.0,
@@ -105,7 +172,10 @@ pub fn score_jsonl(
             summary.records += 1;
             score_total += quality.buyer_acceptance.score;
             summary.tokens.add_assign(&quality.buyer_acceptance.tokens);
+            summary.delivery_ready += u64::from(quality.readiness.delivery_ready);
+            summary.training_ready += u64::from(quality.readiness.training_ready);
             if quality.buyer_acceptance.eligible {
+                summary.buyer_eligible += 1;
                 summary.eligible += 1;
                 summary
                     .eligible_tokens
@@ -124,7 +194,7 @@ pub fn score_jsonl(
             } else {
                 "rejected"
             };
-            writer.write_value(&json!({
+            let record = json!({
                 "trajectory_id": session.get("trajectory_id"),
                 "session_id": session.get("session_id"),
                 "provider": session.get("provider"),
@@ -132,7 +202,9 @@ pub fn score_jsonl(
                 "quality": quality,
                 "release_decision": release_decision,
                 "content_fingerprint": exact_content_fingerprint(&session),
-            }))?;
+            });
+            assessment_schemas.validate(&record)?;
+            writer.write_value(&record)?;
         }
     }
     writer.finish()?;
@@ -407,6 +479,46 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         || runtime_dag_source == Some("canonical_model_interaction:codex_rollout_jsonl"))
         && (!legacy_runtime_events_present
             || runtime_dag_source == Some("codex_rollout_trace_bundle"));
+    let artifact_valid = session
+        .pointer("/meta/trace_readiness/artifact_valid")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let raw_bytes_complete = session
+        .pointer("/meta/trace_readiness/raw_bytes_complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let protocol_complete = session
+        .pointer("/meta/trace_readiness/protocol_complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let runtime_complete = session
+        .pointer("/meta/trace_readiness/runtime_complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let root_complete = session
+        .pointer("/meta/trace_readiness/root_complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let wire_ready = session
+        .pointer("/meta/trace_readiness/wire_ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let runtime_ready = session
+        .pointer("/meta/trace_readiness/runtime_ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let delivery_ready = session
+        .pointer("/meta/trace_readiness/delivery_ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let trace_readiness_consistent = session
+        .pointer("/meta/trace_readiness/schema_version")
+        .and_then(Value::as_str)
+        == Some("chiptrace.trace-readiness.v1")
+        && wire_ready == (artifact_valid && raw_bytes_complete && protocol_complete)
+        && runtime_ready == (runtime_complete && root_complete)
+        && delivery_ready == (wire_ready && runtime_ready);
+    let source_delivery_ready = trace_readiness_consistent && delivery_ready;
     let inference_api_conservation_applicable = session
         .pointer("/meta/inference_api_conservation/applicable")
         .and_then(Value::as_bool)
@@ -799,6 +911,20 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
             "API-only Sessions are not reclassified as runtime-complete; Stock rollout and legacy bundle evidence cannot be omitted to bypass this gate",
         ),
     );
+    push_gate(
+        &mut gates,
+        "trace_delivery_ready",
+        source_delivery_ready,
+        true,
+        session
+            .pointer("/meta/trace_readiness")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "canonical Wire bytes, protocol terminal, Runtime DAG, and root must all be complete",
+        Some(
+            "buyer score cannot compensate for missing Raw bytes, protocol terminal, Runtime evidence, or task root",
+        ),
+    );
     let inference_api_conservation_pass = !inference_api_conservation_applicable
         || (inference_api_conservation_complete
             && runtime_completed_inferences > 0
@@ -983,8 +1109,20 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         corrections,
         messages,
     );
+    let has_training_exchange = effective_user_pairs > 0;
+    let training_ready = source_delivery_ready && closed && has_training_exchange;
+    let readiness = TrainingReadiness {
+        policy_version: "training-readiness-v1".to_owned(),
+        wire_ready: trace_readiness_consistent && wire_ready,
+        runtime_ready: trace_readiness_consistent && runtime_ready,
+        delivery_ready: source_delivery_ready,
+        session_closed: closed,
+        has_training_exchange,
+        training_ready,
+    };
     QualityEnvelope {
         capture_completeness: completeness,
+        readiness,
         buyer_acceptance: buyer,
         semantic_quality: semantic,
     }
@@ -2223,12 +2361,44 @@ pub fn eligible_assessment_contract_valid(
     assessment_contract_valid(assessment, profile, minimum_score) && assessment.eligible
 }
 
+pub fn recompute_assessment_for_version(
+    session: &Value,
+    profile: Profile,
+    minimum_score: f64,
+    schema_version: &str,
+) -> Option<BuyerAssessment> {
+    let mut assessment = assess_session(session, profile, minimum_score).buyer_acceptance;
+    match schema_version {
+        ASSESSMENT_SCHEMA_VERSION => Some(assessment),
+        LEGACY_ASSESSMENT_SCHEMA_VERSION => {
+            assessment.schema_version = LEGACY_ASSESSMENT_SCHEMA_VERSION.to_owned();
+            assessment
+                .gates
+                .retain(|gate| gate.name != "trace_delivery_ready");
+            assessment.hard_gate_pass = assessment
+                .gates
+                .iter()
+                .filter(|gate| gate.required)
+                .all(|gate| gate.pass);
+            assessment.eligible = assessment.hard_gate_pass && assessment.score >= minimum_score;
+            assessment.failure_reasons = assessment
+                .gates
+                .iter()
+                .filter(|gate| gate.required && !gate.pass)
+                .map(|gate| gate.name.clone())
+                .collect();
+            Some(assessment)
+        }
+        _ => None,
+    }
+}
+
 pub fn assessment_contract_valid(
     assessment: &BuyerAssessment,
     profile: Profile,
     minimum_score: f64,
 ) -> bool {
-    const REQUIRED_GATES: [&str; 16] = [
+    const REQUIRED_GATES_V1: [&str; 16] = [
         "required_fields",
         "message_roles",
         "first_message_role",
@@ -2246,13 +2416,37 @@ pub fn assessment_contract_valid(
         "session_closed",
         "content_domain",
     ];
+    const REQUIRED_GATES_V2: [&str; 17] = [
+        "required_fields",
+        "message_roles",
+        "first_message_role",
+        "system_prompt",
+        "effective_turns",
+        "structured_tool_calls",
+        "valid_tool_results",
+        "tool_definitions",
+        "tool_pairing_after_open_tail",
+        "machine_turn_ratio",
+        "assembly_integrity",
+        "runtime_dag_integrity",
+        "trace_delivery_ready",
+        "inference_api_conservation",
+        "model",
+        "session_closed",
+        "content_domain",
+    ];
+    let required_gates: &[&str] = match assessment.schema_version.as_str() {
+        ASSESSMENT_SCHEMA_VERSION => &REQUIRED_GATES_V2,
+        LEGACY_ASSESSMENT_SCHEMA_VERSION => &REQUIRED_GATES_V1,
+        _ => return false,
+    };
     let observed: BTreeSet<&str> = assessment
         .gates
         .iter()
         .map(|gate| gate.name.as_str())
         .collect();
-    let expected: BTreeSet<&str> = REQUIRED_GATES.into_iter().collect();
-    let gate_contract_valid = assessment.gates.len() == REQUIRED_GATES.len()
+    let expected: BTreeSet<&str> = required_gates.iter().copied().collect();
+    let gate_contract_valid = assessment.gates.len() == required_gates.len()
         && observed == expected
         && assessment.gates.iter().all(|gate| gate.required);
     let required_gates_pass = assessment
@@ -2276,8 +2470,7 @@ pub fn assessment_contract_valid(
         .filter(|gate| gate.required && !gate.pass)
         .map(|gate| gate.name.clone())
         .collect();
-    assessment.schema_version == ASSESSMENT_SCHEMA_VERSION
-        && profile_metadata_compatible(assessment, profile)
+    profile_metadata_compatible(assessment, profile)
         && minimum_score.is_finite()
         && (0.0..=100.0).contains(&minimum_score)
         && assessment.minimum_score == minimum_score
@@ -2634,6 +2827,151 @@ mod tests {
                 .failure_reasons
                 .contains(&"structured_tool_calls".to_owned())
         );
+    }
+
+    #[test]
+    fn trace_delivery_readiness_is_independent_from_buyer_score() {
+        let mut session = json!({
+            "schema_version":"chiptrace.session.v1",
+            "trajectory_id":"trace-readiness",
+            "session_id":"trace-readiness",
+            "provider":"OpenAI",
+            "model":"gpt-5.6-sol",
+            "created_at":"2026-09-01T00:00:00Z",
+            "ended_at":"2026-09-01T00:01:00Z",
+            "status":"completed",
+            "is_final_snapshot":true,
+            "source_request_count":1,
+            "system_prompt":"system",
+            "tools":[],
+            "messages":[
+                {"role":"system","content":"system"},
+                {"role":"user","content":"inspect"},
+                {"role":"assistant","content":"done"}
+            ],
+            "usage":{},
+            "meta":{"trace_readiness":{
+                "schema_version":"chiptrace.trace-readiness.v1",
+                "artifact_valid":true,
+                "raw_bytes_complete":true,
+                "protocol_complete":true,
+                "runtime_complete":true,
+                "root_complete":true,
+                "wire_ready":true,
+                "runtime_ready":true,
+                "delivery_ready":false
+            }}
+        });
+        let inconsistent = assess_session(&session, Profile::BuyerV7, 0.0);
+        assert!(!inconsistent.readiness.delivery_ready);
+        assert!(!inconsistent.readiness.training_ready);
+        assert!(
+            !inconsistent
+                .buyer_acceptance
+                .gates
+                .iter()
+                .find(|gate| gate.name == "trace_delivery_ready")
+                .unwrap()
+                .pass
+        );
+
+        session["meta"]["trace_readiness"]["delivery_ready"] = json!(true);
+        let complete = assess_session(&session, Profile::BuyerV7, 0.0);
+        assert_eq!(
+            inconsistent.buyer_acceptance.score,
+            complete.buyer_acceptance.score
+        );
+        assert!(complete.readiness.delivery_ready);
+        assert!(complete.readiness.training_ready);
+        assert!(!complete.buyer_acceptance.eligible);
+        assert!(
+            complete
+                .buyer_acceptance
+                .gates
+                .iter()
+                .find(|gate| gate.name == "trace_delivery_ready")
+                .unwrap()
+                .pass
+        );
+    }
+
+    #[test]
+    fn legacy_v1_assessment_contract_is_read_only_compatible() {
+        let session = json!({
+            "trajectory_id":"legacy-v1","session_id":"legacy-v1",
+            "provider":"OpenAI","model":"gpt-5.6-sol",
+            "created_at":"2026-09-01T00:00:00Z","status":"completed",
+            "is_final_snapshot":true,"source_request_count":1,
+            "system_prompt":"system","tools":[],
+            "messages":[{"role":"system","content":"system"}],"usage":{}
+        });
+        let legacy = recompute_assessment_for_version(
+            &session,
+            Profile::BuyerV7,
+            90.0,
+            LEGACY_ASSESSMENT_SCHEMA_VERSION,
+        )
+        .unwrap();
+        assert_eq!(legacy.schema_version, LEGACY_ASSESSMENT_SCHEMA_VERSION);
+        assert_eq!(legacy.gates.len(), 16);
+        assert!(
+            legacy
+                .gates
+                .iter()
+                .all(|gate| gate.name != "trace_delivery_ready")
+        );
+        assert!(assessment_contract_valid(&legacy, Profile::BuyerV7, 90.0));
+        assert!(
+            recompute_assessment_for_version(&session, Profile::BuyerV7, 90.0, "unknown").is_none()
+        );
+    }
+
+    #[test]
+    fn assessment_v2_schema_rejects_weak_or_inconsistent_quality() {
+        let session = json!({
+            "trajectory_id":"schema-v2","session_id":"schema-v2",
+            "provider":"OpenAI","model":"gpt-5.6-sol",
+            "created_at":"2026-09-01T00:00:00Z","status":"completed",
+            "is_final_snapshot":true,"source_request_count":1,
+            "system_prompt":"system","tools":[],
+            "messages":[
+                {"role":"system","content":"system"},
+                {"role":"user","content":"inspect"},
+                {"role":"assistant","content":"done"}
+            ],
+            "usage":{},
+            "meta":{"trace_readiness":{
+                "schema_version":"chiptrace.trace-readiness.v1",
+                "artifact_valid":true,"raw_bytes_complete":true,"protocol_complete":true,
+                "runtime_complete":true,"root_complete":true,
+                "wire_ready":true,"runtime_ready":true,"delivery_ready":true
+            }}
+        });
+        let quality = assess_session(&session, Profile::BuyerV7, 90.0);
+        let record = json!({
+            "trajectory_id":"schema-v2","session_id":"schema-v2",
+            "provider":"OpenAI","model":"gpt-5.6-sol",
+            "quality":quality,
+            "release_decision":"rejected",
+            "content_fingerprint":"0".repeat(64)
+        });
+        let schema: Value =
+            serde_json::from_str(include_str!("../../../schemas/assessment-v2.schema.json"))
+                .unwrap();
+        let validator = jsonschema::draft202012::new(&schema).unwrap();
+        assert!(validator.is_valid(&record));
+
+        let mut weak = record.clone();
+        weak["quality"]["capture_completeness"] = json!({});
+        assert!(!validator.is_valid(&weak));
+
+        let mut empty_gate = record.clone();
+        empty_gate["quality"]["buyer_acceptance"]["gates"][0] = json!({});
+        assert!(!validator.is_valid(&empty_gate));
+
+        let mut inconsistent = record;
+        inconsistent["quality"]["readiness"]["training_ready"] = json!(false);
+        assert!(!validator.is_valid(&inconsistent));
     }
 
     #[test]

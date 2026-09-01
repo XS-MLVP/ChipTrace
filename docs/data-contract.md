@@ -150,6 +150,11 @@ chiptrace enrich \
 chiptrace verify-enrichment --enrichment /srv/chiptrace/enriched
 ```
 
+生产导出使用 `integrations/sub2api/export-usage.sql`，按递增 `usage_logs.id` 分批生成最小
+JSONL。查询只输出 request ID、模型路由、账号平台、Token、时间和 usage log ID，不读取
+正文、API Key、用户信息或账号凭据；运行方法见
+[`integrations/sub2api/README.md`](../integrations/sub2api/README.md)。
+
 Sub2API 原生 `usage_logs` 表不保存 provider；其仓库以
 `COALESCE(NULLIF(groups.platform,''), accounts.platform)` 计算有效平台。生产导出必须
 显式联表，且只输出 Trace 对账所需字段，例如：
@@ -169,7 +174,9 @@ SELECT jsonb_build_object(
   'channel_id', ul.channel_id,
   'input_tokens', ul.input_tokens,
   'cache_read_tokens', ul.cache_read_tokens,
-  'cache_creation_tokens', ul.cache_creation_tokens,
+  'cache_creation_tokens', COALESCE(ul.cache_creation_tokens, 0)
+      + COALESCE(ul.cache_creation_5m_tokens, 0)
+      + COALESCE(ul.cache_creation_1h_tokens, 0),
   'output_tokens', ul.output_tokens,
   'created_at', ul.created_at
 )::text
@@ -300,11 +307,19 @@ canonical Manifest 固定保存六个不可补偿的布尔结果：
 5. `root_complete`：每个 Turn 有且只有一个成对的 lifecycle Root，Session 边界另行验收。
 6. `delivery_ready`：以上五项全部为 true。
 
+Stock Codex Assembly 将这些结果原样写入 `meta.trace_readiness`。评分中的
+`trace_delivery_ready` 是零分值、不可补偿的 hard gate：缺失该证据、字段自相矛盾或
+`delivery_ready=false` 都不能进入 Buyer Release。
+
 `project-interactions` 可以为取证生成 `not_ready` 产物；`verify-interactions` 对其严格失败。
 Session Assessment 的采购分数和语义 reward 都不能补偿上述任何门槛。采集完整性不能
 替代采购验收，结构分不能替代任务正确性。
 `semantic_quality` 只接受带来源的 0–1 reward，或对已采集证据中的明确
 pass/fail、0–1 score 求平均；未知状态不参与计算。
+
+Assessment 同时输出三种口径：`delivery_ready` 表示 Trace 事实完整；`training_ready`
+还要求 Session 闭合且至少有一组真实 User → Assistant 交互；`buyer_eligible` 再要求
+指定 Profile 的全部 hard gate 和最低分。三者不得合并汇报。
 
 ## 版本化验收
 
@@ -369,7 +384,7 @@ projection，Session 不再复制第二棵树。dispatcher 与 runtime 终态分
 rollout 不提供独立 inference ID，模型调用事实直接来自无损 Wire，不补造第二份 inference。
 
 `chiptrace score` 的输出文件和 Release 的 `reports/assessments-part-*.jsonl.zst` 使用
-`schemas/assessment-v1.schema.json`，逐条给出 Gate、观测值、期望值、失败原因、
+`schemas/assessment-v2.schema.json`，逐条给出 Gate、观测值、期望值、失败原因、
 canonical 三类结果、Session 附加观测和 Token。`release_decision=eligible` 仅在全部 hard gate 通过且
 分数达到阈值时产生。
 

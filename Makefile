@@ -1,6 +1,6 @@
 .PHONY: check test gateway-test self-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
 
-CHIPTRACE_VERSION ?= 0.5.1
+CHIPTRACE_VERSION ?= 0.6.0
 CHIPTRACE_REVISION ?= $(shell git rev-parse HEAD)
 
 check:

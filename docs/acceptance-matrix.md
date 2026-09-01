@@ -46,6 +46,7 @@ ChipTrace 将原始采集、轨迹组装、质量评分和采购交付拆成四�
 每条 Assessment 同时保存：
 
 - `capture_completeness`：身份、时间、usage、层级和终态采集情况；
+- `readiness`：独立的 `delivery_ready`、`training_ready` 与训练交互证据；
 - `buyer_acceptance`：结构分、全部 Gate、失败原因和 release decision；
 - `semantic_quality`：测试、构建、搜索、用户修正、最终验收和 evaluator evidence。
 
@@ -284,6 +285,27 @@ runtime 结果，并通过六项完整性硬门槛。
 永久失败记录保留在 `failed`，没有重新序列化或伪造 Raw。该 canary 证明普通 Stock Codex
 已经自动形成可交付完整 Trace；Buyer 准入仍由真实长任务自身的轮次、工具多样性和验收
 结果决定。
+
+## Stock Codex 多轮真实审计（2026-09-01）
+
+使用当前 `0.6.0` 源码只读回放生产 sealed Raw 中 Session
+`01a05a92-c0ef-7422-b152-afb145d12cd8`。审计没有修改或重启 `18084`、Relay、Collector
+和运行中的 `codex-agent`。
+
+| 阶段 | 结果 |
+| --- | --- |
+| Raw/Wire | 657 条唯一 Capture；55/55 Responses streaming 原始字节、长度、SHA-256 和协议终态完整 |
+| Runtime | 227 个 RuntimeSpan；52/52 模型工具调用均有回传结果和真实执行；173 个内层执行中 162 成功、11 失败 |
+| Session/Turn | 1 个 Stock Session、2 个 Turn Root；`delivery_ready=true`、`training_ready=true` |
+| OTLP | 282 个 span、2 条 Turn Trace、280/280 内部父引用解析；相同上游 trace ID 不会合并两个 Turn |
+| OTLP 体积 | 20 KiB 预览 policy 下未压缩体积从 31,949,674 降至 4,140,098 bytes，减少 87.0%；完整值仍在 Canonical/Raw |
+| Buyer v7 | 85 分，52 次真实模型调用、5 个真实模型工具名、52/52 配对；唯一失败为 `tool_definitions` |
+
+`exec` 是 Stock Codex 原生 custom grammar，不是采购合同要求的 JSON function
+`parameters` schema；其余 4 个被调用工具具有完整定义。内层 `CommandExecution` 仅保留在
+Runtime DAG/OTLP，不改写成新的模型 tool call。该样本不能通过清洗、改名或静态 Schema
+补造升到 90 分；采购方需接受 custom-tool Profile，或 Stock Codex 必须真实暴露并调用
+5 个符合合同的 JSON function 工具。
 
 ## 正式交付门槛
 

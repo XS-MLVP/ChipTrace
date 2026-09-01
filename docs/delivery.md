@@ -62,6 +62,10 @@ chiptrace verify-release \
   --require-pass
 ```
 
+Sub2API PostgreSQL 的最小 JSONL 导出使用
+[`integrations/sub2api/export-usage.sql`](../integrations/sub2api/export-usage.sql)，不应把数据库
+全表、凭据或请求正文复制进 Release 工作目录。
+
 `enrich` 不修改 Raw 恢复目录；它只按上游 request ID 或 Sub2API 的
 `client:<X-Client-Request-ID>` 规则生成版本化投影。未命中和歧义记录仍原样输出，
 但没有 `proxy_route_verified`，不能靠模型名推断通过 expanded Profile 的模型门槛。
@@ -74,9 +78,9 @@ chiptrace verify-release \
 
 `reports/assessments-part-*.jsonl.zst` 包含每条去重 Session 的完整 Gate、失败原因、
 采购 Gate、附加完整性/语义观测和 Token，字段遵循
-`schemas/assessment-v1.schema.json`。canonical 的 wire/runtime/buyer 三类结果保存在
-Interaction 投影 Manifest。`data/`
-只包含 `eligible=true` 的 Session。
+`schemas/assessment-v2.schema.json`。每条 Assessment 分别保存 `delivery_ready`、
+`training_ready` 与 `buyer_eligible`；`data/` 只包含三者均通过且
+`buyer_acceptance.eligible=true` 的 Session。
 
 若输入来自 OSS Raw Zone，Release Manifest 的 `raw_sources` 保存原始 Checkpoint、
 Manifest 的对象键和 SHA-256，采购包的 `source_release_manifest_sha256` 继续绑定

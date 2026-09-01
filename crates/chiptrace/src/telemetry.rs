@@ -17,6 +17,11 @@ use time::format_description::well_known::Rfc3339;
 use walkdir::WalkDir;
 
 pub const OTLP_EXPORT_SCHEMA_VERSION: &str = "chiptrace.otlp-export.v1";
+const LEGACY_OTLP_BODY_POLICY: &str =
+    "normalized_io_and_raw_references; raw wire request and response bodies are not copied";
+const OTLP_BODY_POLICY: &str =
+    "bounded_20k_normalized_io_and_raw_references; full values remain in canonical and Raw";
+const OTLP_PAYLOAD_ATTRIBUTE_MAX_BYTES: usize = 20 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct OtlpExportConfig {
@@ -86,9 +91,7 @@ pub fn export_otlp(config: OtlpExportConfig) -> Result<OtlpExportManifest> {
         resolved_internal_parents: hierarchy.resolved_internal_parents,
         resolved_internal_parent_rate: hierarchy.resolved_internal_parent_rate,
         missing_parent_nodes: hierarchy.missing_parent_nodes,
-        body_policy:
-            "normalized_io_and_raw_references; raw wire request and response bodies are not copied"
-                .to_owned(),
+        body_policy: OTLP_BODY_POLICY.to_owned(),
         parts,
         validation_status: "verified".to_owned(),
     };
@@ -112,8 +115,10 @@ pub fn verify_otlp_export(root: &Path) -> Result<OtlpExportManifest> {
     if manifest.schema_version != OTLP_EXPORT_SCHEMA_VERSION
         || manifest.source_projection_schema_version != INTERACTION_PROJECTION_SCHEMA_VERSION
         || manifest.validation_status != "verified"
-        || manifest.body_policy
-            != "normalized_io_and_raw_references; raw wire request and response bodies are not copied"
+        || !matches!(
+            manifest.body_policy.as_str(),
+            OTLP_BODY_POLICY | LEGACY_OTLP_BODY_POLICY
+        )
     {
         bail!("unsupported or unsafe OTLP export manifest");
     }
@@ -136,6 +141,9 @@ pub fn verify_otlp_export(root: &Path) -> Result<OtlpExportManifest> {
         }
         if values.iter().any(contains_large_body_field) {
             bail!("OTLP export copied a forbidden large body field");
+        }
+        if manifest.body_policy == OTLP_BODY_POLICY {
+            validate_bounded_payload_attributes(&values)?;
         }
         otlp_records.extend(values);
     }
@@ -526,18 +534,12 @@ fn interaction_otlp(interaction: &Value, parent_span_id: Option<&str>) -> Value 
         otlp_attr("input.mime_type", json!("application/json")),
         otlp_attr(
             "input.value",
-            interaction
-                .pointer("/request/input_items")
-                .cloned()
-                .unwrap_or_else(|| json!([])),
+            bounded_payload_value(interaction.pointer("/request/input_items")),
         ),
         otlp_attr("output.mime_type", json!("application/json")),
         otlp_attr(
             "output.value",
-            interaction
-                .pointer("/response/output_items")
-                .cloned()
-                .unwrap_or_else(|| json!([])),
+            bounded_payload_value(interaction.pointer("/response/output_items")),
         ),
         otlp_attr(
             "chiptrace.raw_capture_refs",
@@ -602,24 +604,18 @@ fn runtime_otlp(span: &Value, parent_span_id: Option<&str>) -> Value {
         ),
         otlp_attr(
             "tool.parameters",
-            span.get("arguments").cloned().unwrap_or(Value::Null),
+            bounded_payload_value(span.get("arguments")),
         ),
         otlp_attr(
             "tool.json_schema",
-            span.get("tool_schema").cloned().unwrap_or(Value::Null),
+            bounded_payload_value(span.get("tool_schema")),
         ),
         otlp_attr("input.mime_type", json!("application/json")),
-        otlp_attr(
-            "input.value",
-            span.get("arguments").cloned().unwrap_or(Value::Null),
-        ),
+        otlp_attr("input.value", bounded_payload_value(span.get("arguments"))),
         otlp_attr("output.mime_type", json!("application/json")),
         otlp_attr(
             "output.value",
-            span.get("result")
-                .or_else(|| span.get("error"))
-                .cloned()
-                .unwrap_or(Value::Null),
+            bounded_payload_value(span.get("result").or_else(|| span.get("error"))),
         ),
         otlp_attr(
             "chiptrace.parent_span_id",
@@ -719,23 +715,37 @@ fn otlp_record(
 }
 
 fn projection_ids(value: &Value, identity_field: &str) -> (String, String) {
-    let traceparent = value
-        .pointer("/trace_context/traceparent")
-        .and_then(Value::as_str);
-    let trace_id = traceparent
-        .and_then(|value| value.split('-').nth(1))
-        .filter(|value| valid_otel_hex(value, 32))
-        .or_else(|| {
-            value
-                .pointer("/trace_context/trace_id")
-                .and_then(Value::as_str)
-                .filter(|value| valid_otel_hex(value, 32))
-        })
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_else(|| {
-            let seed = projection_trace_scope(value, identity_field);
-            sha256(seed.as_bytes())[..32].to_owned()
-        });
+    let session_turn_scoped = value
+        .pointer("/trace_context/task_session_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .is_none()
+        && value
+            .pointer("/trace_context/root_turn_id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+    let trace_id = if session_turn_scoped {
+        let seed = projection_trace_scope(value, identity_field);
+        sha256(seed.as_bytes())[..32].to_owned()
+    } else {
+        let traceparent = value
+            .pointer("/trace_context/traceparent")
+            .and_then(Value::as_str);
+        traceparent
+            .and_then(|value| value.split('-').nth(1))
+            .filter(|value| valid_otel_hex(value, 32))
+            .or_else(|| {
+                value
+                    .pointer("/trace_context/trace_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| valid_otel_hex(value, 32))
+            })
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| {
+                let seed = projection_trace_scope(value, identity_field);
+                sha256(seed.as_bytes())[..32].to_owned()
+            })
+    };
     let span_seed = string_field(value, identity_field).unwrap_or("missing");
     let span_id = sha256(span_seed.as_bytes())[..16].to_owned();
     (trace_id, span_id)
@@ -816,6 +826,76 @@ fn compact_refs(value: &Value) -> Value {
     )
 }
 
+fn bounded_payload_value(value: Option<&Value>) -> Value {
+    let value = value.unwrap_or(&Value::Null);
+    let (source, encoding) = match value {
+        Value::String(text) => (text.clone(), "utf8"),
+        _ => (
+            serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()),
+            "json",
+        ),
+    };
+    if source.len() <= OTLP_PAYLOAD_ATTRIBUTE_MAX_BYTES {
+        return value.clone();
+    }
+
+    let digest = sha256(source.as_bytes());
+    let mut prefix_bytes = OTLP_PAYLOAD_ATTRIBUTE_MAX_BYTES / 2;
+    loop {
+        let prefix_end = utf8_prefix_boundary(&source, prefix_bytes);
+        let summary = json!({
+            "truncated":true,
+            "encoding":encoding,
+            "original_bytes":source.len(),
+            "sha256":digest,
+            "preview":&source[..prefix_end],
+        });
+        let encoded = serde_json::to_string(&summary).unwrap_or_default();
+        if encoded.len() <= OTLP_PAYLOAD_ATTRIBUTE_MAX_BYTES || prefix_bytes == 0 {
+            return Value::String(encoded);
+        }
+        prefix_bytes /= 2;
+    }
+}
+
+fn utf8_prefix_boundary(value: &str, maximum: usize) -> usize {
+    let mut end = maximum.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+fn validate_bounded_payload_attributes(records: &[Value]) -> Result<()> {
+    const PAYLOAD_KEYS: [&str; 4] = [
+        "input.value",
+        "output.value",
+        "tool.parameters",
+        "tool.json_schema",
+    ];
+    for record in records {
+        for attribute in record
+            .pointer("/resourceSpans/0/scopeSpans/0/spans/0/attributes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(key) = attribute.get("key").and_then(Value::as_str) else {
+                continue;
+            };
+            if PAYLOAD_KEYS.contains(&key)
+                && attribute
+                    .pointer("/value/stringValue")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.len() > OTLP_PAYLOAD_ATTRIBUTE_MAX_BYTES)
+            {
+                bail!("OTLP payload attribute {key} exceeds the 20 KiB projection limit");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn contains_large_body_field(value: &Value) -> bool {
     match value {
         Value::Object(object) => object.iter().any(|(key, value)| {
@@ -889,6 +969,37 @@ mod tests {
         assert!(!value.to_string().contains("large"));
         assert!(!contains_large_body_field(&value));
         assert!(value.to_string().contains("cap-1"));
+    }
+
+    #[test]
+    fn otlp_payload_preview_is_bounded_utf8_and_content_addressed() {
+        let source = "芯迹".repeat(8_000);
+        let bounded = bounded_payload_value(Some(&json!(source)));
+        let encoded = bounded.as_str().unwrap();
+        assert!(encoded.len() <= OTLP_PAYLOAD_ATTRIBUTE_MAX_BYTES);
+        let summary: Value = serde_json::from_str(encoded).unwrap();
+        assert_eq!(summary["truncated"], true);
+        assert_eq!(summary["encoding"], "utf8");
+        assert_eq!(summary["original_bytes"], source.len());
+        assert_eq!(summary["sha256"], sha256(source.as_bytes()));
+        assert!(source.starts_with(summary["preview"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn bounded_otlp_policy_rejects_an_oversized_payload_attribute() {
+        let record = otlp_record(
+            "0123456789abcdef0123456789abcdef",
+            "1111111111111111",
+            None,
+            "oversized",
+            (None, None),
+            "completed",
+            vec![otlp_attr(
+                "output.value",
+                json!("x".repeat(OTLP_PAYLOAD_ATTRIBUTE_MAX_BYTES + 1)),
+            )],
+        );
+        assert!(validate_bounded_payload_attributes(&[record]).is_err());
     }
 
     #[test]
@@ -982,7 +1093,11 @@ mod tests {
         let roots = ["turn-a", "turn-b"].map(|turn| {
             json!({
                 "span_id":format!("root-{turn}"),
-                "trace_context":{"session_id":"session-1","root_turn_id":turn},
+                "trace_context":{
+                    "session_id":"session-1",
+                    "root_turn_id":turn,
+                    "trace_id":"0123456789abcdef0123456789abcdef"
+                },
                 "span_kind":"task_root","name":"turn","status":"completed",
                 "started_at":"100","finished_at":"200","raw_capture_refs":[turn]
             })
@@ -992,6 +1107,15 @@ mod tests {
         assert_eq!(hierarchy.root_spans, 2);
         assert_eq!(hierarchy.resolved_internal_parent_rate, 1.0);
         assert!(verify_otlp_tree(&records).is_ok());
+        let trace_ids: BTreeSet<&str> = records
+            .iter()
+            .filter_map(|record| {
+                record
+                    .pointer("/resourceSpans/0/scopeSpans/0/spans/0/traceId")
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        assert_eq!(trace_ids.len(), 2);
     }
 
     #[test]

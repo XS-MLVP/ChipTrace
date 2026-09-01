@@ -19,7 +19,7 @@ RUN --mount=type=cache,id=chiptrace-cargo-registry,target=/usr/local/cargo/regis
 
 FROM debian:bookworm-slim
 
-ARG CHIPTRACE_VERSION=0.5.1
+ARG CHIPTRACE_VERSION=0.6.0
 ARG CHIPTRACE_REVISION=unknown
 
 LABEL org.opencontainers.image.source="https://github.com/XS-MLVP/ChipTrace" \

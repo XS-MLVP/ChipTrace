@@ -157,8 +157,9 @@ chiptrace send-otlp \
 `delivery_ready=false`。瞬时网络错误、408、429 与 5xx 至少重试 20 次；其他 4xx
 立即失败。同一投影重放保持确定性的 Trace ID 和 Span ID。
 
-只有 `delivery_ready=true` 的 Trace 进入采购候选。Release 继续执行精确去重、连续子序列
-去重、Buyer Profile 评分、Session 原子分包和全对象 SHA-256。具体命令见
+`delivery_ready=true` 的 Trace 可以进入训练候选；`training_ready` 还要求闭合 Session 和
+真实训练交互。只有 `buyer_eligible=true` 才进入采购 Release。Release 继续执行精确去重、
+连续子序列去重、Buyer Profile 评分、Session 原子分包和全对象 SHA-256。具体命令见
 [数据交付](delivery.md)。
 
 ## 真实 canary
@@ -186,7 +187,8 @@ canary 必须使用未修改的 Stock Codex 和普通 `codex` 命令：
 - Collector accepted、sealed segment、磁盘剩余空间和 fsync 延迟。
 - Wire 有业务但 Capture 零增长、Producer 有事件但 rollout 零增长。
 - unknown rollout event、未关联 runtime span、原始字节缺失和 OTLP 缺父节点。
-- `wire_ready`、`runtime_ready`、`buyer_eligible` 三个 cohort，禁止混报。
+- `wire_ready`、`runtime_ready`、`delivery_ready`、`training_ready`、`buyer_eligible`
+  五个 cohort，禁止混报。
 
 热服务升级前必须完成隔离测试和真实 canary，并准备旧镜像与配置回滚。只升级旁路采集，
 不改变业务路由、模型选择或响应语义；出现业务延迟、Capture 冲突、积压持续增长或 Raw

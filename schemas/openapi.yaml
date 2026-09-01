@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: 芯迹采集 API
-  version: 0.5.1
+  version: 0.6.0
   description: >-
     Rust Collector/Relay 的持久化采集接口。Capture 与 producer event 最终进入
     同一 durable WAL；producer 路径由本机 Relay 提供。

@@ -2,6 +2,7 @@ use crate::capture::{extract_body, validate_stored_capture};
 use crate::jsonl::{JsonlWriter, absolute_path, ensure_safe_relative_path, sha256_file, utc_now};
 use crate::schema::{FileManifest, RAW_LINEAGE_SCHEMA_VERSION, RawSourceLineage};
 use crate::tool_registry::canonical_runtime_tool_name;
+use crate::wire_tools::request_tool_definitions as captured_request_tool_definitions;
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,11 @@ struct CanonicalRecords {
     interactions: Vec<Value>,
     runtime_spans: Vec<Value>,
     links: Vec<Value>,
+}
+
+pub(crate) struct CanonicalTraceSummary {
+    pub runtime_dag: Value,
+    pub readiness: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -401,8 +407,8 @@ fn build_canonical_records(captures: &[Value]) -> Result<CanonicalRecords> {
     })
 }
 
-pub(crate) fn stock_runtime_dag_summary(captures: &[Value]) -> Result<Option<Value>> {
-    let source_event_count = captures
+pub(crate) fn canonical_trace_summary(captures: &[Value]) -> Result<Option<CanonicalTraceSummary>> {
+    let stock_event_count = captures
         .iter()
         .filter(|capture| {
             capture
@@ -411,6 +417,34 @@ pub(crate) fn stock_runtime_dag_summary(captures: &[Value]) -> Result<Option<Val
                 == Some("codex_rollout_jsonl")
         })
         .count();
+    let legacy_event_count = captures
+        .iter()
+        .filter(|capture| {
+            capture
+                .pointer("/rolloutEvent/source")
+                .and_then(Value::as_str)
+                == Some("codex_rollout_trace_bundle")
+        })
+        .count();
+    let producer_runtime_event_count = captures
+        .iter()
+        .filter(|capture| {
+            capture.get("lifecycleEvent").is_some() || capture.get("toolExecution").is_some()
+        })
+        .count();
+    let (runtime_source, source_event_count) = match (stock_event_count, legacy_event_count) {
+        (stock, 0) if stock > 0 => ("canonical_model_interaction:codex_rollout_jsonl", stock),
+        (0, legacy) if legacy > 0 => ("codex_rollout_trace_bundle", legacy),
+        (stock, legacy) if stock > 0 && legacy > 0 => (
+            "canonical_model_interaction:mixed_runtime_sources",
+            stock.saturating_add(legacy),
+        ),
+        _ if producer_runtime_event_count > 0 => (
+            "canonical_model_interaction:producer_events",
+            producer_runtime_event_count,
+        ),
+        _ => ("", 0),
+    };
     if source_event_count == 0 {
         return Ok(None);
     }
@@ -420,6 +454,8 @@ pub(crate) fn stock_runtime_dag_summary(captures: &[Value]) -> Result<Option<Val
         runtime_spans,
         links,
     } = build_canonical_records(captures)?;
+    let (raw_bytes_complete, protocol_complete, interaction_metrics) =
+        aggregate_interaction_integrity(&interactions);
     let integrity = runtime_integrity(&interactions, &runtime_spans, &links);
     let metrics = &integrity.metrics;
     let roots: BTreeSet<String> = runtime_spans
@@ -450,9 +486,9 @@ pub(crate) fn stock_runtime_dag_summary(captures: &[Value]) -> Result<Option<Val
     let task_session_ids = canonical_task_session_ids(&interactions, &runtime_spans);
     let session_ids = canonical_session_ids(&interactions, &runtime_spans);
     let complete = integrity.runtime_complete && integrity.root_complete;
-    Ok(Some(json!({
+    let runtime_dag = json!({
         "schema_version":"chiptrace.runtime-dag.v1",
-        "source":"canonical_model_interaction:codex_rollout_jsonl",
+        "source":runtime_source,
         "native_event_count":source_event_count,
         "roots":roots,
         "root_mode":if roots.len() > 1 { "session_scoped_turn_forest" } else { "single_turn" },
@@ -466,7 +502,27 @@ pub(crate) fn stock_runtime_dag_summary(captures: &[Value]) -> Result<Option<Val
         "root_complete":integrity.root_complete,
         "complete":complete,
         "applicable":true,
-    })))
+    });
+    let wire_ready = raw_bytes_complete && protocol_complete;
+    let runtime_ready = integrity.runtime_complete && integrity.root_complete;
+    let delivery_ready = wire_ready && runtime_ready;
+    let readiness = json!({
+        "schema_version":"chiptrace.trace-readiness.v1",
+        "artifact_valid":true,
+        "raw_bytes_complete":raw_bytes_complete,
+        "protocol_complete":protocol_complete,
+        "runtime_complete":integrity.runtime_complete,
+        "root_complete":integrity.root_complete,
+        "wire_ready":wire_ready,
+        "runtime_ready":runtime_ready,
+        "delivery_ready":delivery_ready,
+        "interaction_metrics":interaction_metrics,
+        "runtime_metrics":integrity.metrics,
+    });
+    Ok(Some(CanonicalTraceSummary {
+        runtime_dag,
+        readiness,
+    }))
 }
 
 fn metric_string_set(metrics: &Value, path: &str) -> BTreeSet<String> {
@@ -2353,89 +2409,25 @@ fn responses_input_items(value: Option<&Value>) -> Vec<Value> {
 }
 
 fn request_tool_definitions(request: &Map<String, Value>) -> Vec<Value> {
-    let mut definitions = Vec::new();
-    for field in ["tools", "additional_tools"] {
-        for tool in request
-            .get(field)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            collect_request_tool_definitions(tool, None, &mut definitions);
-        }
-    }
-    for item in request
-        .get("input")
-        .and_then(Value::as_array)
+    captured_request_tool_definitions(&Value::Object(request.clone()))
         .into_iter()
-        .flatten()
-        .filter(|item| string_field(item, "type") == Some("additional_tools"))
-    {
-        for field in ["tools", "additional_tools", "definitions"] {
-            for tool in item
-                .get(field)
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                collect_request_tool_definitions(tool, None, &mut definitions);
-            }
-        }
-    }
-    for (index, definition) in definitions.iter_mut().enumerate() {
-        definition["index"] = json!(index);
-    }
-    definitions
-}
-
-fn collect_request_tool_definitions(
-    value: &Value,
-    inherited_namespace: Option<&str>,
-    output: &mut Vec<Value>,
-) {
-    let container_namespace = if string_field(value, "type") == Some("namespace") {
-        string_field(value, "name").or(inherited_namespace)
-    } else {
-        string_field(value, "namespace").or(inherited_namespace)
-    };
-    let mut children_found = false;
-    for field in ["tools", "additional_tools", "definitions"] {
-        for child in value
-            .get(field)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            children_found = true;
-            collect_request_tool_definitions(child, container_namespace, output);
-        }
-    }
-    if children_found
-        && (string_field(value, "type") == Some("namespace")
-            || value.get("parameters").is_none()
-                && value.get("input_schema").is_none()
-                && value.get("format").is_none())
-    {
-        return;
-    }
-
-    let nested = value.get("function").unwrap_or(value);
-    let namespace = string_field(nested, "runtime_namespace")
-        .or_else(|| string_field(nested, "namespace"))
-        .or_else(|| string_field(value, "namespace"))
-        .or(inherited_namespace);
-    let name =
-        string_field(nested, "name").map(|name| canonical_runtime_tool_name(namespace, name));
-    output.push(json!({
-        "index":0,
-        "name":name,
-        "description":nested.get("description"),
-        "parameters":nested.get("parameters").or_else(|| nested.get("input_schema")),
-        "format":nested.get("format"),
-        "namespace":namespace,
-        "tool_type":value.get("type"),
-        "raw":value,
-    }));
+        .enumerate()
+        .map(|(index, captured)| {
+            let nested = captured.nested();
+            json!({
+                "index":index,
+                "name":captured.canonical_name(),
+                "definition_key":captured.definition_key(),
+                "description":nested.get("description"),
+                "parameters":nested.get("parameters").or_else(|| nested.get("input_schema")),
+                "format":nested.get("format"),
+                "namespace":captured.namespace(),
+                "namespace_path":captured.namespace_path,
+                "tool_type":captured.raw.get("type"),
+                "raw":captured.raw,
+            })
+        })
+        .collect()
 }
 
 fn responses_model_tool_calls(items: &[Value]) -> Vec<Value> {
@@ -2971,20 +2963,27 @@ impl RuntimeScopeIndex {
         if let Some(root_turn_id) = trace_string(value, "root_turn_id") {
             return Some(("turn", root_turn_id.to_owned()));
         }
+        if let Some(thread_id) = trace_string(value, "thread_id")
+            && let Some(root_turn_id) = self.unique_root_turn(value, thread_id)
+        {
+            return Some(("turn", root_turn_id));
+        }
         if let Some(parent_thread_id) = trace_string(value, "parent_thread_id") {
-            let candidates = self
-                .root_turns_by_thread
-                .get(&runtime_thread_key(value, parent_thread_id))?;
-            if candidates.len() == 1 {
-                return candidates
-                    .iter()
-                    .next()
-                    .cloned()
-                    .map(|value| ("turn", value));
+            if let Some(root_turn_id) = self.unique_root_turn(value, parent_thread_id) {
+                return Some(("turn", root_turn_id));
             }
             return None;
         }
         trace_string(value, "turn_id").map(|value| ("turn", value.to_owned()))
+    }
+
+    fn unique_root_turn(&self, value: &Value, thread_id: &str) -> Option<String> {
+        let candidates = self
+            .root_turns_by_thread
+            .get(&runtime_thread_key(value, thread_id))?;
+        (candidates.len() == 1)
+            .then(|| candidates.iter().next().cloned())
+            .flatten()
     }
 
     fn key(&self, value: &Value) -> Option<String> {
@@ -4734,7 +4733,8 @@ mod tests {
         assert!(integrity.root_complete);
         assert_eq!(integrity.metrics["unscoped_span_ids"], json!([]));
 
-        let summary = stock_runtime_dag_summary(&captures).unwrap().unwrap();
+        let summary = canonical_trace_summary(&captures).unwrap().unwrap();
+        let summary = summary.runtime_dag;
         assert_eq!(summary["applicable"], true);
         assert_eq!(
             summary["source"],
@@ -4925,6 +4925,24 @@ mod tests {
         })]);
         assert_eq!(calls[0]["name"], "catalog.query");
         assert_eq!(calls[0]["arguments"], "part-42");
+    }
+
+    #[test]
+    fn interaction_tool_projection_keeps_exact_namespace_path() {
+        let request = json!({"tools":[{
+            "type":"namespace","name":"same","tools":[{
+                "type":"namespace","name":"same","tools":[{
+                    "type":"namespace","name":"segment.with.dot","tools":[{
+                        "type":"function","name":"lookup","parameters":{"type":"object","properties":{}}
+                    }]
+                }]
+            }]
+        }]});
+        let definitions = request_tool_definitions(request.as_object().unwrap());
+        assert_eq!(
+            definitions[0]["namespace_path"],
+            json!(["same", "same", "segment.with.dot"])
+        );
     }
 
     fn fixture_capture(
@@ -5928,5 +5946,48 @@ mod tests {
         assert_eq!(manifest.input_records, 1);
         assert_eq!(manifest.interactions, 1);
         assert_eq!(verify_interaction_artifacts(&projection).unwrap(), manifest);
+    }
+
+    #[test]
+    fn child_thread_uses_its_observed_root_turn_in_a_multi_turn_session() {
+        let root_a = json!({
+            "sourceNamespace":"stock",
+            "traceContext":{
+                "session_id":"session-a","thread_id":"thread-root",
+                "root_turn_id":"turn-a","turn_id":"turn-a"
+            }
+        });
+        let root_b = json!({
+            "sourceNamespace":"stock",
+            "traceContext":{
+                "session_id":"session-a","thread_id":"thread-root",
+                "root_turn_id":"turn-b","turn_id":"turn-b"
+            }
+        });
+        let child_wire = json!({
+            "sourceNamespace":"stock",
+            "traceContext":{
+                "session_id":"session-a","thread_id":"thread-child",
+                "parent_thread_id":"thread-root",
+                "root_turn_id":"turn-a","turn_id":"turn-child"
+            }
+        });
+        let child_rollout = json!({
+            "sourceNamespace":"stock",
+            "traceContext":{
+                "session_id":"session-a","thread_id":"thread-child",
+                "parent_thread_id":"thread-root","turn_id":"turn-child"
+            }
+        });
+        let index = RuntimeScopeIndex::new(&[root_a, root_b, child_wire]);
+
+        assert_eq!(
+            index.scope(&child_rollout),
+            Some(("turn", "turn-a".to_owned()))
+        );
+        assert_eq!(
+            index.trace_context(&child_rollout, true)["root_turn_id"],
+            "turn-a"
+        );
     }
 }

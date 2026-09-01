@@ -4,9 +4,10 @@ use crate::schema::{
     RawSourceLineage, ReleaseCounts, ReleaseManifest, TokenCounts,
 };
 use crate::score::{
-    Profile, assess_session, assessment_contract_valid, eligible_assessment_contract_valid,
-    exact_content_fingerprint, is_contiguous_subsequence, materialize_profile_session,
-    message_fingerprints, normalize_assessment_profile,
+    AssessmentSchemaValidators, Profile, assess_session, assessment_contract_valid,
+    assessment_record_from_session, eligible_assessment_contract_valid, exact_content_fingerprint,
+    is_contiguous_subsequence, materialize_profile_session, message_fingerprints,
+    normalize_assessment_profile, recompute_assessment_for_version,
 };
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
@@ -345,6 +346,7 @@ pub fn verify_release(root: &Path, require_pass: bool) -> Result<ReleaseManifest
         "buyer-v7" | "buyer-v7-codex-runtime-expanded" => Profile::BuyerV7,
         value => bail!("unsupported release buyer profile {value:?}"),
     };
+    let assessment_schemas = AssessmentSchemaValidators::new()?;
     if require_pass && manifest.validation_status != "pass" {
         bail!(
             "release validation status is {}, not pass",
@@ -385,8 +387,12 @@ pub fn verify_release(root: &Path, require_pass: bool) -> Result<ReleaseManifest
             }
             part_bytes = part_bytes.saturating_add(line.len() as u64);
             let session: Value = serde_json::from_slice(&line)?;
-            let assessment =
-                validate_embedded_acceptance(&session, profile, manifest.minimum_score)?;
+            let assessment = validate_embedded_acceptance(
+                &session,
+                profile,
+                manifest.minimum_score,
+                &assessment_schemas,
+            )?;
             if !eligible_fingerprints.insert(exact_content_fingerprint(&session)) {
                 bail!("release contains duplicate eligible Session content");
             }
@@ -410,7 +416,7 @@ pub fn verify_release(root: &Path, require_pass: bool) -> Result<ReleaseManifest
     if eligible_tokens != manifest.eligible_tokens {
         bail!("release eligible Token totals mismatch");
     }
-    let report_audit = verify_release_reports(root, &manifest, profile)?;
+    let report_audit = verify_release_reports(root, &manifest, profile, &assessment_schemas)?;
     if report_audit.assessed != manifest.counts.assessed_sessions
         || report_audit.eligible != manifest.counts.eligible_sessions
         || report_audit
@@ -471,6 +477,7 @@ fn verify_release_reports(
     root: &Path,
     manifest: &ReleaseManifest,
     profile: Profile,
+    assessment_schemas: &AssessmentSchemaValidators,
 ) -> Result<ReportAudit> {
     let mut audit = ReportAudit::default();
     for report in &manifest.reports {
@@ -495,7 +502,7 @@ fn verify_release_reports(
             if report.file.starts_with("reports/assessments-part-")
                 && report.file.ends_with(".jsonl.zst")
             {
-                audit_assessment_record(&value, manifest, profile, &mut audit)?;
+                audit_assessment_record(&value, manifest, profile, assessment_schemas, &mut audit)?;
             } else if report.file == "reports/divergent-sessions.jsonl.zst" {
                 audit_divergent_record(&value, &mut audit)?;
             } else {
@@ -523,8 +530,10 @@ fn audit_assessment_record(
     value: &Value,
     manifest: &ReleaseManifest,
     profile: Profile,
+    assessment_schemas: &AssessmentSchemaValidators,
     audit: &mut ReportAudit,
 ) -> Result<()> {
+    assessment_schemas.validate(value)?;
     let assessment: BuyerAssessment = serde_json::from_value(
         value
             .pointer("/quality/buyer_acceptance")
@@ -602,6 +611,7 @@ fn validate_embedded_acceptance(
     session: &Value,
     profile: Profile,
     minimum_score: f64,
+    assessment_schemas: &AssessmentSchemaValidators,
 ) -> Result<BuyerAssessment> {
     let assessment: BuyerAssessment = serde_json::from_value(
         session
@@ -612,7 +622,14 @@ fn validate_embedded_acceptance(
     if !eligible_assessment_contract_valid(&assessment, profile, minimum_score) {
         bail!("release contains an inconsistent or ineligible Session assessment");
     }
-    let recomputed = assess_session(session, profile, minimum_score).buyer_acceptance;
+    assessment_schemas.validate(&assessment_record_from_session(session, "eligible"))?;
+    let recomputed = recompute_assessment_for_version(
+        session,
+        profile,
+        minimum_score,
+        &assessment.schema_version,
+    )
+    .context("release Session uses an unsupported assessment schema")?;
     let mut comparable = assessment.clone();
     normalize_assessment_profile(&mut comparable, profile);
     if recomputed != comparable {
@@ -1199,6 +1216,8 @@ fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::LEGACY_ASSESSMENT_SCHEMA_VERSION;
+    use crate::score::recompute_assessment_for_version;
     use serde_json::json;
 
     fn complete_raw_lineage() -> RawSourceLineage {
@@ -1232,6 +1251,115 @@ mod tests {
             "tools":[],
             "messages":messages,
             "usage":{}
+        })
+    }
+
+    fn eligible_session(id: &str) -> Value {
+        let tool_names = [
+            "repository_search",
+            "file_read",
+            "shell_execute",
+            "source_patch",
+            "test_run",
+        ];
+        let tools: Vec<Value> = tool_names
+            .iter()
+            .map(|name| {
+                json!({
+                    "name":name,
+                    "description":format!("Execute {name}."),
+                    "parameters":{
+                        "type":"object",
+                        "properties":{
+                            "value":{"type":"string","description":"Input value."}
+                        }
+                    }
+                })
+            })
+            .collect();
+        let mut messages = vec![
+            json!({"role":"system","content":"system"}),
+            json!({"role":"user","content":"inspect the repository"}),
+            json!({"role":"assistant","content":"I will inspect it."}),
+        ];
+        for index in 0..8 {
+            messages.push(json!({
+                "role":"assistant","content":"",
+                "tool_calls":[{
+                    "id":format!("call-{index}"),"type":"function",
+                    "function":{
+                        "name":tool_names[index % tool_names.len()],
+                        "arguments":format!("{{\"value\":\"{index}\"}}")
+                    }
+                }]
+            }));
+            messages.push(json!({
+                "role":"tool","tool_call_id":format!("call-{index}"),
+                "content":format!("result-{index}"),"status":"success","is_error":false
+            }));
+        }
+        messages.extend([
+            json!({"role":"user","content":"verify the result"}),
+            json!({"role":"assistant","content":"Verification passed."}),
+        ]);
+        json!({
+            "schema_version":"chiptrace.session.v1",
+            "trajectory_id":format!("traj-{id}"),
+            "session_id":id,
+            "provider":"OpenAI",
+            "model":"gpt-5.6-sol",
+            "created_at":"2026-09-01T00:00:00Z",
+            "ended_at":"2026-09-01T00:01:00Z",
+            "status":"completed",
+            "is_final_snapshot":true,
+            "source_request_count":1,
+            "system_prompt":"system",
+            "tools":tools,
+            "messages":messages,
+            "usage":{},
+            "meta":{
+                "trace":{"session_id":id},
+                "lifecycle_events":["session_start","session_end"],
+                "merge_divergences":0,
+                "schema_conflicts":[],
+                "trace_conflicts":[],
+                "system_prompt_conflicts":[],
+                "usage_conflicts":[],
+                "tool_execution_conflicts":[],
+                "producer_event_conflicts":[],
+                "rollout_unknown_events":[],
+                "rollout_unmapped_tools":[],
+                "capture_dag":{
+                    "has_cycle":false,
+                    "unresolved_parent_response_ids":[],
+                    "unresolved_parent_span_ids":[]
+                },
+                "runtime_dag":{"applicable":false,"complete":false},
+                "task_dag":{"complete":true},
+                "inference_api_conservation":{"applicable":false,"complete":true},
+                "model_evidence":{
+                    "provider_identity_attested":true,
+                    "consistent":true,
+                    "api_snapshot_count":1,
+                    "attestation_candidate_count":1,
+                    "request_models":["gpt-5.6-sol"],
+                    "effective_models":["gpt-5.6-sol"],
+                    "response_models":["gpt-5.6-sol"],
+                    "providers":["OpenAI"],
+                    "non_attestable_api_snapshots":[]
+                },
+                "trace_readiness":{
+                    "schema_version":"chiptrace.trace-readiness.v1",
+                    "artifact_valid":true,
+                    "raw_bytes_complete":true,
+                    "protocol_complete":true,
+                    "runtime_complete":true,
+                    "root_complete":true,
+                    "wire_ready":true,
+                    "runtime_ready":true,
+                    "delivery_ready":true
+                }
+            }
         })
     }
 
@@ -1373,5 +1501,51 @@ mod tests {
                 .to_string()
                 .contains("cannot mix Raw-lineaged and unlineaged Session inputs")
         );
+    }
+
+    #[test]
+    fn release_read_only_verifier_accepts_a_legacy_v1_assessment() {
+        let mut session = eligible_session("legacy-release");
+        let current = assess_session(&session, Profile::BuyerV7, 90.0);
+        assert!(
+            current.buyer_acceptance.eligible,
+            "current assessment failures: {:?}",
+            current.buyer_acceptance.failure_reasons
+        );
+        let legacy = recompute_assessment_for_version(
+            &session,
+            Profile::BuyerV7,
+            90.0,
+            LEGACY_ASSESSMENT_SCHEMA_VERSION,
+        )
+        .unwrap();
+        assert!(legacy.eligible);
+        session["quality"] = json!({
+            "capture_completeness":current.capture_completeness,
+            "buyer_acceptance":legacy,
+            "semantic_quality":current.semantic_quality,
+        });
+
+        let validators = AssessmentSchemaValidators::new().unwrap();
+        let verified =
+            validate_embedded_acceptance(&session, Profile::BuyerV7, 90.0, &validators).unwrap();
+        assert_eq!(verified.schema_version, LEGACY_ASSESSMENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn release_rejects_current_assessment_with_missing_readiness_envelope() {
+        let mut session = eligible_session("missing-readiness");
+        let quality = assess_session(&session, Profile::BuyerV7, 90.0);
+        assert!(quality.buyer_acceptance.eligible);
+        session["quality"] = serde_json::to_value(quality).unwrap();
+        session["quality"]
+            .as_object_mut()
+            .unwrap()
+            .remove("readiness");
+
+        let validators = AssessmentSchemaValidators::new().unwrap();
+        let error = validate_embedded_acceptance(&session, Profile::BuyerV7, 90.0, &validators)
+            .unwrap_err();
+        assert!(error.to_string().contains("chiptrace.assessment.v2"));
     }
 }

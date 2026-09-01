@@ -5,7 +5,7 @@ services:
     build:
       context: ..
       args:
-        CHIPTRACE_VERSION: ${CHIPTRACE_VERSION:-0.5.1}
+        CHIPTRACE_VERSION: ${CHIPTRACE_VERSION:-0.6.0}
         CHIPTRACE_REVISION: ${CHIPTRACE_REVISION:-unknown}
     image: ${CHIPTRACE_IMAGE:-chiptrace:m0-local}
     init: true

@@ -35,7 +35,8 @@ flowchart LR
 - Hook 先原子写入本地 outbox，`codex-agent` 在 durable ACK 后推进队列。
 - 精确关联 Session、Turn、模型调用、真实工具执行、子代理和 Token。
 - 分离模型状态、上游传输状态和客户端交付状态。
-- 生成 OpenInference OTLP 树、验收评分、Manifest、JSONL 和 `tar.gz` 分包。
+- 生成 OpenInference OTLP 树、验收评分、Manifest、JSONL 和 `tar.gz` 分包；OTLP 正文仅
+  保留 20 KiB 预览、原长度和 SHA-256，完整值留在 Canonical/Raw。
 
 Langfuse 负责查询、展示和评测；ChipTrace 负责 Raw 事实、可靠投递与采购验收。
 
@@ -110,9 +111,9 @@ chiptrace send-otlp \
   --endpoint "$LANGFUSE_BASE_URL/api/public/otel/v1/traces"
 ```
 
-`delivery_ready` 由 Raw 字节、协议终态、Runtime、根节点和制品校验共同决定。Buyer 分数
-不能补偿任何完整性硬门槛；缺少真实 schema、工具结果或 Session 边界的记录保留在 Raw，
-但不会进入采购交付集。
+`delivery_ready` 只表示 Raw、协议、Runtime 和根节点完整；`training_ready` 还要求闭合
+Session 和真实训练交互；`buyer_eligible` 再叠加指定采购 Profile。三种口径独立统计，
+Buyer 分数不能补偿任何完整性硬门槛。
 
 JSONL 评分、10 GiB 级分包和对象存储发布见[数据交付](docs/delivery.md)。
 

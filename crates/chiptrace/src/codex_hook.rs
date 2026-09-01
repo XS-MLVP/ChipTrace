@@ -535,7 +535,7 @@ mod tests {
             "last_assistant_message":"done"
         }))
         .unwrap();
-        spool_hook_event(
+        let spooled = spool_hook_event(
             &raw,
             &HookSpoolConfig {
                 queue_root: queue_root.clone(),
@@ -543,33 +543,35 @@ mod tests {
             },
         )
         .unwrap();
+        let spooled_bytes = fs::read(&spooled.path).unwrap();
         let output = temporary.path().join("captures.jsonl");
-        let summary = run_codex_agent(
-            CodexAgentConfig {
-                queue_root: queue_root.clone(),
-                session_root: fixture("stock-rollout-root.jsonl")
-                    .parent()
-                    .unwrap()
-                    .to_owned(),
-                state_root: temporary.path().join("state"),
-                target: DeliveryTarget::Jsonl(output.clone()),
-                source_namespace: "test-stock-codex".to_owned(),
-                batch_records: 2,
-                max_envelope_bytes: 4 * 1024 * 1024,
-                request_timeout: Duration::from_secs(1),
-                retry_max_times: 20,
-                poll_interval: Duration::from_millis(10),
-                once: true,
-            },
-            std::future::pending(),
-        )
-        .await
-        .unwrap();
+        let agent_config = CodexAgentConfig {
+            queue_root: queue_root.clone(),
+            session_root: fixture("stock-rollout-root.jsonl")
+                .parent()
+                .unwrap()
+                .to_owned(),
+            state_root: temporary.path().join("state"),
+            target: DeliveryTarget::Jsonl(output.clone()),
+            source_namespace: "test-stock-codex".to_owned(),
+            batch_records: 2,
+            max_envelope_bytes: 4 * 1024 * 1024,
+            request_timeout: Duration::from_secs(1),
+            retry_max_times: 20,
+            poll_interval: Duration::from_millis(10),
+            once: true,
+        };
+        let summary = run_codex_agent(agent_config.clone(), std::future::pending())
+            .await
+            .unwrap();
+        assert_eq!(summary.queued, summary.acknowledged + summary.failed);
         assert_eq!(summary.acknowledged, 1);
         assert_eq!(summary.failed, 0);
+        assert_eq!(summary.duplicate_captures, 0);
         assert_eq!(summary.rollout_captures, 8);
         assert_eq!(fs::read_dir(queue_root.join("pending")).unwrap().count(), 0);
-        let records: Vec<Value> = fs::read_to_string(output)
+        let delivered_bytes = fs::read(&output).unwrap();
+        let records: Vec<Value> = String::from_utf8(delivered_bytes.clone())
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
@@ -578,6 +580,18 @@ mod tests {
         assert_eq!(records[0]["lifecycleEvent"]["type"], "turn_stop");
         assert_eq!(records[0]["traceContext"]["session_id"], "session-root");
         assert_eq!(records[0]["traceContext"]["thread_id"], "thread-root");
+
+        fs::write(&spooled.path, spooled_bytes).unwrap();
+        let replay = run_codex_agent(agent_config, std::future::pending())
+            .await
+            .unwrap();
+        assert_eq!(replay.queued, replay.acknowledged + replay.failed);
+        assert_eq!(replay.acknowledged, 1);
+        assert_eq!(replay.failed, 0);
+        assert_eq!(replay.duplicate_captures, 1);
+        assert_eq!(replay.rollout_captures, 0);
+        assert_eq!(fs::read(&output).unwrap(), delivered_bytes);
+        assert_eq!(fs::read_dir(queue_root.join("pending")).unwrap().count(), 0);
     }
 
     #[tokio::test]
