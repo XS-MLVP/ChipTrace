@@ -550,10 +550,18 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     let mut task_scoped_system_prompts = BTreeSet::new();
     let mut system_prompt = None;
     let mut divergences = 0_u64;
+    let mut rollout_user_message_fingerprints = HashSet::new();
     for capture in &parsed {
         let mut candidate = capture.messages.clone();
         candidate.retain(|message| string_field(message, "role") != Some("system"));
         candidate.extend(capture.response_messages.clone());
+        candidate.retain(|message| {
+            retain_distinct_rollout_user_message(
+                message,
+                capture,
+                &mut rollout_user_message_fingerprints,
+            )
+        });
         divergences += merge_messages(&mut messages, &candidate);
         for tool in &capture.tools {
             insert_observed_tool_schema(
@@ -4902,6 +4910,33 @@ fn merge_messages(current: &mut Vec<Value>, candidate: &[Value]) -> u64 {
     divergences
 }
 
+fn retain_distinct_rollout_user_message(
+    message: &Value,
+    capture: &ParsedCapture,
+    seen: &mut HashSet<String>,
+) -> bool {
+    if string_field(message, "role") != Some("user")
+        || !string_field(message, "source")
+            .is_some_and(|source| source.starts_with("codex_rollout."))
+    {
+        return true;
+    }
+    let Some(turn_id) = capture
+        .trace_context
+        .get("root_turn_id")
+        .or_else(|| capture.trace_context.get("turn_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return true;
+    };
+    let text = content_text(message.get("content")).unwrap_or_default();
+    let fingerprint = hex::encode(Sha256::digest(
+        format!("{}\0{turn_id}\0{text}", capture.session_identity).as_bytes(),
+    ));
+    seen.insert(fingerprint)
+}
+
 fn message_identity(message: &Value) -> String {
     let role = string_field(message, "role").unwrap_or("unknown");
     if role == "system" {
@@ -4925,7 +4960,7 @@ fn message_identity(message: &Value) -> String {
             return format!("tool-call:{}", ids.join("\0"));
         }
     }
-    if let Some(id) = string_field(message, "id") {
+    if let Some(id) = string_field(message, "id").or_else(|| string_field(message, "message_id")) {
         return format!("message:{id}");
     }
     let bytes = serde_json::to_vec(message).unwrap_or_default();
@@ -4938,6 +4973,19 @@ fn merge_message(existing: &mut Value, candidate: &Value) -> bool {
 
 fn merge_value(existing: &mut Value, candidate: &Value, field: Option<&str>) -> bool {
     if existing == candidate {
+        return false;
+    }
+    if field == Some("content") && content_text(Some(existing)) == content_text(Some(candidate)) {
+        return false;
+    }
+    if field == Some("source")
+        && existing
+            .as_str()
+            .is_some_and(|source| source.starts_with("codex_rollout."))
+        && candidate
+            .as_str()
+            .is_some_and(|source| source.starts_with("codex_rollout."))
+    {
         return false;
     }
     if field == Some("arguments")
@@ -6829,6 +6877,93 @@ mod tests {
         let cumulative = vec![repeated.clone(), repeated.clone(), repeated];
         assert_eq!(merge_messages(&mut current, &cumulative), 0);
         assert_eq!(current.len(), 3);
+    }
+
+    #[test]
+    fn rollout_message_provenance_views_are_not_semantic_divergences() {
+        let mut current = vec![json!({
+            "role":"assistant",
+            "content":[{"type":"Text","text":"checking"}],
+            "message_id":"msg-assistant",
+            "source":"codex_rollout.item_completed"
+        })];
+        let candidate = vec![json!({
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"checking"}],
+            "message_id":"msg-assistant",
+            "source":"codex_rollout.response_item"
+        })];
+        assert_eq!(merge_messages(&mut current, &candidate), 0);
+        assert_eq!(current.len(), 1);
+    }
+
+    #[test]
+    fn stock_user_message_views_merge_once_per_turn() {
+        let trace = json!({
+            "session_id":"stock-session",
+            "thread_id":"stock-session",
+            "root_turn_id":"stock-turn",
+            "turn_id":"stock-turn"
+        });
+        let rollout_response = json!({
+            "recordType":"rollout_event",
+            "captureId":"cap-rollout-response",
+            "sourceNamespace":"stock-runtime",
+            "receivedAt":"2026-09-01T00:00:00Z",
+            "traceContext":trace,
+            "rolloutMessages":[{
+                "role":"user",
+                "content":[{"type":"input_text","text":"run the checks"}],
+                "message_id":"msg-user",
+                "source":"codex_rollout.response_item"
+            }]
+        });
+        let rollout_completed = json!({
+            "recordType":"rollout_event",
+            "captureId":"cap-rollout-completed",
+            "sourceNamespace":"stock-runtime",
+            "receivedAt":"2026-09-01T00:00:00.001Z",
+            "traceContext":trace,
+            "rolloutMessages":[{
+                "role":"user",
+                "content":[{"type":"text","text":"run the checks","text_elements":[]}],
+                "message_id":"runtime-user-item",
+                "source":"codex_rollout.item_completed"
+            }]
+        });
+        let wire = json!({
+            "recordType":"api_snapshot",
+            "captureId":"cap-wire",
+            "sourceNamespace":"wire-gateway",
+            "startedAt":"2026-09-01T00:00:01Z",
+            "traceContext":trace,
+            "requestBody":{"kind":"json","value":{
+                "model":"gpt-5.6-sol",
+                "instructions":"system",
+                "input":[{"type":"message","id":"msg-user","role":"user","content":"run the checks"}]
+            }},
+            "responseBody":{"kind":"json","value":{
+                "id":"response-one",
+                "model":"gpt-5.6-sol",
+                "status":"completed",
+                "output":[{"type":"message","id":"assistant-one","role":"assistant","content":"done"}]
+            }}
+        });
+
+        let (session, _, divergences) =
+            assemble_group(vec![wire, rollout_completed, rollout_response]).unwrap();
+        assert_eq!(divergences, 0);
+        let user_messages: Vec<&Value> = session["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .collect();
+        assert_eq!(user_messages.len(), 1);
+        assert_eq!(
+            content_text(user_messages[0].get("content")).unwrap(),
+            "run the checks"
+        );
     }
 
     #[test]

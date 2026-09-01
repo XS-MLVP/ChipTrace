@@ -3580,9 +3580,18 @@ fn build_tool_runtime_spans(
             .key(first)
             .unwrap_or_else(|| "unscoped".to_owned());
         let span_id = stable_id("runtime-span", &[&scope, call_id]);
-        let parent_call_id = (parent_call_ids.len() == 1)
+        let observed_parent_call_id = (parent_call_ids.len() == 1)
             .then(|| parent_call_ids.iter().next().cloned())
             .flatten();
+        // Stock Codex may repeat the execution call ID as parent_call_id for a
+        // direct/unified-exec item. The call_id already carries that identity;
+        // retaining it as a parent would create a self edge when no Wire call
+        // exists. Only a distinct call can be a real parent.
+        let parent_call_id = observed_parent_call_id
+            .as_deref()
+            .filter(|parent| *parent != call_id)
+            .map(str::to_owned);
+        let collapsed_self_parent = observed_parent_call_id.as_deref() == Some(call_id);
         let conflict = terminal.len() > 1 || names.len() > 1 || parent_call_ids.len() > 1;
         spans.push(json!({
             "schema_version":RUNTIME_SPAN_SCHEMA_VERSION,
@@ -3625,6 +3634,8 @@ fn build_tool_runtime_spans(
                     "codex_rollout_runtime_item.status"
                 },
                 "runtime_tool_name":runtime_name,
+                "observed_parent_call_ids":parent_call_ids,
+                "collapsed_self_parent_call_id":collapsed_self_parent,
             },
         }));
     }
@@ -5230,6 +5241,80 @@ mod tests {
         assert_eq!(
             interaction["extensions"]["wire"]["response"]["raw_utf8"],
             RESPONSES_STREAM_RESPONSE
+        );
+    }
+
+    #[test]
+    fn runtime_only_direct_call_collapses_redundant_self_parent() {
+        let context = json!({
+            "session_id":"session-stock",
+            "thread_id":"session-stock",
+            "root_turn_id":"turn-stock",
+            "turn_id":"turn-stock"
+        });
+        let lifecycle = |capture_id: &str, event_type: &str, status: &str, at: &str| {
+            json!({
+                "recordType":"lifecycle_event",
+                "captureId":capture_id,
+                "sourceNamespace":"stock-codex",
+                "receivedAt":at,
+                "traceContext":context,
+                "lifecycleEvent":{
+                    "type":event_type,
+                    "status":status,
+                    "occurred_at":at
+                }
+            })
+        };
+        let tool = json!({
+            "recordType":"tool_execution",
+            "captureId":"cap-tool",
+            "sourceNamespace":"stock-codex",
+            "receivedAt":"2026-09-01T00:00:01Z",
+            "traceContext":context,
+            "toolExecution":{
+                "call_id":"call-direct",
+                "parent_call_id":"call-direct",
+                "name":"exec_command",
+                "status":"success",
+                "started_at":"2026-09-01T00:00:01Z",
+                "finished_at":"2026-09-01T00:00:01Z",
+                "arguments":{"cmd":"git diff --check"},
+                "result":{"exit_code":0}
+            }
+        });
+        let captures = vec![
+            lifecycle("cap-start", "turn_start", "started", "2026-09-01T00:00:00Z"),
+            tool,
+            lifecycle("cap-end", "turn_end", "completed", "2026-09-01T00:00:02Z"),
+        ];
+
+        let spans = build_runtime_spans(&captures).unwrap();
+        let tool_span = spans
+            .iter()
+            .find(|span| span["call_id"] == "call-direct")
+            .unwrap();
+        assert_eq!(tool_span["parent_call_id"], Value::Null);
+        assert_eq!(
+            tool_span["extensions"]["observed_parent_call_ids"],
+            json!(["call-direct"])
+        );
+        assert_eq!(
+            tool_span["extensions"]["collapsed_self_parent_call_id"],
+            true
+        );
+
+        let links = build_interaction_links(&[], &spans, &captures).unwrap();
+        assert!(links.iter().any(|link| {
+            link["relation"] == "runtime_parent_to_child"
+                && link["to"] == format!("runtime-span:{}", tool_span["span_id"].as_str().unwrap())
+        }));
+        let integrity = runtime_integrity(&[], &spans, &links);
+        assert!(integrity.root_complete);
+        assert!(integrity.runtime_complete);
+        assert_eq!(
+            integrity.metrics["unresolved_parent_call_span_ids"],
+            json!([])
         );
     }
 

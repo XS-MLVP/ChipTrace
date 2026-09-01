@@ -3,8 +3,9 @@ use crate::delivery::{DeliveryConfig, DeliveryTarget, deliver_batch};
 use crate::producer::deterministic_codex_rollout_capture_id;
 use crate::tool_registry::{
     LoadedToolRegistry, ToolRegistryEntry, canonical_runtime_tool_name, load_tool_registry,
-    registry_entry_identity,
+    registry_entry_identity, tool_definition_source_complete,
 };
+use crate::wire_tools::request_tool_definitions;
 use anyhow::{Context, Result, bail};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -176,6 +177,7 @@ struct RolloutContext {
     thread_source: Option<String>,
     model_tool_calls: BTreeMap<String, ObservedModelToolCall>,
     open_code_mode_calls: BTreeMap<String, ObservedModelToolCall>,
+    observed_tool_definitions: BTreeMap<String, ObservedToolDefinition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +186,13 @@ struct ObservedModelToolCall {
     event_type: String,
     source_ordinal: u64,
     turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ObservedToolDefinition {
+    schema: Value,
+    source_ordinal: u64,
+    source_line_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,9 +301,10 @@ enum RuntimeCallCorrelation {
     ToolNameMismatch,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RuntimeProjection<'a> {
     registry_entry: Option<(&'a LoadedRegistry, &'a ToolRegistryEntry)>,
+    observed_schema: Option<ObservedToolDefinition>,
     correlation: Option<RuntimeCallCorrelation>,
     parent_call_id: Option<&'a str>,
 }
@@ -604,7 +614,12 @@ fn project_event(
         && event_type == "item_completed"
         && matches!(
             item_type,
-            "CommandExecution" | "FileChange" | "ImageView" | "CollabAgentToolCall" | "WebSearch"
+            "CommandExecution"
+                | "FileChange"
+                | "ImageView"
+                | "CollabAgentToolCall"
+                | "WebSearch"
+                | "McpToolCall"
         );
     let legacy_web_tool =
         top_type == "event_msg" && matches!(event_type, "web_search_begin" | "web_search_end");
@@ -624,6 +639,10 @@ fn project_event(
     let registry_match = completed_runtime_tool
         .then(|| matching_registry_entry(payload, context, registry))
         .flatten();
+    let observed_schema = completed_runtime_tool
+        .then(|| matching_observed_schema(payload, context))
+        .flatten()
+        .cloned();
     let runtime_correlation = completed_runtime_tool
         .then(|| runtime_call_correlation(payload, context, registry_match, turn_id.as_deref()));
     let runtime_parent_call_id = completed_runtime_tool
@@ -761,6 +780,7 @@ fn project_event(
                     item_type,
                     RuntimeProjection {
                         registry_entry: registry_match,
+                        observed_schema,
                         correlation: runtime_correlation,
                         parent_call_id: runtime_parent_call_id.as_deref(),
                     },
@@ -803,6 +823,17 @@ fn project_event(
                     capture["rolloutEvent"]["projection"] = json!("tool_result_unknown_status");
                     kind = ProjectionKind::Message;
                 }
+            }
+            "tool_search_call" => {
+                capture["rolloutEvent"]["projection"] = json!("tool_discovery_call");
+                kind = ProjectionKind::Metadata;
+            }
+            "tool_search_output" => {
+                let definitions =
+                    remember_observed_tool_definitions(context, payload, ordinal, &source_digest)?;
+                capture["rolloutToolDefinitions"] = Value::Array(definitions);
+                capture["rolloutEvent"]["projection"] = json!("tool_definitions");
+                kind = ProjectionKind::Metadata;
             }
             _ => {}
         }
@@ -911,7 +942,12 @@ fn project_completed_item(
             set_lifecycle(capture, event_type, status, item, timestamp, ordinal);
             Ok(ProjectionKind::Lifecycle)
         }
-        "CommandExecution" | "FileChange" | "ImageView" | "CollabAgentToolCall" | "WebSearch" => {
+        "CommandExecution"
+        | "FileChange"
+        | "ImageView"
+        | "CollabAgentToolCall"
+        | "WebSearch"
+        | "McpToolCall" => {
             capture["runtimeToolObservation"] = item.clone();
             capture["recordType"] = json!("tool_execution");
             capture["toolExecution"] = match runtime.registry_entry {
@@ -928,6 +964,7 @@ fn project_completed_item(
                 None => tool_execution_without_schema(
                     payload,
                     item_type,
+                    runtime.observed_schema.as_ref(),
                     runtime
                         .correlation
                         .is_some_and(RuntimeCallCorrelation::is_matched),
@@ -952,14 +989,12 @@ fn matching_registry_entry<'a>(
     }
     let item = payload.get("item")?;
     let item_type = string(item, "type")?;
-    let observed_name = string(item, "tool")
-        .map(|name| canonical_runtime_tool_name(string(item, "namespace"), name))
-        .or_else(|| {
-            item.get("id")
-                .and_then(Value::as_str)
-                .and_then(|id| context.model_tool_calls.get(id))
-                .map(|call| call.name.clone())
-        });
+    let observed_name = runtime_item_identity(item, item_type).or_else(|| {
+        item.get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| context.model_tool_calls.get(id))
+            .map(|call| call.name.clone())
+    });
     let candidates: Vec<&ToolRegistryEntry> = registry
         .registry
         .tools
@@ -978,6 +1013,34 @@ fn matching_registry_entry<'a>(
     } else {
         None
     }
+}
+
+fn matching_observed_schema<'a>(
+    payload: &Value,
+    context: &'a RolloutContext,
+) -> Option<&'a ObservedToolDefinition> {
+    let item = payload.get("item")?;
+    let call_id = string(item, "id");
+    let name = call_id
+        .and_then(|call_id| context.model_tool_calls.get(call_id))
+        .map(|call| call.name.clone())
+        .or_else(|| {
+            string(item, "type").and_then(|item_type| runtime_item_identity(item, item_type))
+        })?;
+    context.observed_tool_definitions.get(&name)
+}
+
+fn runtime_item_identity(item: &Value, item_type: &str) -> Option<String> {
+    let runtime_tool = string(item, "tool")?;
+    let namespace = string(item, "namespace").map(str::to_owned).or_else(|| {
+        (item_type == "McpToolCall")
+            .then(|| string(item, "server").map(|server| format!("mcp__{server}")))
+            .flatten()
+    });
+    Some(canonical_runtime_tool_name(
+        namespace.as_deref(),
+        runtime_tool,
+    ))
 }
 
 fn remember_model_tool_call(
@@ -1037,6 +1100,59 @@ fn remember_model_tool_call(
         };
         context.model_tool_calls.remove(&oldest);
     }
+}
+
+fn remember_observed_tool_definitions(
+    context: &mut RolloutContext,
+    payload: &Value,
+    source_ordinal: u64,
+    source_line_sha256: &str,
+) -> Result<Vec<Value>> {
+    let request_shape = json!({
+        "tools":payload.get("tools").cloned().unwrap_or_else(|| json!([]))
+    });
+    let mut projected = Vec::new();
+    for captured in request_tool_definitions(&request_shape) {
+        let Some(source_name) = captured.source_name() else {
+            continue;
+        };
+        let Some(name) = captured.canonical_name() else {
+            continue;
+        };
+        let mut schema = captured.nested().clone();
+        schema["name"] = json!(name);
+        schema["runtime_tool"] = json!(source_name);
+        if let Some(namespace) = captured.namespace() {
+            schema["runtime_namespace"] = json!(namespace);
+        }
+        schema["raw_definition"] = captured.raw.clone();
+        let source_complete = tool_definition_source_complete(&schema, &name);
+        let schema_hash = sha256(serde_json::to_vec(&schema)?);
+        if let Some(existing) = context.observed_tool_definitions.get(&name)
+            && existing.schema.get("schema_hash").and_then(Value::as_str) != Some(&schema_hash)
+        {
+            bail!("Codex rollout changed the observed schema for tool {name:?}");
+        }
+        schema["schema_hash"] = json!(schema_hash);
+        schema["schema_version"] = json!(format!("sha256:{schema_hash}"));
+        schema["schema_provenance"] = json!({
+            "source":"codex_rollout.tool_search_output",
+            "source_complete":source_complete,
+            "source_ordinal":source_ordinal,
+            "source_line_sha256":source_line_sha256,
+            "generated_adapter":false,
+        });
+        projected.push(schema.clone());
+        context.observed_tool_definitions.insert(
+            name,
+            ObservedToolDefinition {
+                schema,
+                source_ordinal,
+                source_line_sha256: source_line_sha256.to_owned(),
+            },
+        );
+    }
+    Ok(projected)
 }
 
 fn runtime_call_correlation(
@@ -1165,6 +1281,7 @@ fn tool_execution(
             "query":item.get("query"),
             "action":item.get("action"),
         }),
+        "McpToolCall" => item.get("arguments").cloned().unwrap_or(Value::Null),
         _ => Value::Null,
     };
     let result = match item_type {
@@ -1183,6 +1300,11 @@ fn tool_execution(
         // Codex records the hosted search action and completion, but not the
         // provider's search result body. Preserve that absence explicitly.
         "WebSearch" => Value::Null,
+        "McpToolCall" => item
+            .get("result")
+            .or_else(|| item.get("error"))
+            .cloned()
+            .unwrap_or(Value::Null),
         _ => Value::Null,
     };
     let started_at = milliseconds_timestamp(payload.get("started_at_ms")).or_else(|| {
@@ -1219,6 +1341,7 @@ fn tool_execution(
         execution["error"] = json!({
             "stderr":item.get("stderr"),
             "exit_code":item.get("exit_code"),
+            "runtime_error":item.get("error"),
             "runtime_status":item.get("status"),
         });
     }
@@ -1228,6 +1351,7 @@ fn tool_execution(
 fn tool_execution_without_schema(
     payload: &Value,
     item_type: &str,
+    observed_schema: Option<&ObservedToolDefinition>,
     model_call_matched: bool,
     parent_call_id: Option<&str>,
 ) -> Result<Value> {
@@ -1235,7 +1359,10 @@ fn tool_execution_without_schema(
         .get("item")
         .ok_or_else(|| anyhow::anyhow!("item_completed is missing item"))?;
     let runtime_tool = string(item, "tool").unwrap_or(item_type);
-    let runtime_namespace = string(item, "namespace");
+    let derived_namespace = (item_type == "McpToolCall")
+        .then(|| string(item, "server").map(|server| format!("mcp__{server}")))
+        .flatten();
+    let runtime_namespace = string(item, "namespace").or(derived_namespace.as_deref());
     let name = canonical_runtime_tool_name(runtime_namespace, runtime_tool);
     let status = normalize_runtime_status(string(item, "status"));
     let (arguments, result) = runtime_arguments_and_result(item, item_type);
@@ -1263,10 +1390,24 @@ fn tool_execution_without_schema(
         "result_content_captured":item_type != "WebSearch",
         "result":result,
     });
+    if let Some(observed) = observed_schema
+        && observed
+            .schema
+            .pointer("/schema_provenance/source_complete")
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        execution["schema"] = observed.schema.clone();
+        execution
+            .as_object_mut()
+            .expect("tool execution is an object")
+            .remove("schema_provenance");
+    }
     if matches!(status, "error" | "cancelled" | "timeout") {
         execution["error"] = json!({
             "stderr":item.get("stderr"),
             "exit_code":item.get("exit_code"),
+            "runtime_error":item.get("error"),
             "runtime_status":item.get("status"),
         });
     }
@@ -1293,6 +1434,7 @@ fn runtime_arguments_and_result(item: &Value, item_type: &str) -> (Value, Value)
             "query":item.get("query"),
             "action":item.get("action"),
         }),
+        "McpToolCall" => item.get("arguments").cloned().unwrap_or(Value::Null),
         _ => Value::Null,
     };
     let result = match item_type {
@@ -1309,6 +1451,11 @@ fn runtime_arguments_and_result(item: &Value, item_type: &str) -> (Value, Value)
         "ImageView" => json!({"path":item.get("path")}),
         "CollabAgentToolCall" => json!({"agents_states":item.get("agents_states")}),
         "WebSearch" => Value::Null,
+        "McpToolCall" => item
+            .get("result")
+            .or_else(|| item.get("error"))
+            .cloned()
+            .unwrap_or(Value::Null),
         _ => Value::Null,
     };
     (arguments, result)
@@ -1411,6 +1558,8 @@ fn known_event(top: &str, event: &str, item: &str) -> bool {
                 | "custom_tool_call_output"
                 | "function_call"
                 | "function_call_output"
+                | "tool_search_call"
+                | "tool_search_output"
                 | "web_search_call"
                 | "message"
                 | "agent_message"
@@ -1424,6 +1573,7 @@ fn known_event(top: &str, event: &str, item: &str) -> bool {
                         | "ImageView"
                         | "CollabAgentToolCall"
                         | "WebSearch"
+                        | "McpToolCall"
                         | "SubAgentActivity"
                         | "ContextCompaction"
                         | "UserMessage"
@@ -1922,6 +2072,113 @@ mod tests {
         assert_eq!(
             last["toolExecution"]["schema_provenance"]["source_complete"],
             false
+        );
+    }
+
+    #[tokio::test]
+    async fn stock_mcp_execution_uses_exact_deferred_schema_and_status() {
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join("captures.jsonl");
+        let lines = [
+            line(
+                0,
+                json!({"type":"session_meta","payload":{
+                    "session_id":"thread-mcp","cli_version":"0.152.0-alpha.7.2"
+                }}),
+            ),
+            line(
+                1,
+                json!({"type":"event_msg","payload":{
+                    "type":"task_started","turn_id":"turn-mcp"
+                }}),
+            ),
+            line(
+                2,
+                json!({"type":"response_item","payload":{
+                    "type":"tool_search_output","call_id":"search-1","status":"completed",
+                    "tools":[{"type":"namespace","name":"mcp__canary","tools":[{
+                        "type":"function","name":"list_repository",
+                        "description":"List repository files.",
+                        "parameters":{"type":"object","properties":{
+                            "path":{"type":"string","description":"Repository-relative path."},
+                            "max_depth":{"type":"integer","description":"Maximum traversal depth."}
+                        },"required":["path","max_depth"],"additionalProperties":false}
+                    }]}]
+                }}),
+            ),
+            line(
+                3,
+                json!({"type":"response_item","payload":{
+                    "type":"function_call","call_id":"call-mcp-1",
+                    "namespace":"mcp__canary","name":"list_repository",
+                    "arguments":"{\"path\":\".\",\"max_depth\":2}"
+                }}),
+            ),
+            line(
+                4,
+                json!({"type":"event_msg","payload":{
+                    "type":"item_completed","thread_id":"thread-mcp","turn_id":"turn-mcp",
+                    "started_at_ms":1787961604000_i64,"completed_at_ms":1787961604001_i64,
+                    "item":{"type":"McpToolCall","id":"call-mcp-1","server":"canary",
+                        "tool":"list_repository","arguments":{"path":".","max_depth":2},
+                        "status":"completed","result":{"content":[{"type":"text","text":"ok"}]}}
+                }}),
+            ),
+            line(
+                5,
+                json!({"type":"response_item","payload":{
+                    "type":"function_call_output","call_id":"call-mcp-1","output":"ok"
+                }}),
+            ),
+            line(
+                6,
+                json!({"type":"event_msg","payload":{
+                    "type":"task_complete","turn_id":"turn-mcp"
+                }}),
+            ),
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(temporary.path().join("rollout.jsonl"), lines).unwrap();
+
+        let summary = export_codex_rollout(config(temporary.path(), &output))
+            .await
+            .unwrap();
+        assert_eq!(summary.tool_executions, 1);
+        assert_eq!(summary.unmapped_tool_events, 0);
+        assert_eq!(summary.unknown_events, 0);
+        let records = read_jsonl(&output);
+        let definition_capture = records
+            .iter()
+            .find(|record| record["rolloutEvent"]["event_type"] == "tool_search_output")
+            .unwrap();
+        assert_eq!(
+            definition_capture["rolloutToolDefinitions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let execution = records
+            .iter()
+            .find(|record| record["recordType"] == "tool_execution")
+            .unwrap();
+        assert_eq!(
+            execution["toolExecution"]["name"],
+            "mcp__canary.list_repository"
+        );
+        assert_eq!(execution["toolExecution"]["status"], "success");
+        assert_eq!(
+            execution["toolExecution"]["schema"]["schema_provenance"]["source"],
+            "codex_rollout.tool_search_output"
+        );
+        assert_eq!(
+            execution["toolExecution"]["schema"]["schema_provenance"]["source_complete"],
+            true
+        );
+        assert_eq!(
+            execution["toolExecution"]["result"]["content"][0]["text"],
+            "ok"
         );
     }
 
