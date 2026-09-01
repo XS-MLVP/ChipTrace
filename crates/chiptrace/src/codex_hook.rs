@@ -8,14 +8,17 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -24,6 +27,32 @@ use time::format_description::well_known::Rfc3339;
 pub const HOOK_SPOOL_SCHEMA_VERSION: &str = "chiptrace.codex-hook-spool.v2";
 const LEGACY_HOOK_SPOOL_SCHEMA_VERSION: &str = "chiptrace.codex-hook-spool.v1";
 const MAX_HOOK_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct HookGateConfig {
+    pub queue_root: PathBuf,
+    pub state_root: PathBuf,
+    pub model_catalog: PathBuf,
+    pub max_input_bytes: usize,
+    pub min_free_bytes: u64,
+    pub max_pending_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum HookGateDecision {
+    Accepted { spool: HookSpoolSummary },
+    Blocked { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectCatalogSummary {
+    pub output: String,
+    pub models: Vec<String>,
+    pub original_tool_modes: BTreeMap<String, String>,
+    pub source_sha256: String,
+    pub output_sha256: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct HookSpoolConfig {
@@ -213,6 +242,262 @@ pub fn spool_hook_event(raw: &[u8], config: &HookSpoolConfig) -> Result<HookSpoo
     })
 }
 
+pub fn gate_hook_event(raw: &[u8], config: &HookGateConfig) -> Result<HookGateDecision> {
+    let event: Value = serde_json::from_slice(raw).context("parse Codex hook input")?;
+    let event_name = required_string(&event, "hook_event_name")?;
+    if event_name == "SessionStart"
+        && let Err(error) = session_start_preflight(&event, raw.len(), config)
+    {
+        return Ok(HookGateDecision::Blocked {
+            reason: format!("ChipTrace preflight failed: {error:#}"),
+        });
+    }
+
+    let spool = spool_hook_event(
+        raw,
+        &HookSpoolConfig {
+            queue_root: config.queue_root.clone(),
+            max_input_bytes: config.max_input_bytes,
+        },
+    );
+    match spool {
+        Ok(spool) => Ok(HookGateDecision::Accepted { spool }),
+        Err(error) if event_name == "SessionStart" => Ok(HookGateDecision::Blocked {
+            reason: format!("ChipTrace could not persist SessionStart: {error:#}"),
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn write_direct_model_catalog(
+    raw: &[u8],
+    output: &Path,
+    required_models: &[String],
+    replace: bool,
+) -> Result<DirectCatalogSummary> {
+    if required_models.is_empty() {
+        bail!("at least one model is required");
+    }
+    let mut unique_models = BTreeSet::new();
+    for model in required_models {
+        if model.trim().is_empty() || !unique_models.insert(model.clone()) {
+            bail!("model names must be non-empty and unique");
+        }
+    }
+    let mut catalog: Value = serde_json::from_slice(raw).context("parse Codex model catalog")?;
+    let models = catalog
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .context("Codex model catalog has no models array")?;
+    let mut original_tool_modes = BTreeMap::new();
+    for required_model in &unique_models {
+        let matching: Vec<&mut Value> = models
+            .iter_mut()
+            .filter(|model| model.get("slug").and_then(Value::as_str) == Some(required_model))
+            .collect();
+        if matching.len() != 1 {
+            bail!(
+                "Codex model catalog must contain exactly one model {required_model:?}, found {}",
+                matching.len()
+            );
+        }
+        let model = matching.into_iter().next().expect("one matching model");
+        let object = model
+            .as_object_mut()
+            .context("Codex model catalog entry must be an object")?;
+        let original = object
+            .get("tool_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("direct")
+            .to_owned();
+        original_tool_modes.insert(required_model.clone(), original);
+        object.insert("tool_mode".to_owned(), json!("direct"));
+        object.remove("apply_patch_tool_type");
+    }
+
+    let mut bytes = serde_json::to_vec_pretty(&catalog)?;
+    bytes.push(b'\n');
+    atomic_write_file(output, &bytes, replace)?;
+    validate_direct_model_catalog(output, unique_models.iter().map(String::as_str))?;
+    Ok(DirectCatalogSummary {
+        output: output.display().to_string(),
+        models: unique_models.into_iter().collect(),
+        original_tool_modes,
+        source_sha256: sha256(raw),
+        output_sha256: sha256(&bytes),
+    })
+}
+
+fn session_start_preflight(event: &Value, raw_bytes: usize, config: &HookGateConfig) -> Result<()> {
+    if config.max_input_bytes == 0 || config.max_pending_bytes == 0 {
+        bail!("Hook input and pending-byte limits must be positive");
+    }
+    let model = required_string(event, "model")?;
+    validate_direct_model_catalog(&config.model_catalog, [model])?;
+    ensure_agent_lock_held(&config.state_root)?;
+    create_queue_directory(&config.queue_root)?;
+    let pending = config.queue_root.join("pending");
+    create_queue_directory(&pending)?;
+    let pending_bytes = pending_queue_bytes(&pending)?;
+    let reservation = (raw_bytes as u64)
+        .checked_mul(7)
+        .and_then(|bytes| bytes.checked_add(4096))
+        .context("Hook outbox reservation overflow")?;
+    let projected_pending = pending_bytes
+        .checked_add(reservation)
+        .context("Hook outbox byte count overflow")?;
+    if projected_pending > config.max_pending_bytes {
+        bail!(
+            "Hook outbox requires {projected_pending} bytes after reserving the SessionStart event, above the {} byte limit",
+            config.max_pending_bytes
+        );
+    }
+    let available = filesystem_available_bytes(&config.queue_root)?;
+    let required_available = config.min_free_bytes.saturating_add(reservation);
+    if available < required_available {
+        bail!(
+            "Hook outbox filesystem has {available} available bytes, below the {required_available} byte minimum including the SessionStart reservation"
+        );
+    }
+    Ok(())
+}
+
+fn validate_direct_model_catalog<'a>(
+    path: &Path,
+    required_models: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    let bytes =
+        fs::read(path).with_context(|| format!("read direct model catalog {}", path.display()))?;
+    let catalog: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse direct model catalog {}", path.display()))?;
+    let models = catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .context("direct model catalog has no models array")?;
+    for required_model in required_models {
+        let matching: Vec<&Value> = models
+            .iter()
+            .filter(|model| model.get("slug").and_then(Value::as_str) == Some(required_model))
+            .collect();
+        if matching.len() != 1 {
+            bail!(
+                "direct model catalog must contain exactly one model {required_model:?}, found {}",
+                matching.len()
+            );
+        }
+        let model = matching[0];
+        if model.get("tool_mode").and_then(Value::as_str) != Some("direct") {
+            bail!("model {required_model:?} is not configured for native direct function tools");
+        }
+        if model
+            .get("apply_patch_tool_type")
+            .is_some_and(|value| !value.is_null())
+        {
+            bail!(
+                "model {required_model:?} still exposes freeform apply_patch; remove apply_patch_tool_type"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn pending_queue_bytes(pending: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir(pending)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            bail!("Hook outbox pending entries must not be symlinks");
+        }
+        if file_type.is_file() {
+            let metadata = entry.metadata()?;
+            total = total
+                .checked_add(metadata.len())
+                .context("Hook outbox byte count overflow")?;
+        }
+    }
+    Ok(total)
+}
+
+#[cfg(unix)]
+fn filesystem_available_bytes(path: &Path) -> Result<u64> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .context("Hook outbox path contains an embedded NUL byte")?;
+    let mut status = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let result = unsafe { libc::statvfs(path.as_ptr(), status.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("read Hook outbox filesystem status");
+    }
+    let status = unsafe { status.assume_init() };
+    Ok(status.f_bavail.saturating_mul(status.f_frsize))
+}
+
+#[cfg(not(unix))]
+fn filesystem_available_bytes(_path: &Path) -> Result<u64> {
+    bail!("ChipTrace Codex preflight is supported only on Unix")
+}
+
+#[cfg(unix)]
+fn ensure_agent_lock_held(state_root: &Path) -> Result<()> {
+    let lock_path = state_root.join("codex-agent.lock");
+    let metadata = fs::symlink_metadata(&lock_path)
+        .with_context(|| format!("Codex agent lock is missing: {}", lock_path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("Codex agent lock must be a non-symlink file");
+    }
+    let file = OpenOptions::new().read(true).write(true).open(&lock_path)?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        bail!(
+            "Codex agent is not running for state root {}",
+            state_root.display()
+        );
+    }
+    let error = std::io::Error::last_os_error();
+    if error
+        .raw_os_error()
+        .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK)
+    {
+        return Ok(());
+    }
+    Err(error).context("check Codex agent lock")
+}
+
+#[cfg(not(unix))]
+fn ensure_agent_lock_held(_state_root: &Path) -> Result<()> {
+    bail!("ChipTrace Codex preflight is supported only on Unix")
+}
+
+fn atomic_write_file(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
+    if path.exists() && !replace {
+        bail!("output already exists: {}", path.display());
+    }
+    let parent = path
+        .parent()
+        .context("direct model catalog output has no parent")?;
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("direct model catalog filename is not UTF-8")?;
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temporary)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o644))?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary, path)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 pub async fn run_codex_agent<S>(config: CodexAgentConfig, shutdown: S) -> Result<CodexAgentSummary>
 where
     S: Future<Output = ()>,
@@ -222,6 +507,24 @@ where
     }
     if config.poll_interval < Duration::from_millis(10) {
         bail!("Codex agent poll interval must be at least 10ms");
+    }
+    if config.source_namespace.trim().is_empty() || config.source_namespace.len() > 256 {
+        bail!("Codex agent source namespace must contain between 1 and 256 bytes");
+    }
+    if config.batch_records == 0
+        || config.max_envelope_bytes == 0
+        || config.request_timeout.is_zero()
+    {
+        bail!("Codex agent batch, envelope, and request timeout values must be positive");
+    }
+    let session_root_metadata = fs::symlink_metadata(&config.session_root).with_context(|| {
+        format!(
+            "read Stock Codex session root {}",
+            config.session_root.display()
+        )
+    })?;
+    if session_root_metadata.file_type().is_symlink() || !session_root_metadata.is_dir() {
+        bail!("Stock Codex session root must be a non-symlink directory");
     }
     create_queue_directory(&config.queue_root)?;
     create_queue_directory(&config.queue_root.join("pending"))?;
@@ -542,6 +845,254 @@ mod tests {
             hook_capture(&spooled, &identity, "test-stock-codex").unwrap(),
             hook_capture(&spooled, &identity, "test-stock-codex").unwrap()
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&first.path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    fn session_start_event() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "hook_event_name":"SessionStart",
+            "session_id":"thread-gated",
+            "source":"startup",
+            "transcript_path":null,
+            "cwd":"/workspace",
+            "model":"gpt-5.6-sol",
+            "permission_mode":"default"
+        }))
+        .unwrap()
+    }
+
+    fn direct_catalog(path: &Path, tool_mode: &str) {
+        fs::write(
+            path,
+            serde_json::to_vec(&json!({
+                "models":[{"slug":"gpt-5.6-sol","tool_mode":tool_mode}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn session_start_gate_fails_closed_without_worker() {
+        let temporary = tempfile::tempdir().unwrap();
+        let catalog = temporary.path().join("models.json");
+        direct_catalog(&catalog, "direct");
+        let decision = gate_hook_event(
+            &session_start_event(),
+            &HookGateConfig {
+                queue_root: temporary.path().join("queue"),
+                state_root: temporary.path().join("state"),
+                model_catalog: catalog,
+                max_input_bytes: MAX_HOOK_BYTES,
+                min_free_bytes: 0,
+                max_pending_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let HookGateDecision::Blocked { reason } = decision else {
+            panic!("SessionStart unexpectedly passed without a worker");
+        };
+        assert!(reason.contains("agent lock is missing"));
+    }
+
+    #[test]
+    fn session_start_gate_requires_native_direct_tools() {
+        let temporary = tempfile::tempdir().unwrap();
+        let catalog = temporary.path().join("models.json");
+        direct_catalog(&catalog, "code_mode_only");
+        let state_root = temporary.path().join("state");
+        let _worker = AgentStateLock::acquire(&state_root).unwrap();
+        let decision = gate_hook_event(
+            &session_start_event(),
+            &HookGateConfig {
+                queue_root: temporary.path().join("queue"),
+                state_root,
+                model_catalog: catalog,
+                max_input_bytes: MAX_HOOK_BYTES,
+                min_free_bytes: 0,
+                max_pending_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let HookGateDecision::Blocked { reason } = decision else {
+            panic!("SessionStart unexpectedly accepted custom grammar tools");
+        };
+        assert!(reason.contains("native direct function tools"));
+    }
+
+    #[test]
+    fn session_start_gate_rejects_freeform_apply_patch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let catalog = temporary.path().join("models.json");
+        fs::write(
+            &catalog,
+            serde_json::to_vec(&json!({
+                "models":[{
+                    "slug":"gpt-5.6-sol",
+                    "tool_mode":"direct",
+                    "apply_patch_tool_type":"freeform"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let state_root = temporary.path().join("state");
+        let _worker = AgentStateLock::acquire(&state_root).unwrap();
+        let decision = gate_hook_event(
+            &session_start_event(),
+            &HookGateConfig {
+                queue_root: temporary.path().join("queue"),
+                state_root,
+                model_catalog: catalog,
+                max_input_bytes: MAX_HOOK_BYTES,
+                min_free_bytes: 0,
+                max_pending_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let HookGateDecision::Blocked { reason } = decision else {
+            panic!("SessionStart unexpectedly accepted freeform apply_patch");
+        };
+        assert!(reason.contains("freeform apply_patch"));
+    }
+
+    #[test]
+    fn session_start_gate_rejects_outbox_over_budget() {
+        let temporary = tempfile::tempdir().unwrap();
+        let catalog = temporary.path().join("models.json");
+        direct_catalog(&catalog, "direct");
+        let state_root = temporary.path().join("state");
+        let _worker = AgentStateLock::acquire(&state_root).unwrap();
+        let queue_root = temporary.path().join("queue");
+        fs::create_dir_all(queue_root.join("pending")).unwrap();
+        let decision = gate_hook_event(
+            &session_start_event(),
+            &HookGateConfig {
+                queue_root,
+                state_root,
+                model_catalog: catalog,
+                max_input_bytes: MAX_HOOK_BYTES,
+                min_free_bytes: 0,
+                max_pending_bytes: 1,
+            },
+        )
+        .unwrap();
+        let HookGateDecision::Blocked { reason } = decision else {
+            panic!("SessionStart unexpectedly accepted an over-budget outbox");
+        };
+        assert!(reason.contains("reserving the SessionStart event"));
+    }
+
+    #[test]
+    fn session_start_gate_rejects_insufficient_disk_budget() {
+        let temporary = tempfile::tempdir().unwrap();
+        let catalog = temporary.path().join("models.json");
+        direct_catalog(&catalog, "direct");
+        let state_root = temporary.path().join("state");
+        let _worker = AgentStateLock::acquire(&state_root).unwrap();
+        let decision = gate_hook_event(
+            &session_start_event(),
+            &HookGateConfig {
+                queue_root: temporary.path().join("queue"),
+                state_root,
+                model_catalog: catalog,
+                max_input_bytes: MAX_HOOK_BYTES,
+                min_free_bytes: u64::MAX,
+                max_pending_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let HookGateDecision::Blocked { reason } = decision else {
+            panic!("SessionStart unexpectedly accepted an impossible disk budget");
+        };
+        assert!(reason.contains("below the"));
+    }
+
+    #[test]
+    fn session_start_gate_rejects_invalid_outbox_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        let catalog = temporary.path().join("models.json");
+        direct_catalog(&catalog, "direct");
+        let state_root = temporary.path().join("state");
+        let _worker = AgentStateLock::acquire(&state_root).unwrap();
+        let queue_root = temporary.path().join("queue-is-a-file");
+        fs::write(&queue_root, b"not-a-directory").unwrap();
+        let decision = gate_hook_event(
+            &session_start_event(),
+            &HookGateConfig {
+                queue_root,
+                state_root,
+                model_catalog: catalog,
+                max_input_bytes: MAX_HOOK_BYTES,
+                min_free_bytes: 0,
+                max_pending_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        assert!(matches!(decision, HookGateDecision::Blocked { .. }));
+    }
+
+    #[test]
+    fn session_start_gate_persists_after_preflight() {
+        let temporary = tempfile::tempdir().unwrap();
+        let catalog = temporary.path().join("models.json");
+        direct_catalog(&catalog, "direct");
+        let state_root = temporary.path().join("state");
+        let _worker = AgentStateLock::acquire(&state_root).unwrap();
+        let queue_root = temporary.path().join("queue");
+        let decision = gate_hook_event(
+            &session_start_event(),
+            &HookGateConfig {
+                queue_root: queue_root.clone(),
+                state_root,
+                model_catalog: catalog,
+                max_input_bytes: MAX_HOOK_BYTES,
+                min_free_bytes: 0,
+                max_pending_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        assert!(matches!(decision, HookGateDecision::Accepted { .. }));
+        assert_eq!(fs::read_dir(queue_root.join("pending")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn direct_catalog_preserves_metadata_and_removes_custom_tools() {
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join("direct-models.json");
+        let source = serde_json::to_vec(&json!({
+            "models":[{
+                "slug":"gpt-5.6-sol",
+                "display_name":"GPT-5.6-Sol",
+                "tool_mode":"code_mode_only",
+                "apply_patch_tool_type":"freeform",
+                "unknown_future_field":{"kept":true}
+            }]
+        }))
+        .unwrap();
+        let summary =
+            write_direct_model_catalog(&source, &output, &["gpt-5.6-sol".to_owned()], false)
+                .unwrap();
+        let catalog: Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+        assert_eq!(catalog["models"][0]["tool_mode"], "direct");
+        assert!(catalog["models"][0].get("apply_patch_tool_type").is_none());
+        assert_eq!(catalog["models"][0]["unknown_future_field"]["kept"], true);
+        assert_eq!(summary.original_tool_modes["gpt-5.6-sol"], "code_mode_only");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&summary.output).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        }
     }
 
     #[test]
@@ -576,6 +1127,32 @@ mod tests {
         assert!(error.to_string().contains("another Codex agent"));
         drop(first);
         AgentStateLock::acquire(&state_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_rejects_invalid_configuration_before_holding_the_gate_lock() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state_root = temporary.path().join("state");
+        let error = run_codex_agent(
+            CodexAgentConfig {
+                queue_root: temporary.path().join("queue"),
+                session_root: temporary.path().join("missing-sessions"),
+                state_root: state_root.clone(),
+                target: DeliveryTarget::Jsonl(temporary.path().join("captures.jsonl")),
+                source_namespace: "test-stock-codex".to_owned(),
+                batch_records: 2,
+                max_envelope_bytes: 4 * 1024 * 1024,
+                request_timeout: Duration::from_secs(1),
+                retry_max_times: 20,
+                poll_interval: Duration::from_millis(10),
+                once: true,
+            },
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("session root"));
+        assert!(!state_root.join("codex-agent.lock").exists());
     }
 
     #[tokio::test]

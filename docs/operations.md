@@ -6,7 +6,7 @@
 /srv/chiptrace/capture/                 Collector sealed/open WAL
 /var/lib/chiptrace/collector-state/     Collector ledger
 /var/lib/chiptrace/relay/               Relay outbox WAL 与 ledger
-~/.local/state/chiptrace/outbox/        Codex Plugin 本地 pending Hook
+~/.local/state/chiptrace/outbox/        Codex Hook 本地 pending 事件
 ~/.local/state/chiptrace/agent/         rollout checkpoint
 ~/.codex/sessions/                      Stock Codex rollout
 ```
@@ -69,25 +69,39 @@ canary 的健康状态。
 入口只能证明模型 Wire，不能单独证明本地工具已经执行。完整 Trace 必须同时收到 Stock
 Codex rollout 与 Hook 生命周期。
 
-## Stock Codex Plugin
+## Stock Codex 配置
 
 构建并安装二进制：
 
 ```bash
 cargo build --release --locked
-install -Dm755 target/release/chiptrace "$HOME/.local/bin/chiptrace"
+install -Dm755 target/release/chiptrace /usr/local/bin/chiptrace
 ```
 
-安装 Marketplace 与插件：
+从当前 Stock Codex 导出模型目录，并在模型交互前启用 direct JSON function 工具：
 
 ```bash
-codex plugin marketplace add XS-MLVP/ChipTrace --ref main
-codex plugin add chiptrace@xs-mlvp
+codex debug models --bundled > codex-models.json
+chiptrace prepare-codex-catalog \
+  --input codex-models.json \
+  --output /etc/chiptrace/codex-models-direct.json \
+  --model gpt-5.6-sol
+install -Dm644 integrations/codex/managed_config.toml.example \
+  /etc/codex/managed_config.toml
+install -Dm644 integrations/codex/requirements.toml.example \
+  /etc/codex/requirements.toml
 ```
 
-插件订阅 `SessionStart`、`SessionEnd`、`Stop`、`Interrupt`、`SubagentStart` 和
-`SubagentStop`。Hook 同步步骤只执行 `codex-hook-spool`，不联网；失败不会替换其他插件
-或全局 Hook。
+将 [受管配置模板](../integrations/codex/managed_config.toml.example) 安装到
+`/etc/codex/managed_config.toml`，将
+[required Hook 模板](../integrations/codex/requirements.toml.example) 安装到
+`/etc/codex/requirements.toml`。Hook 订阅 `SessionStart`、`SessionEnd`、`Stop`、
+`Interrupt`、`SubagentStart` 和 `SubagentStop`，不使用自定义启动命令。用户级未确认
+hash 的 Hook 会被 Stock Codex 标记为 `Untrusted` 并跳过，因此不作为生产部署方式。
+
+SessionStart 同步验证当前模型的 direct 目录、`codex-agent` 独占锁、本地积压和磁盘预算，
+再原子写入 outbox。结构配置错误返回 Codex 原生 `continue:false`，首个 Turn 不执行。
+远端暂时不可用不属于启动失败；只要本地闭环健康，后续由 outbox 续投。
 
 ## codex-agent 用户服务
 
@@ -116,8 +130,8 @@ journalctl --user -u chiptrace-codex-agent.service -n 100 --no-pager
 ```
 
 主机需要无人登录持续采集时，由系统管理员为该账号启用 user manager linger。自定义
-`XDG_STATE_HOME` 时，同步修改 unit 中的 `queue-root` 和插件环境
-`CHIPTRACE_STATE_ROOT`，两者必须指向同一目录。`codex-agent` 对同一 `state-root` 持有
+`XDG_STATE_HOME` 时，同步修改 unit 和 managed Hook 中的 `queue-root`、`state-root`，
+两者必须指向同一目录。`codex-agent` 对同一 `state-root` 持有
 进程级独占锁，第二个实例直接失败，禁止两个 writer 同时推进 rollout checkpoint。
 每批 Capture 获得 Relay durable ACK 后，Agent 以源文件当前长度和最后一行 SHA-256
 重新校验再提交 checkpoint；Codex 正常追加 rollout 不会被误判为越界或截断。
@@ -170,7 +184,7 @@ chiptrace send-otlp \
 canary 必须使用未修改的 Stock Codex 和普通 `codex` 命令：
 
 1. provider `base_url` 指向 18084。
-2. Plugin 与 `codex-agent` 自动产生 Hook、rollout 和 durable ACK。
+2. managed Hook 与 `codex-agent` 自动产生生命周期、rollout 和 durable ACK。
 3. Wire 与 rollout 通过 request/response/call ID 精确关联。
 4. Session start/end、每个 Turn、工具参数/结果/错误、子代理和 Token 均可见。
 5. Raw 重放不重复，原始长度与 SHA-256 守恒。
@@ -197,5 +211,4 @@ canary 必须使用未修改的 Stock Codex 和普通 `codex` 命令：
 不改变业务路由、模型选择或响应语义；出现业务延迟、Capture 冲突、积压持续增长或 Raw
 hash 不守恒时立即回滚。
 
-历史 Harness、patched Codex、bundle 与启动器代码只用于旧数据重放，已从公开 CLI 帮助
-和生产文档移除。
+历史 Harness、bundle 与启动器代码只用于旧数据重放，已从公开 CLI 帮助和生产接入移除。

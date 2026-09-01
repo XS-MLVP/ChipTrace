@@ -5,7 +5,10 @@ use chiptrace::buyer::{
     verify_buyer_package_legacy,
 };
 use chiptrace::capture::{CAPTURE_SCHEMA_VERSION, normalize_capture};
-use chiptrace::codex_hook::{CodexAgentConfig, HookSpoolConfig, run_codex_agent, spool_hook_event};
+use chiptrace::codex_hook::{
+    CodexAgentConfig, HookGateConfig, HookGateDecision, gate_hook_event, run_codex_agent,
+    write_direct_model_catalog,
+};
 use chiptrace::codex_rollout::{
     ExportConfig as CodexRolloutExportConfig, ExportTarget as CodexRolloutTarget,
     export_codex_rollout, resolve_hook_rollout, watch_codex_rollout,
@@ -97,9 +100,11 @@ enum Command {
     /// 从 Codex Stop hook stdin 定位 rollout 并可靠导出。
     #[command(hide = true)]
     CodexHook(CodexHookArgs),
-    /// 将 Stock Codex Hook 原子写入本地 durable outbox；不访问网络。
+    /// 验证 Stock Codex 采集前置条件并将 Hook 原子写入本地 outbox。
     #[command(hide = true)]
-    CodexHookSpool(CodexHookSpoolArgs),
+    CodexHookGate(CodexHookGateArgs),
+    /// 从 Stock Codex 原始模型目录生成 direct JSON function 工具目录。
+    PrepareCodexCatalog(PrepareCodexCatalogArgs),
     /// 恢复 Hook outbox 和 rollout，获得 durable ACK 后推进本地队列。
     CodexAgent(CodexAgentArgs),
     /// 从 Codex 原生 rollout-trace bundle 校验并导出完整运行时事实。
@@ -451,12 +456,35 @@ struct CodexHookArgs {
 }
 
 #[derive(Debug, Args)]
-struct CodexHookSpoolArgs {
-    /// 插件私有数据目录中的本地 outbox 根目录。
+struct CodexHookGateArgs {
+    /// 本地 Hook outbox 根目录。
     #[arg(long)]
     queue_root: PathBuf,
+    /// `codex-agent` 持有独占锁的状态目录。
+    #[arg(long)]
+    state_root: PathBuf,
+    /// `config.toml` 中 `model_catalog_json` 指向的 direct 模型目录。
+    #[arg(long)]
+    model_catalog: PathBuf,
     #[arg(long, default_value_t = 4)]
     max_input_mib: usize,
+    #[arg(long, default_value_t = 5)]
+    min_free_gib: u64,
+    #[arg(long, default_value_t = 10)]
+    max_pending_gib: u64,
+}
+
+#[derive(Debug, Args)]
+struct PrepareCodexCatalogArgs {
+    /// `codex debug models` 的原始 JSON 文件；使用 `-` 从 stdin 读取。
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long, required = true)]
+    model: Vec<String>,
+    #[arg(long)]
+    replace: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1373,21 +1401,51 @@ async fn main() -> Result<()> {
                 .await?,
             )?
         }
-        Command::CodexHookSpool(args) => {
+        Command::CodexHookGate(args) => {
             let max_input_bytes = checked_mib(args.max_input_mib)?;
             let mut hook_input = Vec::new();
             std::io::stdin()
                 .take(max_input_bytes.saturating_add(1) as u64)
                 .read_to_end(&mut hook_input)?;
-            spool_hook_event(
+            match gate_hook_event(
                 &hook_input,
-                &HookSpoolConfig {
+                &HookGateConfig {
                     queue_root: args.queue_root,
+                    state_root: args.state_root,
+                    model_catalog: args.model_catalog,
                     max_input_bytes,
+                    min_free_bytes: checked_gib(args.min_free_gib)?,
+                    max_pending_bytes: checked_gib(args.max_pending_gib)?,
                 },
-            )?;
-            // Command hooks must not print the regular CLI JSON summary to stdout.
+            )? {
+                HookGateDecision::Accepted { .. } => {}
+                HookGateDecision::Blocked { reason } => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&json!({
+                            "continue":false,
+                            "stopReason":reason
+                        }))?
+                    );
+                }
+            }
+            // Codex command hooks accept only their event-specific JSON on stdout.
             return Ok(());
+        }
+        Command::PrepareCodexCatalog(args) => {
+            let mut input = Vec::new();
+            if args.input.as_os_str() == "-" {
+                std::io::stdin().read_to_end(&mut input)?;
+            } else {
+                input = fs::read(&args.input)
+                    .with_context(|| format!("read model catalog {}", args.input.display()))?;
+            }
+            serde_json::to_value(write_direct_model_catalog(
+                &input,
+                &args.output,
+                &args.model,
+                args.replace,
+            )?)?
         }
         Command::CodexAgent(args) => serde_json::to_value(
             run_codex_agent(
@@ -1534,6 +1592,7 @@ async fn main() -> Result<()> {
                 zstd_level: args.zstd_level,
                 workers: args.workers,
                 replace: args.replace,
+                require_pass: true,
             })?)?
         }
         Command::VerifyAssembly(args) => serde_json::to_value(verify_assembly(&args.assembly)?)?,
@@ -1720,6 +1779,12 @@ fn checked_mib(value: usize) -> Result<usize> {
     value
         .checked_mul(1024 * 1024)
         .ok_or_else(|| anyhow::anyhow!("MiB value overflows usize"))
+}
+
+fn checked_gib(value: u64) -> Result<u64> {
+    value
+        .checked_mul(1024 * 1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("GiB value overflows u64"))
 }
 
 async fn shutdown_signal() {
@@ -2033,6 +2098,7 @@ async fn self_test() -> Result<Value> {
         zstd_level: 1,
         workers: 4,
         replace: false,
+        require_pass: true,
     })?;
     let rejection_diagnostic = if release.validation_status == "pass" {
         None
@@ -3490,8 +3556,9 @@ mod cli_tests {
     fn public_help_exposes_only_the_stock_codex_ingest_path() {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("codex-agent"));
+        assert!(help.contains("prepare-codex-catalog"));
         for hidden in [
-            "codex-hook-spool",
+            "codex-hook-gate",
             "codex-run",
             "export-codex-rollout",
             "watch-codex-rollout",

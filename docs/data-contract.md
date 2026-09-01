@@ -49,9 +49,9 @@ dispatcher 必须分别发送 started 与 terminal；Assembly 将它们归并为
 
 ### Stock Codex 生产者
 
-Stock Codex Plugin 将 Hook 原始 JSON 先原子写入本地 outbox；`codex-agent` 再读取 Hook
-引用的 rollout 完整行，并在 Relay durable ACK 后推进 checkpoint。生产者不要求 patched
-Codex、Harness、Runtime Registry 或自定义启动命令。
+Stock Codex managed Hook 将原始 JSON 先原子写入本地 outbox；`codex-agent` 再读取 Hook
+引用的 rollout 完整行，并在 Relay durable ACK 后推进 checkpoint。生产者不要求 Codex
+补丁、Harness、Runtime Registry 或自定义启动命令。
 
 身份按源字段解释：
 

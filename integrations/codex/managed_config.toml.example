@@ -1,0 +1,13 @@
+# 安装到 /etc/codex/managed_config.toml。该层由 Stock Codex 作为受管配置加载。
+model = "gpt-5.6-sol"
+model_provider = "ChipTrace"
+model_catalog_json = "/etc/chiptrace/codex-models-direct.json"
+
+[model_providers.ChipTrace]
+name = "ChipTrace Gateway"
+base_url = "http://172.28.11.121:18084/"
+wire_api = "responses"
+requires_openai_auth = true
+
+[features]
+hooks = true

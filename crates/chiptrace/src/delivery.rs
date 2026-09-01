@@ -42,12 +42,30 @@ enum RelayAck {
 }
 
 pub fn producer_relay_target(base: String) -> Result<DeliveryTarget> {
+    let base = normalized_relay_base(&base)?;
     let bearer_token = std::env::var("CHIPTRACE_PRODUCER_TOKEN")
         .context("CHIPTRACE_PRODUCER_TOKEN is required for /producer/events")?;
     if bearer_token.trim().len() < 32 {
         bail!("CHIPTRACE_PRODUCER_TOKEN must contain at least 32 non-whitespace bytes");
     }
     Ok(DeliveryTarget::ProducerRelay { base, bearer_token })
+}
+
+fn normalized_relay_base(base: &str) -> Result<String> {
+    let base = base.trim();
+    let url = reqwest::Url::parse(base).context("parse ChipTrace Relay URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!(
+            "ChipTrace Relay URL must be an HTTP(S) base URL without credentials, query, or fragment"
+        );
+    }
+    Ok(base.trim_end_matches('/').to_owned())
 }
 
 pub async fn deliver_batch(
@@ -392,6 +410,24 @@ mod tests {
             "counts":{"total":1,"durable":1,"duplicates":0,"conflicts":0,"unavailable":0},
             "results":[{"capture_id":"cap-1","ok":true,"durable":true,"duplicate":false}]
         })
+    }
+
+    #[test]
+    fn relay_base_requires_a_clean_http_url() {
+        assert_eq!(
+            normalized_relay_base("  https://trace.example.com/api/  ").unwrap(),
+            "https://trace.example.com/api"
+        );
+        for invalid in [
+            "",
+            "relay.internal",
+            "ftp://relay.internal",
+            "https://user:secret@relay.internal",
+            "https://relay.internal?tenant=one",
+            "https://relay.internal#fragment",
+        ] {
+            assert!(normalized_relay_base(invalid).is_err(), "{invalid}");
+        }
     }
 
     async fn spawn_server(router: Router) -> (String, tokio::task::JoinHandle<()>) {

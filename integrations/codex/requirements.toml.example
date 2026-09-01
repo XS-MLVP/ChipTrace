@@ -1,0 +1,44 @@
+# 安装到 /etc/codex/requirements.toml。Hook 从 required 层加载且不可被用户关闭。
+model_catalog_json = "/etc/chiptrace/codex-models-direct.json"
+
+[features]
+hooks = true
+
+[hooks]
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "/usr/bin/timeout --signal=KILL 8s /usr/local/bin/chiptrace codex-hook-gate --queue-root \"$HOME/.local/state/chiptrace/outbox\" --state-root \"$HOME/.local/state/chiptrace/agent\" --model-catalog /etc/chiptrace/codex-models-direct.json --min-free-gib 5 --max-pending-gib 10 || /usr/bin/printf '%s\\n' '{\"continue\":false,\"stopReason\":\"ChipTrace preflight command failed\"}'"
+timeout = 12
+statusMessage = "验证 Trace 采集前置条件"
+
+[[hooks.SessionEnd]]
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command = "/usr/local/bin/chiptrace codex-hook-gate --queue-root \"$HOME/.local/state/chiptrace/outbox\" --state-root \"$HOME/.local/state/chiptrace/agent\" --model-catalog /etc/chiptrace/codex-models-direct.json --min-free-gib 5 --max-pending-gib 10"
+timeout = 3
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "/usr/local/bin/chiptrace codex-hook-gate --queue-root \"$HOME/.local/state/chiptrace/outbox\" --state-root \"$HOME/.local/state/chiptrace/agent\" --model-catalog /etc/chiptrace/codex-models-direct.json --min-free-gib 5 --max-pending-gib 10"
+timeout = 10
+
+[[hooks.Interrupt]]
+[[hooks.Interrupt.hooks]]
+type = "command"
+command = "/usr/local/bin/chiptrace codex-hook-gate --queue-root \"$HOME/.local/state/chiptrace/outbox\" --state-root \"$HOME/.local/state/chiptrace/agent\" --model-catalog /etc/chiptrace/codex-models-direct.json --min-free-gib 5 --max-pending-gib 10"
+timeout = 3
+
+[[hooks.SubagentStart]]
+[[hooks.SubagentStart.hooks]]
+type = "command"
+command = "/usr/local/bin/chiptrace codex-hook-gate --queue-root \"$HOME/.local/state/chiptrace/outbox\" --state-root \"$HOME/.local/state/chiptrace/agent\" --model-catalog /etc/chiptrace/codex-models-direct.json --min-free-gib 5 --max-pending-gib 10"
+timeout = 10
+
+[[hooks.SubagentStop]]
+[[hooks.SubagentStop.hooks]]
+type = "command"
+command = "/usr/local/bin/chiptrace codex-hook-gate --queue-root \"$HOME/.local/state/chiptrace/outbox\" --state-root \"$HOME/.local/state/chiptrace/agent\" --model-catalog /etc/chiptrace/codex-models-direct.json --min-free-gib 5 --max-pending-gib 10"
+timeout = 10

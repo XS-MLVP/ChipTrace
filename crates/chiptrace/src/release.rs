@@ -36,6 +36,7 @@ pub struct ReleaseConfig {
     pub zstd_level: i32,
     pub workers: usize,
     pub replace: bool,
+    pub require_pass: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +91,9 @@ pub fn build_release(config: ReleaseConfig) -> Result<ReleaseManifest> {
     }
     if !(0.0..=100.0).contains(&config.minimum_score) {
         bail!("minimum_score must be between 0 and 100");
+    }
+    if config.require_pass && config.profile == Profile::BuyerV7 && config.minimum_score < 90.0 {
+        bail!("buyer-v7 Release requires minimum_score >= 90");
     }
     if config.target_part_bytes == 0 || config.dedup_partitions == 0 {
         bail!("target part bytes and dedup partitions must be positive");
@@ -318,6 +322,13 @@ pub fn build_release(config: ReleaseConfig) -> Result<ReleaseManifest> {
     write_checksums(&staging, &manifest)?;
     sync_tree(&staging)?;
     verify_release(&staging, false)?;
+    if config.require_pass && manifest.validation_status != "pass" {
+        bail!(
+            "Release failed closed: eligible_sessions={}, parse_failures={}, conserved={conserved}",
+            manifest.counts.eligible_sessions,
+            manifest.counts.parse_failures
+        );
+    }
     if output.exists() {
         fs::remove_dir_all(&output)?;
     }
@@ -1449,6 +1460,7 @@ mod tests {
             zstd_level: 1,
             workers: 4,
             replace: false,
+            require_pass: false,
         })
         .unwrap();
         assert_eq!(manifest.processing_workers, 4);
@@ -1456,6 +1468,43 @@ mod tests {
         assert_eq!(manifest.counts.exact_duplicates_removed, 1);
         assert_eq!(manifest.counts.assessed_sessions, 1);
         assert_eq!(manifest.counts.rejected_sessions, 1);
+    }
+
+    #[test]
+    fn strict_release_does_not_publish_a_failed_artifact() {
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("sessions.jsonl");
+        let output = temporary.path().join("release");
+        fs::write(
+            &input,
+            format!(
+                "{}\n",
+                session(
+                    "too-short",
+                    vec![
+                        json!({"role":"user","content":"short"}),
+                        json!({"role":"assistant","content":"answer"})
+                    ]
+                )
+            ),
+        )
+        .unwrap();
+        let error = build_release(ReleaseConfig {
+            inputs: vec![input],
+            output: output.clone(),
+            release_id: "strict-failure".to_owned(),
+            profile: Profile::BuyerV7,
+            minimum_score: 90.0,
+            target_part_bytes: 1024 * 1024,
+            dedup_partitions: 1,
+            zstd_level: 1,
+            workers: 1,
+            replace: false,
+            require_pass: true,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("Release failed closed"));
+        assert!(!output.exists());
     }
 
     #[test]

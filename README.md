@@ -21,7 +21,7 @@ OpenAI-compatible Wire 与本地 rollout 合并为可验证轨迹，并输出 La
 ```mermaid
 flowchart LR
     A[Stock Codex] -->|Responses| B[18084 / Gateway]
-    A -->|Plugin Hooks| C[Local Outbox]
+    A -->|Managed Hooks| C[Local Outbox]
     B --> D[Wire Raw]
     C --> E[codex-agent]
     E --> F[Relay / Collector WAL]
@@ -32,7 +32,7 @@ flowchart LR
 ```
 
 - 无损保存请求、响应、SSE、rollout 原始行及其 SHA-256。
-- Hook 先原子写入本地 outbox，`codex-agent` 在 durable ACK 后推进队列。
+- SessionStart 前置检查通过后原子写入本地 outbox，`codex-agent` 在 durable ACK 后推进队列。
 - 精确关联 Session、Turn、模型调用、真实工具执行、子代理和 Token。
 - 分离模型状态、上游传输状态和客户端交付状态。
 - 生成 OpenInference OTLP 树、验收评分、Manifest、JSONL 和 `tar.gz` 分包；OTLP 正文仅
@@ -59,21 +59,22 @@ make m0-test
 
 ## 接入 Stock Codex
 
-先将 `chiptrace` 安装到 Hook 和用户服务都能访问的位置：
+管理员安装一次 `chiptrace`、用户服务、受管配置并生成 direct 模型目录：
 
 ```bash
-install -Dm755 target/release/chiptrace "$HOME/.local/bin/chiptrace"
+install -Dm755 target/release/chiptrace /usr/local/bin/chiptrace
+codex debug models --bundled > codex-models.json
+chiptrace prepare-codex-catalog \
+  --input codex-models.json \
+  --output /etc/chiptrace/codex-models-direct.json \
+  --model gpt-5.6-sol
+install -Dm644 integrations/codex/managed_config.toml.example \
+  /etc/codex/managed_config.toml
+install -Dm644 integrations/codex/requirements.toml.example \
+  /etc/codex/requirements.toml
 ```
 
-Codex 的 OpenAI provider `base_url` 指向承载 Wire 旁路采集的网关。安装仓库插件后，
-用户仍直接运行普通 `codex`：
-
-```bash
-codex plugin marketplace add XS-MLVP/ChipTrace --ref main
-codex plugin add chiptrace@xs-mlvp
-```
-
-插件只写本地 outbox，不访问网络。使用仓库提供的 systemd 用户服务持续投递：
+使用仓库提供的 systemd 用户服务持续投递：
 
 ```bash
 install -Dm644 deploy/chiptrace-codex-agent.service \
@@ -89,6 +90,11 @@ Relay、18084 入口及 canary 步骤见[部署与运维](docs/operations.md)。
 systemctl --user daemon-reload
 systemctl --user enable --now chiptrace-codex-agent.service
 ```
+
+安装 [Stock Codex 受管配置](integrations/codex/managed_config.toml.example) 和
+[required Hook](integrations/codex/requirements.toml.example)。此后用户只运行普通 `codex`。
+配置错误、worker 未运行、outbox 超限或磁盘预算不足时，SessionStart 在首个 Turn 前失败；
+远端短时断开由本地 outbox 吸收。用户级未受信 Hook 不属于严格生产接入。
 
 ## 处理与交付
 

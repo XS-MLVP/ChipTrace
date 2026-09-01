@@ -1,8 +1,8 @@
 # 交付验收矩阵
 
-> 本文中 `codex-run`、patched Codex、Harness 与 bundle canary 仅记录历史兼容验证，
-> 不代表当前生产接入。当前唯一生产验收路径是 Stock Codex + Plugin + Wire；历史 100 分
-> 不能替代真实 Stock Codex canary。
+> 本文中的旧采集入口、patched Codex、Harness 与 bundle canary 仅记录历史兼容验证，
+> 不代表当前生产接入。当前唯一生产验收路径是 Stock Codex managed config + required
+> Hook + Wire；历史 100 分不能替代真实 Stock Codex canary。
 
 ChipTrace 将原始采集、轨迹组装、质量评分和采购交付拆成四个可独立复验的层。
 每层只声明自己能证明的事实，不用传输完整性替代轨迹语义，也不用结构分替代任务
@@ -65,8 +65,8 @@ all_required_gates_pass && score >= minimum_score
 
 ## Stock Codex 主链 canary（2026-09-01）
 
-使用未修改的 Stock Codex、普通 `codex` 命令、Plugin 本地 outbox 和隔离 Wire 入口完成
-真实代码任务。该结果验证当前源码，不表示生产 `18084` 已升级：
+使用未修改的 Stock Codex、普通 `codex` 命令、旧 Hook outbox 和隔离 Wire 入口完成真实
+代码任务。该结果验证对应历史源码，不表示生产 `18084` 已升级：
 
 | 项目 | 结果 |
 | --- | --- |
@@ -98,7 +98,7 @@ Token 为 0。13/13 未达到结构化工具门槛且缺少合格的真实结果
 因此主要缺口不是 WAL/OSS 拼接。完整证据见仓库外同级报告
 `reports/oss-raw-archive-and-online-quality-20260828.md`。
 
-该批数据形成于 Stock Plugin 主链上线前，只包含代理可见的模型 Wire。若原生产主机仍
+该批数据形成于 Stock Codex 生命周期采集上线前，只包含代理可见的模型 Wire。若原生产主机仍
 保留 rollout，可以用当前 importer 精确回填；否则只能保留为 API-only 历史数据，不能
 补造 Session、工具执行、Schema 或 provider 身份。
 
@@ -267,7 +267,7 @@ runtime 结果，并通过六项完整性硬门槛。
 ## Stock Codex 生产闭环（2026-09-01）
 
 生产 `18084`、Relay 和 Collector 保持 revision `68ab122`，使用未修改的
-`codex-cli 0.152.0-alpha.7.2`、普通 `codex exec`、`0.6.0` Plugin 和常驻
+`codex-cli 0.152.0-alpha.7.2`、普通 `codex exec`、当时的 Hook 入口和常驻
 `codex-agent` 完成真实只读 canary。未使用 Harness、Registry、patched Codex、bundle
 或自定义启动器。Session ID 为 `01a05b3e-71bf-7d30-9df7-8b06441d21b1`，Langfuse
 Trace ID 为 `073f59de062830b6bebfbb14d4b1e0c9`。
@@ -320,11 +320,30 @@ AGENT、22 个 GENERATION 和 19 个 TOOL。
 | OTLP 体积 | 20 KiB 预览 policy 下未压缩体积从 31,949,674 降至 4,140,098 bytes，减少 87.0%；完整值仍在 Canonical/Raw |
 | Buyer v7 | 85 分，52 次真实模型调用、5 个真实模型工具名、52/52 配对；唯一失败为 `tool_definitions` |
 
-`exec` 是 Stock Codex 原生 custom grammar，不是采购合同要求的 JSON function
-`parameters` schema；其余 4 个被调用工具具有完整定义。内层 `CommandExecution` 仅保留在
-Runtime DAG/OTLP，不改写成新的模型 tool call。该样本不能通过清洗、改名或静态 Schema
-补造升到 90 分；采购方需接受 custom-tool Profile，或 Stock Codex 必须真实暴露并调用
-5 个符合合同的 JSON function 工具。
+该历史 Session 的 `exec` 是 Stock Codex custom grammar，不是采购合同要求的 JSON
+function `parameters` schema；其余 4 个被调用工具具有完整定义。内层
+`CommandExecution` 仅保留在 Runtime DAG/OTLP，不改写成新的模型 tool call。该历史样本
+不能通过清洗、改名或静态 Schema 补造升到 90 分。
+
+### Direct function 生产者验证
+
+使用未修改的 `codex-cli 0.152.0-alpha.7.2` 和 `model_catalog_json` 将
+`gpt-5.6-sol` 在请求构造前切换为 `tool_mode=direct`。隔离 Wire 请求包含 10 个叶子工具：
+10/10 为 `type=function`，10/10 有 JSON `parameters`，custom/freeform 工具为 0，缺失
+Schema 为 0。工具名包括 `exec_command`、`write_stdin`、`view_image` 和多代理工具。
+
+同一隔离入口先收到 1 次正常 direct 请求；随后分别模拟 `codex-agent` 缺失和 Hook
+二进制缺失，两次 SessionStart 均在首个 Turn 前停止，入口请求计数保持为 1。该验证证明
+工具定义问题已在生产者请求构造前解决，且启动门禁先于 HTTP；它是短协议 canary，不代表
+任一自然 Session 已满足 10 个有效轮次、实际调用 5 种工具或 buyer-v7 90 分。正式上线前
+仍需以 managed config + required Hook 跑一条真实长 Session 并重新评分。
+
+同版本 Stock Codex 在隔离 Linux 容器中加载最终两份系统模板后，`hooks/list` 恰好返回 6 个
+处理器；全部 `enabled=true`、`isManaged=true`、`trustStatus=managed`，warning/error 为 0。
+`managed_config.toml` 本身不再包含 Hook，因此不会与 `requirements.toml` 的 required Hook
+重复注册。另以 session flag 尝试切换到旁路 provider 后，`config/read` 的有效配置仍为
+`model_provider=ChipTrace`、`base_url=http://172.28.11.121:18084/`，direct catalog 路径也
+保持 `/etc/chiptrace/codex-models-direct.json`。
 
 ## 正式交付门槛
 

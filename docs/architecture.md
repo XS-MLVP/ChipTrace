@@ -12,7 +12,7 @@ ChipTrace 只解决四件事：无损保存模型 Wire 与 Codex rollout、可�
 flowchart TB
     subgraph Host[Stock Codex 主机]
         C[Stock Codex]
-        P[ChipTrace Plugin]
+        P[Managed Hook Gate]
         O[Local Durable Outbox]
         A[codex-agent]
         C --> P --> O --> A
@@ -30,8 +30,10 @@ flowchart TB
     T --> Q[Buyer Score / JSONL Release]
 ```
 
-Stock Codex 不需要补丁、启动器或自定义任务标签。插件 Hook 只做同步本地落盘，网络重试由
-独立 `codex-agent` 承担，避免采集故障阻塞用户交互。
+Stock Codex 不需要补丁、启动器或自定义任务标签。`/etc/codex/managed_config.toml` 固定
+18084 provider 与模型，`/etc/codex/requirements.toml` 固定 direct function 模型目录和
+required Hook。Hook 不依赖用户确认 hash。SessionStart 只检查本地持久化闭环；网络重试
+由独立 `codex-agent` 承担。
 
 ## 事实层
 
@@ -42,7 +44,7 @@ ChipTrace 不从下游投影反推或补造上游事实：
 | 请求、响应、SSE、HTTP 状态 | 18084 Wire | 模型输入输出、工具定义、usage、协议终态 |
 | Session/Turn 与消息事件 | Stock Codex rollout | 会话边界、系统提示词、压缩、子代理 |
 | 工具真实执行 | rollout `item_completed` | 参数、结果、错误、取消、耗时 |
-| Hook 生命周期 | Codex Plugin | Session start/end、Stop、Interrupt、子代理事件 |
+| Hook 生命周期 | Codex managed Hook | Session start/end、Stop、Interrupt、子代理事件 |
 | Raw lineage | Relay/Collector | 原始字节、长度、SHA-256、attempt、checkpoint |
 
 Canonical 以单次模型交互为原子：
@@ -55,8 +57,9 @@ Trace
 └── raw_capture_refs[]
 ```
 
-`model_tool_call`、`tool_result_submitted` 和 `runtime_tool_execution` 分别保存。外层 Code
-Mode `exec` 与内层命令执行同时保留，不互相替换。
+`model_tool_call`、`tool_result_submitted` 和 `runtime_tool_execution` 分别保存。历史 Code
+Mode 外层 `exec` 与内层命令执行同时保留，不互相替换；新生产数据使用模型实际发出的
+direct function call。
 
 ## 身份与关联
 
@@ -68,12 +71,14 @@ Mode `exec` 与内层命令执行同时保留，不互相替换。
 - `parent_thread_id` 与 `agent_path` 组成子代理 DAG。
 - `request_id`、`response_id`、`previous_response_id` 和 `call_id` 只做精确关联。
 
-Code Mode 内层执行只在同一 Turn 恰有一个未闭合外层调用时挂到该调用。存在多个候选时，
+历史 Code Mode 内层执行只在同一 Turn 恰有一个未闭合外层调用时挂到该调用。存在多个候选时，
 执行挂到 Turn 根并标记 warning，不选择一个“最像”的父节点。
 
 工具 schema 优先来自 Wire 中模型实际收到的 `tools`/`additional_tools`。rollout 未携带
 schema 时保持 `source_complete=false`；只有调用名能与完整真实定义精确匹配时，Buyer
-工具定义门槛才通过。Runtime Registry 不是生产依赖，也不能用静态模板补 schema。
+工具定义门槛才通过。生产配置通过 Stock Codex `model_catalog_json` 在请求构造前选择
+`tool_mode=direct`。当前仅有 freeform 形态的 `apply_patch` 不在 direct 请求中出现，也不
+转换为 function；Runtime Registry 和清洗期 Schema 适配都不是生产依赖。
 
 ## 状态模型
 
@@ -110,7 +115,8 @@ delivery_ready -> training_ready -> buyer_eligible
 
 ## 可靠投递
 
-1. Hook 在用户主机写临时文件、`fsync`，再原子发布到 `pending/`。
+1. SessionStart 验证 direct 模型目录、worker 锁、积压和磁盘预算，再写临时文件、
+   `fsync` 并原子发布到 `pending/`；失败时 Codex 在首个 Turn 前停止。
 2. `codex-agent` 读取 Hook 指向的 rollout 完整行，保留原文与 SHA-256。
 3. Producer 使用确定性 Capture ID，断线至少重试 20 次。
 4. Relay 本地 WAL durable ACK 后，Agent 才删除 pending Hook。
