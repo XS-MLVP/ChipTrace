@@ -1,148 +1,72 @@
 # 架构
 
-## 目标
-
-ChipTrace 只解决四件事：无损保存模型 Wire 与 Codex rollout、可靠投递、生成标准 OTLP、
-输出可验证的采购数据。查询、回放、人工评分和 LLM Judge 交给 Langfuse，不在本项目重复
-建设。
-
-## 单一主链
-
-```mermaid
-flowchart TB
-    subgraph Host[Stock Codex 主机]
-        C[Stock Codex]
-        P[Managed Hook Gate]
-        O[Local Durable Outbox]
-        A[codex-agent]
-        C --> P --> O --> A
-    end
-
-    C -->|OpenAI Responses| W[18084 Wire Adapter]
-    W -->|api_snapshot| R[Rust Relay]
-    A -->|rollout + lifecycle| R
-    R --> L[Rust Collector / WAL]
-    L --> S[Raw Segment / Checkpoint / OSS]
-    S --> N[Canonical Normalizer]
-    N --> T[ModelInteraction + RuntimeSpan + Link]
-    T --> X[OTLP / OpenInference]
-    X --> F[Langfuse]
-    T --> Q[Buyer Score / JSONL Release]
-```
-
-Stock Codex 不需要补丁、启动器或自定义任务标签。`/etc/codex/managed_config.toml` 固定
-18084 provider 与模型，`/etc/codex/requirements.toml` 固定 direct function 模型目录和
-required Hook。Hook 不依赖用户确认 hash。SessionStart 只检查本地持久化闭环；网络重试
-由独立 `codex-agent` 承担。
-
-## 事实层
-
-ChipTrace 不从下游投影反推或补造上游事实：
-
-| 事实 | 权威来源 | 用途 |
-| --- | --- | --- |
-| 请求、响应、SSE、HTTP 状态 | 18084 Wire | 模型输入输出、工具定义、usage、协议终态 |
-| Session/Turn 与消息事件 | Stock Codex rollout | 会话边界、系统提示词、压缩、子代理 |
-| 工具真实执行 | rollout `item_completed` | 参数、结果、错误、取消、耗时 |
-| Hook 生命周期 | Codex managed Hook | Session start/end、Stop、Interrupt、子代理事件 |
-| Raw lineage | Relay/Collector | 原始字节、长度、SHA-256、attempt、checkpoint |
-
-Canonical 以单次模型交互为原子：
+ChipTrace 只维护一条生产数据路径：
 
 ```text
-Trace
-├── ModelInteraction[]
-├── RuntimeSpan[]
-├── InteractionLink[]
-└── raw_capture_refs[]
+Stock Codex
+  ├─ OpenAI Responses ───────────────┐
+  ├─ OTLP JSON logs/traces ─────────┼─> 18084 Cloud Gateway
+  └─ required lifecycle Hooks ──────┘          │
+                                                v
+                                    Rust Relay -> WAL -> OSS Raw
+                                                │
+                                                v
+                                       cloud-acceptance
+                                                │
+                         ┌──────────────────────┴───────────────────┐
+                         v                                          v
+              Buyer JSONL tar.gz                           OTLP / Langfuse
 ```
 
-`model_tool_call`、`tool_result_submitted` 和 `runtime_tool_execution` 分别保存。历史 Code
-Mode 外层 `exec` 与内层命令执行同时保留，不互相替换；新生产数据使用模型实际发出的
-direct function call。
+用户主机只运行未修改的 Stock Codex 和系统下发的原生配置。采集、可靠存储、
+轨迹组装和采购验收全部在云端完成。Langfuse 是可选展示层，不是 Raw 事实源或采购准入器。
 
-## 身份与关联
+## 权威事实
 
-身份使用源字段，不从 thread ID 猜任务边界：
+| 事实 | 来源 |
+| --- | --- |
+| 请求、响应、SSE、工具定义、模型调用、结果回传 | 18084 Responses Wire |
+| 工具真实参数、输出、成功失败、截断和耗时 | Stock Codex `codex.tool_result` OTLP log |
+| Session、Turn、中断、压缩和子代理生命周期 | Stock Codex required Hook |
+| 模型路由、Provider 和 API Token | Sub2API usage log |
 
-- `session_meta.session_id` 映射为 `session.id`。
-- `session_meta.id` 映射为 `thread_id`。
-- 根线程的 `root_turn_id` 是 OTLP Trace 边界。
-- `parent_thread_id` 与 `agent_path` 组成子代理 DAG。
-- `request_id`、`response_id`、`previous_response_id` 和 `call_id` 只做精确关联。
+入口保留每个 HTTP envelope 的原始 UTF-8 字节、长度和 SHA-256。Canonical 只通过
+`session-id`、`thread-id`、`x-codex-turn-metadata`、`call_id`、request ID 和
+`traceparent` 精确关联。不同来源冲突、未来事件无法解析、工具输出截断或任务未闭合时，
+Raw 继续保留，但 Session 为 incomplete。
 
-历史 Code Mode 内层执行只在同一 Turn 恰有一个未闭合外层调用时挂到该调用。存在多个候选时，
-执行挂到 Turn 根并标记 warning，不选择一个“最像”的父节点。
+## 工具定义
 
-工具 schema 优先来自 Wire 中模型实际收到的 `tools`/`additional_tools`。rollout 未携带
-schema 时保持 `source_complete=false`；只有调用名能与完整真实定义精确匹配时，Buyer
-工具定义门槛才通过。生产配置通过 Stock Codex `model_catalog_json` 在请求构造前选择
-`tool_mode=direct`。当前仅有 freeform 形态的 `apply_patch` 不在 direct 请求中出现，也不
-转换为 function；Runtime Registry 和清洗期 Schema 适配都不是生产依赖。
+云端 `/models` 为真实模型名 `gpt-5.6-sol` 返回版本化模型能力，并将 `tool_mode` 固定为
+`direct`。18084 网关验证 Provider 业务凭据，再用内部采集凭据读取 Relay 目录；业务凭据
+不会传给 Relay。Stock Codex 因而在真实 Responses 请求中发送 JSON function tools 和完整
+`parameters`；这份 Wire 是 Tool Schema 的唯一依据。运行时结果只能关联已有模型调用，
+不能把内层执行改写为另一个模型调用。
 
-## 状态模型
+## 完整性
 
-流式响应分别记录：
+以下条件相互独立，任何分数都不能补偿硬失败：
 
 ```text
-model_status
-upstream_transport_status
-client_delivery_status
+Raw committed
+  AND raw bytes complete
+  AND Responses protocol complete
+  AND runtime complete
+  AND Session root complete
+  AND exact parent/call links complete
+  AND Buyer v7 hard gates pass
+  AND score >= 90
+  = delivery ready
 ```
 
-`[DONE]` 只表示 SSE framing 结束。模型 completed 与客户端 cancelled 可以同时成立；
-SSE error、EOF 无终态和传输错误不会被改写为 completed。
+成功、失败、取消、重试和 open tail 都保留。Responses `[DONE]` 只表示传输 framing 结束；
+模型终态、上游传输状态和客户端交付状态分别记录。
 
-制品采用六项硬门槛：
+## 可靠性
 
-```text
-artifact_valid
-raw_bytes_complete
-protocol_complete
-runtime_complete
-root_complete
-delivery_ready
-```
+18084 的 Wire Capture 先写云端网关磁盘 outbox，再异步送入 Rust Relay。OTLP 和 Hook 在
+Relay durable ACK 后返回。Relay 和 Collector 使用确定性 Capture ID、WAL、ledger、重启
+恢复、批量投递和有界背压；OSS 只接收 sealed Segment，并以 Manifest + Checkpoint 提交。
 
-Assembly 将同一结果写入 `meta.trace_readiness`。评分依次区分：
-
-```text
-delivery_ready -> training_ready -> buyer_eligible
-```
-
-`training_ready` 还要求闭合 Session 和真实 User → Assistant 训练交互；
-`buyer_eligible` 再叠加指定采购 Profile。`score >= 90` 仍需全部采购 hard gate 通过。
-
-## 可靠投递
-
-1. SessionStart 验证 direct 模型目录、worker 锁、积压和磁盘预算，再写临时文件、
-   `fsync` 并原子发布到 `pending/`；失败时 Codex 在首个 Turn 前停止。
-2. `codex-agent` 读取 Hook 指向的 rollout 完整行，保留原文与 SHA-256。
-3. Producer 使用确定性 Capture ID，断线至少重试 20 次。
-4. Relay 本地 WAL durable ACK 后，Agent 才删除 pending Hook。
-5. Relay 异步续投 Collector；相同 ID/相同字节幂等，相同 ID/不同字节冲突。
-6. Collector 封存 Segment 后写 Manifest 和 Checkpoint，再发布到 OSS/S3。
-
-认证只作用于 `/producer/event(s)`；OpenAI Wire Capture 路径保持与网关内部集成一致。正文
-校验失败返回 400 并隔离，只有网络或下游暂时故障返回可重试的 5xx。
-
-## OTLP 与 Langfuse
-
-OTLP 投影读取 Canonical 与 `InteractionLink`，输出：
-
-- `openinference.span.kind=AGENT|LLM|TOOL`
-- 每个 Span 的 `session.id`
-- `gen_ai.*` 模型、Token 和响应字段
-- 工具名称、ID、参数、结果和真实 schema
-- 每个 Turn 一个根，内部父引用解析率 100%
-
-Langfuse 接收裁剪后的标准 OTLP。输入、输出、工具参数、结果和 schema 单属性最多保留
-20 KiB UTF-8 预览；超限值附原长度与 SHA-256。完整正文和大对象留在 Canonical/Raw，
-通过 hash 与引用回查。
-
-## 性能边界
-
-在线路径使用有界 Body、队列、批次和在途字节预算。Relay 与 Collector 分开确认，按
-`SHA-256(captureId) % shards` 固定分片；离线投影、压缩和 OSS 发布不占业务请求时延。
-吞吐测试必须分别报告业务 Wire、WAL durable ACK、压缩与对象上传，不把内存处理速度
-写成端到端吞吐。
+纯云端模式不能保证客户端断网后补发尚未到达云端的事件。因此 required `SessionStart`
+在采集入口不可达时阻止任务开始；运行中缺失的 Session 保留作取证，但不会进入 Release。

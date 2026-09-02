@@ -7,7 +7,7 @@
   "properties": {
     "version": {"const": "chiptrace.capture.v2"},
     "recordType": {
-      "enum": ["api_snapshot", "lifecycle_event", "tool_execution", "evaluation", "rollout_event"]
+      "enum": ["api_snapshot", "lifecycle_event", "tool_execution", "evaluation", "rollout_event", "telemetry_batch"]
     },
     "captureId": {
       "type": "string",
@@ -85,6 +85,7 @@
     "captureErrorCode": {"type": ["string", "null"]},
     "isFinalSnapshot": {"type": "boolean"},
     "producerModel": {"type": ["string", "null"]},
+    "requestedModelAlias": {"type": ["string", "null"]},
     "systemPrompt": {"type": ["string", "null"]},
     "rolloutMessages": {
       "type": "array",
@@ -147,6 +148,7 @@
     },
     "lifecycleEvent": {"$ref": "#/$defs/lifecycleEvent"},
     "toolExecution": {"$ref": "#/$defs/toolExecution"},
+    "telemetryBatch": {"$ref": "#/$defs/telemetryBatch"},
     "fieldEvidence": {
       "type": "array",
       "items": {"$ref": "#/$defs/fieldEvidence"}
@@ -154,6 +156,10 @@
     "fieldEvidenceConflicts": {
       "type": "array",
       "items": {"$ref": "#/$defs/fieldEvidenceConflict"}
+    },
+    "traceContextErrors": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
     },
     "gatewayEvidence": {"$ref": "#/$defs/gatewayEvidence"},
     "gatewayEvidenceJoin": {"$ref": "#/$defs/gatewayEvidenceJoin"}
@@ -464,6 +470,36 @@
       ],
       "additionalProperties": true
     },
+    "telemetryBatch": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "endpoint",
+        "raw_json",
+        "raw_bytes",
+        "raw_sha256",
+        "source_records",
+        "derived_captures",
+        "unknown_events",
+        "conversion_errors"
+      ],
+      "properties": {
+        "schema_version": {"const": "chiptrace.telemetry-batch.v1"},
+        "endpoint": {"enum": ["otlp_logs", "otlp_traces", "codex_hook"]},
+        "raw_json": {"type": "string"},
+        "raw_bytes": {"type": "integer", "minimum": 1},
+        "raw_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_records": {"type": "integer", "minimum": 0},
+        "derived_captures": {"type": "integer", "minimum": 0},
+        "unknown_events": {"type": "integer", "minimum": 0},
+        "attributed_quality_errors": {"type": "integer", "minimum": 0},
+        "conversion_errors": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      },
+      "additionalProperties": false
+    },
     "toolDefinition": {
       "type": "object",
       "required": ["name"],
@@ -543,6 +579,10 @@
     {
       "if": {"properties": {"recordType": {"const": "rollout_event"}}, "required": ["recordType"]},
       "then": {"required": ["rolloutEvent"]}
+    },
+    {
+      "if": {"properties": {"recordType": {"const": "telemetry_batch"}}, "required": ["recordType"]},
+      "then": {"required": ["telemetryBatch"]}
     }
   ],
   "additionalProperties": true

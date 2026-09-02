@@ -28,7 +28,7 @@
     "encoding": {"const": "UTF-8"},
     "session_atomic": {"const": true},
     "source_part": {"type": "string", "minLength": 1},
-    "lineage_status": {"enum": ["complete", "legacy_unbound"]},
+    "lineage_status": {"const": "complete"},
     "records": {"type": "integer", "minimum": 1},
     "jsonl_file": {"const": "sessions.jsonl"},
     "jsonl_bytes": {"type": "integer", "minimum": 1},

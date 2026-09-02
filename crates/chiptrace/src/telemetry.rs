@@ -715,16 +715,16 @@ fn otlp_record(
 }
 
 fn projection_ids(value: &Value, identity_field: &str) -> (String, String) {
-    let session_turn_scoped = value
+    let canonical_session_scoped = value
         .pointer("/trace_context/task_session_id")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .is_none()
-        && value
-            .pointer("/trace_context/root_turn_id")
+        .is_some()
+        || value
+            .pointer("/trace_context/session_id")
             .and_then(Value::as_str)
             .is_some_and(|value| !value.trim().is_empty());
-    let trace_id = if session_turn_scoped {
+    let trace_id = if canonical_session_scoped {
         let seed = projection_trace_scope(value, identity_field);
         sha256(seed.as_bytes())[..32].to_owned()
     } else {
@@ -763,19 +763,22 @@ fn projection_trace_scope(value: &Value, identity_field: &str) -> String {
         .pointer("/trace_context/session_id")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty());
-    let turn_id = value
+    if let Some(session_id) = session_id {
+        return format!("session:{session_id}");
+    }
+    value
         .pointer("/trace_context/root_turn_id")
         .or_else(|| value.pointer("/trace_context/turn_id"))
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty());
-    match (session_id, turn_id) {
-        (Some(session_id), Some(turn_id)) => format!("session:{session_id}\0turn:{turn_id}"),
-        (Some(session_id), None) => format!("session:{session_id}"),
-        (None, Some(turn_id)) => format!("turn:{turn_id}"),
-        (None, None) => string_field(value, identity_field)
-            .unwrap_or("missing")
-            .to_owned(),
-    }
+        .filter(|value| !value.trim().is_empty())
+        .map_or_else(
+            || {
+                string_field(value, identity_field)
+                    .unwrap_or("missing")
+                    .to_owned()
+            },
+            |turn_id| format!("turn:{turn_id}"),
+        )
 }
 
 fn session_id(value: &Value) -> Option<&str> {
@@ -1089,14 +1092,18 @@ mod tests {
     }
 
     #[test]
-    fn otlp_export_accepts_multiple_turn_traces_with_one_root_each() {
-        let roots = ["turn-a", "turn-b"].map(|turn| {
+    fn otlp_export_accepts_multiple_session_traces_with_one_root_each() {
+        let roots = [("session-a", "turn-a"), ("session-b", "turn-b")].map(|(session, turn)| {
             json!({
                 "span_id":format!("root-{turn}"),
                 "trace_context":{
-                    "session_id":"session-1",
+                    "session_id":session,
                     "root_turn_id":turn,
-                    "trace_id":"0123456789abcdef0123456789abcdef"
+                    "trace_id":if session == "session-a" {
+                        "0123456789abcdef0123456789abcdef"
+                    } else {
+                        "fedcba9876543210fedcba9876543210"
+                    }
                 },
                 "span_kind":"task_root","name":"turn","status":"completed",
                 "started_at":"100","finished_at":"200","raw_capture_refs":[turn]

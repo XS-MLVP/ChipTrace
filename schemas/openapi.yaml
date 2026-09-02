@@ -1,14 +1,25 @@
 openapi: 3.1.0
 info:
-  title: 芯迹采集 API
+  title: 芯迹云端采集 API
   version: 0.6.0
-  description: >-
-    Rust Collector/Relay 的持久化采集接口。Capture 与 producer event 最终进入
-    同一 durable WAL；producer 路径由本机 Relay 提供。
+  description: Stock Codex Wire、OTLP JSON 与 required Hook 的唯一云端采集入口。
 paths:
+  /models:
+    get:
+      summary: 返回 Stock Codex 受管模型目录
+      description: 18084 验证 Provider 业务凭据后返回只读目录；业务凭据不进入 Relay。
+      security:
+        - businessBearer: []
+      responses:
+        "200": {description: 版本化模型能力与 ETag}
+        "401": {description: Provider 业务凭据缺失或无效}
+        "500": {description: 服务端目录无效}
+        "503": {description: Provider 或采集目录暂时不可用}
   /capture:
     post:
-      summary: 持久化一条 Capture
+      summary: 持久化一条网关 Wire Capture
+      security:
+        - cloudBearer: []
       requestBody:
         required: true
         content:
@@ -16,102 +27,100 @@ paths:
             schema:
               $ref: ./capture-v2.schema.json
       responses:
-        "202": {description: WAL 与 ledger 已完成持久化}
-        "200": {description: 相同 captureId 与字节已持久化}
+        "202": {description: WAL 与 ledger 已持久化}
+        "200": {description: 相同 Capture 已持久化}
         "400": {description: Capture 无效}
-        "409": {description: captureId 对应不同字节}
-        "413": {description: Capture 超过大小上限}
-        "415": {description: Content-Type 不是 application/json}
+        "401": {description: 内部采集 Token 缺失或无效}
+        "409": {description: Capture ID 对应不同字节}
+        "413": {description: 请求超过大小上限}
         "503": {description: 背压或存储不可用}
   /captures:
     post:
-      summary: 批量持久化 Capture NDJSON
-      description: >-
-        每行一个 Capture。响应逐条返回 durable、duplicate、conflict 或
-        unavailable；所有条目 durable 时返回 200/202，部分失败时返回 207。
+      summary: 批量持久化网关 Wire Capture
+      security:
+        - cloudBearer: []
       requestBody:
         required: true
         content:
           application/x-ndjson:
-            schema:
-              type: string
-          application/ndjson:
-            schema:
-              type: string
+            schema: {type: string}
       responses:
-        "202": {description: 全部条目已持久化，至少一条为首次提交}
-        "200": {description: 全部条目均为幂等重复}
-        "207": {description: 部分条目失败，读取 results 获取逐条结果}
+        "202": {description: 全部记录持久化}
+        "200": {description: 全部记录为幂等重放}
+        "207": {description: 部分记录失败}
         "400": {description: NDJSON 或 Capture 无效}
-        "413": {description: 批次超过字节或记录数上限}
-        "415": {description: Content-Type 不是 NDJSON}
+        "401": {description: 内部采集 Token 缺失或无效}
         "503": {description: 背压或存储不可用}
-  /producer/event:
+  /otel/v1/logs:
     post:
-      summary: 校验并持久化一条 Agent Producer 事件
-      description: >-
-        Relay 根据 producer 身份与 sequence 生成确定性 Capture ID，或复验 Stock Codex
-        原始证据派生的 source-native Capture ID 与 SHA-256。
+      summary: 持久化 Stock Codex OTLP JSON logs
       security:
-        - producerBearer: []
+        - cloudBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        "200": {description: Raw envelope 与严格派生事实已持久化}
+        "400": {description: OTLP JSON 无效}
+        "401": {description: Token 缺失或无效}
+        "409": {description: 确定性 Capture ID 冲突}
+        "503": {description: 背压或存储不可用}
+  /otel/v1/traces:
+    post:
+      summary: 持久化 Stock Codex OTLP JSON traces
+      security:
+        - cloudBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        "200": {description: Raw envelope 已持久化}
+        "400": {description: OTLP JSON 无效}
+        "401": {description: Token 缺失或无效}
+        "503": {description: 背压或存储不可用}
+  /hooks/codex:
+    post:
+      summary: 持久化 Stock Codex 生命周期 Hook
+      security:
+        - cloudBearer: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              oneOf:
-                - $ref: ./producer-event-v1.schema.json
-                - $ref: ./capture-v2.schema.json
+              type: object
+              required: [hook_event_name, session_id]
       responses:
-        "202": {description: 已生成 Capture ID 并持久化到本地 outbox}
-        "200": {description: 相同事件已持久化}
-        "400": {description: producer event 无效}
-        "401": {description: Producer Bearer Token 缺失或无效}
-        "409": {description: 确定性 Capture ID 对应不同字节}
-        "503": {description: 背压或存储不可用}
-  /producer/events:
-    post:
-      summary: 批量校验并持久化 Agent Producer NDJSON
-      security:
-        - producerBearer: []
-      requestBody:
-        required: true
-        content:
-          application/x-ndjson:
-            schema:
-              type: string
-          application/ndjson:
-            schema:
-              type: string
-      responses:
-        "202": {description: 全部事件已持久化，至少一条为首次提交}
-        "200": {description: 全部事件均为幂等重复}
-        "207": {description: 部分事件失败，读取 results 获取逐条结果}
-        "400": {description: NDJSON 或 producer event 无效}
-        "401": {description: Producer Bearer Token 缺失或无效}
+        "200": {description: Hook Raw 与生命周期事实已持久化}
+        "400": {description: Hook JSON 无效}
+        "401": {description: Token 缺失或无效}
         "503": {description: 背压或存储不可用}
   /health:
     get:
-      summary: Collector 健康与守恒指标
+      summary: WAL、队列与投递守恒状态
       responses:
         "200": {description: 就绪}
         "503": {description: 未就绪}
-  /audit:
-    get:
-      summary: O(1) 运行时计数守恒检查
-      description: 完整 WAL、locator、哈希审计由离线 chiptrace audit 命令执行。
-      responses:
-        "200": {description: 审计通过}
-        "500": {description: 审计失败}
   /flush:
     post:
-      summary: 封存当前 WAL 段并创建新段
+      summary: 封存当前 WAL Segment
+      security:
+        - cloudBearer: []
       responses:
-        "200": {description: 所有分片已执行持久化屏障并封存非空段}
+        "200": {description: 已完成持久化屏障}
+        "401": {description: 内部采集 Token 缺失或无效}
         "503": {description: 封存失败}
 components:
   securitySchemes:
-    producerBearer:
+    businessBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: provider-credential
+    cloudBearer:
       type: http
       scheme: bearer
       bearerFormat: opaque

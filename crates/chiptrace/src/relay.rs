@@ -1,6 +1,7 @@
 use crate::capture::{CaptureRecord, normalize_capture, normalize_capture_batch};
+use crate::cloud_ingest::{CloudEndpoint, CloudIngestBatch, prepare_cloud_ingest};
 use crate::ingest::{BodyReadError, InflightBodyBudget};
-use crate::producer::{prepare_producer_capture, prepare_producer_capture_batch};
+use crate::managed_models::{CATALOG_SOURCE_VERSION, managed_model_catalog};
 use crate::sharded::{ShardedCaptureStore, ShardedStoreHealth};
 use crate::store::{CaptureLocator, StoreConfig, SubmitAck, SubmitError, SubmitErrorKind};
 use anyhow::{Context, Result, bail};
@@ -54,9 +55,8 @@ pub struct RelayConfig {
     pub max_envelope_bytes: usize,
     pub max_inflight_body_bytes: usize,
     pub max_batch_records: usize,
-    /// When set, only producer routes require this bearer token. Raw Wire
-    /// capture routes remain available to the OpenAI-compatible proxy.
-    pub producer_bearer_token: Option<String>,
+    /// Every mutating ingest route requires this token in production.
+    pub ingest_bearer_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,7 +112,7 @@ pub struct RelayHealth {
     pub delivery_body_budget_capacity: usize,
     pub conservation_ok: bool,
     pub backlog_degraded: bool,
-    pub producer_auth_required: bool,
+    pub ingest_auth_required: bool,
 }
 
 struct DeliveryLedger {
@@ -589,6 +589,7 @@ impl DurableRelay {
         }
         let (sender, receiver) = flume::bounded(config.delivery_queue_items);
         let (shutdown, _) = watch::channel(false);
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
             .build()?;
@@ -712,7 +713,7 @@ impl DurableRelay {
             delivery_body_budget_capacity: self.inner.config.max_delivery_inflight_bytes,
             conservation_ok,
             backlog_degraded,
-            producer_auth_required: self.inner.config.producer_bearer_token.is_some(),
+            ingest_auth_required: self.inner.config.ingest_bearer_token.is_some(),
         })
     }
 
@@ -1193,8 +1194,11 @@ pub async fn serve_relay(
     let app = Router::new()
         .route("/capture", post(relay_capture))
         .route("/captures", post(relay_captures))
-        .route("/producer/event", post(relay_producer_event))
-        .route("/producer/events", post(relay_producer_events))
+        .route("/otel/v1/logs", post(relay_otlp_logs))
+        .route("/otel/v1/traces", post(relay_otlp_traces))
+        .route("/hooks/codex", post(relay_codex_hook))
+        .route("/models", get(relay_models))
+        .route("/v1/models", get(relay_models))
         .route("/health", get(relay_health))
         .route("/flush", post(relay_flush))
         .fallback(relay_not_found)
@@ -1221,7 +1225,177 @@ pub async fn serve_relay(
     result
 }
 
+async fn relay_models(State(state): State<RelayAppState>, request: Request) -> Response {
+    if !ingest_authorized(&state, &request) {
+        return relay_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"ok":false,"reason":"ingest_auth_required"}),
+        );
+    }
+    match managed_model_catalog() {
+        Ok(catalog) => (
+            StatusCode::OK,
+            [
+                ("content-type", "application/json; charset=utf-8"),
+                ("cache-control", "private, max-age=300"),
+                ("etag", catalog.etag.as_str()),
+                ("x-chiptrace-catalog-source", CATALOG_SOURCE_VERSION),
+            ],
+            catalog.bytes,
+        )
+            .into_response(),
+        Err(error) => relay_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"ok":false,"reason":"managed_model_catalog_invalid","detail":error.to_string()}),
+        ),
+    }
+}
+
+async fn relay_otlp_logs(State(state): State<RelayAppState>, request: Request) -> Response {
+    relay_cloud_ingest(state, request, CloudEndpoint::OtlpLogs).await
+}
+
+async fn relay_otlp_traces(State(state): State<RelayAppState>, request: Request) -> Response {
+    relay_cloud_ingest(state, request, CloudEndpoint::OtlpTraces).await
+}
+
+async fn relay_codex_hook(State(state): State<RelayAppState>, request: Request) -> Response {
+    relay_cloud_ingest(state, request, CloudEndpoint::CodexHook).await
+}
+
+async fn relay_cloud_ingest(
+    state: RelayAppState,
+    request: Request,
+    endpoint: CloudEndpoint,
+) -> Response {
+    if !ingest_authorized(&state, &request) {
+        return relay_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"ok":false,"reason":"ingest_auth_required"}),
+        );
+    }
+    let body = match state.body_budget.read_json(request).await {
+        Ok(body) => body,
+        Err(error) => return relay_body_error_response(error),
+    };
+    let CloudIngestBatch { records, summary } = match prepare_cloud_ingest(
+        endpoint,
+        &body.bytes,
+        state.relay.inner.config.max_envelope_bytes,
+    ) {
+        Ok(batch) => batch,
+        Err(error) => {
+            return relay_response(
+                StatusCode::BAD_REQUEST,
+                json!({"ok":false,"reason":"invalid_cloud_ingest","detail":error.to_string()}),
+            );
+        }
+    };
+    let capture_ids: Vec<String> = records
+        .iter()
+        .map(|record| record.capture_id.clone())
+        .collect();
+    let results = match state.relay.enqueue_batch(records).await {
+        Ok(results) => results,
+        Err(error) => {
+            return relay_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"ok":false,"reason":"relay_unavailable","detail":error.to_string()}),
+            );
+        }
+    };
+    let mut duplicates = 0_u64;
+    let mut conflict = None;
+    let mut unavailable = None;
+    for (capture_id, result) in capture_ids.iter().zip(results) {
+        match result {
+            Ok(ack) => duplicates = duplicates.saturating_add(u64::from(ack.duplicate)),
+            Err(error) if error.kind == SubmitErrorKind::Conflict => {
+                conflict = Some(capture_id.clone())
+            }
+            Err(error) => unavailable = Some(error.message),
+        }
+    }
+    if let Some(capture_id) = conflict {
+        return relay_response(
+            StatusCode::CONFLICT,
+            json!({"ok":false,"reason":"capture_id_conflict","capture_id":capture_id}),
+        );
+    }
+    if let Some(detail) = unavailable {
+        return relay_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"ok":false,"reason":"relay_unavailable","detail":detail}),
+        );
+    }
+    // A durable acknowledgement means the evidence is safe, but it does not
+    // make an invalid or unknown producer event acceptable. Fail closed after
+    // enqueueing so SDKs and required hooks stop/retry instead of silently
+    // treating a partial trace as valid.
+    let quality_rejections = summary
+        .unknown_events
+        .saturating_add(summary.conversion_errors.len() as u64);
+    let unattributed_quality_errors =
+        quality_rejections.saturating_sub(summary.attributed_quality_errors);
+    if quality_rejections > 0
+        && (endpoint == CloudEndpoint::CodexHook || unattributed_quality_errors > 0)
+    {
+        let error_message = if summary.conversion_errors.is_empty() {
+            format!("{} unknown cloud event(s)", summary.unknown_events)
+        } else {
+            summary.conversion_errors.join("; ")
+        };
+        return relay_response(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "ok":false,
+                "durable":true,
+                "local_durable":true,
+                "reason":"cloud_ingest_quality_error",
+                "detail":error_message,
+                "summary":summary,
+                "unattributed_quality_errors":unattributed_quality_errors,
+                "captures":capture_ids.len(),
+                "duplicates":duplicates,
+            }),
+        );
+    }
+    let error_message = (quality_rejections > 0).then(|| {
+        if summary.conversion_errors.is_empty() {
+            format!(
+                "{} unknown event(s) retained as Raw",
+                summary.unknown_events
+            )
+        } else {
+            summary.conversion_errors.join("; ")
+        }
+    });
+    relay_response(
+        StatusCode::OK,
+        json!({
+            "partialSuccess":{
+                "rejectedLogRecords":if endpoint == CloudEndpoint::OtlpLogs {quality_rejections} else {0},
+                "rejectedSpans":if endpoint == CloudEndpoint::OtlpTraces {quality_rejections} else {0},
+                "errorMessage":error_message,
+            },
+            "chiptrace":{
+                "ok":true,
+                "durable":true,
+                "captures":capture_ids.len(),
+                "duplicates":duplicates,
+                "summary":summary,
+            }
+        }),
+    )
+}
+
 async fn relay_captures(State(state): State<RelayAppState>, request: Request) -> Response {
+    if !ingest_authorized(&state, &request) {
+        return relay_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"ok":false,"reason":"ingest_auth_required"}),
+        );
+    }
     let body = match state.body_budget.read_ndjson(request).await {
         Ok(body) => body,
         Err(error) => return relay_body_error_response(error),
@@ -1236,33 +1410,6 @@ async fn relay_captures(State(state): State<RelayAppState>, request: Request) ->
             return relay_response(
                 StatusCode::BAD_REQUEST,
                 json!({"ok": false, "reason": "invalid_capture_batch", "detail": error.to_string()}),
-            );
-        }
-    };
-    relay_enqueue_batch(&state, records).await
-}
-
-async fn relay_producer_events(State(state): State<RelayAppState>, request: Request) -> Response {
-    if !producer_authorized(&state, &request) {
-        return relay_response(
-            StatusCode::UNAUTHORIZED,
-            json!({"ok":false,"reason":"producer_auth_required"}),
-        );
-    }
-    let body = match state.body_budget.read_ndjson(request).await {
-        Ok(body) => body,
-        Err(error) => return relay_body_error_response(error),
-    };
-    let records = match prepare_producer_capture_batch(
-        &body.bytes,
-        state.relay.inner.config.max_envelope_bytes,
-        state.max_batch_records,
-    ) {
-        Ok(records) => records,
-        Err(error) => {
-            return relay_response(
-                StatusCode::BAD_REQUEST,
-                json!({"ok": false, "reason": "invalid_producer_event_batch", "detail": error.to_string()}),
             );
         }
     };
@@ -1354,62 +1501,13 @@ async fn relay_enqueue_batch(state: &RelayAppState, records: Vec<CaptureRecord>)
     )
 }
 
-async fn relay_producer_event(State(state): State<RelayAppState>, request: Request) -> Response {
-    if !producer_authorized(&state, &request) {
+async fn relay_capture(State(state): State<RelayAppState>, request: Request) -> Response {
+    if !ingest_authorized(&state, &request) {
         return relay_response(
             StatusCode::UNAUTHORIZED,
-            json!({"ok":false,"reason":"producer_auth_required"}),
+            json!({"ok":false,"reason":"ingest_auth_required"}),
         );
     }
-    let body = match state.body_budget.read_json(request).await {
-        Ok(body) => body,
-        Err(error) => return relay_body_error_response(error),
-    };
-    let record = match prepare_producer_capture(
-        &body.bytes,
-        state.relay.inner.config.max_envelope_bytes,
-    ) {
-        Ok(record) => record,
-        Err(error) => {
-            return relay_response(
-                StatusCode::BAD_REQUEST,
-                json!({"ok":false,"reason":"invalid_producer_event","detail":error.to_string()}),
-            );
-        }
-    };
-    match state.relay.enqueue_record(record).await {
-        Ok(ack) => relay_response(
-            if ack.duplicate {
-                StatusCode::OK
-            } else {
-                StatusCode::ACCEPTED
-            },
-            json!({
-                "ok":true,
-                "durable":true,
-                "local_durable":true,
-                "duplicate":ack.duplicate,
-                "capture":ack,
-            }),
-        ),
-        Err(error)
-            if error
-                .downcast_ref::<crate::store::SubmitError>()
-                .is_some_and(|error| error.kind == SubmitErrorKind::Conflict) =>
-        {
-            relay_response(
-                StatusCode::CONFLICT,
-                json!({"ok":false,"reason":"capture_id_conflict"}),
-            )
-        }
-        Err(error) => relay_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({"ok":false,"reason":"relay_unavailable","detail":error.to_string()}),
-        ),
-    }
-}
-
-async fn relay_capture(State(state): State<RelayAppState>, request: Request) -> Response {
     let body = match state.body_budget.read_json(request).await {
         Ok(body) => body,
         Err(error) => return relay_body_error_response(error),
@@ -1455,8 +1553,8 @@ async fn relay_capture(State(state): State<RelayAppState>, request: Request) -> 
     }
 }
 
-fn producer_authorized(state: &RelayAppState, request: &Request) -> bool {
-    let Some(expected) = state.relay.inner.config.producer_bearer_token.as_deref() else {
+fn ingest_authorized(state: &RelayAppState, request: &Request) -> bool {
+    let Some(expected) = state.relay.inner.config.ingest_bearer_token.as_deref() else {
         return true;
     };
     let Some(observed) = request
@@ -1510,7 +1608,13 @@ async fn relay_health(State(state): State<RelayAppState>) -> Response {
     }
 }
 
-async fn relay_flush(State(state): State<RelayAppState>) -> Response {
+async fn relay_flush(State(state): State<RelayAppState>, request: Request) -> Response {
+    if !ingest_authorized(&state, &request) {
+        return relay_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"ok":false,"reason":"ingest_auth_required"}),
+        );
+    }
     match state.relay.flush().await {
         Ok(segments) => relay_response(
             StatusCode::OK,
@@ -1604,7 +1708,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn producer_auth_and_invalid_capture_fail_before_retry_queue() {
+    async fn cloud_auth_and_invalid_payload_fail_before_retry_queue() {
         let temporary = tempfile::tempdir().unwrap();
         let config = RelayConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
@@ -1635,7 +1739,7 @@ mod tests {
             max_envelope_bytes: 1024 * 1024,
             max_inflight_body_bytes: 4 * 1024 * 1024,
             max_batch_records: 64,
-            producer_bearer_token: Some("test-producer-token-32-bytes-long".to_owned()),
+            ingest_bearer_token: Some("test-cloud-token-at-least-32-bytes".to_owned()),
         };
         let relay = DurableRelay::open(config).await.unwrap();
         let state = RelayAppState {
@@ -1644,29 +1748,54 @@ mod tests {
             max_batch_records: 64,
         };
 
+        let catalog_unauthorized = relay_models(
+            State(state.clone()),
+            Request::builder().body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(catalog_unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let catalog_response = relay_models(
+            State(state.clone()),
+            Request::builder()
+                .header(AUTHORIZATION, "Bearer test-cloud-token-at-least-32-bytes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(catalog_response.status(), StatusCode::OK);
+        let catalog: Value = serde_json::from_slice(
+            &to_bytes(catalog_response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(catalog["models"][0]["tool_mode"], "direct");
+
         let unauthorized = Request::builder()
-            .header("content-type", "application/x-ndjson")
-            .body(Body::from("{}\n"))
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
             .unwrap();
         assert_eq!(
-            relay_producer_events(State(state.clone()), unauthorized)
+            relay_cloud_ingest(state.clone(), unauthorized, CloudEndpoint::OtlpLogs)
                 .await
                 .status(),
             StatusCode::UNAUTHORIZED
         );
         let authorized_bad = Request::builder()
-            .header("content-type", "application/x-ndjson")
-            .header(AUTHORIZATION, "Bearer test-producer-token-32-bytes-long")
-            .body(Body::from("{}\n"))
+            .header("content-type", "application/json")
+            .header(AUTHORIZATION, "Bearer test-cloud-token-at-least-32-bytes")
+            .body(Body::from("{}"))
             .unwrap();
         assert_eq!(
-            relay_producer_events(State(state.clone()), authorized_bad)
+            relay_cloud_ingest(state.clone(), authorized_bad, CloudEndpoint::OtlpLogs)
                 .await
                 .status(),
             StatusCode::BAD_REQUEST
         );
         let invalid_capture = Request::builder()
             .header("content-type", "application/json")
+            .header(AUTHORIZATION, "Bearer test-cloud-token-at-least-32-bytes")
             .body(Body::from("{}"))
             .unwrap();
         assert_eq!(
@@ -1674,8 +1803,10 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         let health = relay.health().await.unwrap();
-        assert_eq!(health.delivery_records, 0);
-        assert!(health.producer_auth_required);
+        // Invalid cloud payloads are retained as an auditable raw batch before
+        // the 400 response; they must never enter canonical Release.
+        assert_eq!(health.delivery_records, 1);
+        assert!(health.ingest_auth_required);
         relay.close().await.unwrap();
     }
 
@@ -1692,7 +1823,6 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_restarts_and_delivers_same_capture() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let temporary = tempfile::tempdir().unwrap();
         let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = reserved.local_addr().unwrap();
@@ -1726,7 +1856,7 @@ mod tests {
             max_envelope_bytes: 1024 * 1024,
             max_inflight_body_bytes: 4 * 1024 * 1024,
             max_batch_records: 32,
-            producer_bearer_token: None,
+            ingest_bearer_token: None,
         };
         let relay = DurableRelay::open(config.clone()).await.unwrap();
         relay

@@ -25,17 +25,16 @@ jobs:
       - run: cargo test --workspace --all-targets --locked
       - run: node --test integrations/openai-gateway/durable-outbox.test.js
       - run: cargo run --locked --bin chiptrace -- self-test
-      - name: Verify Relay producer benchmark path
+      - name: Verify Relay cloud delivery benchmark path
         run: |
           cargo run --locked --bin chiptrace -- benchmark-http \
             --records 32 --payload-kib 4 --batch-records 8 \
-            --concurrency 4 --store-shards 2 --relay --producer-events \
+            --concurrency 4 --store-shards 2 --relay \
           | python3 -c '
           import json, sys
           result = json.load(sys.stdin)
           assert result["records"] == 32
           assert result["relay"] is True
-          assert result["producer_events"] is True
           assert result["relay_health"]["delivered"] == 32
           assert result["relay_health"]["conservation_ok"] is True
           '
@@ -57,12 +56,14 @@ jobs:
           assert result["acceptance"]["hard_gate_pass"] is True
           assert result["acceptance"]["score"] == 100
           assert result["collection_submission"]["durable"] is True
-          assert result["collection_submission"]["producer_replay_duplicates"] == 15
-          assert result["checks"]["producer_stream_conservation"] is True
+          assert result["collection_submission"]["otlp_replay_duplicates"] == 7
+          assert result["checks"]["legacy_producer_absent"] is True
+          assert result["checks"]["cloud_acceptance"] is True
+          assert result["cloud_acceptance_tamper_detected"] is True
           assert result["checks"]["tool_execution_state_machine"] is True
-          assert result["acceptance"]["source_capture_count"] == 21
+          assert result["acceptance"]["source_capture_count"] == 20
           assert result["assembly"]["capture_schema_versions"] == ["chiptrace.capture.v2"]
-          assert result["buyer_package"]["buyer_profile"] == "buyer-v7"
+          assert result["buyer_package"]["buyer_profile"] == "buyer-v7-codex-runtime-expanded"
           assert result["buyer_package"]["minimum_score"] >= 90
           assert result["buyer_package"]["eligible_sessions"] == 1
           assert result["buyer_tamper_detected"] is True

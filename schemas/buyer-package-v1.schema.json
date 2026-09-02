@@ -30,7 +30,7 @@
     "buyer_profile": {"enum": ["buyer-v7", "buyer-v7-codex-runtime-expanded"]},
     "minimum_score": {"type": "number", "minimum": 90, "maximum": 100},
     "source_release_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "lineage_status": {"enum": ["complete", "legacy_unbound"]},
+    "lineage_status": {"const": "complete"},
     "raw_sources": {
       "type": "array",
       "items": {"$ref": "raw-lineage-v1.schema.json"}

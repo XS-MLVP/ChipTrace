@@ -193,23 +193,8 @@ pub(crate) async fn ensure_object(
         .await
     {
         Ok(writer) => writer,
-        Err(error)
-            if matches!(
-                error.kind(),
-                ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
-            ) =>
-        {
-            let metadata = operator.stat(&object.key).await?;
-            verify_remote_object(
-                operator,
-                &object.key,
-                object.bytes,
-                &object.sha256,
-                metadata.content_length(),
-                config.verify_remote_sha256,
-            )
-            .await?;
-            return Ok(());
+        Err(error) if is_immutable_write_conflict(&error) => {
+            return verify_existing_local_object(operator, object, config).await;
         }
         Err(error) => return Err(error.into()),
     };
@@ -220,11 +205,43 @@ pub(crate) async fn ensure_object(
         if count == 0 {
             break;
         }
-        writer
-            .write(Bytes::copy_from_slice(&buffer[..count]))
-            .await?;
+        if let Err(error) = writer.write(Bytes::copy_from_slice(&buffer[..count])).await {
+            if is_immutable_write_conflict(&error) {
+                return verify_existing_local_object(operator, object, config).await;
+            }
+            return Err(error.into());
+        }
     }
-    writer.close().await?;
+    if let Err(error) = writer.close().await {
+        if is_immutable_write_conflict(&error) {
+            return verify_existing_local_object(operator, object, config).await;
+        }
+        return Err(error.into());
+    }
+    let metadata = operator.stat(&object.key).await?;
+    verify_remote_object(
+        operator,
+        &object.key,
+        object.bytes,
+        &object.sha256,
+        metadata.content_length(),
+        config.verify_remote_sha256,
+    )
+    .await
+}
+
+fn is_immutable_write_conflict(error: &opendal::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
+    )
+}
+
+async fn verify_existing_local_object(
+    operator: &Operator,
+    object: &LocalObject,
+    config: &ObjectStoreConfig,
+) -> Result<()> {
     let metadata = operator.stat(&object.key).await?;
     verify_remote_object(
         operator,

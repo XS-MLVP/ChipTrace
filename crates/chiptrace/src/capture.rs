@@ -75,15 +75,14 @@ fn normalize_capture_with_policy(
     object
         .entry("recordType".to_owned())
         .or_insert_with(|| Value::String("api_snapshot".to_owned()));
-    if enforce_current_producer_contract && let Some(producer_event) = object.get("producerEvent") {
-        crate::producer::validate_producer_event_value(producer_event)?;
-        if producer_event
-            .get("identity_scheme")
-            .and_then(Value::as_str)
-            == Some(crate::producer::DETERMINISTIC_CAPTURE_IDENTITY)
-        {
-            crate::producer::validate_stored_producer_capture(object, &capture_id)?;
-        }
+    if enforce_current_producer_contract && object.get("producerEvent").is_some() {
+        bail!("producerEvent is historical read-only data; use Wire, OTLP, or Codex Hook ingest");
+    }
+    if enforce_current_producer_contract
+        && (object.get("rolloutEvent").is_some()
+            || object.get("recordType").and_then(Value::as_str) == Some("rollout_event"))
+    {
+        bail!("rolloutEvent is historical read-only data; use Wire, OTLP, or Codex Hook ingest");
     }
     validate_optional_string(object, "sourceNamespace")?;
     validate_optional_string(object, "receivedAt")?;
@@ -131,6 +130,7 @@ fn normalize_capture_with_policy(
     validate_tool_registry_snapshot(object)?;
     validate_evaluation_evidence(object)?;
     validate_rollout_event(object)?;
+    validate_telemetry_batch(object)?;
 
     normalize_body_fields(object)?;
     promote_protocol_fields(object)?;
@@ -857,7 +857,12 @@ fn validate_record_type(object: &Map<String, Value>) -> Result<()> {
     };
     if !matches!(
         record_type,
-        "api_snapshot" | "lifecycle_event" | "tool_execution" | "evaluation" | "rollout_event"
+        "api_snapshot"
+            | "lifecycle_event"
+            | "tool_execution"
+            | "evaluation"
+            | "rollout_event"
+            | "telemetry_batch"
     ) {
         bail!("unsupported recordType {record_type:?}");
     }
@@ -905,6 +910,9 @@ fn validate_record_type(object: &Map<String, Value>) -> Result<()> {
         }
         "rollout_event" if !object.get("rolloutEvent").is_some_and(Value::is_object) => {
             bail!("rollout_event requires rolloutEvent")
+        }
+        "telemetry_batch" if !object.get("telemetryBatch").is_some_and(Value::is_object) => {
+            bail!("telemetry_batch requires telemetryBatch")
         }
         _ => {}
     }
@@ -981,6 +989,61 @@ fn validate_rollout_event(object: &Map<String, Value>) -> Result<()> {
         .is_some_and(|usage| !usage.is_object())
     {
         bail!("rolloutUsage must be an object");
+    }
+    Ok(())
+}
+
+fn validate_telemetry_batch(object: &Map<String, Value>) -> Result<()> {
+    let Some(batch) = object.get("telemetryBatch") else {
+        return Ok(());
+    };
+    let batch = batch
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("telemetryBatch must be an object"))?;
+    if batch.get("schema_version").and_then(Value::as_str)
+        != Some(crate::cloud_ingest::TELEMETRY_BATCH_SCHEMA_VERSION)
+    {
+        bail!("telemetryBatch.schema_version is unsupported");
+    }
+    if !matches!(
+        batch.get("endpoint").and_then(Value::as_str),
+        Some("otlp_logs" | "otlp_traces" | "codex_hook")
+    ) {
+        bail!("telemetryBatch.endpoint is unsupported");
+    }
+    let raw = batch
+        .get("raw_json")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("telemetryBatch.raw_json is required"))?;
+    serde_json::from_str::<Value>(raw).context("telemetryBatch.raw_json must be JSON")?;
+    if batch.get("raw_bytes").and_then(Value::as_u64) != Some(raw.len() as u64) {
+        bail!("telemetryBatch.raw_bytes does not match raw_json UTF-8 bytes");
+    }
+    let raw_sha256 = hex::encode(Sha256::digest(raw.as_bytes()));
+    if batch.get("raw_sha256").and_then(Value::as_str) != Some(raw_sha256.as_str()) {
+        bail!("telemetryBatch.raw_sha256 does not match raw_json");
+    }
+    for field in ["source_records", "derived_captures", "unknown_events"] {
+        if batch.get(field).and_then(Value::as_u64).is_none() {
+            bail!("telemetryBatch.{field} must be a non-negative integer");
+        }
+    }
+    if batch
+        .get("attributed_quality_errors")
+        .is_some_and(|value| value.as_u64().is_none())
+    {
+        bail!("telemetryBatch.attributed_quality_errors must be a non-negative integer");
+    }
+    if batch
+        .get("conversion_errors")
+        .and_then(Value::as_array)
+        .is_none_or(|errors| {
+            errors
+                .iter()
+                .any(|error| error.as_str().is_none_or(str::is_empty))
+        })
+    {
+        bail!("telemetryBatch.conversion_errors must contain strings");
     }
     Ok(())
 }
@@ -1104,6 +1167,7 @@ fn validate_lifecycle_event(object: &Map<String, Value>) -> Result<()> {
                 | "aborted"
                 | "abandoned"
                 | "incomplete"
+                | "closed"
                 | "unknown"
         ) {
             bail!("unsupported terminal lifecycleEvent.status {status:?}");
@@ -2002,7 +2066,9 @@ mod tests {
             }
         });
 
-        let first = normalize_capture(&serde_json::to_vec(&value).unwrap(), 1024 * 1024).unwrap();
+        let raw = serde_json::to_vec(&value).unwrap();
+        assert!(normalize_capture(&raw, 1024 * 1024).is_err());
+        let first = validate_stored_capture(&raw).unwrap();
         let normalized: Value = serde_json::from_slice(&first.canonical).unwrap();
         let stored = normalized["rolloutEvent"]["payloads"][0]["raw_json"]
             .as_str()
@@ -2017,7 +2083,7 @@ mod tests {
             payload_raw.len()
         );
 
-        let second = normalize_capture(&first.canonical, 1024 * 1024).unwrap();
+        let second = validate_stored_capture(&first.canonical).unwrap();
         assert_eq!(second.canonical, first.canonical);
         assert_eq!(second.sha256, first.sha256);
     }

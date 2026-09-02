@@ -1,7 +1,6 @@
 # OSS 原始层与提交协议
 
-方案调研和开源能力取舍见 [OSS 方案选型](oss-research.md)。本协议是 ChipTrace
-Raw Zone 的唯一对象存储实现；FS 后端只用于离线复现和自测。
+本协议是 ChipTrace Raw Zone 的唯一对象存储实现；FS 后端只用于离线复现和自测。
 
 ChipTrace 将原始 Trace 保存为一条逻辑连续日志，物理上由多个不可变 OSS/S3
 对象组成。采集确认点仍是本地 durable WAL；对象存储只接收已封存的 Segment，
@@ -141,11 +140,10 @@ chiptrace assemble \
 | --- | --- | --- |
 | 字节完整 | Segment 长度、记录数、SHA-256、Checkpoint | Release Manifest、SHA256SUMS |
 | JSON 合法 | 每行 JSON 对象和 `captureId` | UTF-8 JSONL 逐行解析 |
-| Session 边界 | 保存所有原始 API/事件，不猜测任务结束 | 依据 `task_session_id`、Response DAG 和生命周期组装 |
+| Session 边界 | 保存所有原始 API/事件，不猜测任务结束 | 依据 Stock Codex `session_id`、Response DAG 和生命周期组装 |
 | Tool 配对 | 原始事件不删改 | Call/Result 配对率、schema 和状态硬门槛 |
 | 质量准入 | 不做过滤 | buyer-v7-codex-runtime-expanded、分数阈值和 hard gate |
 | 分包 | 不切断 Segment | Session 原子 `tar.gz + JSONL`，目标约 10 GiB |
 
-只有同时接入 Agent harness 和工具执行器，记录 task start/end、cancel/retry、
-compaction、subagent join、真实工具状态和 evaluator evidence，才能满足轨迹验收。
-OSS 只能证明原始证据没有丢失，不能从 API 快照凭空生成这些语义字段。
+完整 Trajectory 由 Stock Codex Wire、OTLP 和 required Hook 三源共同提供。OSS 只能证明
+原始证据没有丢失，不能从 API 快照生成生命周期、工具状态或 Schema。

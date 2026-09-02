@@ -1,6 +1,7 @@
 use crate::capture::{extract_body, validate_stored_capture};
 use crate::jsonl::{JsonlWriter, absolute_path, ensure_safe_relative_path, sha256_file, utc_now};
 use crate::schema::{FileManifest, RAW_LINEAGE_SCHEMA_VERSION, RawSourceLineage};
+use crate::session_lineage::StockSessionLineage;
 use crate::tool_registry::canonical_runtime_tool_name;
 use crate::wire_tools::request_tool_definitions as captured_request_tool_definitions;
 use anyhow::{Context, Result, bail};
@@ -372,7 +373,7 @@ fn build_canonical_records(captures: &[Value]) -> Result<CanonicalRecords> {
         string_field(left, "interaction_id").cmp(&string_field(right, "interaction_id"))
     });
 
-    let mut runtime_spans = build_runtime_spans(captures)?;
+    let mut runtime_spans = build_runtime_spans(captures, &interactions)?;
     deduplicate_runtime_spans(&mut runtime_spans)?;
     runtime_spans
         .sort_by(|left, right| string_field(left, "span_id").cmp(&string_field(right, "span_id")));
@@ -821,6 +822,10 @@ fn select_projection_captures(
                 .map(str::to_owned)
         })
         .collect();
+    let mut session_lineage = StockSessionLineage::default();
+    for capture in &captures {
+        session_lineage.observe(capture)?;
+    }
 
     if let Some(requested) = requested_task {
         let requested = requested.trim();
@@ -847,12 +852,11 @@ fn select_projection_captures(
         if !available_sessions.contains(requested) {
             bail!("session_id {requested:?} was not found in Capture inputs");
         }
-        captures.retain(|capture| {
-            capture
-                .pointer("/traceContext/session_id")
-                .and_then(Value::as_str)
-                == Some(requested)
-        });
+        let selection = session_lineage.selection(requested)?;
+        captures.retain(|capture| selection.contains(capture));
+        for capture in &mut captures {
+            selection.canonicalize(capture)?;
+        }
         return Ok((captures, None, Some(requested.to_owned())));
     }
 
@@ -873,16 +877,16 @@ fn select_projection_captures(
         }
     }
 
-    match available_sessions.len() {
+    let top_level_sessions = session_lineage.top_level_sessions(&available_sessions);
+    match top_level_sessions.len() {
         0 => Ok((captures, None, None)),
         1 => {
-            let selected = available_sessions.into_iter().next().unwrap_or_default();
-            captures.retain(|capture| {
-                capture
-                    .pointer("/traceContext/session_id")
-                    .and_then(Value::as_str)
-                    == Some(selected.as_str())
-            });
+            let selected = top_level_sessions.into_iter().next().unwrap_or_default();
+            let selection = session_lineage.selection(&selected)?;
+            captures.retain(|capture| selection.contains(capture));
+            for capture in &mut captures {
+                selection.canonicalize(capture)?;
+            }
             Ok((captures, None, Some(selected)))
         }
         count => bail!(
@@ -1728,6 +1732,14 @@ fn interaction_integrity(
         && capture
             .get("clientResponseClosedBeforeFinish")
             .is_some_and(Value::is_boolean);
+    let trace_identity_complete = capture
+        .get("fieldEvidenceConflicts")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+        && capture
+            .get("traceContextErrors")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty);
     let protocol_complete = shape.family == "openai"
         && shape.endpoint == "responses"
         && shape.transport == "stream"
@@ -1740,13 +1752,15 @@ fn interaction_integrity(
                 | StreamOutcome::Cancelled
         )
         && malformed_events == 0
-        && status_dimensions_complete;
+        && status_dimensions_complete
+        && trace_identity_complete;
     json!({
         "artifact_valid":artifact_valid,
         "raw_bytes_complete":raw_bytes_complete,
         "protocol_complete":protocol_complete,
         "stream_outcome":state.outcome.as_str(),
         "status_dimensions_complete":status_dimensions_complete,
+        "trace_identity_complete":trace_identity_complete,
         "malformed_sse_events":malformed_events,
         "unknown_item_count":unknown_items,
     })
@@ -1821,11 +1835,21 @@ fn runtime_integrity(
         .iter()
         .filter(|span| string_field(span, "span_kind") == Some("task_root"))
         .collect();
+    let scope_root_spans: Vec<&Value> = runtime_spans
+        .iter()
+        .filter(|span| {
+            string_field(span, "span_kind") == Some("task_root")
+                || span
+                    .pointer("/extensions/scope_root")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
+        .collect();
     let task_scopes: BTreeSet<String> = runtime_spans
         .iter()
         .filter_map(runtime_task_scope)
         .collect();
-    let root_task_scopes: BTreeSet<String> = root_spans
+    let root_task_scopes: BTreeSet<String> = scope_root_spans
         .iter()
         .filter_map(|span| runtime_task_scope(span))
         .collect();
@@ -1837,9 +1861,10 @@ fn runtime_integrity(
     let root_complete = applicable
         && unscoped_span_ids.is_empty()
         && !task_scopes.is_empty()
-        && root_spans.len() == task_scopes.len()
+        && root_spans.len() == 1
+        && scope_root_spans.len() == task_scopes.len()
         && root_task_scopes == task_scopes
-        && root_spans.iter().all(|span| {
+        && scope_root_spans.iter().all(|span| {
             span.pointer("/extensions/root_complete")
                 .and_then(Value::as_bool)
                 == Some(true)
@@ -1854,6 +1879,24 @@ fn runtime_integrity(
         .iter()
         .filter(|span| {
             span.pointer("/extensions/state_conflict")
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+        .filter_map(|span| string_field(span, "span_id"))
+        .collect();
+    let incomplete_result_span_ids: BTreeSet<&str> = runtime_spans
+        .iter()
+        .filter(|span| {
+            span.pointer("/extensions/result_content_captured")
+                .and_then(Value::as_bool)
+                == Some(false)
+        })
+        .filter_map(|span| string_field(span, "span_id"))
+        .collect();
+    let quality_failure_span_ids: BTreeSet<&str> = runtime_spans
+        .iter()
+        .filter(|span| {
+            span.pointer("/extensions/quality_gate_failed")
                 .and_then(Value::as_bool)
                 == Some(true)
         })
@@ -2033,6 +2076,8 @@ fn runtime_integrity(
         && unscoped_span_ids.is_empty()
         && open_span_ids.is_empty()
         && conflicting_span_ids.is_empty()
+        && incomplete_result_span_ids.is_empty()
+        && quality_failure_span_ids.is_empty()
         && unresolved_parent_call_span_ids.is_empty()
         && unresolved_parent_span_ids.is_empty()
         && calls_without_results.is_empty()
@@ -2046,9 +2091,12 @@ fn runtime_integrity(
             "runtime_spans":runtime_spans.len(),
             "task_scopes":task_scopes.len(),
             "root_span_count":root_spans.len(),
+            "scope_root_span_count":scope_root_spans.len(),
             "unscoped_span_ids":unscoped_span_ids,
             "open_span_ids":open_span_ids,
             "conflicting_span_ids":conflicting_span_ids,
+            "incomplete_result_span_ids":incomplete_result_span_ids,
+            "quality_failure_span_ids":quality_failure_span_ids,
             "unresolved_parent_call_span_ids":unresolved_parent_call_span_ids,
             "unresolved_parent_span_ids":unresolved_parent_span_ids,
             "unobserved_external_parent_spans":unobserved_external_parent_spans,
@@ -2072,7 +2120,7 @@ fn runtime_integrity(
 fn runtime_span_is_terminal(span: &Value) -> bool {
     matches!(
         string_field(span, "status"),
-        Some("completed" | "failed" | "cancelled" | "timeout" | "incomplete")
+        Some("completed" | "failed" | "cancelled" | "timeout" | "incomplete" | "closed")
     )
 }
 
@@ -2976,10 +3024,11 @@ fn append_delta(output: &mut String, value: Option<&Value>) {
 #[derive(Debug, Default)]
 struct RuntimeScopeIndex {
     root_turns_by_thread: HashMap<String, BTreeSet<String>>,
+    root_turns_by_session_call: HashMap<String, BTreeSet<String>>,
 }
 
 impl RuntimeScopeIndex {
-    fn new(captures: &[Value]) -> Self {
+    fn with_interactions(captures: &[Value], interactions: &[Value]) -> Self {
         let mut index = Self::default();
         for capture in captures {
             let Some(root_turn_id) = capture
@@ -3002,6 +3051,28 @@ impl RuntimeScopeIndex {
                 .or_default()
                 .insert(root_turn_id.to_owned());
         }
+        for interaction in interactions {
+            let Some(session_id) = trace_string(interaction, "session_id") else {
+                continue;
+            };
+            let Some(root_turn_id) = trace_string(interaction, "root_turn_id") else {
+                continue;
+            };
+            for call_id in interaction
+                .get("model_tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|call| call.get("call_id").and_then(Value::as_str))
+                .filter(|call_id| !call_id.trim().is_empty())
+            {
+                index
+                    .root_turns_by_session_call
+                    .entry(session_call_key(session_id, call_id))
+                    .or_default()
+                    .insert(root_turn_id.to_owned());
+            }
+        }
         index
     }
 
@@ -3011,6 +3082,21 @@ impl RuntimeScopeIndex {
         }
         if let Some(root_turn_id) = trace_string(value, "root_turn_id") {
             return Some(("turn", root_turn_id.to_owned()));
+        }
+        if is_session_lifecycle(value)
+            && let Some(session_id) = trace_string(value, "session_id")
+        {
+            return Some(("session", session_id.to_owned()));
+        }
+        if let (Some(session_id), Some(call_id)) = (
+            trace_string(value, "session_id"),
+            value
+                .pointer("/toolExecution/call_id")
+                .and_then(Value::as_str)
+                .filter(|call_id| !call_id.trim().is_empty()),
+        ) && let Some(root_turn_id) = self.unique_root_turn_for_call(session_id, call_id)
+        {
+            return Some(("turn", root_turn_id));
         }
         if let Some(thread_id) = trace_string(value, "thread_id")
             && let Some(root_turn_id) = self.unique_root_turn(value, thread_id)
@@ -3030,6 +3116,15 @@ impl RuntimeScopeIndex {
         let candidates = self
             .root_turns_by_thread
             .get(&runtime_thread_key(value, thread_id))?;
+        (candidates.len() == 1)
+            .then(|| candidates.iter().next().cloned())
+            .flatten()
+    }
+
+    fn unique_root_turn_for_call(&self, session_id: &str, call_id: &str) -> Option<String> {
+        let candidates = self
+            .root_turns_by_session_call
+            .get(&session_call_key(session_id, call_id))?;
         (candidates.len() == 1)
             .then(|| candidates.iter().next().cloned())
             .flatten()
@@ -3057,68 +3152,148 @@ impl RuntimeScopeIndex {
     }
 }
 
-fn build_runtime_spans(captures: &[Value]) -> Result<Vec<Value>> {
-    let scope_index = RuntimeScopeIndex::new(captures);
+fn session_call_key(session_id: &str, call_id: &str) -> String {
+    format!("session:{session_id}\0call:{call_id}")
+}
+
+fn is_session_lifecycle(value: &Value) -> bool {
+    value
+        .pointer("/lifecycleEvent/type")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| {
+            matches!(
+                event_type,
+                "session_start" | "session_end" | "session_ended" | "session_cancelled"
+            ) || event_type.starts_with("session_cancel")
+        })
+}
+
+fn build_runtime_spans(captures: &[Value], interactions: &[Value]) -> Result<Vec<Value>> {
+    let scope_index = RuntimeScopeIndex::with_interactions(captures, interactions);
     let mut spans = build_task_root_spans(captures, &scope_index)?;
     spans.extend(build_dispatcher_runtime_spans(captures, &scope_index)?);
-    spans.extend(build_tool_runtime_spans(captures, &scope_index)?);
+    spans.extend(build_tool_runtime_spans(
+        captures,
+        interactions,
+        &scope_index,
+    )?);
     spans.extend(build_subagent_runtime_spans(captures, &scope_index)?);
+    spans.extend(build_quality_signal_spans(captures, &scope_index));
     spans.extend(build_native_runtime_spans(captures, &scope_index)?);
     Ok(spans)
+}
+
+fn build_quality_signal_spans(captures: &[Value], scope_index: &RuntimeScopeIndex) -> Vec<Value> {
+    captures
+        .iter()
+        .filter(|capture| {
+            capture
+                .pointer("/lifecycleEvent/type")
+                .and_then(Value::as_str)
+                == Some("telemetry_incomplete")
+        })
+        .map(|capture| {
+            let capture_id = string_field(capture, "captureId").unwrap_or("missing");
+            let (scope_kind, scope_id) = scope_index
+                .scope(capture)
+                .unwrap_or(("unscoped", capture_id.to_owned()));
+            let parent_span_id = (scope_kind != "unscoped")
+                .then(|| canonical_scope_root_span_id(scope_kind, &scope_id));
+            json!({
+                "schema_version":RUNTIME_SPAN_SCHEMA_VERSION,
+                "span_id":stable_id("runtime-span", &["quality", capture_id]),
+                "trace_context":scope_index.trace_context(capture, true),
+                "span_kind":"quality_signal",
+                "name":"telemetry_incomplete",
+                "call_id":Value::Null,
+                "parent_call_id":Value::Null,
+                "parent_span_id":parent_span_id,
+                "status":"incomplete",
+                "started_at":capture.pointer("/lifecycleEvent/occurred_at")
+                    .or_else(|| capture.get("receivedAt")),
+                "finished_at":capture.pointer("/lifecycleEvent/occurred_at")
+                    .or_else(|| capture.get("receivedAt")),
+                "arguments":capture.get("lifecycleEvent"),
+                "result":Value::Null,
+                "error":capture.get("lifecycleEvent"),
+                "tool_schema":Value::Null,
+                "raw_capture_refs":[capture_id],
+                "extensions":{
+                    "quality_gate_failed":true,
+                    "parent_span_required":scope_kind != "unscoped",
+                    "state_conflict":false
+                }
+            })
+        })
+        .collect()
 }
 
 fn build_task_root_spans(
     captures: &[Value],
     scope_index: &RuntimeScopeIndex,
 ) -> Result<Vec<Value>> {
-    let mut groups: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
+    let mut groups: BTreeMap<String, (&'static str, String, Vec<&Value>)> = BTreeMap::new();
     for capture in captures {
-        let Some(event) = capture.get("lifecycleEvent") else {
-            continue;
-        };
-        let event_type = string_field(event, "type").unwrap_or("");
-        if !is_task_root_start(event_type) && !is_task_root_terminal(event_type) {
-            continue;
-        }
-        let stock_turn_root = matches!(
-            event_type,
-            "turn_start" | "turn_end" | "turn_stop" | "turn_interrupt" | "turn_aborted"
-        ) && trace_string(capture, "parent_thread_id").is_none();
-        let explicit_task_root = trace_string(capture, "task_session_id").is_some()
-            && !matches!(
-                event_type,
-                "turn_start" | "turn_end" | "turn_stop" | "turn_interrupt" | "turn_aborted"
-            );
-        if !stock_turn_root && !explicit_task_root {
+        let event_type = capture
+            .pointer("/lifecycleEvent/type")
+            .and_then(Value::as_str);
+        let wire_turn_start = record_type(capture) == "api_snapshot"
+            && trace_string(capture, "root_turn_id").is_some();
+        if !wire_turn_start
+            && !event_type.is_some_and(|event_type| {
+                is_task_root_start(event_type)
+                    || is_task_root_terminal(event_type)
+                    || is_subagent_root_event(event_type)
+            })
+        {
             continue;
         }
-        let Some(scope) = scope_index.key(capture) else {
+        let Some((scope_kind, scope_id)) = scope_index.scope(capture) else {
             continue;
         };
-        groups.entry(scope).or_default().push(capture);
+        let relevant = match scope_kind {
+            "session" => event_type.is_some_and(is_session_root_event),
+            "turn" => {
+                wire_turn_start
+                    || event_type.is_some_and(|event_type| {
+                        is_turn_root_event(event_type) || is_subagent_root_event(event_type)
+                    })
+            }
+            "task" => event_type.is_some_and(is_explicit_task_root_event),
+            _ => false,
+        };
+        if !relevant {
+            continue;
+        }
+        let scope = runtime_scope_key(capture, scope_kind, &scope_id);
+        groups
+            .entry(scope)
+            .or_insert_with(|| (scope_kind, scope_id, Vec::new()))
+            .2
+            .push(capture);
     }
 
+    let session_root_ids: HashMap<String, String> = groups
+        .values()
+        .filter(|(scope_kind, _, _)| *scope_kind == "session")
+        .map(|(_, scope_id, _)| {
+            (
+                scope_id.clone(),
+                canonical_scope_root_span_id("session", scope_id),
+            )
+        })
+        .collect();
     let mut spans = Vec::new();
-    for observations in groups.into_values() {
+    for (scope_kind, scope_id, observations) in groups.into_values() {
         let starts: Vec<&Value> = observations
             .iter()
             .copied()
-            .filter(|capture| {
-                capture
-                    .pointer("/lifecycleEvent/type")
-                    .and_then(Value::as_str)
-                    .is_some_and(is_task_root_start)
-            })
+            .filter(|capture| root_observation_is_start(capture, scope_kind))
             .collect();
         let terminals: Vec<&Value> = observations
             .iter()
             .copied()
-            .filter(|capture| {
-                capture
-                    .pointer("/lifecycleEvent/type")
-                    .and_then(Value::as_str)
-                    .is_some_and(is_task_root_terminal)
-            })
+            .filter(|capture| root_observation_is_terminal(capture, scope_kind))
             .collect();
         let first = starts
             .first()
@@ -3126,10 +3301,6 @@ fn build_task_root_spans(
             .or_else(|| observations.first().copied())
             .context("task root group is empty")?;
         let selected = terminals.last().copied().unwrap_or(first);
-        let (scope_kind, scope_id) = scope_index
-            .scope(first)
-            .context("task root has no canonical runtime scope")?;
-        let namespace = string_field(first, "sourceNamespace").unwrap_or("default");
         let trace_ids: BTreeSet<&str> = observations
             .iter()
             .filter_map(|capture| {
@@ -3156,11 +3327,8 @@ fn build_task_root_spans(
                 )
             })
             .collect();
-        let root_complete = starts.len() == 1
-            && !terminals.is_empty()
-            && trace_ids.len() <= 1
-            && native_span_ids.len() <= 1
-            && terminal_statuses.len() == 1;
+        let root_complete =
+            !starts.is_empty() && !terminals.is_empty() && terminal_statuses.len() == 1;
         let status = terminals
             .last()
             .and_then(|capture| {
@@ -3174,15 +3342,27 @@ fn build_task_root_spans(
             .iter()
             .filter_map(|capture| string_field(capture, "captureId"))
             .collect();
+        let parent_span_id = if scope_kind == "turn" {
+            trace_string(selected, "session_id")
+                .or_else(|| trace_string(first, "session_id"))
+                .map(|session_id| {
+                    session_root_ids
+                        .get(session_id)
+                        .cloned()
+                        .unwrap_or_else(|| canonical_scope_root_span_id("session", session_id))
+                })
+        } else {
+            None
+        };
         spans.push(json!({
             "schema_version":RUNTIME_SPAN_SCHEMA_VERSION,
-            "span_id":stable_id("runtime-span", &[namespace, scope_kind, &scope_id, "task_root"]),
+            "span_id":canonical_scope_root_span_id(scope_kind, &scope_id),
             "trace_context":scope_index.trace_context(selected, false),
-            "span_kind":"task_root",
-            "name":if scope_kind == "turn" {"turn"} else {"task"},
+            "span_kind":if scope_kind == "turn" {"turn"} else {"task_root"},
+            "name":scope_kind,
             "call_id":Value::Null,
             "parent_call_id":Value::Null,
-            "parent_span_id":Value::Null,
+            "parent_span_id":parent_span_id,
             "status":status,
             "started_at":starts.first().and_then(|capture| {
                 capture.pointer("/lifecycleEvent/occurred_at").and_then(Value::as_str)
@@ -3202,17 +3382,91 @@ fn build_task_root_spans(
             "tool_schema":Value::Null,
             "raw_capture_refs":capture_ids,
             "extensions":{
-                "state_conflict":!root_complete && (starts.len() > 1 || trace_ids.len() > 1 || native_span_ids.len() > 1 || terminal_statuses.len() > 1),
+                "state_conflict":terminal_statuses.len() > 1,
                 "root_complete":root_complete,
+                "scope_root":true,
+                "parent_span_required":scope_kind == "turn",
                 "start_observations":starts.len(),
                 "terminal_observations":terminals.len(),
+                "wire_start_observations":starts.iter()
+                    .filter(|capture| record_type(capture) == "api_snapshot").count(),
                 "scope_kind":scope_kind,
                 "scope_id":scope_id,
+                "observed_trace_ids":trace_ids,
+                "observed_native_span_ids":native_span_ids,
                 "lifecycle":observations.iter().filter_map(|capture| capture.get("lifecycleEvent")).cloned().collect::<Vec<_>>(),
             },
         }));
     }
     Ok(spans)
+}
+
+fn canonical_scope_root_span_id(scope_kind: &str, scope_id: &str) -> String {
+    stable_id("runtime-span", &[scope_kind, scope_id, "scope_root"])
+}
+
+fn root_observation_is_start(capture: &Value, scope_kind: &str) -> bool {
+    if scope_kind == "turn" && record_type(capture) == "api_snapshot" {
+        return true;
+    }
+    capture
+        .pointer("/lifecycleEvent/type")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| match scope_kind {
+            "session" => event_type == "session_start",
+            "turn" => matches!(event_type, "turn_start" | "subagent_spawn"),
+            "task" => event_type == "task_start",
+            _ => false,
+        })
+}
+
+fn root_observation_is_terminal(capture: &Value, scope_kind: &str) -> bool {
+    capture
+        .pointer("/lifecycleEvent/type")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| match scope_kind {
+            "session" => is_session_root_terminal(event_type),
+            "turn" => is_turn_root_terminal(event_type) || event_type == "subagent_join",
+            "task" => is_explicit_task_root_terminal(event_type),
+            _ => false,
+        })
+}
+
+fn is_session_root_event(event_type: &str) -> bool {
+    event_type == "session_start" || is_session_root_terminal(event_type)
+}
+
+fn is_session_root_terminal(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "session_end" | "session_ended" | "session_cancelled"
+    ) || event_type.starts_with("session_cancel")
+}
+
+fn is_turn_root_event(event_type: &str) -> bool {
+    event_type == "turn_start" || is_turn_root_terminal(event_type)
+}
+
+fn is_turn_root_terminal(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "turn_end" | "turn_stop" | "turn_interrupt" | "turn_aborted"
+    )
+}
+
+fn is_subagent_root_event(event_type: &str) -> bool {
+    matches!(event_type, "subagent_spawn" | "subagent_join")
+}
+
+fn is_explicit_task_root_event(event_type: &str) -> bool {
+    event_type == "task_start" || is_explicit_task_root_terminal(event_type)
+}
+
+fn is_explicit_task_root_terminal(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "task_end" | "task_ended" | "cancel" | "cancelled" | "canceled" | "terminated" | "aborted"
+    ) || event_type.starts_with("task_cancel")
 }
 
 fn is_task_root_start(event_type: &str) -> bool {
@@ -3487,9 +3741,10 @@ fn canonical_json(value: &Value) -> Result<String> {
 
 fn build_tool_runtime_spans(
     captures: &[Value],
+    interactions: &[Value],
     scope_index: &RuntimeScopeIndex,
 ) -> Result<Vec<Value>> {
-    let model_call_names = rollout_model_call_names(captures, scope_index);
+    let model_call_names = interaction_model_call_names(interactions);
     let mut groups: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
     for capture in captures {
         let Some(execution) = capture.get("toolExecution") else {
@@ -3513,19 +3768,16 @@ fn build_tool_runtime_spans(
             .push(capture);
     }
     let mut spans = Vec::new();
-    for (group_key, captures) in groups {
+    for (_group_key, captures) in groups {
         let first = captures[0];
         let first_execution = &first["toolExecution"];
         let call_id = string_field(first_execution, "call_id").unwrap_or("missing");
         let runtime_name = string_field(first_execution, "name").unwrap_or("unknown");
-        let exact_model_match = captures.iter().any(|capture| {
-            capture
-                .pointer("/toolExecution/model_call_matched")
-                .and_then(Value::as_bool)
-                == Some(true)
-        });
-        let model_names = model_call_names.get(&group_key);
-        let name = if exact_model_match && model_names.is_some_and(|names| names.len() == 1) {
+        let session_id = trace_string(first, "session_id");
+        let model_names = session_id
+            .map(|session_id| session_call_key(session_id, call_id))
+            .and_then(|key| model_call_names.get(&key));
+        let name = if model_names.is_some_and(|names| names.len() == 1) {
             model_names
                 .and_then(|names| names.iter().next())
                 .map(String::as_str)
@@ -3538,7 +3790,16 @@ fn build_tool_runtime_spans(
             .copied()
             .filter(|capture| string_field(&capture["toolExecution"], "status") != Some("started"))
             .collect();
-        let selected = terminal.last().copied().unwrap_or(first);
+        // PostToolUse proves the hook ran but does not report an authoritative
+        // result status. Prefer codex.tool_result when both observations share
+        // the same call_id.
+        let selected = terminal
+            .iter()
+            .rev()
+            .copied()
+            .find(|capture| string_field(&capture["toolExecution"], "status") != Some("unknown"))
+            .or_else(|| terminal.last().copied())
+            .unwrap_or(first);
         let execution = &selected["toolExecution"];
         let lifecycle_terminal = terminal.iter().any(|capture| {
             capture
@@ -3566,11 +3827,23 @@ fn build_tool_runtime_spans(
                 string_field(&capture["toolExecution"], "name").map(str::to_owned)
             })
             .collect();
+        let authoritative_names: BTreeSet<String> = captures
+            .iter()
+            .filter(|capture| runtime_observation_is_authoritative(capture))
+            .filter_map(|capture| {
+                string_field(&capture["toolExecution"], "name").map(str::to_owned)
+            })
+            .collect();
         let statuses: Vec<String> = captures
             .iter()
             .filter_map(|capture| {
                 string_field(&capture["toolExecution"], "status").map(str::to_owned)
             })
+            .collect();
+        let authoritative_statuses: BTreeSet<&str> = captures
+            .iter()
+            .filter_map(|capture| string_field(&capture["toolExecution"], "status"))
+            .filter(|status| !matches!(*status, "started" | "unknown"))
             .collect();
         let capture_ids: Vec<String> = captures
             .iter()
@@ -3592,7 +3865,15 @@ fn build_tool_runtime_spans(
             .filter(|parent| *parent != call_id)
             .map(str::to_owned);
         let collapsed_self_parent = observed_parent_call_id.as_deref() == Some(call_id);
-        let conflict = terminal.len() > 1 || names.len() > 1 || parent_call_ids.len() > 1;
+        let model_name_conflict = model_names.is_some_and(|model_names| {
+            model_names.len() > 1
+                || (!authoritative_names.is_empty()
+                    && model_names.is_disjoint(&authoritative_names))
+        });
+        let conflict = authoritative_statuses.len() > 1
+            || authoritative_names.len() > 1
+            || model_name_conflict
+            || parent_call_ids.len() > 1;
         spans.push(json!({
             "schema_version":RUNTIME_SPAN_SCHEMA_VERSION,
             "span_id":span_id,
@@ -3626,6 +3907,9 @@ fn build_tool_runtime_spans(
                 "buyer_schema_eligible":execution.get("schema").is_some_and(|schema| !schema.is_null())
                     && execution.pointer("/schema/schema_provenance/source_complete")
                         .and_then(Value::as_bool) != Some(false),
+                "result_content_captured":execution.get("result_content_captured")
+                    .and_then(Value::as_bool).unwrap_or(true),
+                "output_truncated":execution.get("output_truncated"),
                 "lifecycle_terminal":lifecycle_terminal,
                 "semantic_status":semantic_status,
                 "semantic_status_provenance":if semantic_status == "unknown" {
@@ -3634,12 +3918,56 @@ fn build_tool_runtime_spans(
                     "codex_rollout_runtime_item.status"
                 },
                 "runtime_tool_name":runtime_name,
+                "observed_tool_name_aliases":names,
+                "authoritative_runtime_tool_names":authoritative_names,
                 "observed_parent_call_ids":parent_call_ids,
                 "collapsed_self_parent_call_id":collapsed_self_parent,
             },
         }));
     }
     Ok(spans)
+}
+
+fn runtime_observation_is_authoritative(capture: &Value) -> bool {
+    let execution = &capture["toolExecution"];
+    string_field(execution, "source_event_name") == Some("codex.tool_result")
+        || string_field(execution, "status")
+            .is_some_and(|status| !matches!(status, "started" | "unknown"))
+}
+
+fn interaction_model_call_names(interactions: &[Value]) -> HashMap<String, BTreeSet<String>> {
+    let mut calls = HashMap::new();
+    for interaction in interactions {
+        let Some(session_id) = trace_string(interaction, "session_id") else {
+            continue;
+        };
+        for call in interaction
+            .get("model_tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(call_id) = call
+                .get("call_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            let Some(name) = call
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            calls
+                .entry(session_call_key(session_id, call_id))
+                .or_insert_with(BTreeSet::new)
+                .insert(name.to_owned());
+        }
+    }
+    calls
 }
 
 fn build_subagent_runtime_spans(
@@ -4097,6 +4425,7 @@ fn normalize_runtime_status(status: Option<&str>) -> String {
         Some(value) if matches!(value.as_str(), "abort" | "aborted" | "terminated") => "cancelled",
         Some(value) if matches!(value.as_str(), "timeout" | "timed_out") => "timeout",
         Some(value) if value == "incomplete" => "incomplete",
+        Some(value) if value == "closed" => "closed",
         Some(value) if value == "started" || value == "running" => "running",
         _ => "unknown",
     }
@@ -4148,7 +4477,7 @@ fn build_interaction_links(
             .filter_map(|call| call.get("call_id").and_then(Value::as_str))
         {
             calls
-                .entry(scoped_identity(interaction, call_id))
+                .entry(scoped_model_call_identity(interaction, call_id))
                 .or_default()
                 .insert(interaction_id.to_owned());
         }
@@ -4239,7 +4568,7 @@ fn build_interaction_links(
             let Some(call_id) = result.get("call_id").and_then(Value::as_str) else {
                 continue;
             };
-            let Some(targets) = calls.get(&scoped_identity(interaction, call_id)) else {
+            let Some(targets) = calls.get(&scoped_model_call_identity(interaction, call_id)) else {
                 continue;
             };
             if targets.len() != 1 {
@@ -4300,25 +4629,26 @@ fn build_interaction_links(
         }
         if let Some(parent_span_id) =
             string_field(span, "parent_span_id").filter(|value| !value.trim().is_empty())
-            && let Some(targets) =
-                runtime_span_identities.get(&runtime_span_identity(span, parent_span_id))
-            && targets.len() == 1
+            && let Some(parent) = runtime_parent_span(
+                span,
+                parent_span_id,
+                &runtime_span_identities,
+                runtime_spans,
+            )
+            && parent != span_id
         {
-            let parent = targets.iter().next().cloned().unwrap_or_default();
-            if parent != span_id {
-                links.push(interaction_link(
-                    &format!("runtime-span:{parent}"),
-                    &format!("runtime-span:{span_id}"),
-                    "runtime_parent_to_child",
-                    json!({
-                        "match":"exact_parent_span_id",
-                        "parent_span_id":parent_span_id,
-                    }),
-                ));
-            }
+            links.push(interaction_link(
+                &format!("runtime-span:{parent}"),
+                &format!("runtime-span:{span_id}"),
+                "runtime_parent_to_child",
+                json!({
+                    "match":"exact_parent_span_id",
+                    "parent_span_id":parent_span_id,
+                }),
+            ));
         }
         if let Some(parent_call_id) = string_field(span, "parent_call_id")
-            && let Some(targets) = calls.get(&scoped_identity(span, parent_call_id))
+            && let Some(targets) = calls.get(&scoped_model_call_identity(span, parent_call_id))
             && targets.len() == 1
         {
             let interaction = targets.iter().next().cloned().unwrap_or_default();
@@ -4333,7 +4663,7 @@ fn build_interaction_links(
                 }),
             ));
         } else if let Some(call_id) = string_field(span, "call_id")
-            && let Some(targets) = calls.get(&scoped_identity(span, call_id))
+            && let Some(targets) = calls.get(&scoped_model_call_identity(span, call_id))
             && targets.len() == 1
         {
             let interaction = targets.iter().next().cloned().unwrap_or_default();
@@ -4371,10 +4701,13 @@ fn build_interaction_links(
     }
 
     let mut roots_by_scope: HashMap<String, BTreeSet<String>> = HashMap::new();
-    for span in runtime_spans
-        .iter()
-        .filter(|span| string_field(span, "span_kind") == Some("task_root"))
-    {
+    for span in runtime_spans.iter().filter(|span| {
+        string_field(span, "span_kind") == Some("task_root")
+            || span
+                .pointer("/extensions/scope_root")
+                .and_then(Value::as_bool)
+                == Some(true)
+    }) {
         if let (Some(scope), Some(span_id)) =
             (runtime_task_scope(span), string_field(span, "span_id"))
         {
@@ -4459,10 +4792,56 @@ fn build_interaction_links(
     Ok(links)
 }
 
+fn runtime_parent_span(
+    child: &Value,
+    parent_span_id: &str,
+    runtime_span_identities: &HashMap<String, BTreeSet<String>>,
+    runtime_spans: &[Value],
+) -> Option<String> {
+    let native = runtime_span_identities.get(&runtime_span_identity(child, parent_span_id));
+    if let Some(targets) = native.filter(|targets| targets.len() == 1) {
+        return targets.iter().next().cloned();
+    }
+    let targets: BTreeSet<String> = runtime_spans
+        .iter()
+        .filter(|span| string_field(span, "span_id") == Some(parent_span_id))
+        .filter(|span| same_session_or_task_scope(child, span))
+        .filter_map(|span| string_field(span, "span_id").map(str::to_owned))
+        .collect();
+    (targets.len() == 1)
+        .then(|| targets.into_iter().next())
+        .flatten()
+}
+
+fn same_session_or_task_scope(left: &Value, right: &Value) -> bool {
+    match (
+        trace_string(left, "task_session_id"),
+        trace_string(right, "task_session_id"),
+    ) {
+        (Some(left), Some(right)) => return left == right,
+        (Some(_), None) | (None, Some(_)) => return false,
+        (None, None) => {}
+    }
+    matches!(
+        (trace_string(left, "session_id"), trace_string(right, "session_id")),
+        (Some(left), Some(right)) if left == right
+    )
+}
+
 fn scoped_identity(value: &Value, identity: &str) -> String {
     let scope = canonical_identity_scope(value)
         .unwrap_or_else(|| format!("source:{}", source_namespace(value)));
     format!("{scope}\0{identity}")
+}
+
+fn scoped_model_call_identity(value: &Value, call_id: &str) -> String {
+    let scope = trace_string(value, "task_session_id")
+        .map(|task_session_id| format!("task:{task_session_id}"))
+        .or_else(|| {
+            trace_string(value, "session_id").map(|session_id| format!("session:{session_id}"))
+        })
+        .unwrap_or_else(|| format!("source:{}", source_namespace(value)));
+    format!("{scope}\0{call_id}")
 }
 
 fn runtime_span_identity(value: &Value, identity: &str) -> String {
@@ -4484,8 +4863,16 @@ fn runtime_span_identity(value: &Value, identity: &str) -> String {
 fn runtime_task_scope(value: &Value) -> Option<String> {
     let (kind, identity) = if let Some(identity) = trace_string(value, "task_session_id") {
         ("task", identity)
+    } else if value
+        .pointer("/extensions/scope_kind")
+        .and_then(Value::as_str)
+        == Some("session")
+    {
+        ("session", trace_string(value, "session_id")?)
     } else if let Some(identity) = trace_string(value, "root_turn_id") {
         ("turn", identity)
+    } else if let Some(identity) = trace_string(value, "session_id") {
+        ("session", identity)
     } else {
         return None;
     };
@@ -4495,6 +4882,9 @@ fn runtime_task_scope(value: &Value) -> Option<String> {
 fn runtime_scope_key(value: &Value, kind: &str, identity: &str) -> String {
     if kind == "task" {
         return format!("task:{identity}");
+    }
+    if kind == "session" {
+        return format!("session:{identity}");
     }
     trace_string(value, "session_id").map_or_else(
         || format!("turn:{identity}"),
@@ -4673,8 +5063,6 @@ fn attach_runtime_link_refs(interactions: &mut [Value], links: &[Value]) {
 mod tests {
     use super::*;
     use crate::capture::{CAPTURE_SCHEMA_VERSION, normalize_capture};
-    use crate::codex_rollout::{ExportConfig, ExportTarget, export_codex_rollout};
-    use std::time::Duration;
 
     const RESPONSES_NON_STREAM_REQUEST: &str =
         include_str!("../../../fixtures/openai/responses-non-stream-request.json");
@@ -4694,129 +5082,6 @@ mod tests {
         include_str!("../../../fixtures/openai/chat-stream-response.sse");
     const TRACE_ID: &str = "0123456789abcdef0123456789abcdef";
     const ROOT_SPAN_ID: &str = "1111111111111111";
-
-    fn codex_fixture(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/codex")
-            .join(name)
-    }
-
-    async fn export_stock_fixture(
-        fixture_name: &str,
-        root: &Path,
-        output: &Path,
-    ) -> ExportSummaryForTest {
-        fs::create_dir_all(root).unwrap();
-        fs::copy(codex_fixture(fixture_name), root.join("rollout.jsonl")).unwrap();
-        let summary = export_codex_rollout(ExportConfig {
-            input: root.join("rollout.jsonl"),
-            state_root: root.join("state"),
-            target: ExportTarget::Jsonl(output.to_owned()),
-            source_namespace: "stock-golden".to_owned(),
-            tool_registry: None,
-            batch_records: 2,
-            max_envelope_bytes: 4 * 1024 * 1024,
-            request_timeout: Duration::from_secs(1),
-            retry_max_times: 20,
-            task_session_id: None,
-            root_session_id: None,
-            parent_session_id: None,
-            goal_id: None,
-        })
-        .await
-        .unwrap();
-        ExportSummaryForTest {
-            captures: summary.captures_emitted,
-        }
-    }
-
-    struct ExportSummaryForTest {
-        captures: u64,
-    }
-
-    #[tokio::test]
-    async fn stock_rollout_projects_root_and_child_runtime_without_harness() {
-        let temporary = tempfile::tempdir().unwrap();
-        let output = temporary.path().join("captures.jsonl");
-        let root = export_stock_fixture(
-            "stock-rollout-root.jsonl",
-            &temporary.path().join("root"),
-            &output,
-        )
-        .await;
-        let child = export_stock_fixture(
-            "stock-rollout-child.jsonl",
-            &temporary.path().join("child"),
-            &output,
-        )
-        .await;
-        assert_eq!((root.captures, child.captures), (8, 5));
-
-        let (captures, duplicates) = read_captures(&[output]).unwrap();
-        assert_eq!(duplicates, 0);
-        let spans = build_runtime_spans(&captures).unwrap();
-        assert_eq!(spans.len(), 4);
-        let root_span = spans
-            .iter()
-            .find(|span| span["span_kind"] == "task_root")
-            .unwrap();
-        assert_eq!(root_span["trace_context"]["session_id"], "session-root");
-        assert_eq!(root_span["trace_context"]["root_turn_id"], "turn-root");
-        assert_eq!(root_span["status"], "completed");
-        assert_eq!(root_span["extensions"]["root_complete"], true);
-
-        let tools: Vec<&Value> = spans
-            .iter()
-            .filter(|span| span["span_kind"] == "tool_execution")
-            .collect();
-        assert_eq!(tools.len(), 3);
-        assert!(tools.iter().all(|span| {
-            span["trace_context"]["root_turn_id"] == "turn-root"
-                && span["extensions"]["buyer_schema_eligible"] == false
-        }));
-        let root_tool = tools
-            .iter()
-            .find(|span| span["call_id"] == "runtime-command-1")
-            .unwrap();
-        assert_eq!(root_tool["parent_call_id"], "call-outer-exec");
-        assert_eq!(root_tool["status"], "failed");
-        let dispatcher = tools
-            .iter()
-            .find(|span| span["call_id"] == "call-outer-exec")
-            .unwrap();
-        assert_eq!(dispatcher["name"], "exec");
-        assert_eq!(dispatcher["status"], "completed");
-        assert_eq!(dispatcher["extensions"]["semantic_status"], "unknown");
-        assert_eq!(dispatcher["extensions"]["lifecycle_terminal"], true);
-        let child_tool = tools
-            .iter()
-            .find(|span| span["call_id"] == "runtime-command-child")
-            .unwrap();
-        assert_eq!(
-            child_tool["trace_context"]["parent_thread_id"],
-            "thread-root"
-        );
-
-        let integrity = runtime_integrity(&[], &spans, &[]);
-        assert!(integrity.root_complete);
-        assert_eq!(integrity.metrics["unscoped_span_ids"], json!([]));
-
-        let summary = canonical_trace_summary(&captures).unwrap().unwrap();
-        let summary = summary.runtime_dag;
-        assert_eq!(summary["applicable"], true);
-        assert_eq!(
-            summary["source"],
-            "canonical_model_interaction:codex_rollout_jsonl"
-        );
-        assert_eq!(summary["native_event_count"], 13);
-        assert_eq!(summary["root_complete"], true);
-        assert_eq!(summary["complete"], false);
-        assert!(
-            summary["unresolved_node_ids"]
-                .as_array()
-                .is_some_and(|nodes| !nodes.is_empty())
-        );
-    }
 
     #[test]
     fn stock_dispatcher_subagent_and_statusless_item_keep_separate_status_facts() {
@@ -4910,7 +5175,7 @@ mod tests {
             }
         });
         let captures = vec![call, result, spawn, interaction, image, join];
-        let spans = build_runtime_spans(&captures).unwrap();
+        let spans = build_runtime_spans(&captures, &[]).unwrap();
         let dispatcher = spans
             .iter()
             .find(|span| span["call_id"] == "call-spawn")
@@ -5053,7 +5318,7 @@ mod tests {
                 }]
             }]
         });
-        let scope_index = RuntimeScopeIndex::new(std::slice::from_ref(&capture));
+        let scope_index = RuntimeScopeIndex::with_interactions(std::slice::from_ref(&capture), &[]);
         let spans = build_dispatcher_runtime_spans(&[capture], &scope_index).unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0]["status"], "running");
@@ -5289,7 +5554,7 @@ mod tests {
             lifecycle("cap-end", "turn_end", "completed", "2026-09-01T00:00:02Z"),
         ];
 
-        let spans = build_runtime_spans(&captures).unwrap();
+        let spans = build_runtime_spans(&captures, &[]).unwrap();
         let tool_span = spans
             .iter()
             .find(|span| span["call_id"] == "call-direct")
@@ -5310,8 +5575,8 @@ mod tests {
                 && link["to"] == format!("runtime-span:{}", tool_span["span_id"].as_str().unwrap())
         }));
         let integrity = runtime_integrity(&[], &spans, &links);
-        assert!(integrity.root_complete);
-        assert!(integrity.runtime_complete);
+        assert!(!integrity.root_complete);
+        assert!(!integrity.runtime_complete);
         assert_eq!(
             integrity.metrics["unresolved_parent_call_span_ids"],
             json!([])
@@ -5511,75 +5776,7 @@ mod tests {
                 }
             }
         });
-        let inference = |capture_id: &str,
-                         event_type: &str,
-                         inference_call_id: &str,
-                         upstream_request_id: &str,
-                         response_id: &str,
-                         received_at: &str| {
-            let payload = json!({
-                "type":event_type,
-                "inference_call_id":inference_call_id,
-                "upstream_request_id":upstream_request_id,
-                "response_id":response_id
-            });
-            let source_line = json!({"payload":payload}).to_string();
-            json!({
-                "recordType":"rollout_event","captureId":capture_id,
-                "sourceNamespace":"golden","receivedAt":received_at,
-                "traceContext":trace_context,
-                "rolloutEvent":{
-                    "schema_version":"chiptrace.codex-rollout.v1",
-                    "source":"codex_rollout_jsonl",
-                    "source_session_id":"task-golden",
-                    "source_ordinal":1,
-                    "classification":"known",
-                    "bundle_trace_id":"m0-bundle",
-                    "event_type":event_type,
-                    "source_line":source_line,
-                    "source_line_sha256":sha256(source_line.as_bytes())
-                }
-            })
-        };
-        let raw_captures = vec![
-            start,
-            first_api.clone(),
-            inference(
-                "cap-m0-inference-1-start",
-                "inference_started",
-                "inference-1",
-                "upstream-1",
-                "resp-responses-stream",
-                "2026-08-30T00:00:00.1Z",
-            ),
-            inference(
-                "cap-m0-inference-1-end",
-                "inference_completed",
-                "inference-1",
-                "upstream-1",
-                "resp-responses-stream",
-                "2026-08-30T00:00:01Z",
-            ),
-            tool,
-            second_api.clone(),
-            inference(
-                "cap-m0-inference-2-start",
-                "inference_started",
-                "inference-2",
-                "upstream-2",
-                "resp-m0-2",
-                "2026-08-30T00:00:03Z",
-            ),
-            inference(
-                "cap-m0-inference-2-end",
-                "inference_completed",
-                "inference-2",
-                "upstream-2",
-                "resp-m0-2",
-                "2026-08-30T00:00:04Z",
-            ),
-            end,
-        ];
+        let raw_captures = [start, first_api.clone(), tool, second_api.clone(), end];
         let stored = raw_captures
             .iter()
             .map(|capture| {
@@ -5606,7 +5803,7 @@ mod tests {
             )
             .unwrap(),
         ];
-        let runtime_spans = build_runtime_spans(&captures).unwrap();
+        let runtime_spans = build_runtime_spans(&captures, &interactions).unwrap();
         let links = build_interaction_links(&interactions, &runtime_spans, &captures).unwrap();
         let (raw_bytes_complete, protocol_complete, _) =
             aggregate_interaction_integrity(&interactions);
@@ -5932,7 +6129,7 @@ mod tests {
             "extensions":{"state_conflict":false}
         });
         let captures = [start, end];
-        let scope_index = RuntimeScopeIndex::new(&captures);
+        let scope_index = RuntimeScopeIndex::with_interactions(&captures, &[]);
         let mut spans = build_task_root_spans(&captures, &scope_index).unwrap();
         assert_eq!(spans.len(), 1);
         spans.push(child);
@@ -5984,7 +6181,7 @@ mod tests {
             "2026-09-01T00:00:02Z",
         );
         let captures = [start.clone(), interrupt, aborted];
-        let scope_index = RuntimeScopeIndex::new(&captures);
+        let scope_index = RuntimeScopeIndex::with_interactions(&captures, &[]);
         let spans = build_task_root_spans(&captures, &scope_index).unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0]["status"], "cancelled");
@@ -5992,8 +6189,8 @@ mod tests {
         assert_eq!(spans[0]["extensions"]["state_conflict"], false);
         assert_eq!(spans[0]["extensions"]["terminal_observations"], 2);
         let integrity = runtime_integrity(&[], &spans, &[]);
-        assert!(integrity.root_complete);
-        assert!(integrity.runtime_complete);
+        assert!(!integrity.root_complete);
+        assert!(!integrity.runtime_complete);
 
         let completed = lifecycle(
             "cap-turn-stop",
@@ -6002,7 +6199,7 @@ mod tests {
             "2026-09-01T00:00:03Z",
         );
         let captures = [start, captures[1].clone(), captures[2].clone(), completed];
-        let scope_index = RuntimeScopeIndex::new(&captures);
+        let scope_index = RuntimeScopeIndex::with_interactions(&captures, &[]);
         let spans = build_task_root_spans(&captures, &scope_index).unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0]["extensions"]["root_complete"], false);
@@ -6299,7 +6496,7 @@ mod tests {
                 "parent_thread_id":"thread-root","turn_id":"turn-child"
             }
         });
-        let index = RuntimeScopeIndex::new(&[root_a, root_b, child_wire]);
+        let index = RuntimeScopeIndex::with_interactions(&[root_a, root_b, child_wire], &[]);
 
         assert_eq!(
             index.scope(&child_rollout),
@@ -6309,5 +6506,61 @@ mod tests {
             index.trace_context(&child_rollout, true)["root_turn_id"],
             "turn-a"
         );
+    }
+
+    #[test]
+    fn stock_session_selection_includes_only_explicitly_linked_subagent_evidence() {
+        let lifecycle = |capture_id: &str, event_type: &str| {
+            json!({
+                "captureId":capture_id,"sourceNamespace":"stock-codex-cloud",
+                "traceContext":{
+                    "session_id":"session-root","root_turn_id":"turn-child",
+                    "turn_id":"turn-child","agent_id":"session-child"
+                },
+                "lifecycleEvent":{
+                    "type":event_type,
+                    "source_event":{
+                        "session_id":"session-root","agent_id":"session-child",
+                        "turn_id":"turn-child"
+                    }
+                }
+            })
+        };
+        let child = json!({
+            "captureId":"cap-child-tool","sourceNamespace":"stock-codex-cloud",
+            "traceContext":{
+                "session_id":"session-child","conversation_id":"session-child",
+                "thread_id":"session-child"
+            },
+            "toolExecution":{
+                "call_id":"call-child","name":"exec_command","status":"success"
+            }
+        });
+        let unrelated = json!({
+            "captureId":"cap-unrelated","sourceNamespace":"stock-codex-cloud",
+            "traceContext":{"session_id":"session-unrelated"}
+        });
+
+        let (selected, task_session_id, session_id) = select_projection_captures(
+            vec![
+                lifecycle("cap-child-start", "subagent_spawn"),
+                child,
+                lifecycle("cap-child-stop", "subagent_join"),
+                unrelated,
+            ],
+            None,
+            Some("session-root"),
+        )
+        .unwrap();
+        assert_eq!(task_session_id, None);
+        assert_eq!(session_id.as_deref(), Some("session-root"));
+        assert_eq!(selected.len(), 3);
+        let child = selected
+            .iter()
+            .find(|capture| string_field(capture, "captureId") == Some("cap-child-tool"))
+            .unwrap();
+        assert_eq!(child["traceContext"]["session_id"], "session-root");
+        assert_eq!(child["traceContext"]["source_session_id"], "session-child");
+        assert_eq!(child["traceContext"]["root_turn_id"], "turn-child");
     }
 }

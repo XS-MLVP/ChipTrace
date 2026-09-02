@@ -559,13 +559,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
     let response_dag_unresolved_parents = session
         .pointer("/meta/capture_dag/unresolved_parent_response_ids")
         .and_then(Value::as_array)
-        .map_or(0, |parents| parents.len() as u64)
-        .saturating_add(
-            session
-                .pointer("/meta/capture_dag/unresolved_parent_span_ids")
-                .and_then(Value::as_array)
-                .map_or(0, |parents| parents.len() as u64),
-        );
+        .map_or(0, |parents| parents.len() as u64);
     let task_dag_complete = session
         .pointer("/meta/task_dag/complete")
         .and_then(Value::as_bool)

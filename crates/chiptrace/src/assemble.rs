@@ -6,6 +6,7 @@ use crate::model_interaction::canonical_trace_summary;
 use crate::schema::{
     FileManifest, RAW_LINEAGE_SCHEMA_VERSION, RawSourceLineage, SESSION_SCHEMA_VERSION,
 };
+use crate::session_lineage::StockSessionLineage;
 use crate::tool_registry::{
     canonical_runtime_tool_name, canonical_tool_registry_sha256, canonical_tool_schema_sha256,
     tool_definition_source_complete,
@@ -33,6 +34,8 @@ pub const ASSEMBLY_SCHEMA_VERSION: &str = "chiptrace.assembly-manifest.v1";
 pub struct AssembleConfig {
     pub inputs: Vec<PathBuf>,
     pub output: PathBuf,
+    pub task_session_id: Option<String>,
+    pub session_id: Option<String>,
     pub partitions: usize,
     pub zstd_level: i32,
     pub replace: bool,
@@ -45,6 +48,10 @@ pub struct AssemblyManifest {
     pub format: String,
     pub capture_schema_versions: BTreeSet<String>,
     pub inputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub raw_sources: Vec<RawSourceLineage>,
     pub input_records: u64,
@@ -211,12 +218,22 @@ pub fn assemble(config: AssembleConfig) -> Result<AssemblyManifest> {
     if config.partitions == 0 {
         bail!("partitions must be positive");
     }
+    let task_session_id =
+        normalized_selector(config.task_session_id.as_deref(), "task_session_id")?;
+    let session_id = normalized_selector(config.session_id.as_deref(), "session_id")?;
+    if task_session_id.is_some() && session_id.is_some() {
+        bail!("task_session_id and session_id cannot be selected together");
+    }
     let inputs = discover_inputs(&config.inputs)?;
     if inputs.is_empty() {
         bail!("no NDJSON capture files found");
     }
     let raw_sources = discover_raw_sources(&config.inputs, &inputs)?;
     let task_links = build_task_link_index(&inputs)?;
+    let session_selection = session_id
+        .as_deref()
+        .map(|selected| build_stock_session_lineage(&inputs)?.selection(selected))
+        .transpose()?;
     let output = absolute_path(&config.output)?;
     if output.exists() && !config.replace {
         bail!("assembly output already exists: {}", output.display());
@@ -255,6 +272,52 @@ pub fn assemble(config: AssembleConfig) -> Result<AssemblyManifest> {
             }
             let mut value: Value = serde_json::from_slice(&line)
                 .with_context(|| format!("parse {} line {}", path.display(), line_index + 1))?;
+            // Raw OTLP/Hook envelopes remain in WAL/Object Storage as the
+            // authoritative replay source. They are evidence containers, not
+            // standalone Sessions, so only their strictly derived captures
+            // enter canonical assembly. A batch carrying an unknown event or a
+            // conversion error is intentionally not assemblable: the raw bytes
+            // remain available for a versioned adapter, but cannot silently
+            // become a buyer-eligible trajectory.
+            if string_field(&value, "recordType") == Some("telemetry_batch") {
+                let batch = value
+                    .get("telemetryBatch")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| anyhow::anyhow!("telemetry_batch requires telemetryBatch"))?;
+                let unknown = batch
+                    .get("unknown_events")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let errors = batch
+                    .get("conversion_errors")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                let attributed = batch
+                    .get("attributed_quality_errors")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let has_unattributed = unknown.saturating_add(errors as u64) > attributed;
+                let current = has_unattributed
+                    .then(|| crate::cloud_ingest::revalidate_telemetry_batch(&value))
+                    .transpose()?;
+                let current_has_unattributed = current.as_ref().is_some_and(|summary| {
+                    summary
+                        .unknown_events
+                        .saturating_add(summary.conversion_errors.len() as u64)
+                        > summary.attributed_quality_errors
+                });
+                if current_has_unattributed {
+                    let summary = current.as_ref().expect("checked current summary");
+                    bail!(
+                        "telemetry batch {} has unattributed quality errors under the current adapter: unknown_events={}, conversion_errors={}, attributed={}",
+                        string_field(&value, "captureId").unwrap_or("unknown"),
+                        summary.unknown_events,
+                        summary.conversion_errors.len(),
+                        summary.attributed_quality_errors,
+                    );
+                }
+                continue;
+            }
             let capture_id = string_field(&value, "captureId")
                 .ok_or_else(|| anyhow::anyhow!("captureId missing in {}", path.display()))?;
             let digest = hex::encode(Sha256::digest(&line));
@@ -267,13 +330,25 @@ pub fn assemble(config: AssembleConfig) -> Result<AssemblyManifest> {
             }
             seen_capture_ids.insert(capture_id.to_owned(), digest);
             let linked = apply_exact_task_link(&mut value, &task_links)?;
+            let selected = if let Some(selection) = session_selection.as_ref() {
+                selection.contains(&value)
+            } else {
+                capture_matches_selection(&value, task_session_id.as_deref(), session_id.as_deref())
+            };
+            if !selected {
+                continue;
+            }
+            let lineage_linked = match session_selection.as_ref() {
+                Some(selection) => selection.canonicalize(&mut value)?,
+                None => false,
+            };
             exact_task_links_applied = exact_task_links_applied.saturating_add(u64::from(linked));
             if let Some(version) = string_field(&value, "version") {
                 versions.insert(version.to_owned());
             }
             let key = task_partition_key(&value);
             let index = partition_index(&key, config.partitions);
-            if linked {
+            if linked || lineage_linked {
                 partition_writers[index].write_all(&serde_json::to_vec(&value)?)?;
             } else {
                 partition_writers[index].write_all(&line)?;
@@ -281,6 +356,18 @@ pub fn assemble(config: AssembleConfig) -> Result<AssemblyManifest> {
             partition_writers[index].write_all(b"\n")?;
             input_records += 1;
         }
+    }
+    if input_records == 0 && (task_session_id.is_some() || session_id.is_some()) {
+        let selector = task_session_id
+            .as_deref()
+            .map(|value| format!("task_session_id={value:?}"))
+            .or_else(|| {
+                session_id
+                    .as_deref()
+                    .map(|value| format!("session_id={value:?}"))
+            })
+            .unwrap_or_default();
+        bail!("selected {selector} was not found in Capture inputs");
     }
     for mut writer in partition_writers {
         writer.flush()?;
@@ -311,6 +398,8 @@ pub fn assemble(config: AssembleConfig) -> Result<AssemblyManifest> {
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect(),
+        task_session_id,
+        session_id,
         raw_sources,
         input_records,
         duplicate_captures_removed: duplicate_captures,
@@ -333,6 +422,24 @@ pub fn assemble(config: AssembleConfig) -> Result<AssemblyManifest> {
     sync_directory(parent)?;
     verify_assembly(&output)?;
     Ok(manifest)
+}
+
+fn build_stock_session_lineage(inputs: &[PathBuf]) -> Result<StockSessionLineage> {
+    let mut lineage = StockSessionLineage::default();
+    for path in inputs {
+        let reader = crate::jsonl::open_jsonl_reader(path)?;
+        for (line_index, line) in reader.split(b'\n').enumerate() {
+            let line =
+                line.with_context(|| format!("read {} line {}", path.display(), line_index + 1))?;
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let value: Value = serde_json::from_slice(&line)
+                .with_context(|| format!("parse {} line {}", path.display(), line_index + 1))?;
+            lineage.observe(&value)?;
+        }
+    }
+    Ok(lineage)
 }
 
 pub fn verify_assembly(root: &Path) -> Result<AssemblyManifest> {
@@ -381,6 +488,21 @@ pub fn verify_assembly(root: &Path) -> Result<AssemblyManifest> {
                 || string_field(&session, "session_id").is_none()
             {
                 bail!("invalid canonical session in {}", path.display());
+            }
+            if manifest.task_session_id.as_deref().is_some_and(|selected| {
+                session
+                    .pointer("/trace/task_session_id")
+                    .and_then(Value::as_str)
+                    != Some(selected)
+                    && string_field(&session, "session_id") != Some(selected)
+            }) {
+                bail!("assembly contains a Session outside its task_session_id selection");
+            }
+            if manifest.session_id.as_deref().is_some_and(|selected| {
+                session.pointer("/trace/session_id").and_then(Value::as_str) != Some(selected)
+                    && string_field(&session, "session_id") != Some(selected)
+            }) {
+                bail!("assembly contains a Session outside its session_id selection");
             }
             part_records += 1;
             sessions += 1;
@@ -469,6 +591,38 @@ fn process_partition(
     Ok(result)
 }
 
+fn normalized_selector(value: Option<&str>, name: &str) -> Result<Option<String>> {
+    value
+        .map(str::trim)
+        .map(|value| {
+            if value.is_empty() {
+                bail!("{name} cannot be empty");
+            }
+            Ok(value.to_owned())
+        })
+        .transpose()
+}
+
+fn capture_matches_selection(
+    capture: &Value,
+    task_session_id: Option<&str>,
+    session_id: Option<&str>,
+) -> bool {
+    if let Some(selected) = task_session_id {
+        return capture
+            .pointer("/traceContext/task_session_id")
+            .and_then(Value::as_str)
+            == Some(selected);
+    }
+    if let Some(selected) = session_id {
+        return capture
+            .pointer("/traceContext/session_id")
+            .and_then(Value::as_str)
+            == Some(selected);
+    }
+    true
+}
+
 fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     let canonical_trace = canonical_trace_summary(&captures)?;
     let canonical_runtime_dag = canonical_trace
@@ -527,6 +681,7 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     let mut trace = Map::new();
     let mut trace_conflicts = BTreeSet::new();
     let mut trace_session_ids = BTreeSet::new();
+    let mut trace_conversation_ids = BTreeSet::new();
     let mut trace_thread_ids = BTreeSet::new();
     let mut trace_agent_ids = BTreeSet::new();
     let mut trace_agent_paths = BTreeSet::new();
@@ -534,6 +689,8 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     let mut previous_response_ids = BTreeSet::new();
     let mut span_ids = BTreeSet::new();
     let mut parent_span_ids = BTreeSet::new();
+    let mut trace_ids = BTreeSet::new();
+    let mut traceparents = BTreeSet::new();
     let mut tool_registry_evidence = Vec::new();
     let mut field_evidence = Vec::new();
     let mut protocol_conflicts = Vec::new();
@@ -645,12 +802,15 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
             if !value.is_null() {
                 if matches!(
                     key.as_str(),
-                    "session_id" | "thread_id" | "agent_id" | "agent_path"
+                    "session_id" | "conversation_id" | "thread_id" | "agent_id" | "agent_path"
                 ) {
                     if let Some(value) = value.as_str().filter(|value| !value.trim().is_empty()) {
                         match key.as_str() {
                             "session_id" => {
                                 trace_session_ids.insert(value.to_owned());
+                            }
+                            "conversation_id" => {
+                                trace_conversation_ids.insert(value.to_owned());
                             }
                             "thread_id" => {
                                 trace_thread_ids.insert(value.to_owned());
@@ -686,6 +846,16 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
                 if key == "previous_response_id" {
                     if let Some(value) = value.as_str() {
                         previous_response_ids.insert(value.to_owned());
+                    }
+                    continue;
+                }
+                if matches!(key.as_str(), "trace_id" | "traceparent") {
+                    if let Some(value) = value.as_str() {
+                        if key == "trace_id" {
+                            trace_ids.insert(value.to_owned());
+                        } else {
+                            traceparents.insert(value.to_owned());
+                        }
                     }
                     continue;
                 }
@@ -862,12 +1032,14 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
             format!("{identity_source}\0{session_identity}").as_bytes()
         ))
     );
-    let created_at = parsed
-        .first()
-        .map(|capture| capture.timestamp.clone())
-        .unwrap();
+    let observed_timestamps: Vec<&str> = parsed
+        .iter()
+        .map(|capture| capture.timestamp.as_str())
+        .filter(|timestamp| !timestamp.trim().is_empty())
+        .collect();
+    let created_at = observed_timestamps.first().copied().unwrap_or("");
     let ended_at = final_snapshot
-        .then(|| parsed.last().map(|capture| capture.timestamp.clone()))
+        .then(|| observed_timestamps.last().copied())
         .flatten();
     let mut expanded_messages = Vec::new();
     let mut expanded_tools_by_identity = tools_by_identity.clone();
@@ -907,9 +1079,17 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     let runtime_dag = canonical_runtime_dag.unwrap_or_else(|| build_runtime_dag(&parsed));
     let inference_api_conservation = build_inference_api_conservation(&parsed);
     insert_scoped_trace_values(&mut trace, "session_id", "session_ids", &trace_session_ids);
+    insert_scoped_trace_values(
+        &mut trace,
+        "conversation_id",
+        "conversation_ids",
+        &trace_conversation_ids,
+    );
     insert_scoped_trace_values(&mut trace, "thread_id", "thread_ids", &trace_thread_ids);
     insert_scoped_trace_values(&mut trace, "agent_id", "agent_ids", &trace_agent_ids);
     insert_scoped_trace_values(&mut trace, "agent_path", "agent_paths", &trace_agent_paths);
+    insert_scoped_trace_values(&mut trace, "trace_id", "trace_ids", &trace_ids);
+    insert_scoped_trace_values(&mut trace, "traceparent", "traceparents", &traceparents);
     if turn_ids.len() == 1 {
         trace.insert(
             "turn_id".to_owned(),
@@ -2394,6 +2574,16 @@ fn parse_capture(value: Value) -> Result<ParsedCapture> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let mut protocol_conflicts = protocol_conflicts;
+    protocol_conflicts.extend(
+        value
+            .get("traceContextErrors")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|error| json!({"field":"traceContext", "error":error})),
+    );
     let gateway_evidence = value.get("gatewayEvidence").cloned();
     let gateway_evidence_join = value.get("gatewayEvidenceJoin").cloned();
     let rollout_event = value.get("rolloutEvent").cloned();
@@ -3241,22 +3431,6 @@ fn reconcile_tool_executions(captures: &[ParsedCapture]) -> (Vec<Value>, Vec<Str
 
     let mut executions = Vec::with_capacity(by_call.len());
     for (call_id, events) in by_call {
-        for field in ["name", "initiator", "arguments"] {
-            if tool_event_field_variants(&events, field, false) > 1 {
-                conflicts.insert(format!("{call_id}:field_mismatch:{field}"));
-            }
-        }
-        for field in [
-            "parent_call_id",
-            "schema",
-            "schema_provenance",
-            "started_at",
-        ] {
-            if tool_event_field_variants(&events, field, true) > 1 {
-                conflicts.insert(format!("{call_id}:field_mismatch:{field}"));
-            }
-        }
-
         let started: Vec<&ParsedCapture> = events
             .iter()
             .copied()
@@ -3268,7 +3442,7 @@ fn reconcile_tool_executions(captures: &[ParsedCapture]) -> (Vec<Value>, Vec<Str
                     == Some("started")
             })
             .collect();
-        let terminal: Vec<&ParsedCapture> = events
+        let closure_evidence: Vec<&ParsedCapture> = events
             .iter()
             .copied()
             .filter(|capture| {
@@ -3279,6 +3453,17 @@ fn reconcile_tool_executions(captures: &[ParsedCapture]) -> (Vec<Value>, Vec<Str
                     != Some("started")
             })
             .collect();
+        let terminal: Vec<&ParsedCapture> = closure_evidence
+            .iter()
+            .copied()
+            .filter(|capture| {
+                capture
+                    .tool_execution
+                    .as_ref()
+                    .and_then(|execution| string_field(execution, "status"))
+                    != Some("unknown")
+            })
+            .collect();
         let producer_event_count = events
             .iter()
             .filter(|capture| capture.producer_event.is_some())
@@ -3287,26 +3472,61 @@ fn reconcile_tool_executions(captures: &[ParsedCapture]) -> (Vec<Value>, Vec<Str
         if producer_state_machine && producer_event_count != events.len() {
             conflicts.insert(format!("{call_id}:mixed_producer_and_composite_evidence"));
         }
-        if started.len() > 1 {
-            conflicts.insert(format!("{call_id}:duplicate_started_event"));
+        let mut evidence_sources: BTreeMap<String, Vec<&ParsedCapture>> = BTreeMap::new();
+        for event in &events {
+            evidence_sources
+                .entry(tool_execution_evidence_source(event))
+                .or_default()
+                .push(*event);
         }
-        if terminal.len() > 1 {
-            conflicts.insert(format!("{call_id}:duplicate_terminal_event"));
+        for (source, source_events) in &evidence_sources {
+            for field in ["name", "arguments", "parent_call_id", "schema"] {
+                if tool_event_field_variants(source_events, field, true) > 1 {
+                    conflicts.insert(format!("{call_id}:source_mismatch:{source}:{field}"));
+                }
+            }
+            let source_started = source_events
+                .iter()
+                .filter(|capture| tool_execution_status(capture) == Some("started"))
+                .count();
+            let source_terminal = source_events
+                .iter()
+                .filter(|capture| {
+                    tool_execution_status(capture)
+                        .is_some_and(|status| !matches!(status, "started" | "unknown"))
+                })
+                .count();
+            if source_started > 1 {
+                conflicts.insert(format!("{call_id}:duplicate_started_event:{source}"));
+            }
+            if source_terminal > 1 {
+                conflicts.insert(format!("{call_id}:duplicate_terminal_event:{source}"));
+            }
+        }
+        let terminal_statuses: BTreeSet<&str> = terminal
+            .iter()
+            .filter_map(|capture| tool_execution_status(capture))
+            .map(normalize_tool_status)
+            .collect();
+        if terminal_statuses.len() > 1 {
+            conflicts.insert(format!("{call_id}:terminal_status_conflict"));
         }
         if terminal.is_empty() {
             conflicts.insert(format!("{call_id}:missing_terminal_event"));
         }
-        if producer_state_machine && started.len() != 1 {
-            conflicts.insert(format!("{call_id}:missing_started_event"));
-        }
-
-        if let Some(finished) = terminal.first() {
-            let execution = finished.tool_execution.as_ref().unwrap();
-            if !producer_state_machine
-                && (string_field(execution, "started_at").is_none()
-                    || string_field(execution, "finished_at").is_none())
-            {
-                conflicts.insert(format!("{call_id}:incomplete_composite_span"));
+        if producer_state_machine {
+            if started.len() != 1 {
+                conflicts.insert(format!("{call_id}:missing_started_event"));
+            }
+            for field in ["name", "initiator", "arguments"] {
+                if tool_event_field_variants(&events, field, false) > 1 {
+                    conflicts.insert(format!("{call_id}:field_mismatch:{field}"));
+                }
+            }
+            for field in ["parent_call_id", "schema", "started_at"] {
+                if tool_event_field_variants(&events, field, true) > 1 {
+                    conflicts.insert(format!("{call_id}:field_mismatch:{field}"));
+                }
             }
         }
 
@@ -3331,9 +3551,19 @@ fn reconcile_tool_executions(captures: &[ParsedCapture]) -> (Vec<Value>, Vec<Str
         }
 
         let selected = terminal
-            .first()
-            .or_else(|| started.first())
-            .or_else(|| events.first())
+            .iter()
+            .copied()
+            .find(|capture| {
+                capture
+                    .tool_execution
+                    .as_ref()
+                    .and_then(|execution| string_field(execution, "source_event_name"))
+                    == Some("codex.tool_result")
+            })
+            .or_else(|| terminal.first().copied())
+            .or_else(|| closure_evidence.first().copied())
+            .or_else(|| started.first().copied())
+            .or_else(|| events.first().copied())
             .and_then(|capture| capture.tool_execution.clone())
             .unwrap_or_else(|| json!({"call_id":call_id}));
         let mut selected = selected.as_object().cloned().unwrap_or_default();
@@ -3345,6 +3575,10 @@ fn reconcile_tool_executions(captures: &[ParsedCapture]) -> (Vec<Value>, Vec<Str
                     .map(|capture| capture.capture_id.as_str())
                     .collect::<Vec<_>>()
             ),
+        );
+        selected.insert(
+            "evidence_sources".to_owned(),
+            json!(evidence_sources.keys().collect::<Vec<_>>()),
         );
         selected.insert(
             "started_capture_ids".to_owned(),
@@ -3378,13 +3612,15 @@ fn reconcile_tool_executions(captures: &[ParsedCapture]) -> (Vec<Value>, Vec<Str
             "evidence_mode".to_owned(),
             json!(if producer_state_machine {
                 "producer_state_machine"
+            } else if evidence_sources.len() > 1 {
+                "multi_source_runtime_evidence"
             } else {
                 "composite_runtime_span"
             }),
         );
         selected.insert(
             "state".to_owned(),
-            json!(if terminal.len() == 1 {
+            json!(if !terminal.is_empty() && terminal_statuses.len() == 1 {
                 "closed"
             } else {
                 "open"
@@ -3393,6 +3629,32 @@ fn reconcile_tool_executions(captures: &[ParsedCapture]) -> (Vec<Value>, Vec<Str
         executions.push(Value::Object(selected));
     }
     (executions, conflicts.into_iter().collect())
+}
+
+fn tool_execution_status(capture: &ParsedCapture) -> Option<&str> {
+    capture
+        .tool_execution
+        .as_ref()
+        .and_then(|execution| string_field(execution, "status"))
+}
+
+fn tool_execution_evidence_source(capture: &ParsedCapture) -> String {
+    if let Some(event) = capture.producer_event.as_ref() {
+        return format!(
+            "producer:{}:{}",
+            string_field(event, "producer").unwrap_or("unknown"),
+            string_field(event, "stream_id").unwrap_or("unknown")
+        );
+    }
+    match capture
+        .tool_execution
+        .as_ref()
+        .and_then(|execution| string_field(execution, "source_event_name"))
+    {
+        Some("PreToolUse" | "PostToolUse") => "codex_hook".to_owned(),
+        Some(source) => source.to_owned(),
+        None => capture.source_namespace.clone(),
+    }
 }
 
 fn tool_event_field_variants(events: &[&ParsedCapture], field: &str, ignore_null: bool) -> usize {
@@ -5749,7 +6011,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_request_identity_links_api_capture_to_harness_task() {
+    fn exact_request_identity_links_api_capture_to_explicit_task() {
         let source = json!({
             "captureId":"cap-runtime",
             "upstreamRequestId":"request-1",
@@ -7114,6 +7376,105 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|conflict| conflict == "call-1:field_mismatch:arguments")
+        );
+    }
+
+    #[test]
+    fn stock_hook_and_otlp_tool_evidence_merge_without_fabricated_conflicts() {
+        let trace = json!({
+            "session_id":"session-cloud","root_turn_id":"turn-cloud",
+            "trace_id":"11111111111111111111111111111111"
+        });
+        let hook = |capture_id: &str, event: &str, status: &str| {
+            json!({
+                "recordType":"tool_execution","captureId":capture_id,
+                "sourceNamespace":"stock-codex-cloud","traceContext":trace,
+                "toolExecution":{
+                    "call_id":"call-cloud","name":"Bash","initiator":"runtime",
+                    "status":status,"arguments":{"command":"true"},
+                    "result":if event == "PostToolUse" { json!("ok") } else { Value::Null },
+                    "source_event_name":event
+                }
+            })
+        };
+        let otlp = json!({
+            "recordType":"tool_execution","captureId":"cap-cloud-otel",
+            "sourceNamespace":"stock-codex-cloud","traceContext":trace,
+            "toolExecution":{
+                "call_id":"call-cloud","name":"exec_command","initiator":"assistant",
+                "status":"success","arguments":{"cmd":"true"},"result":"ok",
+                "started_at":"2026-09-03T00:00:00Z",
+                "finished_at":"2026-09-03T00:00:01Z",
+                "source_event_name":"codex.tool_result"
+            }
+        });
+
+        let (session, _, _) = assemble_group(vec![
+            hook("cap-cloud-pre", "PreToolUse", "started"),
+            hook("cap-cloud-post", "PostToolUse", "unknown"),
+            otlp,
+        ])
+        .unwrap();
+        assert!(
+            session["meta"]["tool_execution_conflicts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let execution = &session["meta"]["tool_executions"][0];
+        assert_eq!(execution["name"], "exec_command");
+        assert_eq!(execution["status"], "success");
+        assert_eq!(execution["state"], "closed");
+        assert_eq!(execution["evidence_mode"], "multi_source_runtime_evidence");
+    }
+
+    #[test]
+    fn per_request_otel_trace_ids_are_scoped_sets_not_session_conflicts() {
+        let capture = |capture_id: &str, trace_id: &str, span_id: &str| {
+            json!({
+                "recordType":"lifecycle_event","captureId":capture_id,
+                "sourceNamespace":"stock-codex-cloud",
+                "traceContext":{
+                    "session_id":"session-cloud","conversation_id":"session-cloud",
+                    "trace_id":trace_id,
+                    "traceparent":format!("00-{trace_id}-{span_id}-01")
+                },
+                "lifecycleEvent":{"type":"session_start","status":"started"}
+            })
+        };
+        let (session, _, _) = assemble_group(vec![
+            capture(
+                "cap-trace-a",
+                "11111111111111111111111111111111",
+                "1111111111111111",
+            ),
+            capture(
+                "cap-trace-b",
+                "22222222222222222222222222222222",
+                "2222222222222222",
+            ),
+        ])
+        .unwrap();
+
+        assert!(
+            session["meta"]["trace_conflicts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            session["meta"]["trace"]["trace_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            session["meta"]["trace"]["traceparents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
         );
     }
 

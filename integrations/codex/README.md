@@ -1,56 +1,30 @@
 # Stock Codex 接入
 
-ChipTrace 使用 Stock Codex 的受管配置采集 Trace，不修改 Codex 二进制，也不依赖启动器。
-主机完成一次部署后，普通用户直接运行 `codex`。
+用户侧只运行未修改的 Stock Codex。管理员下发一个原生配置包：
 
-## 管理员准备
+| 文件 | 作用 |
+| --- | --- |
+| [managed_config.toml.example](managed_config.toml.example) | 安装为 `/etc/codex/managed_config.toml`，固定 18084 Provider、Responses、OTLP 和 25 次网络重试 |
+| [requirements.toml.example](requirements.toml.example) | 安装为 `/etc/codex/requirements.toml`，固定 required lifecycle Hooks，并在 SessionStart 检查云端入口 |
 
-从当前 Codex 生成同版本模型目录，并将采购模型切换为原生 direct function 工具模式：
+将 `<CHIPTRACE_INGEST_TOKEN>` 替换为云端采集 Token，并由主机管理系统写入 Stock Codex 的
+系统配置位置。业务凭据只通过 `CHIPTRACE_API_KEY` 环境变量提供，不写入配置或 Trace。
+用户侧不部署任何 ChipTrace 程序或服务。
+
+`managed_config.toml` 只固定模型网络与 OTLP 路由，`requirements.toml` 固定 required
+Hook 并启用 `allow_managed_hooks_only`，避免用户或项目配置重复采集。下发后用
+`codex --strict-config` 启动，字段不受当前 Stock Codex 支持时直接失败。
+
+云端 `/models` 使用真实模型名 `gpt-5.6-sol` 返回版本化能力元数据，只将 `tool_mode` 固定为
+`direct`。Stock Codex 使用 Provider 业务凭据访问 18084；网关完成业务鉴权后，以内部采集
+凭据读取 Relay 目录。Stock Codex 因而能自动刷新目录，并在真实 Wire 中提供 JSON function
+Tool Schema。模型身份仍以 Wire 与 Sub2API 路由事实为准，不能由目录内容代替。
+
+配置完成后，用户的操作不变：
 
 ```bash
-codex debug models --bundled > codex-models.json
-chiptrace prepare-codex-catalog \
-  --input codex-models.json \
-  --output /etc/chiptrace/codex-models-direct.json \
-  --model gpt-5.6-sol
+codex
 ```
 
-该命令保留原模型目录的全部字段，只将指定模型的 `tool_mode` 设为 `direct`，并移除
-freeform `apply_patch`。当前 Stock Codex 没有 `apply_patch` 的 JSON function 形态，因此该
-工具不会出现在 direct 请求中，也不会被 ChipTrace 改名或补造 Schema；文件操作由请求中
-真实存在的 direct function 工具完成。变更发生在模型请求构造前，Assembly 只保留事实。
-
-将 `chiptrace` 安装到 `/usr/local/bin`，安装
-[managed_config.toml.example](managed_config.toml.example) 到
-`/etc/codex/managed_config.toml`，安装
-[requirements.toml.example](requirements.toml.example) 到
-`/etc/codex/requirements.toml`，再启用 `chiptrace-codex-agent.service`。服务持有
-`codex-agent.lock`，断网时继续依赖本地 outbox，不要求远端健康才能启动 Codex。
-
-受管配置同时固定以下事实：
-
-- OpenAI-compatible provider 指向 `18084`；
-- 当前采购模型读取 direct 模型目录；
-- required 生命周期 Hook 不需要用户确认 Hook hash，也不能被用户配置静默替换。
-
-两份系统文件各有一个职责：`managed_config.toml` 固定 provider、模型和 Wire 路由；
-`requirements.toml` 固定 direct catalog 与 required Hook。不要把 Hook 同时写进两份文件，
-否则 Stock Codex 的兼容加载路径可能重复注册同一个处理器。
-
-不要把生产 Hook 仅写入用户级 `config.toml`。Stock Codex 会将未确认 hash 的用户 Hook
-标记为 `Untrusted` 并跳过执行，无法提供严格采集保证。
-
-## 启动门禁
-
-`SessionStart` 在首个 Turn 前同步验证：
-
-- 模型目录中当前模型为 `tool_mode=direct`，且未暴露 freeform `apply_patch`；
-- `codex-agent` 正在持有指定状态目录的独占锁；
-- outbox 可原子写入，积压未超过上限，磁盘空间满足预算。
-
-任一条件失败时，Hook 返回 Codex 原生 `continue:false`，首个 Turn 不会执行。检查通过后
-SessionStart 先持久化到本地 outbox。Hook 命令缺失或异常退出时，受管命令中的固定兜底
-同样返回 `continue:false`。
-
-远端短时断网不阻止启动：已经落盘的事件由 `codex-agent` 幂等续投。主机部署完成后，
-用户侧没有额外命令或标签。
+一次可交付 Session 必须同时收到完整 Wire、OTLP tool result 和 start/end Hook。缺少任一
+来源、字段冲突、工具输出截断或云端验收失败时，只保留 Raw，不进入采购 Release。

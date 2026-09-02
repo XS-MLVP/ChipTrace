@@ -1088,6 +1088,8 @@ mod tests {
         let assembly = crate::assemble::assemble(crate::assemble::AssembleConfig {
             inputs: vec![output],
             output: directory.path().join("assembly"),
+            task_session_id: None,
+            session_id: None,
             partitions: 1,
             zstd_level: 1,
             replace: false,

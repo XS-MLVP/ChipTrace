@@ -87,9 +87,9 @@ pub fn canonical_tool_registry_sha256(value: &Value) -> Result<String> {
     )?)))
 }
 
-/// Content address for one captured tool definition. This projection is used
-/// by both producer-side Harness enrichment and offline Assembly, so metadata
-/// fields never make the same source Schema appear to drift between stages.
+/// Content address for one captured tool definition. Ingest adapters and
+/// offline Assembly use the same projection, so metadata fields never make the
+/// same source Schema appear to drift between stages.
 pub fn canonical_tool_schema_sha256(value: &Value) -> Result<String> {
     let nested = value.get("function").unwrap_or(value);
     let name = nested

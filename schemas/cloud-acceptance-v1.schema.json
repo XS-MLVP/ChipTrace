@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/cloud-acceptance-v1.schema.json",
+  "title": "ChipTrace Cloud Acceptance v1",
+  "type": "object",
+  "required": [
+    "schema_version", "created_at_utc", "archive_id", "session_id", "release_id",
+    "quality_profile", "minimum_score", "score", "hard_gate_pass", "delivery_ready",
+    "effective_turns", "distinct_tool_names", "complete_tool_definitions",
+    "pairing_rate_after_open_tail", "eligible_sessions", "api_total_tokens",
+    "normalized_corpus_tokens", "root_spans", "internal_parent_references",
+    "resolved_internal_parents", "raw_records", "raw_bytes", "artifacts",
+    "validation_status"
+  ],
+  "properties": {
+    "schema_version": {"const": "chiptrace.cloud-acceptance.v1"},
+    "created_at_utc": {"type": "string", "minLength": 1},
+    "archive_id": {"type": "string", "minLength": 1},
+    "session_id": {"type": "string", "minLength": 1},
+    "release_id": {"type": "string", "minLength": 1},
+    "quality_profile": {"const": "buyer-v7-codex-runtime-expanded"},
+    "minimum_score": {"type": "number", "minimum": 90, "maximum": 100},
+    "score": {"type": "number", "minimum": 90, "maximum": 100},
+    "hard_gate_pass": {"const": true},
+    "delivery_ready": {"const": true},
+    "effective_turns": {"type": "integer", "minimum": 10},
+    "distinct_tool_names": {"type": "integer", "minimum": 5},
+    "complete_tool_definitions": {"type": "integer", "minimum": 5},
+    "pairing_rate_after_open_tail": {"const": 1.0},
+    "eligible_sessions": {"const": 1},
+    "api_total_tokens": {"type": "integer", "minimum": 0},
+    "normalized_corpus_tokens": {"type": "integer", "minimum": 1},
+    "root_spans": {"const": 1},
+    "internal_parent_references": {"type": "integer", "minimum": 0},
+    "resolved_internal_parents": {"type": "integer", "minimum": 0},
+    "raw_records": {"type": "integer", "minimum": 1},
+    "raw_bytes": {"type": "integer", "minimum": 1},
+    "artifacts": {
+      "type": "object",
+      "required": ["raw", "enriched", "interactions", "otlp", "assembly", "release", "buyer_package"],
+      "additionalProperties": {"$ref": "#/$defs/artifact"}
+    },
+    "validation_status": {"const": "pass"}
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "required": ["path", "manifest_sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

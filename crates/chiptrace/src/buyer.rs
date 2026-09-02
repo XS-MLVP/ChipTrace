@@ -25,7 +25,6 @@ use walkdir::WalkDir;
 pub const BUYER_PACKAGE_SCHEMA_VERSION: &str = "chiptrace.buyer-package.v1";
 const BUYER_ARCHIVE_SCHEMA_VERSION: &str = "chiptrace.buyer-archive.v1";
 const LINEAGE_COMPLETE: &str = "complete";
-const LINEAGE_LEGACY: &str = "legacy_unbound";
 
 #[derive(Debug, Clone)]
 pub struct BuyerPackageConfig {
@@ -95,17 +94,6 @@ struct PackagePartContext<'a> {
 }
 
 pub fn package_buyer_release(config: BuyerPackageConfig) -> Result<BuyerPackageManifest> {
-    package_buyer_release_with_policy(config, true)
-}
-
-pub fn package_buyer_release_legacy(config: BuyerPackageConfig) -> Result<BuyerPackageManifest> {
-    package_buyer_release_with_policy(config, false)
-}
-
-fn package_buyer_release_with_policy(
-    config: BuyerPackageConfig,
-    require_raw_lineage: bool,
-) -> Result<BuyerPackageManifest> {
     if config.gzip_level > 9 {
         bail!("gzip_level must be between 0 and 9");
     }
@@ -122,10 +110,8 @@ fn package_buyer_release_with_policy(
     {
         bail!("buyer package requires buyer-v7 with minimum_score >= 90");
     }
-    if require_raw_lineage && source.raw_sources.is_empty() {
-        bail!(
-            "buyer package requires complete OSS Raw lineage; use the explicit legacy packaging path only for migration"
-        );
+    if source.raw_sources.is_empty() {
+        bail!("buyer package requires complete OSS Raw lineage");
     }
     let output = absolute_path(&config.output)?;
     if output.exists() && !config.replace {
@@ -152,11 +138,7 @@ fn package_buyer_release_with_policy(
         .num_threads(workers)
         .thread_name(|index| format!("chiptrace-buyer-{index}"))
         .build()?;
-    let lineage_status = if source.raw_sources.is_empty() {
-        LINEAGE_LEGACY
-    } else {
-        LINEAGE_COMPLETE
-    };
+    let lineage_status = LINEAGE_COMPLETE;
     let part_context = PackagePartContext {
         release: &release,
         package_root: &package_root,
@@ -205,7 +187,7 @@ fn package_buyer_release_with_policy(
     )?;
     write_outer_checksums(&staging, &manifest)?;
     sync_tree(&staging)?;
-    let verified = verify_buyer_package_with_policy(&staging, require_raw_lineage)?;
+    let verified = verify_buyer_package(&staging)?;
     if output.exists() {
         fs::remove_dir_all(&output)?;
     }
@@ -244,17 +226,6 @@ fn require_current_assessments(release: &Path, manifest: &ReleaseManifest) -> Re
 }
 
 pub fn verify_buyer_package(root: &Path) -> Result<BuyerPackageManifest> {
-    verify_buyer_package_with_policy(root, true)
-}
-
-pub fn verify_buyer_package_legacy(root: &Path) -> Result<BuyerPackageManifest> {
-    verify_buyer_package_with_policy(root, false)
-}
-
-fn verify_buyer_package_with_policy(
-    root: &Path,
-    require_complete_lineage: bool,
-) -> Result<BuyerPackageManifest> {
     let manifest_path = root.join("manifest.json");
     let manifest: BuyerPackageManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
     if manifest.schema_version != BUYER_PACKAGE_SCHEMA_VERSION {
@@ -280,13 +251,8 @@ fn verify_buyer_package_with_policy(
         || manifest.eligible_sessions == 0
         || manifest.packages.is_empty()
         || !is_sha256(&manifest.source_release_manifest_sha256)
-        || !matches!(
-            manifest.lineage_status.as_str(),
-            LINEAGE_COMPLETE | LINEAGE_LEGACY
-        )
-        || (require_complete_lineage && manifest.lineage_status != LINEAGE_COMPLETE)
-        || (manifest.lineage_status == LINEAGE_COMPLETE && manifest.raw_sources.is_empty())
-        || (manifest.lineage_status == LINEAGE_LEGACY && !manifest.raw_sources.is_empty())
+        || manifest.lineage_status != LINEAGE_COMPLETE
+        || manifest.raw_sources.is_empty()
         || manifest
             .raw_sources
             .iter()

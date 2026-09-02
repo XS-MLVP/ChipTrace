@@ -48,6 +48,132 @@ function validCaptureId(value) {
   return CAPTURE_ID_RE.test(value) && Buffer.byteLength(value, 'utf8') <= 256;
 }
 
+function firstHeaderValue(headers, name) {
+  const value = headers?.[String(name).toLowerCase()];
+  if (Array.isArray(value)) return value[0] || '';
+  return value === undefined || value === null ? '' : String(value);
+}
+
+async function validateProviderCredential(options = {}) {
+  const authorization = String(options.authorization || '').trim();
+  if (!/^Bearer\s+\S+$/i.test(authorization)) {
+    return { ok: false, status: 401, reason: 'model_auth_required' };
+  }
+  const modelsUrl = String(options.modelsUrl || '').trim();
+  if (!modelsUrl) {
+    return { ok: false, status: 503, reason: 'model_auth_not_configured' };
+  }
+  const timeoutMs = positiveInteger(options.timeoutMs, 30000, 1, 300000);
+  const fetchImpl = options.fetchImpl || globalThis.fetch;
+  if (typeof fetchImpl !== 'function') {
+    return { ok: false, status: 503, reason: 'model_auth_not_configured' };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchImpl(modelsUrl, {
+      method: 'GET',
+      headers: { authorization, accept: 'application/json' },
+      signal: controller.signal,
+    });
+    if (response.ok) return { ok: true, status: response.status };
+    if (response.status === 401 || response.status === 403) {
+      return { ok: false, status: response.status, reason: 'model_auth_rejected' };
+    }
+    return { ok: false, status: 503, reason: 'model_auth_unavailable' };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 503,
+      reason: error?.name === 'AbortError' ? 'model_auth_timeout' : 'model_auth_unavailable',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Extract the task identity Stock Codex already sends with every Responses
+ * request. Values are copied only from observed protocol headers; this helper
+ * never invents a task/session boundary.
+ */
+function codexTraceContextFromHeaders(requestHeaders, responseHeaders = {}) {
+  const candidates = new Map();
+  const errors = [];
+  const add = (field, value, source, priority) => {
+    const normalized = typeof value === 'string' ? value.trim() : '';
+    if (!normalized) return;
+    const entries = candidates.get(field) || [];
+    entries.push({
+      field: `traceContext.${field}`,
+      value: normalized,
+      source,
+      producer: 'stock_codex',
+      authority: 'protocol_observed',
+      priority,
+    });
+    candidates.set(field, entries);
+  };
+
+  add('session_id', firstHeaderValue(requestHeaders, 'session-id'), 'requestHeaders.session-id', 0);
+  add('thread_id', firstHeaderValue(requestHeaders, 'thread-id'), 'requestHeaders.thread-id', 0);
+  add('session_id', firstHeaderValue(requestHeaders, 'session_id'), 'requestHeaders.session_id', 1);
+  add('thread_id', firstHeaderValue(requestHeaders, 'thread_id'), 'requestHeaders.thread_id', 1);
+
+  const rawMetadata = firstHeaderValue(requestHeaders, 'x-codex-turn-metadata');
+  if (rawMetadata) {
+    try {
+      const metadata = JSON.parse(rawMetadata);
+      if (!metadata || Array.isArray(metadata) || typeof metadata !== 'object') {
+        throw new Error('must be a JSON object');
+      }
+      for (const [sourceField, targetField] of [
+        ['session_id', 'session_id'],
+        ['thread_id', 'thread_id'],
+        ['turn_id', 'turn_id'],
+        ['root_turn_id', 'root_turn_id'],
+        ['parent_thread_id', 'parent_thread_id'],
+        ['agent_name', 'agent_path'],
+        ['window_id', 'window_id'],
+        ['context_window_id', 'context_window_id'],
+      ]) {
+        add(
+          targetField,
+          metadata[sourceField],
+          `requestHeaders.x-codex-turn-metadata.${sourceField}`,
+          2,
+        );
+      }
+    } catch (error) {
+      errors.push(`invalid x-codex-turn-metadata: ${error.message || String(error)}`);
+    }
+  }
+
+  for (const field of ['traceparent', 'tracestate']) {
+    const requestValue = firstHeaderValue(requestHeaders, field);
+    const responseValue = firstHeaderValue(responseHeaders, field);
+    add(field, requestValue || responseValue, `${requestValue ? 'requestHeaders' : 'responseHeaders'}.${field}`, 0);
+  }
+
+  const trace = {};
+  const evidence = [];
+  const conflicts = [];
+  for (const [field, entries] of candidates) {
+    entries.sort((left, right) => left.priority - right.priority || left.source.localeCompare(right.source));
+    const selected = entries[0];
+    trace[field] = selected.value;
+    const publicEntries = entries.map(({ priority: _priority, ...entry }) => ({
+      ...entry,
+      selected: entry.source === selected.source && entry.value === selected.value,
+    }));
+    evidence.push(...publicEntries);
+    const distinct = new Set(entries.map((entry) => entry.value));
+    if (distinct.size > 1) conflicts.push({ field: `traceContext.${field}`, evidence: publicEntries });
+  }
+  if (trace.session_id && !trace.conversation_id) trace.conversation_id = trace.session_id;
+  return { trace, evidence, conflicts, errors };
+}
+
 function captureFileName(captureId) {
   if (Buffer.byteLength(`${captureId}.json`, 'utf8') <= 240) return `${captureId}.json`;
   return `${captureId.slice(0, 80)}-${sha256(Buffer.from(captureId, 'utf8'))}.json`;
@@ -273,6 +399,7 @@ class DurableCaptureOutbox {
     this.processingDir = path.join(this.root, 'processing');
     this.failedDir = path.join(this.root, 'failed');
     this.relayUrl = String(options.relayUrl || '').replace(/\/$/, '');
+    this.bearerToken = String(options.bearerToken || '').trim();
     this.maxBytes = positiveInteger(options.maxBytes, 10 * 1024 * 1024 * 1024, 1024 * 1024);
     this.maxFiles = positiveInteger(options.maxFiles, 100000, 1);
     this.minFreeBytes = positiveInteger(options.minFreeBytes, 5 * 1024 * 1024 * 1024, 0);
@@ -290,7 +417,7 @@ class DurableCaptureOutbox {
     this.retryMaxMs = positiveInteger(options.retryMaxMs, 5000, this.retryBaseMs, 300000);
     this.retryJitterPercent = positiveInteger(options.retryJitterPercent, 20, 0, 50);
     // Wire bodies are training evidence. Mutating them breaks the declared
-    // byte length and SHA-256, so body sanitization is opt-in legacy behavior.
+    // byte length and SHA-256, so body sanitization is disabled by default.
     this.sanitize = options.sanitize === undefined ? false : asBoolean(options.sanitize, false);
     this.onDurable = typeof options.onDurable === 'function' ? options.onDurable : null;
     this.onAttempt = typeof options.onAttempt === 'function' ? options.onAttempt : null;
@@ -499,7 +626,7 @@ class DurableCaptureOutbox {
       throw new Error('captureId is invalid for outbox');
     }
     // Authentication material is never persisted. Body bytes remain unchanged
-    // unless the legacy sanitizer was explicitly enabled.
+    // unless body sanitization was explicitly enabled.
     const prepared = sanitizeCaptureRecord(record, this.sanitize);
     const bytes = Buffer.from(`${JSON.stringify(prepared)}\n`, 'utf8');
     const digest = sha256(bytes);
@@ -698,7 +825,10 @@ class DurableCaptureOutbox {
       try {
         const response = await fetch(`${this.relayUrl}/capture`, {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: {
+            'content-type': 'application/json',
+            ...(this.bearerToken ? { authorization: `Bearer ${this.bearerToken}` } : {}),
+          },
           body: bytes,
           signal: controller.signal,
         });
@@ -859,6 +989,8 @@ class DurableCaptureOutbox {
 
 module.exports = {
   DurableCaptureOutbox,
+  codexTraceContextFromHeaders,
   sanitizeCaptureRecord,
   retryDelayMs,
+  validateProviderCredential,
 };

@@ -65,6 +65,7 @@
         "protocol_complete",
         "stream_outcome",
         "status_dimensions_complete",
+        "trace_identity_complete",
         "malformed_sse_events",
         "unknown_item_count"
       ],
@@ -83,6 +84,7 @@
           ]
         },
         "status_dimensions_complete": {"type": "boolean"},
+        "trace_identity_complete": {"type": "boolean"},
         "malformed_sse_events": {"type": "integer", "minimum": 0},
         "unknown_item_count": {"type": "integer", "minimum": 0}
       },

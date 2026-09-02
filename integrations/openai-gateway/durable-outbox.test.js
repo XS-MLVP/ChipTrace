@@ -8,7 +8,88 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { DurableCaptureOutbox } = require('./durable-outbox');
+const {
+  DurableCaptureOutbox,
+  codexTraceContextFromHeaders,
+  validateProviderCredential,
+} = require('./durable-outbox');
+
+test('Stock Codex headers provide exact Session and Turn identity', () => {
+  const metadata = JSON.stringify({
+    session_id: 'session-1',
+    thread_id: 'thread-1',
+    turn_id: 'turn-1',
+    root_turn_id: 'turn-root',
+    parent_thread_id: 'thread-parent',
+    agent_name: '/root/review',
+  });
+  const result = codexTraceContextFromHeaders({
+    'session-id': 'session-1',
+    'thread-id': 'thread-1',
+    'x-codex-turn-metadata': metadata,
+    traceparent: '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01',
+  });
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(result.conflicts, []);
+  assert.equal(result.trace.session_id, 'session-1');
+  assert.equal(result.trace.conversation_id, 'session-1');
+  assert.equal(result.trace.thread_id, 'thread-1');
+  assert.equal(result.trace.turn_id, 'turn-1');
+  assert.equal(result.trace.root_turn_id, 'turn-root');
+  assert.equal(result.trace.parent_thread_id, 'thread-parent');
+  assert.equal(result.trace.agent_path, '/root/review');
+});
+
+test('malformed or conflicting Stock Codex metadata is explicit', () => {
+  const malformed = codexTraceContextFromHeaders({
+    'session-id': 'session-1',
+    'x-codex-turn-metadata': '{not-json',
+  });
+  assert.equal(malformed.errors.length, 1);
+  const conflict = codexTraceContextFromHeaders({
+    'session-id': 'session-1',
+    'x-codex-turn-metadata': JSON.stringify({ session_id: 'session-other' }),
+  });
+  assert.equal(conflict.trace.session_id, 'session-1');
+  assert.equal(conflict.conflicts.length, 1);
+});
+
+test('managed model access validates the Provider credential upstream', async () => {
+  const observed = [];
+  const fetchImpl = async (url, options) => {
+    observed.push({ url, authorization: options.headers.authorization });
+    const valid = options.headers.authorization === 'Bearer provider-valid';
+    return { ok: valid, status: valid ? 200 : 401 };
+  };
+  const missing = await validateProviderCredential({
+    authorization: '',
+    modelsUrl: 'http://provider.test/v1/models',
+    fetchImpl,
+  });
+  const rejected = await validateProviderCredential({
+    authorization: 'Bearer provider-invalid',
+    modelsUrl: 'http://provider.test/v1/models',
+    fetchImpl,
+  });
+  const accepted = await validateProviderCredential({
+    authorization: 'Bearer provider-valid',
+    modelsUrl: 'http://provider.test/v1/models',
+    fetchImpl,
+  });
+  assert.deepEqual(missing, { ok: false, status: 401, reason: 'model_auth_required' });
+  assert.deepEqual(rejected, { ok: false, status: 401, reason: 'model_auth_rejected' });
+  assert.deepEqual(accepted, { ok: true, status: 200 });
+  assert.deepEqual(observed, [
+    {
+      url: 'http://provider.test/v1/models',
+      authorization: 'Bearer provider-invalid',
+    },
+    {
+      url: 'http://provider.test/v1/models',
+      authorization: 'Bearer provider-valid',
+    },
+  ]);
+});
 
 function temporaryRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'chiptrace-outbox-test-'));
@@ -39,8 +120,10 @@ async function fakeRelay(handler) {
 
 test('outbox preserves Wire bodies, strips credentials, retries, and removes after durable ACK', async () => {
   let attempts = 0;
+  const ingestToken = 'test-ingest-token-at-least-32-bytes';
   const relay = await fakeRelay((req, res) => {
     attempts += 1;
+    assert.equal(req.headers.authorization, `Bearer ${ingestToken}`);
     req.resume();
     req.once('end', () => {
       res.setHeader('content-type', 'application/json');
@@ -57,6 +140,7 @@ test('outbox preserves Wire bodies, strips credentials, retries, and removes aft
   const outbox = new DurableCaptureOutbox({
     root,
     relayUrl: relay.url,
+    bearerToken: ingestToken,
     retryBaseMs: 1,
     retryMaxMs: 2,
     retryJitterPercent: 0,
