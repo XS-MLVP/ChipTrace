@@ -400,3 +400,52 @@ test('permanent validation error is retained once and never retried', async () =
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('historical failed evidence is reported without poisoning fresh health', async () => {
+  const root = temporaryRoot();
+  await fsp.mkdir(path.join(root, 'failed'), { recursive: true });
+  await fsp.writeFile(
+    path.join(root, 'failed', 'cap-historical.json'),
+    `${JSON.stringify(capture('cap-historical'))}\n`,
+    { mode: 0o600 },
+  );
+  await fsp.writeFile(
+    path.join(root, 'failed', 'cap-historical.json.error.json'),
+    `${JSON.stringify({ captureId: 'cap-historical', reason: 'http_400' })}\n`,
+    { mode: 0o600 },
+  );
+  const relay = await fakeRelay((req, res) => {
+    req.resume();
+    req.once('end', () => {
+      res.statusCode = 202;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ ok: true, durable: true, duplicate: false }));
+    });
+  });
+  const outbox = new DurableCaptureOutbox({
+    root,
+    relayUrl: relay.url,
+    retryBaseMs: 1,
+    retryMaxMs: 1,
+    retryJitterPercent: 0,
+    maxAttempts: 20,
+  });
+  try {
+    await outbox.start();
+    let snapshot = outbox.snapshot();
+    assert.equal(snapshot.historicalFailedFiles, 1);
+    assert.equal(snapshot.historicalAuxiliaryFiles, 1);
+    assert.equal(snapshot.recentFailureCount, 0);
+    assert.equal(snapshot.currentFailureCount, 0);
+    await outbox.enqueue(capture('cap-fresh'));
+    assert.equal(await outbox.flush(2000), true);
+    snapshot = outbox.snapshot();
+    assert.equal(snapshot.recentFailureCount, 0);
+    assert.equal(snapshot.currentFailureCount, 0);
+    assert.equal(snapshot.historicalFailureCount, 2);
+  } finally {
+    await outbox.close();
+    await relay.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

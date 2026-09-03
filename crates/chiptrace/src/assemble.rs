@@ -4817,6 +4817,7 @@ fn gateway_request_id_linked(capture: &ParsedCapture, evidence: &Value, request_
         };
         let transformed = match string_field(join, "transform") {
             Some("exact") => captured.to_owned(),
+            Some("comma_separated_member") => captured.to_owned(),
             Some("sub2api_client_prefix") => format!("client:{captured}"),
             _ => return false,
         };
@@ -4825,7 +4826,16 @@ fn gateway_request_id_linked(capture: &ParsedCapture, evidence: &Value, request_
         }
         return match object.get("capture_field").and_then(Value::as_str) {
             Some("upstreamRequestId" | "responseHeaders.x-request-id") => {
-                capture.upstream_request_id.as_deref() == Some(captured)
+                if string_field(join, "transform") == Some("comma_separated_member") {
+                    capture.upstream_request_id.as_deref().is_some_and(|value| {
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .any(|member| member == captured)
+                    })
+                } else {
+                    capture.upstream_request_id.as_deref() == Some(captured)
+                }
             }
             Some(
                 "requestId"

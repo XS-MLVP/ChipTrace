@@ -376,7 +376,7 @@
             "responseHeaders.x-request-id"
           ]
         },
-        "transform": {"enum": ["exact", "sub2api_client_prefix"]},
+        "transform": {"enum": ["exact", "comma_separated_member", "sub2api_client_prefix"]},
         "usage_fact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       },
       "additionalProperties": false

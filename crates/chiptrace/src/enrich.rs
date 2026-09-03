@@ -6,7 +6,7 @@
 //! similarity as a fallback: those values are useful diagnostics but cannot
 //! prove that two records describe the same request.
 
-use crate::capture::{gateway_evidence_fingerprint, normalize_capture};
+use crate::capture::{gateway_evidence_fingerprint, normalize_capture_with_policy};
 use crate::jsonl::{
     JsonlWriter, absolute_path, open_jsonl_reader, sha256_file, utc_now, value_as_u64,
 };
@@ -173,8 +173,14 @@ pub fn enrich_captures(config: EnrichConfig) -> Result<EnrichSummary> {
             // the Collector.  The original input remains untouched; this
             // output is an explicitly versioned projection.
             let bytes = serde_json::to_vec(&capture)?;
-            let normalized =
-                normalize_capture(&bytes, bytes.len().saturating_add(4 * 1024 * 1024))?;
+            // Enrichment is an offline projection of already persisted Raw.
+            // Historical rollout events are valid here, while the online
+            // producer path remains strict via `normalize_capture`.
+            let normalized = normalize_capture_with_policy(
+                &bytes,
+                bytes.len().saturating_add(4 * 1024 * 1024),
+                false,
+            )?;
             let normalized_value: Value = serde_json::from_slice(&normalized.canonical)?;
             writer.write_value(&normalized_value)?;
             summary.output_records += 1;
@@ -279,7 +285,11 @@ pub fn verify_enrichment(root: &Path) -> Result<EnrichSummary> {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let _ = normalize_capture(&line, line.len().saturating_add(4 * 1024 * 1024))?;
+        let _ = normalize_capture_with_policy(
+            &line,
+            line.len().saturating_add(4 * 1024 * 1024),
+            false,
+        )?;
         records += 1;
     }
     if records != manifest.output_records {
@@ -418,12 +428,7 @@ fn capture_request_id_candidates(object: &Map<String, Value>) -> Vec<RequestIdCa
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
     {
-        candidates.push(RequestIdCandidate {
-            lookup_key: value.to_owned(),
-            capture_value: value.to_owned(),
-            source: "upstreamRequestId".to_owned(),
-            transform: "exact",
-        });
+        append_upstream_request_id_candidates(&mut candidates, value, "upstreamRequestId");
     }
     if let Some(value) = object
         .get("requestId")
@@ -439,12 +444,11 @@ fn capture_request_id_candidates(object: &Map<String, Value>) -> Vec<RequestIdCa
     }
     if let Some(headers) = object.get("responseHeaders").and_then(Value::as_object) {
         if let Some(value) = header_value(headers, "x-request-id") {
-            candidates.push(RequestIdCandidate {
-                lookup_key: value.to_owned(),
-                capture_value: value.to_owned(),
-                source: "responseHeaders.x-request-id".to_owned(),
-                transform: "exact",
-            });
+            append_upstream_request_id_candidates(
+                &mut candidates,
+                value,
+                "responseHeaders.x-request-id",
+            );
         }
         if let Some(value) = header_value(headers, "x-client-request-id") {
             candidates.push(RequestIdCandidate {
@@ -468,6 +472,43 @@ fn capture_request_id_candidates(object: &Map<String, Value>) -> Vec<RequestIdCa
     candidates.sort();
     candidates.dedup();
     candidates
+}
+
+/// Sub2API can expose the complete upstream retry chain in one response
+/// header (`id-a, id-b, id-c`).  Keep the complete value as a candidate for
+/// backwards compatibility, then add each explicitly delimited member.  A
+/// member is evidence only when that exact ID exists in the usage index; no
+/// time/model/body fallback is allowed.
+fn append_upstream_request_id_candidates(
+    candidates: &mut Vec<RequestIdCandidate>,
+    value: &str,
+    source: &str,
+) {
+    let value = value.trim();
+    candidates.push(RequestIdCandidate {
+        lookup_key: value.to_owned(),
+        capture_value: value.to_owned(),
+        source: source.to_owned(),
+        transform: "exact",
+    });
+    if !value.contains(',') {
+        return;
+    }
+    for member in value
+        .split(',')
+        .map(str::trim)
+        .filter(|member| !member.is_empty())
+    {
+        if member == value {
+            continue;
+        }
+        candidates.push(RequestIdCandidate {
+            lookup_key: member.to_owned(),
+            capture_value: member.to_owned(),
+            source: source.to_owned(),
+            transform: "comma_separated_member",
+        });
+    }
 }
 
 fn build_usage_index_from_paths(
@@ -861,6 +902,7 @@ fn extract_usage_values(value: Value) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
 
     fn complete_raw_lineage() -> RawSourceLineage {
         RawSourceLineage {
@@ -958,6 +1000,46 @@ mod tests {
             value["gatewayEvidenceJoin"]["capture_request_id"],
             "forwarded-client-id"
         );
+    }
+
+    #[test]
+    fn joins_an_explicit_member_of_an_upstream_retry_chain() {
+        let mut value = capture("no-client-match");
+        value["upstreamRequestId"] = json!("retry-a, retry-b, retry-c");
+        value["responseHeaders"] = json!({"x-request-id":"retry-a, retry-b, retry-c"});
+        let (index, ..) = build_usage_index_from_values(vec![usage("retry-b", "gpt-5.6-sol")]);
+
+        assert!(matches!(
+            enrich_one(&mut value, &index),
+            JoinOutcome::Matched { .. }
+        ));
+        assert_eq!(
+            value["gatewayEvidenceJoin"]["transform"],
+            "comma_separated_member"
+        );
+        assert_eq!(value["gatewayEvidenceJoin"]["request_id"], "retry-b");
+        assert_eq!(
+            value["gatewayEvidenceJoin"]["capture_request_id"],
+            "retry-b"
+        );
+    }
+
+    #[test]
+    fn conflicting_facts_across_retry_chain_members_remain_ambiguous() {
+        let mut value = capture("no-client-match");
+        value["upstreamRequestId"] = json!("retry-a, retry-b");
+        value["responseHeaders"] = json!({"x-request-id":"retry-a, retry-b"});
+        let (index, ..) = build_usage_index_from_values(vec![
+            usage("retry-a", "gpt-5.6-sol"),
+            usage("retry-b", "gpt-5.5"),
+        ]);
+
+        assert!(matches!(
+            enrich_one(&mut value, &index),
+            JoinOutcome::Ambiguous { reason }
+                if reason == "capture_has_conflicting_request_id_matches"
+        ));
+        assert!(value.get("gatewayEvidence").is_none());
     }
 
     #[test]
@@ -1096,6 +1178,67 @@ mod tests {
         })
         .unwrap();
         assert_eq!(assembly.raw_sources, vec![lineage]);
+    }
+
+    #[test]
+    fn offline_enrichment_preserves_historical_rollout_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let capture_root = directory.path().join("raw");
+        fs::create_dir_all(capture_root.join("segments")).unwrap();
+        let source_line = r#"{"type":"item_completed","item":{"type":"command_execution"}}"#;
+        let rollout = json!({
+            "version": crate::capture::CAPTURE_SCHEMA_VERSION,
+            "recordType": "rollout_event",
+            "captureId": "cap-historical-rollout",
+            "traceContext": {"session_id": "codex-session-1"},
+            "rolloutEvent": {
+                "schema_version": "chiptrace.codex-rollout.v1",
+                "source": "codex_rollout_jsonl",
+                "source_session_id": "codex-session-1",
+                "source_ordinal": 1,
+                "source_line": source_line,
+                "source_line_sha256": hex::encode(sha2::Sha256::digest(source_line.as_bytes())),
+                "classification": "known"
+            }
+        });
+        fs::write(
+            capture_root
+                .join("segments")
+                .join("segment-00000000000000000001.sealed.ndjson"),
+            format!("{}\n", serde_json::to_string(&rollout).unwrap()),
+        )
+        .unwrap();
+        fs::write(
+            capture_root.join("RAW_SOURCE.json"),
+            serde_json::to_vec(&complete_raw_lineage()).unwrap(),
+        )
+        .unwrap();
+        let usage_path = directory.path().join("usage.jsonl");
+        fs::write(
+            &usage_path,
+            format!("{}\n", usage("missing-wire-id", "gpt-5.6-sol")),
+        )
+        .unwrap();
+
+        let output = directory.path().join("enriched");
+        let manifest = enrich_captures(EnrichConfig {
+            inputs: vec![capture_root],
+            usage_logs: vec![usage_path],
+            output: output.clone(),
+            zstd_level: 1,
+            replace: false,
+        })
+        .unwrap();
+        assert_eq!(manifest.output_records, 1);
+        assert_eq!(manifest.unmatched, 1);
+
+        let mut reader = open_jsonl_reader(&output.join(&manifest.output_file)).unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let enriched: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(enriched["recordType"], "rollout_event");
+        assert_eq!(enriched["rolloutEvent"]["source_line"], source_line);
+        assert_eq!(verify_enrichment(&output).unwrap(), manifest);
     }
 
     #[test]

@@ -49,7 +49,7 @@ pub fn normalize_capture(raw: &[u8], max_bytes: usize) -> Result<CaptureRecord> 
     normalize_capture_with_policy(raw, max_bytes, true)
 }
 
-fn normalize_capture_with_policy(
+pub(crate) fn normalize_capture_with_policy(
     raw: &[u8],
     max_bytes: usize,
     enforce_current_producer_contract: bool,
@@ -1584,6 +1584,7 @@ fn validate_gateway_evidence_join(
     let captured = join["capture_request_id"].as_str().unwrap();
     let transformed = match join["transform"].as_str().unwrap() {
         "exact" => captured.to_owned(),
+        "comma_separated_member" => captured.to_owned(),
         "sub2api_client_prefix" => format!("client:{captured}"),
         value => bail!("unsupported gatewayEvidenceJoin.transform {value:?}"),
     };
@@ -1607,7 +1608,16 @@ fn validate_gateway_evidence_join(
             .and_then(|headers| header_value(headers, "x-request-id")),
         value => bail!("unsupported gatewayEvidenceJoin.capture_field {value:?}"),
     };
-    if observed != Some(captured) {
+    let observed_matches = match join["transform"].as_str().unwrap() {
+        "comma_separated_member" => observed.is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|member| member == captured)
+        }),
+        _ => observed == Some(captured),
+    };
+    if !observed_matches {
         bail!("gatewayEvidenceJoin.capture_request_id does not match the captured field");
     }
     let digest = join["usage_fact_sha256"].as_str().unwrap();
@@ -2183,5 +2193,35 @@ mod tests {
         let mut tampered = value;
         tampered["gatewayEvidence"]["upstream_model"] = json!("gpt-5.5");
         assert!(normalize_capture(&serde_json::to_vec(&tampered).unwrap(), 8192).is_err());
+    }
+
+    #[test]
+    fn validates_gateway_join_for_a_comma_separated_upstream_member() {
+        let evidence = json!({
+            "source":"sub2api_usage_log",
+            "request_id":"retry-b",
+            "requested_model":"gpt-5.6-sol",
+            "upstream_model":"gpt-5.6-sol",
+            "response_model":null,
+            "provider":"OpenAI",
+            "model_mapping_chain":null
+        });
+        let digest = gateway_evidence_fingerprint(&evidence);
+        let value = json!({
+            "captureId":"cap-gateway-retry-member",
+            "upstreamRequestId":"retry-a, retry-b, retry-c",
+            "requestBody":{"kind":"json","value":{"model":"gpt-5.6-sol"}},
+            "gatewayEvidence":evidence,
+            "gatewayEvidenceJoin":{
+                "schema_version":"chiptrace.gateway-enrichment.v1",
+                "mode":"exact_request_id",
+                "request_id":"retry-b",
+                "capture_request_id":"retry-b",
+                "capture_field":"upstreamRequestId",
+                "transform":"comma_separated_member",
+                "usage_fact_sha256":digest
+            }
+        });
+        normalize_capture(&serde_json::to_vec(&value).unwrap(), 8192).unwrap();
     }
 }

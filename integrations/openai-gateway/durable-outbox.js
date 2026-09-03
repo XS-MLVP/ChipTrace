@@ -437,6 +437,15 @@ class DurableCaptureOutbox {
       processing: 0,
       failedFiles: 0,
       auxiliaryFiles: 0,
+      // Files already present when the process starts are retained audit
+      // evidence. They must not make a healthy, newly started submitter look
+      // broken. Failures observed during this process are tracked separately.
+      historicalFailedFiles: 0,
+      historicalAuxiliaryFiles: 0,
+      historicalFailedBytes: 0,
+      recentFailedFiles: 0,
+      recentAuxiliaryFiles: 0,
+      recentFailureBytes: 0,
       stalledFiles: 0,
       queueBytes: 0,
       activeQueueBytes: 0,
@@ -494,6 +503,9 @@ class DurableCaptureOutbox {
       }
     }
     await this.refreshQueueStats();
+    this.metrics.historicalFailedFiles = this.metrics.failedFiles;
+    this.metrics.historicalAuxiliaryFiles = this.metrics.auxiliaryFiles;
+    this.metrics.historicalFailedBytes = this.metrics.failedBytes;
     this.metrics.startedAt = new Date().toISOString();
     this.started = true;
     this.scheduleDrain(0);
@@ -917,6 +929,8 @@ class DurableCaptureOutbox {
       if (!move.duplicate) {
         this.metrics.failedFiles += 1;
         this.metrics.failedBytes += retainedBytes;
+        this.metrics.recentFailedFiles += 1;
+        this.metrics.recentFailureBytes += retainedBytes;
       } else {
         this.metrics.queueBytes = Math.max(0, this.metrics.queueBytes - retainedBytes);
       }
@@ -931,6 +945,8 @@ class DurableCaptureOutbox {
           this.metrics.auxiliaryFiles += 1;
           this.metrics.queueBytes += markerBytes.length;
           this.metrics.failedBytes += markerBytes.length;
+          this.metrics.recentAuxiliaryFiles += 1;
+          this.metrics.recentFailureBytes += markerBytes.length;
           if (this.metrics.filesystemFreeBytes !== null) {
             this.metrics.filesystemFreeBytes = Math.max(0, this.metrics.filesystemFreeBytes - markerBytes.length);
           }
@@ -977,6 +993,12 @@ class DurableCaptureOutbox {
       timeoutMs: this.timeoutMs,
       sanitize: this.sanitize,
       ...this.metrics,
+      historicalFailureCount: this.metrics.historicalFailedFiles
+        + this.metrics.historicalAuxiliaryFiles,
+      recentFailureCount: this.metrics.recentFailedFiles
+        + this.metrics.recentAuxiliaryFiles,
+      currentFailureCount: this.metrics.recentFailedFiles
+        + this.metrics.recentAuxiliaryFiles,
       oldestPendingAt: oldestQueuedAtMs === null
         ? null
         : new Date(oldestQueuedAtMs).toISOString(),
