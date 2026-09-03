@@ -53,6 +53,7 @@ jobs:
           import json, sys
           result = json.load(sys.stdin)
           assert result["ok"] is True
+          assert result["checks"] and all(result["checks"].values())
           assert result["acceptance"]["hard_gate_pass"] is True
           assert result["acceptance"]["score"] == 100
           assert result["collection_submission"]["durable"] is True
@@ -60,7 +61,7 @@ jobs:
           assert result["checks"]["legacy_producer_absent"] is True
           assert result["checks"]["cloud_acceptance"] is True
           assert result["cloud_acceptance_tamper_detected"] is True
-          assert result["checks"]["tool_execution_state_machine"] is True
+          assert result["checks"]["cloud_tool_execution_evidence"] is True
           assert result["acceptance"]["source_capture_count"] == 20
           assert result["assembly"]["capture_schema_versions"] == ["chiptrace.capture.v2"]
           assert result["buyer_package"]["buyer_profile"] == "buyer-v7-codex-runtime-expanded"
