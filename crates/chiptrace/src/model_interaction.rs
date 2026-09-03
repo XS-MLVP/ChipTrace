@@ -153,6 +153,7 @@ struct ResponsesStreamView {
     protocol_terminal_observed: bool,
     framing_done_observed: bool,
     malformed_events: u64,
+    framing_recovered_events: u64,
     error_event: Option<Value>,
 }
 
@@ -1284,12 +1285,27 @@ fn detect_protocol_shape(
     }
 }
 
-fn parse_sse(raw: &str) -> (Vec<SseEvent>, bool, u64) {
+#[derive(Debug, Default)]
+struct SseParseResult {
+    events: Vec<SseEvent>,
+    done: bool,
+    malformed: u64,
+    recovered_boundaries: u64,
+}
+
+fn parse_sse(raw: &str) -> SseParseResult {
     let mut events = Vec::new();
     let mut event_name: Option<String> = None;
     let mut data_lines = Vec::new();
     let mut done = false;
     let mut malformed = 0_u64;
+    let mut recovered_boundaries = 0_u64;
+    // A conforming SSE frame ends with a blank line. Some upstream gateways
+    // omit that separator between the first event/data pairs while keeping
+    // each JSON payload and its event name intact. An event: line is an
+    // unambiguous boundary in that case; recover it only when the pending
+    // payload is independently valid JSON (or [DONE]). Other malformed data
+    // remains visible and fail-closed through `malformed`.
     let flush = |event_name: &mut Option<String>,
                  data_lines: &mut Vec<String>,
                  events: &mut Vec<SseEvent>,
@@ -1297,14 +1313,16 @@ fn parse_sse(raw: &str) -> (Vec<SseEvent>, bool, u64) {
                  malformed: &mut u64| {
         if data_lines.is_empty() {
             *event_name = None;
-            return;
+            return false;
         }
         let data_raw = data_lines.join("\n");
-        if data_raw.trim() == "[DONE]" {
+        let valid = if data_raw.trim() == "[DONE]" {
             *done = true;
+            true
         } else {
             let data = serde_json::from_str::<Value>(&data_raw).ok();
-            if data.is_none() {
+            let valid = data.is_some();
+            if !valid {
                 *malformed = malformed.saturating_add(1);
             }
             events.push(SseEvent {
@@ -1313,14 +1331,16 @@ fn parse_sse(raw: &str) -> (Vec<SseEvent>, bool, u64) {
                 data_raw,
                 data,
             });
-        }
+            valid
+        };
         data_lines.clear();
         *event_name = None;
+        valid
     };
     for line in raw.lines() {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
-            flush(
+            let _ = flush(
                 &mut event_name,
                 &mut data_lines,
                 &mut events,
@@ -1328,19 +1348,62 @@ fn parse_sse(raw: &str) -> (Vec<SseEvent>, bool, u64) {
                 &mut malformed,
             );
         } else if let Some(value) = line.strip_prefix("event:") {
+            if !data_lines.is_empty()
+                && flush(
+                    &mut event_name,
+                    &mut data_lines,
+                    &mut events,
+                    &mut done,
+                    &mut malformed,
+                )
+            {
+                recovered_boundaries = recovered_boundaries.saturating_add(1);
+            }
             event_name = Some(value.trim().to_owned());
         } else if let Some(value) = line.strip_prefix("data:") {
+            // A few OpenAI-compatible gateways omit the blank separator even
+            // when they emit data-only frames. Split only when both the
+            // pending payload and the new payload are complete JSON objects
+            // or arrays; partial/multiline JSON remains one frame and fails
+            // closed if it cannot be decoded.
+            let pending_is_complete = (!data_lines.is_empty()).then(|| {
+                serde_json::from_str::<Value>(&data_lines.join("\n"))
+                    .ok()
+                    .is_some_and(|json| json.is_object() || json.is_array())
+            }) == Some(true);
+            let next = value.trim_start();
+            let next_is_complete = next == "[DONE]"
+                || serde_json::from_str::<Value>(next)
+                    .ok()
+                    .is_some_and(|json| json.is_object() || json.is_array());
+            if pending_is_complete
+                && next_is_complete
+                && flush(
+                    &mut event_name,
+                    &mut data_lines,
+                    &mut events,
+                    &mut done,
+                    &mut malformed,
+                )
+            {
+                recovered_boundaries = recovered_boundaries.saturating_add(1);
+            }
             data_lines.push(value.trim_start().to_owned());
         }
     }
-    flush(
+    let _ = flush(
         &mut event_name,
         &mut data_lines,
         &mut events,
         &mut done,
         &mut malformed,
     );
-    (events, done, malformed)
+    SseParseResult {
+        events,
+        done,
+        malformed,
+        recovered_boundaries,
+    }
 }
 
 fn sse_events_value(events: &[SseEvent]) -> Value {
@@ -2257,6 +2320,7 @@ fn adapt_responses(
                 "response":wire_body_value(&response_body),
                 "sse_events":stream_view.events,
                 "malformed_sse_events":stream_view.malformed_events,
+                "framing_recovered_events":stream_view.framing_recovered_events,
                 "stream_state":stream_state_value(&state),
             },
             "routing":routing_extension(capture),
@@ -2271,7 +2335,7 @@ fn adapt_chat_completions(
     shape: ProtocolShape,
 ) -> Result<Value> {
     let request = request_body.parsed.as_object().cloned().unwrap_or_default();
-    let (response, stream_events, stream_terminal, malformed_events) =
+    let (response, stream_events, stream_terminal, malformed_events, framing_recovered_events) =
         chat_response_view(&response_body, &shape);
     let request_messages = request
         .get("messages")
@@ -2365,6 +2429,7 @@ fn adapt_chat_completions(
                 "response":wire_body_value(&response_body),
                 "sse_events":stream_events,
                 "malformed_sse_events":malformed_events,
+                "framing_recovered_events":framing_recovered_events,
                 "stream_state":stream_state_value(&state),
             },
             "routing":routing_extension(capture),
@@ -2764,6 +2829,7 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
             protocol_terminal_observed: true,
             framing_done_observed: true,
             malformed_events: 0,
+            framing_recovered_events: 0,
             error_event: None,
         };
     }
@@ -2775,10 +2841,15 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
             protocol_terminal_observed: false,
             framing_done_observed: false,
             malformed_events: 0,
+            framing_recovered_events: 0,
             error_event: None,
         };
     };
-    let (events, done, mut malformed) = parse_sse(raw);
+    let parsed_sse = parse_sse(raw);
+    let events = parsed_sse.events;
+    let done = parsed_sse.done;
+    let mut malformed = parsed_sse.malformed;
+    let framing_recovered_events = parsed_sse.recovered_boundaries;
     let mut created = None;
     let mut terminal = None;
     let mut output = BTreeMap::new();
@@ -2847,6 +2918,7 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
         protocol_terminal_observed: terminal_outcome.is_some(),
         framing_done_observed: done,
         malformed_events: malformed,
+        framing_recovered_events,
         error_event,
     }
 }
@@ -2871,14 +2943,18 @@ struct ChatToolCallAccumulator {
     raw_deltas: Vec<Value>,
 }
 
-fn chat_response_view(body: &WireBody, shape: &ProtocolShape) -> (Value, Value, bool, u64) {
+fn chat_response_view(body: &WireBody, shape: &ProtocolShape) -> (Value, Value, bool, u64, u64) {
     if shape.transport != "stream" {
-        return (body.parsed.clone(), json!([]), true, 0);
+        return (body.parsed.clone(), json!([]), true, 0, 0);
     }
     let Some(raw) = body.raw_utf8.as_deref() else {
-        return (body.parsed.clone(), json!([]), false, 0);
+        return (body.parsed.clone(), json!([]), false, 0, 0);
     };
-    let (events, done, malformed) = parse_sse(raw);
+    let parsed_sse = parse_sse(raw);
+    let events = parsed_sse.events;
+    let done = parsed_sse.done;
+    let malformed = parsed_sse.malformed;
+    let framing_recovered_events = parsed_sse.recovered_boundaries;
     let mut response_id = None;
     let mut response_model = None;
     let mut response_created = None;
@@ -3012,6 +3088,7 @@ fn chat_response_view(body: &WireBody, shape: &ProtocolShape) -> (Value, Value, 
         sse_events_value(&events),
         done,
         malformed,
+        framing_recovered_events,
     )
 }
 
@@ -5506,6 +5583,95 @@ mod tests {
         assert_eq!(
             interaction["extensions"]["wire"]["response"]["raw_utf8"],
             RESPONSES_STREAM_RESPONSE
+        );
+    }
+
+    #[test]
+    fn sse_missing_blank_boundaries_are_recovered_only_for_valid_json() {
+        let response = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-recovered\",\"status\":\"in_progress\"}}\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-recovered\",\"status\":\"completed\",\"output\":[]}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let capture = fixture_capture(
+            "sse-recovered",
+            "/v1/responses",
+            true,
+            RESPONSES_STREAM_REQUEST,
+            response,
+        );
+        let interaction = model_interaction_from_capture(&capture).unwrap();
+        assert_eq!(interaction["integrity"]["protocol_complete"], true);
+        assert_eq!(interaction["extensions"]["wire"]["malformed_sse_events"], 0);
+        assert_eq!(
+            interaction["extensions"]["wire"]["framing_recovered_events"],
+            1
+        );
+        assert_eq!(
+            interaction["extensions"]["wire"]["stream_state"]["framing_done_observed"],
+            true
+        );
+
+        let invalid = concat!(
+            "event: response.created\n",
+            "data: {not-json}\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let invalid_capture = fixture_capture(
+            "sse-invalid",
+            "/v1/responses",
+            true,
+            RESPONSES_STREAM_REQUEST,
+            invalid,
+        );
+        let invalid_interaction = model_interaction_from_capture(&invalid_capture).unwrap();
+        assert_eq!(
+            invalid_interaction["extensions"]["wire"]["malformed_sse_events"],
+            1
+        );
+        assert_eq!(
+            invalid_interaction["extensions"]["wire"]["framing_recovered_events"],
+            0
+        );
+        assert_eq!(invalid_interaction["integrity"]["protocol_complete"], false);
+    }
+
+    #[test]
+    fn chat_sse_missing_blank_boundary_is_reported_without_losing_raw_bytes() {
+        let request = r#"{"model":"model-family-latest","stream":true,"messages":[{"role":"user","content":"hello"}]}"#;
+        let response = concat!(
+            "data: {\"id\":\"chat-recovered\",\"model\":\"model-family-latest\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n",
+            "data: {\"id\":\"chat-recovered\",\"model\":\"model-family-latest\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n",
+            "data: [DONE]\n\n",
+        );
+        let capture = fixture_capture(
+            "chat-recovered",
+            "/v1/chat/completions",
+            true,
+            request,
+            response,
+        );
+        let interaction = model_interaction_from_capture(&capture).unwrap();
+        // The KISS delivery gate currently admits Responses streaming only;
+        // Chat Completions remains a forensic projection even when framing is
+        // recovered correctly.
+        assert_eq!(interaction["integrity"]["protocol_complete"], false);
+        assert_eq!(interaction["extensions"]["wire"]["malformed_sse_events"], 0);
+        assert_eq!(
+            interaction["extensions"]["wire"]["framing_recovered_events"],
+            2
+        );
+        assert_eq!(
+            interaction["response"]["choices"][0]["message"]["content"],
+            "ok"
+        );
+        assert_eq!(
+            interaction["extensions"]["wire"]["response"]["raw_utf8"],
+            response
         );
     }
 

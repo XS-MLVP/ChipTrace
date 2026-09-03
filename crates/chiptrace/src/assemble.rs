@@ -280,6 +280,26 @@ pub fn assemble(config: AssembleConfig) -> Result<AssemblyManifest> {
             // remain available for a versioned adapter, but cannot silently
             // become a buyer-eligible trajectory.
             if string_field(&value, "recordType") == Some("telemetry_batch") {
+                match telemetry_batch_scope(
+                    &value,
+                    task_session_id.as_deref(),
+                    session_id.as_deref(),
+                    session_selection.as_ref(),
+                )? {
+                    // A selector gives the caller an explicit Session scope.
+                    // Batches with a different explicit identity are raw
+                    // evidence for another Session and must not poison this
+                    // projection. An unscoped batch cannot be attributed to
+                    // the selected Session, so it is likewise retained only
+                    // in Raw storage and excluded from assembly.
+                    TelemetryBatchScope::Other | TelemetryBatchScope::Unscoped
+                        if task_session_id.is_some() || session_id.is_some() =>
+                    {
+                        continue;
+                    }
+                    TelemetryBatchScope::Selected => {}
+                    TelemetryBatchScope::Other | TelemetryBatchScope::Unscoped => {}
+                }
                 let batch = value
                     .get("telemetryBatch")
                     .and_then(Value::as_object)
@@ -621,6 +641,179 @@ fn capture_matches_selection(
             == Some(selected);
     }
     true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelemetryBatchScope {
+    Selected,
+    Other,
+    Unscoped,
+}
+
+#[derive(Debug, Default)]
+struct TelemetryBatchIdentities {
+    task_session_ids: BTreeSet<String>,
+    session_ids: BTreeSet<String>,
+}
+
+/// Return only identities carried by protocol metadata. Do not search free
+/// text or `raw_json` contents indiscriminately: a user prompt can contain an
+/// arbitrary string that happens to look like a Session ID.
+fn collect_telemetry_identity(object: &Value, identities: &mut TelemetryBatchIdentities) {
+    let Some(object) = object.as_object() else {
+        return;
+    };
+    for key in [
+        "task_session_id",
+        "taskSessionId",
+        "task.session.id",
+        "session_id",
+        "sessionId",
+        "session.id",
+        "conversation_id",
+        "conversation.id",
+        "thread_id",
+        "thread.id",
+    ] {
+        if let Some(value) = object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if matches!(key, "task_session_id" | "taskSessionId" | "task.session.id") {
+                identities.task_session_ids.insert(value.to_owned());
+            } else {
+                identities.session_ids.insert(value.to_owned());
+            }
+        }
+    }
+}
+
+fn collect_otlp_attribute_identities(value: &Value, identities: &mut TelemetryBatchIdentities) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_otlp_attribute_identities(value, identities);
+            }
+        }
+        Value::Object(object) => {
+            // OTLP attributes are `{key, value}` objects. Restrict recursive
+            // collection to those metadata containers so arbitrary span
+            // names, log bodies and user content cannot become identities.
+            if let (Some(key), Some(value)) = (
+                object.get("key").and_then(Value::as_str),
+                object.get("value"),
+            ) && let Some(value) = value
+                .get("stringValue")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                match key {
+                    "task_session_id" | "taskSessionId" | "task.session.id" => {
+                        identities.task_session_ids.insert(value.to_owned());
+                    }
+                    "session_id" | "sessionId" | "session.id" | "conversation_id"
+                    | "conversation.id" | "thread_id" | "thread.id" => {
+                        identities.session_ids.insert(value.to_owned());
+                    }
+                    _ => {}
+                }
+            }
+            // Continue through OTLP resource/scope/record arrays to find
+            // attributes at any legal level, but never inspect scalar text.
+            for (key, child) in object {
+                if matches!(
+                    key.as_str(),
+                    "resourceLogs"
+                        | "resourceSpans"
+                        | "scopeLogs"
+                        | "scopeSpans"
+                        | "logRecords"
+                        | "spans"
+                        | "resource"
+                        | "scope"
+                        | "attributes"
+                ) {
+                    collect_otlp_attribute_identities(child, identities);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn telemetry_batch_identities(value: &Value) -> Result<TelemetryBatchIdentities> {
+    let batch = value
+        .get("telemetryBatch")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("telemetry_batch requires telemetryBatch"))?;
+    let mut identities = TelemetryBatchIdentities::default();
+    collect_telemetry_identity(
+        value.get("traceContext").unwrap_or(&Value::Null),
+        &mut identities,
+    );
+    let raw = batch.get("raw_json").and_then(Value::as_str).unwrap_or("");
+    if let Ok(raw_value) = serde_json::from_str::<Value>(raw) {
+        let endpoint = batch.get("endpoint").and_then(Value::as_str).unwrap_or("");
+        if endpoint == "codex_hook" {
+            collect_telemetry_identity(&raw_value, &mut identities);
+        } else {
+            collect_otlp_attribute_identities(&raw_value, &mut identities);
+            // Some OpenTelemetry clients put the correlation fields in a
+            // top-level envelope extension rather than an attribute array.
+            collect_telemetry_identity(&raw_value, &mut identities);
+        }
+    }
+    Ok(identities)
+}
+
+fn telemetry_batch_scope(
+    value: &Value,
+    task_session_id: Option<&str>,
+    session_id: Option<&str>,
+    session_selection: Option<&crate::session_lineage::StockSessionSelection>,
+) -> Result<TelemetryBatchScope> {
+    let identities = telemetry_batch_identities(value)?;
+    if let Some(selected) = task_session_id {
+        if identities.task_session_ids.len() > 1 {
+            bail!(
+                "telemetry batch has conflicting task_session_id identities: {:?}",
+                identities.task_session_ids
+            );
+        }
+        return Ok(match identities.task_session_ids.iter().next() {
+            Some(identity) if identity == selected => TelemetryBatchScope::Selected,
+            Some(_) => TelemetryBatchScope::Other,
+            None => TelemetryBatchScope::Unscoped,
+        });
+    }
+    if let Some(selected) = session_id {
+        if identities.session_ids.is_empty() {
+            return Ok(TelemetryBatchScope::Unscoped);
+        }
+        let allowed = |identity: &String| {
+            session_selection.is_some_and(|selection| selection.allows_session_id(identity))
+                || identity == selected
+        };
+        let selected_count = identities
+            .session_ids
+            .iter()
+            .filter(|id| allowed(id))
+            .count();
+        if selected_count == identities.session_ids.len() {
+            return Ok(TelemetryBatchScope::Selected);
+        }
+        if selected_count > 0 {
+            bail!(
+                "telemetry batch mixes selected and unrelated session identities: {:?}",
+                identities.session_ids
+            );
+        }
+        return Ok(TelemetryBatchScope::Other);
+    }
+    Ok(TelemetryBatchScope::Selected)
 }
 
 fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
@@ -7954,6 +8147,188 @@ mod tests {
         let discovered = discover_inputs(&[temporary.path().to_path_buf()]).unwrap();
         assert_eq!(discovered, vec![sealed.canonicalize().unwrap()]);
         assert!(discover_inputs(&[open]).is_err());
+    }
+
+    #[test]
+    fn selected_session_ignores_unrelated_or_unscoped_bad_telemetry_batches() {
+        let unrelated = json!({
+            "recordType":"telemetry_batch",
+            "captureId":"batch-unrelated",
+            "traceContext":{},
+            "telemetryBatch":{
+                "endpoint":"codex_hook",
+                "raw_json":"{\"session_id\":\"other-session\",\"bad\":true}",
+                "unknown_events":0,
+                "attributed_quality_errors":0,
+                "conversion_errors":["invalid hook"]
+            }
+        });
+        assert_eq!(
+            telemetry_batch_scope(&unrelated, None, Some("target-session"), None).unwrap(),
+            TelemetryBatchScope::Other
+        );
+
+        let unscoped = json!({
+            "recordType":"telemetry_batch",
+            "captureId":"batch-unscoped",
+            "traceContext":{},
+            "telemetryBatch":{
+                "endpoint":"codex_hook",
+                "raw_json":"{\"bad\":true}",
+                "unknown_events":0,
+                "attributed_quality_errors":0,
+                "conversion_errors":["missing session"]
+            }
+        });
+        assert_eq!(
+            telemetry_batch_scope(&unscoped, None, Some("target-session"), None).unwrap(),
+            TelemetryBatchScope::Unscoped
+        );
+
+        let selected = json!({
+            "recordType":"telemetry_batch",
+            "captureId":"batch-selected",
+            "traceContext":{},
+            "telemetryBatch":{
+                "endpoint":"codex_hook",
+                "raw_json":"{\"session_id\":\"target-session\",\"bad\":true}",
+                "unknown_events":0,
+                "attributed_quality_errors":0,
+                "conversion_errors":["invalid hook"]
+            }
+        });
+        assert_eq!(
+            telemetry_batch_scope(&selected, None, Some("target-session"), None).unwrap(),
+            TelemetryBatchScope::Selected
+        );
+
+        let otlp = json!({
+            "recordType":"telemetry_batch",
+            "captureId":"batch-otlp-selected",
+            "traceContext":{},
+            "telemetryBatch":{
+                "endpoint":"otlp_logs",
+                "raw_json":serde_json::to_string(&json!({
+                    "resourceLogs":[{"scopeLogs":[{"logRecords":[{
+                        "attributes":[{
+                            "key":"conversation.id",
+                            "value":{"stringValue":"target-session"}
+                        }]
+                    }]}]}]
+                })).unwrap(),
+                "unknown_events":0,
+                "attributed_quality_errors":0,
+                "conversion_errors":[]
+            }
+        });
+        assert_eq!(
+            telemetry_batch_scope(&otlp, None, Some("target-session"), None).unwrap(),
+            TelemetryBatchScope::Selected
+        );
+    }
+
+    #[test]
+    fn selected_session_does_not_fail_on_unrelated_bad_telemetry_batch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("captures.ndjson");
+        let capture = multi_source_usage_capture(
+            "cap-selected-assembly",
+            "api_snapshot",
+            "request-selected-assembly",
+            "response-selected-assembly",
+            100,
+        );
+        let mut capture = capture;
+        capture["traceContext"]["task_session_id"] = json!("target-session");
+        capture["traceContext"]["session_id"] = json!("target-session");
+        let unrelated = json!({
+            "recordType":"telemetry_batch",
+            "captureId":"batch-bad-other",
+            "captureStage":"event",
+            "sourceNamespace":"stock-codex-cloud",
+            "traceContext":{},
+            "telemetryBatch":{
+                "schema_version":"chiptrace.telemetry-batch.v1",
+                "endpoint":"codex_hook",
+                "raw_json":"{\"session_id\":\"other-session\",\"bad\":true}",
+                "raw_bytes":44,
+                "raw_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "source_records":1,
+                "derived_captures":0,
+                "unknown_events":0,
+                "attributed_quality_errors":0,
+                "conversion_errors":["invalid hook"]
+            }
+        });
+        let mut bytes = serde_json::to_vec(&unrelated).unwrap();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&serde_json::to_vec(&capture).unwrap());
+        bytes.push(b'\n');
+        fs::write(&input, bytes).unwrap();
+        let output = temporary.path().join("assembly");
+        let manifest = assemble(AssembleConfig {
+            inputs: vec![input],
+            output,
+            task_session_id: None,
+            session_id: Some("target-session".to_owned()),
+            partitions: 1,
+            zstd_level: 1,
+            replace: false,
+        })
+        .unwrap();
+        assert_eq!(manifest.sessions, 1);
+        assert_eq!(manifest.session_id.as_deref(), Some("target-session"));
+    }
+
+    #[test]
+    fn selected_session_bad_telemetry_batch_still_fails_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("captures.ndjson");
+        let capture = multi_source_usage_capture(
+            "cap-selected-assembly-fail",
+            "api_snapshot",
+            "request-selected-assembly-fail",
+            "response-selected-assembly-fail",
+            100,
+        );
+        let mut capture = capture;
+        capture["traceContext"]["task_session_id"] = json!("target-session");
+        capture["traceContext"]["session_id"] = json!("target-session");
+        let selected_bad = json!({
+            "recordType":"telemetry_batch",
+            "captureId":"batch-bad-selected",
+            "captureStage":"event",
+            "sourceNamespace":"stock-codex-cloud",
+            "traceContext":{},
+            "telemetryBatch":{
+                "schema_version":"chiptrace.telemetry-batch.v1",
+                "endpoint":"codex_hook",
+                "raw_json":"{\"session_id\":\"target-session\",\"bad\":true}",
+                "raw_bytes":51,
+                "raw_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "source_records":1,
+                "derived_captures":0,
+                "unknown_events":0,
+                "attributed_quality_errors":0,
+                "conversion_errors":["invalid hook"]
+            }
+        });
+        let mut bytes = serde_json::to_vec(&selected_bad).unwrap();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&serde_json::to_vec(&capture).unwrap());
+        bytes.push(b'\n');
+        fs::write(&input, bytes).unwrap();
+        let error = assemble(AssembleConfig {
+            inputs: vec![input],
+            output: temporary.path().join("assembly"),
+            task_session_id: None,
+            session_id: Some("target-session".to_owned()),
+            partitions: 1,
+            zstd_level: 1,
+            replace: false,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("unattributed quality errors"));
     }
 
     #[test]

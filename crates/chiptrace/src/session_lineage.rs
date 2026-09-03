@@ -124,13 +124,15 @@ impl StockSessionLineage {
 }
 
 impl StockSessionSelection {
+    pub(crate) fn allows_session_id(&self, session_id: &str) -> bool {
+        session_id == self.root_session_id || self.members.contains_key(session_id)
+    }
+
     pub(crate) fn contains(&self, capture: &Value) -> bool {
         capture
             .pointer("/traceContext/session_id")
             .and_then(Value::as_str)
-            .is_some_and(|session_id| {
-                session_id == self.root_session_id || self.members.contains_key(session_id)
-            })
+            .is_some_and(|session_id| self.allows_session_id(session_id))
     }
 
     /// Canonicalize only the derived projection. Raw Capture bytes remain
