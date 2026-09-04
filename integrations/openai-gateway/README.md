@@ -30,6 +30,8 @@ await outbox.enqueue(capture);
 
 接入约束：
 
+- 每条记录必须显式使用 `version=chiptrace.capture.v2`、`recordType=api_snapshot` 和非空
+  `sourceNamespace`；该入口不接受 Runtime、生命周期或评价记录。
 - 请求和响应正文必须使用实际观察到的原始 UTF-8 字节计算长度与 SHA-256。
 - `/models` 必须验证真实 Provider 业务凭据；只检查 Bearer 非空不算鉴权。
 - `sanitize: false` 保留 Wire 正文；认证头、Cookie 和 API Key 不得写入 Capture headers。

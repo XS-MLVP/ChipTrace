@@ -21,6 +21,10 @@ Stock Codex
 用户主机只运行未修改的 Stock Codex 和系统下发的原生配置。采集、可靠存储、
 轨迹组装和采购验收全部在云端完成。Langfuse 是可选展示层，不是 Raw 事实源或采购准入器。
 
+在线入口按事实来源隔离：`/capture` 与 `/captures` 只接受 18084 网关产生的当前版
+`api_snapshot`；OTLP 与 Hook 入口先保存原始 envelope，再由服务器派生 Runtime 和生命周期
+事实。历史 rollout、Registry 和其他生产者记录只允许从 sealed Raw 离线重放，不能在线写入。
+
 ## 权威事实
 
 | 事实 | 来源 |

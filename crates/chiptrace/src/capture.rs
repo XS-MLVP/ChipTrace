@@ -49,6 +49,46 @@ pub fn normalize_capture(raw: &[u8], max_bytes: usize) -> Result<CaptureRecord> 
     normalize_capture_with_policy(raw, max_bytes, true)
 }
 
+pub fn normalize_wire_capture(raw: &[u8], max_bytes: usize) -> Result<CaptureRecord> {
+    let value: Value = serde_json::from_slice(raw)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Wire Capture envelope must be a JSON object"))?;
+    if object.get("version").and_then(Value::as_str) != Some(CAPTURE_SCHEMA_VERSION) {
+        bail!("Wire Capture version must be {CAPTURE_SCHEMA_VERSION}");
+    }
+    if object.get("recordType").and_then(Value::as_str) != Some("api_snapshot") {
+        bail!("Wire Capture recordType must be api_snapshot");
+    }
+    if object
+        .get("sourceNamespace")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        bail!("Wire Capture sourceNamespace is required");
+    }
+    for field in [
+        "evaluationEvidence",
+        "evaluation_evidence",
+        "lifecycleEvent",
+        "producerEvent",
+        "producerModel",
+        "rolloutEvent",
+        "rolloutMessages",
+        "rolloutUsage",
+        "runtimeToolObservation",
+        "telemetryBatch",
+        "toolExecution",
+        "toolRegistry",
+        "toolRegistrySha256",
+    ] {
+        if object.contains_key(field) {
+            bail!("Wire Capture must not contain {field}");
+        }
+    }
+    normalize_capture(raw, max_bytes)
+}
+
 pub(crate) fn normalize_capture_with_policy(
     raw: &[u8],
     max_bytes: usize,
@@ -214,6 +254,23 @@ pub fn normalize_capture_batch(
     max_envelope_bytes: usize,
     max_records: usize,
 ) -> Result<Vec<CaptureRecord>> {
+    normalize_capture_lines(raw, max_envelope_bytes, max_records, normalize_capture)
+}
+
+pub fn normalize_wire_capture_batch(
+    raw: &[u8],
+    max_envelope_bytes: usize,
+    max_records: usize,
+) -> Result<Vec<CaptureRecord>> {
+    normalize_capture_lines(raw, max_envelope_bytes, max_records, normalize_wire_capture)
+}
+
+fn normalize_capture_lines(
+    raw: &[u8],
+    max_envelope_bytes: usize,
+    max_records: usize,
+    normalize: fn(&[u8], usize) -> Result<CaptureRecord>,
+) -> Result<Vec<CaptureRecord>> {
     if max_records == 0 {
         bail!("batch record limit must be positive");
     }
@@ -227,7 +284,7 @@ pub fn normalize_capture_batch(
             bail!("batch contains more than {max_records} records");
         }
         records.push(
-            normalize_capture(line, max_envelope_bytes)
+            normalize(line, max_envelope_bytes)
                 .with_context(|| format!("invalid capture at NDJSON line {}", index + 1))?,
         );
     }
@@ -1824,6 +1881,78 @@ mod tests {
         assert!(value["requestHeaders"].get("Authorization").is_none());
         assert_eq!(value["requestHeaders"]["x-id"], "keep");
         assert_eq!(value["responseStatus"], 500);
+    }
+
+    #[test]
+    fn wire_ingest_accepts_only_current_api_snapshots() {
+        let wire = json!({
+            "version":CAPTURE_SCHEMA_VERSION,
+            "recordType":"api_snapshot",
+            "captureId":"cap-wire-current",
+            "sourceNamespace":"gateway-test",
+            "requestBodyText":"{\"model\":\"gpt-5.6-sol\"}",
+            "responseBodyText":"{\"status\":\"completed\"}",
+            "responseStatus":200
+        });
+        normalize_wire_capture(&serde_json::to_vec(&wire).unwrap(), 4096).unwrap();
+
+        let mut missing_version = wire.clone();
+        missing_version.as_object_mut().unwrap().remove("version");
+        assert!(
+            normalize_wire_capture(&serde_json::to_vec(&missing_version).unwrap(), 4096).is_err()
+        );
+
+        for (record_type, field, value) in [
+            (
+                "lifecycle_event",
+                "lifecycleEvent",
+                json!({"type":"session_start","status":"started"}),
+            ),
+            (
+                "tool_execution",
+                "toolExecution",
+                json!({"call_id":"call-1","name":"exec_command","status":"started"}),
+            ),
+            (
+                "evaluation",
+                "evaluationEvidence",
+                json!([{"kind":"test","source":"test","status":"passed"}]),
+            ),
+            (
+                "telemetry_batch",
+                "telemetryBatch",
+                json!({"schema_version":"chiptrace.telemetry-batch.v1"}),
+            ),
+            (
+                "rollout_event",
+                "rolloutEvent",
+                json!({"schema_version":"chiptrace.codex-rollout.v1"}),
+            ),
+        ] {
+            let mut invalid = wire.clone();
+            invalid["recordType"] = json!(record_type);
+            invalid[field] = value;
+            assert!(
+                normalize_wire_capture(&serde_json::to_vec(&invalid).unwrap(), 4096).is_err(),
+                "online Wire ingress accepted {record_type}"
+            );
+        }
+
+        for field in [
+            "producerEvent",
+            "producerModel",
+            "rolloutMessages",
+            "rolloutUsage",
+            "runtimeToolObservation",
+            "toolRegistry",
+        ] {
+            let mut invalid = wire.clone();
+            invalid[field] = json!({});
+            assert!(
+                normalize_wire_capture(&serde_json::to_vec(&invalid).unwrap(), 4096).is_err(),
+                "online Wire ingress accepted historical field {field}"
+            );
+        }
     }
 
     #[test]

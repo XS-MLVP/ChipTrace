@@ -1,4 +1,6 @@
-use crate::capture::{CaptureRecord, normalize_capture, normalize_capture_batch};
+use crate::capture::{
+    CaptureRecord, normalize_capture, normalize_wire_capture, normalize_wire_capture_batch,
+};
 use crate::cloud_ingest::{CloudEndpoint, CloudIngestBatch, prepare_cloud_ingest};
 use crate::ingest::{BodyReadError, InflightBodyBudget};
 use crate::jsonl::utc_now;
@@ -1547,7 +1549,7 @@ async fn relay_captures(State(state): State<RelayAppState>, request: Request) ->
         Ok(body) => body,
         Err(error) => return relay_body_error_response(error),
     };
-    let records = match normalize_capture_batch(
+    let records = match normalize_wire_capture_batch(
         &body.bytes,
         state.relay.inner.config.max_envelope_bytes,
         state.max_batch_records,
@@ -1664,15 +1666,16 @@ async fn relay_capture(State(state): State<RelayAppState>, request: Request) -> 
         Ok(body) => body,
         Err(error) => return relay_body_error_response(error),
     };
-    let record = match normalize_capture(&body.bytes, state.relay.inner.config.max_envelope_bytes) {
-        Ok(record) => record,
-        Err(error) => {
-            return relay_response(
-                StatusCode::BAD_REQUEST,
-                json!({"ok":false,"reason":"invalid_capture","detail":error.to_string()}),
-            );
-        }
-    };
+    let record =
+        match normalize_wire_capture(&body.bytes, state.relay.inner.config.max_envelope_bytes) {
+            Ok(record) => record,
+            Err(error) => {
+                return relay_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({"ok":false,"reason":"invalid_capture","detail":error.to_string()}),
+                );
+            }
+        };
     match state.relay.enqueue_record(record).await {
         Ok(ack) => {
             state
@@ -1972,6 +1975,61 @@ mod tests {
                 .status(),
             StatusCode::BAD_REQUEST
         );
+        let non_wire_capture = Request::builder()
+            .header("content-type", "application/json")
+            .header(AUTHORIZATION, "Bearer test-cloud-token-at-least-32-bytes")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "version":"chiptrace.capture.v2",
+                    "recordType":"lifecycle_event",
+                    "captureId":"cap-forbidden-online-lifecycle",
+                    "sourceNamespace":"test",
+                    "traceContext":{"session_id":"session-1"},
+                    "lifecycleEvent":{"type":"session_start","status":"started"}
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(
+            relay_capture(State(state.clone()), non_wire_capture)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mixed_batch = [
+            json!({
+                "version":"chiptrace.capture.v2",
+                "recordType":"api_snapshot",
+                "captureId":"cap-current-wire",
+                "sourceNamespace":"gateway-test",
+                "requestBodyText":"{}",
+                "responseBodyText":"{}",
+                "responseStatus":200
+            }),
+            json!({
+                "version":"chiptrace.capture.v2",
+                "recordType":"evaluation",
+                "captureId":"cap-forbidden-online-evaluation",
+                "sourceNamespace":"test",
+                "traceContext":{"session_id":"session-1"},
+                "evaluationEvidence":[{"kind":"test","source":"test","status":"passed"}]
+            }),
+        ]
+        .into_iter()
+        .map(|value| serde_json::to_string(&value).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let mixed_batch = Request::builder()
+            .header("content-type", "application/x-ndjson")
+            .header(AUTHORIZATION, "Bearer test-cloud-token-at-least-32-bytes")
+            .body(Body::from(mixed_batch))
+            .unwrap();
+        assert_eq!(
+            relay_captures(State(state.clone()), mixed_batch)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
         let health = relay.health().await.unwrap();
         // Invalid cloud payloads are retained as an auditable raw batch before
         // the 400 response; they must never enter canonical Release.
@@ -1985,6 +2043,7 @@ mod tests {
         assert_eq!(coverage["status"], "partial");
         assert_eq!(coverage["required_sources_observed"], false);
         assert_eq!(coverage["otlp_logs"]["requests"], 1);
+        assert_eq!(coverage["wire"]["requests"], 0);
         assert_eq!(coverage["quality_errors"], 1);
         assert_eq!(coverage["buyer_eligibility_claimed"], false);
         relay.close().await.unwrap();

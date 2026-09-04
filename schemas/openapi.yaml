@@ -18,6 +18,7 @@ paths:
   /capture:
     post:
       summary: 持久化一条网关 Wire Capture
+      description: 仅接收当前版 api_snapshot；生命周期、工具执行、评价和历史生产者格式返回 400。
       security:
         - cloudBearer: []
       requestBody:
@@ -25,7 +26,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: ./capture-v2.schema.json
+              $ref: "#/components/schemas/WireCapture"
       responses:
         "202": {description: WAL 与 ledger 已持久化}
         "200": {description: 相同 Capture 已持久化}
@@ -37,6 +38,7 @@ paths:
   /captures:
     post:
       summary: 批量持久化网关 Wire Capture
+      description: NDJSON 每个非空行必须符合 WireCapture；整批先校验，任一行无效则不写入。
       security:
         - cloudBearer: []
       requestBody:
@@ -115,6 +117,31 @@ paths:
         "401": {description: 内部采集 Token 缺失或无效}
         "503": {description: 封存失败}
 components:
+  schemas:
+    WireCapture:
+      allOf:
+        - $ref: ./capture-v2.schema.json
+        - type: object
+          required: [version, recordType, sourceNamespace]
+          properties:
+            version: {const: chiptrace.capture.v2}
+            recordType: {const: api_snapshot}
+            sourceNamespace: {type: string, minLength: 1}
+          not:
+            anyOf:
+              - required: [evaluationEvidence]
+              - required: [evaluation_evidence]
+              - required: [lifecycleEvent]
+              - required: [producerEvent]
+              - required: [producerModel]
+              - required: [rolloutEvent]
+              - required: [rolloutMessages]
+              - required: [rolloutUsage]
+              - required: [runtimeToolObservation]
+              - required: [telemetryBatch]
+              - required: [toolExecution]
+              - required: [toolRegistry]
+              - required: [toolRegistrySha256]
   securitySchemes:
     businessBearer:
       type: http

@@ -1092,13 +1092,16 @@ async fn self_test() -> Result<Value> {
         },
     ));
     wait_for_health(&client, &format!("http://{relay_bind}/health")).await?;
-    let mut captures = self_test_captures();
-    captures.retain(|capture| {
-        matches!(
-            capture.get("recordType").and_then(Value::as_str),
-            Some("api_snapshot" | "evaluation")
-        )
-    });
+    let self_test_captures = self_test_captures();
+    let captures: Vec<Value> = self_test_captures
+        .iter()
+        .filter(|capture| capture["recordType"] == "api_snapshot")
+        .cloned()
+        .collect();
+    let evaluator_capture = self_test_captures
+        .iter()
+        .find(|capture| capture["recordType"] == "evaluation")
+        .context("self-test evaluator Capture is missing")?;
     let api_snapshot_count = captures
         .iter()
         .filter(|capture| capture["recordType"] == "api_snapshot")
@@ -1130,6 +1133,51 @@ async fn self_test() -> Result<Value> {
         "route":"/captures",
         "http_status":gateway_status.as_u16(),
         "counts":gateway_result.get("counts"),
+    }));
+
+    let rejected_evaluator_response = client
+        .post(format!("http://{relay_bind}/capture"))
+        .json(evaluator_capture)
+        .send()
+        .await?;
+    let rejected_evaluator_status = rejected_evaluator_response.status();
+    let rejected_evaluator_result: Value = rejected_evaluator_response.json().await?;
+    let relay_source_isolation = rejected_evaluator_status == reqwest::StatusCode::BAD_REQUEST
+        && rejected_evaluator_result
+            .get("reason")
+            .and_then(Value::as_str)
+            == Some("invalid_capture");
+    if !relay_source_isolation {
+        bail!("self-test Relay accepted evaluator evidence as Wire: {rejected_evaluator_result}");
+    }
+    submission_routes.push(json!({
+        "route":"/capture",
+        "source":"cloud_evaluator",
+        "http_status":rejected_evaluator_status.as_u16(),
+        "durable":false,
+        "expected_rejection":true,
+    }));
+
+    // Evaluation evidence is produced by a cloud evaluator, not by the Wire
+    // gateway. Submit it to the private Collector path so the public Relay
+    // ingress remains a single-source record of observed model traffic.
+    let evaluator_response = client
+        .post(format!("http://{collector_bind}/capture"))
+        .json(evaluator_capture)
+        .send()
+        .await?;
+    let evaluator_status = evaluator_response.status();
+    let evaluator_result: Value = evaluator_response.json().await?;
+    if !evaluator_status.is_success()
+        || evaluator_result.get("durable").and_then(Value::as_bool) != Some(true)
+    {
+        bail!("self-test evaluator Capture was not durable: {evaluator_result}");
+    }
+    submission_routes.push(json!({
+        "route":"collector:/capture",
+        "source":"cloud_evaluator",
+        "http_status":evaluator_status.as_u16(),
+        "durable":true,
     }));
 
     let otlp_logs = serde_json::to_vec(&self_test_otlp_logs())?;
@@ -1193,8 +1241,8 @@ async fn self_test() -> Result<Value> {
     {
         bail!("self-test OTLP replay was not idempotent: {replay_result}");
     }
-    let expected_collector_records =
-        captures.len() as u64 + otlp_capture_count + hook_capture_count;
+    let expected_relay_records = captures.len() as u64 + otlp_capture_count + hook_capture_count;
+    let expected_collector_records = expected_relay_records.saturating_add(1);
     let raw_batch_count = 8_u64;
     let canonical_capture_count = expected_collector_records.saturating_sub(raw_batch_count);
     let non_api_capture_count =
@@ -1214,7 +1262,7 @@ async fn self_test() -> Result<Value> {
             .error_for_status()?
             .json()
             .await?;
-        if health.get("delivered").and_then(Value::as_u64) == Some(expected_collector_records) {
+        if health.get("delivered").and_then(Value::as_u64) == Some(expected_relay_records) {
             break health;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -1606,13 +1654,16 @@ async fn self_test() -> Result<Value> {
         "tool_projection":completed_tool_calls == 5 && failed_tool_calls == 1,
         "cloud_tool_execution_evidence":tool_execution_audit_pass,
         "cloud_runtime_evidence":cloud_runtime_audit_pass,
+        "cloud_source_isolation":relay_source_isolation
+            && relay_health.pointer("/ingest_coverage/wire/durable_captures")
+                .and_then(Value::as_u64) == Some(api_snapshot_count as u64),
         "capture_counts":delivered["source_request_count"] == 6
             && delivered["source_capture_count"] == canonical_capture_count,
         "assembly_integrity":assembly.merge_divergences == 0
             && assembly.capture_schema_versions.len() == 1
             && assembly.capture_schema_versions.contains(CAPTURE_SCHEMA_VERSION),
         "relay_delivery_conservation":relay_health.get("delivered").and_then(Value::as_u64)
-                == Some(expected_collector_records)
+                == Some(expected_relay_records)
             && relay_health.get("pending").and_then(Value::as_u64) == Some(0)
             && relay_health.get("inflight").and_then(Value::as_u64) == Some(0)
             && relay_health.get("conservation_ok").and_then(Value::as_bool) == Some(true),
@@ -1944,6 +1995,7 @@ fn self_test_captures() -> Vec<Value> {
             json!({"type":"response.completed","response":response_value})
         );
         captures.push(json!({
+            "version":CAPTURE_SCHEMA_VERSION,
             "recordType":"api_snapshot",
             "captureId":format!("cap-self-api-{ordinal}"),
             "upstreamRequestId":format!("request-{ordinal}"),
@@ -2045,6 +2097,7 @@ fn self_test_captures() -> Vec<Value> {
         json!({"type":"response.completed","response":final_response_value})
     );
     captures.push(json!({
+        "version":CAPTURE_SCHEMA_VERSION,
         "recordType":"api_snapshot",
         "captureId":"cap-self-api-final",
         "upstreamRequestId":"request-final",

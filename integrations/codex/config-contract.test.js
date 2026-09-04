@@ -84,8 +84,38 @@ test('required Hooks contain lifecycle only and fail closed at SessionStart', ()
 });
 
 test('configuration has no ChipTrace client or plugin dependency', () => {
-  const contract = `${config}\n${requirements}\n${readme}`;
-  assert.doesNotMatch(contract, /codex-run|producer\/events|rollout exporter/i);
-  assert.doesNotMatch(contract, /\/usr\/local\/bin\/chiptrace|chiptrace-codex-agent/i);
-  assert.doesNotMatch(contract, /install.*plugin|chiptrace plugin/i);
+  const repositoryRoot = path.resolve(integrationRoot, '..', '..');
+  assert.equal(fs.existsSync(path.join(repositoryRoot, 'examples', 'tool-registry.json')), false);
+  const publicContractPaths = [
+    'README.md',
+    'deploy/collector-relay.yml',
+    'deploy/docker-compose.yml',
+    'docs/acceptance-matrix.md',
+    'docs/architecture.md',
+    'docs/data-contract.md',
+    'docs/delivery.md',
+    'docs/object-storage.md',
+    'docs/operations.md',
+    'integrations/codex/README.md',
+    'integrations/codex/config.toml.example',
+    'integrations/codex/requirements.toml.example',
+  ];
+  const forbiddenPatterns = [
+    /\bcodex-run\b/i,
+    /\/producer\/events\b/i,
+    /\brollout exporter\b/i,
+    /\/usr\/local\/bin\/chiptrace/i,
+    /\bchiptrace-codex-agent\b/i,
+    /install.*plugin/i,
+    /\bchiptrace plugin\b/i,
+    /managed_config\.toml/i,
+    /patched codex/i,
+    /修改版 codex/i,
+  ];
+  for (const relativePath of publicContractPaths) {
+    const content = fs.readFileSync(path.join(repositoryRoot, relativePath), 'utf8');
+    for (const pattern of forbiddenPatterns) {
+      assert.doesNotMatch(content, pattern, `${relativePath} contains ${pattern}`);
+    }
+  }
 });

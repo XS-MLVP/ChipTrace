@@ -25,6 +25,11 @@ OTLP/Hook 的原始 envelope 始终先保存。已知事件严格转换为 Captu
 能归属 Session 时生成 `telemetry_incomplete`，无法归属时返回 400。两者都不能进入合格
 Release。
 
+Relay 的 `/capture` 和 `/captures` 只接收显式
+`version=chiptrace.capture.v2`、`recordType=api_snapshot` 的 Wire 记录。Runtime、生命周期、评价、
+Telemetry 及历史生产者字段出现在这两个入口时整条或整批返回 400，不能绕过对应的权威来源。
+历史字段仅由离线读取器验证原始字节和哈希，不属于在线采集契约。
+
 ## 身份与关联
 
 Stock Codex 已在 Responses 请求中提供：
