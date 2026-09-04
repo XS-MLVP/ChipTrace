@@ -10,6 +10,7 @@ requires_openai_auth = false
 supports_websockets = false
 request_max_retries = 25
 stream_max_retries = 25
+# Command auth also enables Stock Codex to refresh the gateway model catalog.
 auth = { command = "printenv", args = ["CHIPTRACE_API_KEY"] }
 
 [features]

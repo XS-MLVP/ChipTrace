@@ -1,6 +1,5 @@
 # Install as /etc/codex/requirements.toml.
 # SessionStart fails closed when cloud ingest is unavailable.
-allow_managed_hooks_only = true
 
 [features]
 hooks = true

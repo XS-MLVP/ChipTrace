@@ -24,7 +24,9 @@ codex --strict-config
 此后用户仍直接运行 `codex`。`SessionStart` 会验证三项环境配置和 18084 Hook 入口；缺失、
 认证失败或入口不可用时，在首个 Turn 前停止。Responses Wire 记录模型事实，
 `codex.tool_result` OTLP 记录真实工具执行，required Hook 只记录 Session、Turn、压缩和子代理
-生命周期。三类事实缺失或冲突时，云端保留 Raw，但拒绝进入采购 Release。
+生命周期，且不覆盖用户已有 Hook。三类事实缺失或冲突时，云端保留 Raw，但拒绝进入采购
+Release。
 
 云端 `/models` 必须先验证真实 Provider 凭据，再为真实模型返回 `direct` function 工具目录。
-Tool Schema 只取模型实际收到的 Responses Wire；模型身份以 Wire 与 Sub2API 精确路由为准。
+Provider 使用 command auth，确保 Stock Codex 会刷新该目录。Tool Schema 只取模型实际收到的
+Responses Wire；模型身份以 Wire 与 Sub2API 精确路由为准。

@@ -28,6 +28,8 @@ test('Responses and OTLP routes are complete without embedded credentials', () =
   assert.match(config, /^wire_api = "responses"$/m);
   assert.match(config, /^request_max_retries = 25$/m);
   assert.match(config, /^stream_max_retries = 25$/m);
+  assert.match(config, /^requires_openai_auth = false$/m);
+  assert.match(config, /^auth\s*=.*CHIPTRACE_API_KEY/m);
   assert.match(config, /18084\/otel\/v1\/logs/);
   assert.match(config, /18084\/otel\/v1\/traces/);
   assert.match(config, /^log_user_prompt = true$/m);
@@ -38,6 +40,7 @@ test('Responses and OTLP routes are complete without embedded credentials', () =
 });
 
 test('required Hooks contain lifecycle only and fail closed at SessionStart', () => {
+  assert.doesNotMatch(requirements, /^allow_managed_hooks_only\s*=\s*true$/m);
   const events = [...requirements.matchAll(/^\[\[hooks\.([A-Za-z]+)\]\]$/gm)]
     .map((match) => match[1])
     .sort();
