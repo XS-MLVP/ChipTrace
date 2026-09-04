@@ -19,6 +19,9 @@ test('Stock Codex uses the current system configuration contract', () => {
     false,
   );
   assert.match(config, /^# Install as \/etc\/codex\/config\.toml\.$/m);
+  assert.match(config, /^model_provider = "OpenAI"$/m);
+  assert.match(config, /^\[model_providers\.OpenAI\]$/m);
+  assert.doesNotMatch(config, /^model_provider = "ChipTrace"$/m);
   assert.match(requirements, /^# Install as \/etc\/codex\/requirements\.toml\.$/m);
   assert.match(readme, /`\/etc\/codex\/config\.toml`/);
   assert.doesNotMatch(readme, /managed_config\.toml/);

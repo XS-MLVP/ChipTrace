@@ -1,6 +1,7 @@
 use crate::capture::{CaptureRecord, normalize_capture, normalize_capture_batch};
 use crate::cloud_ingest::{CloudEndpoint, CloudIngestBatch, prepare_cloud_ingest};
 use crate::ingest::{BodyReadError, InflightBodyBudget};
+use crate::jsonl::utc_now;
 use crate::managed_models::{CATALOG_SOURCE_VERSION, managed_model_catalog};
 use crate::sharded::{ShardedCaptureStore, ShardedStoreHealth};
 use crate::store::{CaptureLocator, StoreConfig, SubmitAck, SubmitError, SubmitErrorKind};
@@ -1177,6 +1178,138 @@ struct RelayAppState {
     relay: DurableRelay,
     body_budget: InflightBodyBudget,
     max_batch_records: usize,
+    ingest_coverage: Arc<Mutex<IngestCoverageState>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RouteCoverage {
+    requests: u64,
+    source_records: u64,
+    durable_captures: u64,
+    duplicates: u64,
+    last_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct IngestCoverageState {
+    started_at: String,
+    wire: RouteCoverage,
+    otlp_logs: RouteCoverage,
+    otlp_traces: RouteCoverage,
+    hooks: RouteCoverage,
+    lifecycle_events: u64,
+    tool_executions: u64,
+    quality_errors: u64,
+}
+
+impl IngestCoverageState {
+    fn new() -> Self {
+        Self {
+            started_at: utc_now(),
+            wire: RouteCoverage::default(),
+            otlp_logs: RouteCoverage::default(),
+            otlp_traces: RouteCoverage::default(),
+            hooks: RouteCoverage::default(),
+            lifecycle_events: 0,
+            tool_executions: 0,
+            quality_errors: 0,
+        }
+    }
+
+    fn observe_wire(&mut self, durable: u64, duplicates: u64) {
+        if durable == 0 {
+            return;
+        }
+        self.wire.requests = self.wire.requests.saturating_add(1);
+        self.wire.source_records = self.wire.source_records.saturating_add(durable);
+        self.wire.durable_captures = self.wire.durable_captures.saturating_add(durable);
+        self.wire.duplicates = self.wire.duplicates.saturating_add(duplicates);
+        self.wire.last_at = Some(utc_now());
+    }
+
+    fn observe_cloud(
+        &mut self,
+        endpoint: CloudEndpoint,
+        summary: &crate::cloud_ingest::CloudIngestSummary,
+        durable_captures: u64,
+        duplicates: u64,
+        lifecycle_events: u64,
+        tool_executions: u64,
+    ) {
+        let route = match endpoint {
+            CloudEndpoint::OtlpLogs => &mut self.otlp_logs,
+            CloudEndpoint::OtlpTraces => &mut self.otlp_traces,
+            CloudEndpoint::CodexHook => &mut self.hooks,
+        };
+        route.requests = route.requests.saturating_add(1);
+        route.source_records = route.source_records.saturating_add(summary.source_records);
+        route.durable_captures = route.durable_captures.saturating_add(durable_captures);
+        route.duplicates = route.duplicates.saturating_add(duplicates);
+        route.last_at = Some(utc_now());
+        self.lifecycle_events = self.lifecycle_events.saturating_add(lifecycle_events);
+        self.tool_executions = self.tool_executions.saturating_add(tool_executions);
+        self.quality_errors = self
+            .quality_errors
+            .saturating_add(summary.unknown_events)
+            .saturating_add(summary.conversion_errors.len() as u64);
+    }
+
+    fn snapshot(&self) -> Value {
+        let sources_observed = self.wire.requests > 0
+            && self.otlp_logs.requests > 0
+            && self.otlp_traces.requests > 0
+            && self.hooks.requests > 0;
+        let any_observed = self.wire.requests > 0
+            || self.otlp_logs.requests > 0
+            || self.otlp_traces.requests > 0
+            || self.hooks.requests > 0;
+        let status = if sources_observed {
+            "complete"
+        } else if any_observed {
+            "partial"
+        } else {
+            "warming"
+        };
+        json!({
+            "scope":"current_relay_process",
+            "started_at":self.started_at,
+            "status":status,
+            "required_sources_observed":sources_observed,
+            "buyer_eligibility_claimed":false,
+            "wire":route_coverage_value(&self.wire),
+            "otlp_logs":route_coverage_value(&self.otlp_logs),
+            "otlp_traces":route_coverage_value(&self.otlp_traces),
+            "hooks":route_coverage_value(&self.hooks),
+            "derived":{
+                "lifecycle_events":self.lifecycle_events,
+                "tool_executions":self.tool_executions,
+            },
+            "quality_errors":self.quality_errors,
+        })
+    }
+}
+
+fn route_coverage_value(route: &RouteCoverage) -> Value {
+    json!({
+        "requests":route.requests,
+        "source_records":route.source_records,
+        "durable_captures":route.durable_captures,
+        "duplicates":route.duplicates,
+        "last_at":route.last_at,
+    })
+}
+
+fn derived_record_counts(records: &[CaptureRecord]) -> (u64, u64) {
+    records.iter().fold((0_u64, 0_u64), |mut counts, record| {
+        if let Ok(value) = serde_json::from_slice::<Value>(&record.canonical) {
+            match value.get("recordType").and_then(Value::as_str) {
+                Some("lifecycle_event") => counts.0 = counts.0.saturating_add(1),
+                Some("tool_execution") => counts.1 = counts.1.saturating_add(1),
+                _ => {}
+            }
+        }
+        counts
+    })
 }
 
 pub async fn serve_relay(
@@ -1214,6 +1347,7 @@ pub async fn serve_relay(
             max_batch_records: relay.inner.config.max_batch_records,
             relay: relay.clone(),
             body_budget,
+            ingest_coverage: Arc::new(Mutex::new(IngestCoverageState::new())),
         });
     let listener = TcpListener::bind(bind).await?;
     info!(address = %bind, "Relay ready");
@@ -1295,6 +1429,7 @@ async fn relay_cloud_ingest(
         .iter()
         .map(|record| record.capture_id.clone())
         .collect();
+    let (lifecycle_events, tool_executions) = derived_record_counts(&records);
     let results = match state.relay.enqueue_batch(records).await {
         Ok(results) => results,
         Err(error) => {
@@ -1328,6 +1463,18 @@ async fn relay_cloud_ingest(
             json!({"ok":false,"reason":"relay_unavailable","detail":detail}),
         );
     }
+    state
+        .ingest_coverage
+        .lock()
+        .expect("ingest coverage poisoned")
+        .observe_cloud(
+            endpoint,
+            &summary,
+            capture_ids.len() as u64,
+            duplicates,
+            lifecycle_events,
+            tool_executions,
+        );
     // A durable acknowledgement means the evidence is safe, but it does not
     // make an invalid or unknown producer event acceptable. Fail closed after
     // enqueueing so SDKs and required hooks stop/retry instead of silently
@@ -1475,6 +1622,11 @@ async fn relay_enqueue_batch(state: &RelayAppState, records: Vec<CaptureRecord>)
         })
         .collect();
     let total = outcomes.len() as u64;
+    state
+        .ingest_coverage
+        .lock()
+        .expect("ingest coverage poisoned")
+        .observe_wire(durable, duplicates);
     relay_response(
         if durable == total {
             if duplicates == total {
@@ -1522,20 +1674,27 @@ async fn relay_capture(State(state): State<RelayAppState>, request: Request) -> 
         }
     };
     match state.relay.enqueue_record(record).await {
-        Ok(ack) => relay_response(
-            if ack.duplicate {
-                StatusCode::OK
-            } else {
-                StatusCode::ACCEPTED
-            },
-            json!({
-                "ok":true,
-                "durable":true,
-                "local_durable":true,
-                "duplicate":ack.duplicate,
-                "capture":ack,
-            }),
-        ),
+        Ok(ack) => {
+            state
+                .ingest_coverage
+                .lock()
+                .expect("ingest coverage poisoned")
+                .observe_wire(1, u64::from(ack.duplicate));
+            relay_response(
+                if ack.duplicate {
+                    StatusCode::OK
+                } else {
+                    StatusCode::ACCEPTED
+                },
+                json!({
+                    "ok":true,
+                    "durable":true,
+                    "local_durable":true,
+                    "duplicate":ack.duplicate,
+                    "capture":ack,
+                }),
+            )
+        }
         Err(error)
             if error
                 .downcast_ref::<crate::store::SubmitError>()
@@ -1597,6 +1756,14 @@ async fn relay_health(State(state): State<RelayAppState>) -> Response {
                 object.insert(
                     "body_budget_available".to_owned(),
                     json!(state.body_budget.available()),
+                );
+                object.insert(
+                    "ingest_coverage".to_owned(),
+                    state
+                        .ingest_coverage
+                        .lock()
+                        .expect("ingest coverage poisoned")
+                        .snapshot(),
                 );
             }
             relay_response(status, value)
@@ -1746,6 +1913,7 @@ mod tests {
             relay: relay.clone(),
             body_budget: InflightBodyBudget::new(4 * 1024 * 1024, 1024 * 1024).unwrap(),
             max_batch_records: 64,
+            ingest_coverage: Arc::new(Mutex::new(IngestCoverageState::new())),
         };
 
         let catalog_unauthorized = relay_models(
@@ -1799,7 +1967,9 @@ mod tests {
             .body(Body::from("{}"))
             .unwrap();
         assert_eq!(
-            relay_capture(State(state), invalid_capture).await.status(),
+            relay_capture(State(state.clone()), invalid_capture)
+                .await
+                .status(),
             StatusCode::BAD_REQUEST
         );
         let health = relay.health().await.unwrap();
@@ -1807,7 +1977,50 @@ mod tests {
         // the 400 response; they must never enter canonical Release.
         assert_eq!(health.delivery_records, 1);
         assert!(health.ingest_auth_required);
+        let coverage = state
+            .ingest_coverage
+            .lock()
+            .expect("ingest coverage poisoned")
+            .snapshot();
+        assert_eq!(coverage["status"], "partial");
+        assert_eq!(coverage["required_sources_observed"], false);
+        assert_eq!(coverage["otlp_logs"]["requests"], 1);
+        assert_eq!(coverage["quality_errors"], 1);
+        assert_eq!(coverage["buyer_eligibility_claimed"], false);
         relay.close().await.unwrap();
+    }
+
+    #[test]
+    fn ingest_coverage_separates_source_observation_from_buyer_eligibility() {
+        let mut coverage = IngestCoverageState::new();
+        coverage.observe_wire(2, 0);
+        for endpoint in [
+            CloudEndpoint::OtlpLogs,
+            CloudEndpoint::OtlpTraces,
+            CloudEndpoint::CodexHook,
+        ] {
+            coverage.observe_cloud(
+                endpoint,
+                &crate::cloud_ingest::CloudIngestSummary {
+                    endpoint: "test".to_owned(),
+                    source_records: 1,
+                    derived_captures: 1,
+                    unknown_events: 0,
+                    attributed_quality_errors: 0,
+                    conversion_errors: Vec::new(),
+                },
+                1,
+                0,
+                u64::from(endpoint == CloudEndpoint::CodexHook),
+                u64::from(endpoint == CloudEndpoint::OtlpLogs),
+            );
+        }
+        let snapshot = coverage.snapshot();
+        assert_eq!(snapshot["status"], "complete");
+        assert_eq!(snapshot["required_sources_observed"], true);
+        assert_eq!(snapshot["buyer_eligibility_claimed"], false);
+        assert_eq!(snapshot["derived"]["lifecycle_events"], 1);
+        assert_eq!(snapshot["derived"]["tool_executions"], 1);
     }
 
     #[test]

@@ -59,7 +59,7 @@ jobs:
           assert result["acceptance"]["score"] == 100
           assert result["collection_submission"]["durable"] is True
           assert result["collection_submission"]["otlp_replay_duplicates"] == 7
-          assert result["checks"]["legacy_producer_absent"] is True
+          assert result["checks"]["cloud_runtime_evidence"] is True
           assert result["checks"]["cloud_acceptance"] is True
           assert result["cloud_acceptance_tamper_detected"] is True
           assert result["checks"]["cloud_tool_execution_evidence"] is True

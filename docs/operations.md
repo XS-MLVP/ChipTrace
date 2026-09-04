@@ -69,6 +69,8 @@ chiptrace verify-cloud-acceptance \
 ## 监控
 
 - 业务 Responses 增长时，Wire、OTLP 和 Hook 三源是否同时增长。
+- Relay `ingest_coverage.required_sources_observed` 及四路 `last_at`；进程预热结束后仍为
+  `partial` 时检查 Stock Codex 系统配置和旧 Session。
 - Relay `pending`、`inflight`、最老队列时间、磁盘空间和 attempt 守恒。
 - `output_truncated=true`、未知 OTLP 事件、转换错误和身份冲突。
 - Session start/end、模型调用/结果/执行、内部父引用的完整率。

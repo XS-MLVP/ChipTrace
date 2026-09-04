@@ -71,3 +71,7 @@ Relay durable ACK 后返回。Relay 和 Collector 使用确定性 Capture ID、W
 
 纯云端模式不能保证客户端断网后补发尚未到达云端的事件。因此 required `SessionStart`
 在采集入口不可达时阻止任务开始；运行中缺失的 Session 保留作取证，但不会进入 Release。
+
+Relay `/health` 分开报告传输健康与 `ingest_coverage`。后者只统计当前 Relay 进程观察到的
+Wire、OTLP logs、OTLP traces 和 Hook 活动；`complete` 表示四路均有真实请求，不代表任何
+Session 已通过 Buyer 验收。Session 是否可交付仍只由 `cloud-acceptance` 判定。

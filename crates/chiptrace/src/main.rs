@@ -1605,7 +1605,7 @@ async fn self_test() -> Result<Value> {
             && delivered.pointer("/meta/capture_dag").is_some(),
         "tool_projection":completed_tool_calls == 5 && failed_tool_calls == 1,
         "cloud_tool_execution_evidence":tool_execution_audit_pass,
-        "legacy_producer_absent":cloud_runtime_audit_pass,
+        "cloud_runtime_evidence":cloud_runtime_audit_pass,
         "capture_counts":delivered["source_request_count"] == 6
             && delivered["source_capture_count"] == canonical_capture_count,
         "assembly_integrity":assembly.merge_divergences == 0
