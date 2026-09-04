@@ -2351,7 +2351,10 @@ async fn benchmark_http(args: BenchmarkHttpArgs) -> Result<Value> {
             );
             for index in first..first + count {
                 let record = json!({
+                    "version": CAPTURE_SCHEMA_VERSION,
+                    "recordType": "api_snapshot",
                     "captureId": format!("cap-http-benchmark-{index:020}"),
+                    "sourceNamespace": "chiptrace-http-benchmark",
                     "startedAt": "2026-08-27T00:00:00Z",
                     "requestBody": {"kind":"json","value":{"model":"gpt-5.6-sol","input":payload.as_str()}},
                     "responseStatus": 200,
