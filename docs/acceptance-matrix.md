@@ -42,6 +42,8 @@ Session 输入以及缺 Tool Schema。
 
 生产部署前必须使用未修改的 Stock Codex 和普通 `codex` 命令完成一条自然长任务。该任务
 必须经隔离 18084、Relay、Collector、OSS Raw 和 `cloud-acceptance`，且满足上表全部条件。
+Stock Codex Session 以 Hook 顺序为边界；最新 `SessionStart` 必须有后续 `SessionEnd`，历史终态、
+`response.completed`、`Stop` 和 OTLP `conversation_starts` 均不能代替该终态。
 
 2026-09-04 已使用未修改的 Stock Codex `0.152.0-alpha.7.2` 完成隔离云端 canary，并用当前
 源码从已提交 Raw Archive 重新验收：

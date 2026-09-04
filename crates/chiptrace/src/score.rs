@@ -1,4 +1,5 @@
 use crate::jsonl::{canonical_bytes, string_field, u64_field};
+use crate::lifecycle::{is_start_event, is_terminal_event, normalize_event};
 use crate::schema::{
     ASSESSMENT_SCHEMA_VERSION, AcceptanceMetrics, BuyerAssessment, CaptureCompleteness, GateResult,
     LEGACY_ASSESSMENT_SCHEMA_VERSION, QualityEnvelope, SemanticQuality, TokenCounts,
@@ -411,6 +412,10 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         .pointer("/meta/tool_execution_conflicts")
         .and_then(Value::as_array)
         .map_or(0, |conflicts| conflicts.len() as u64);
+    let lifecycle_invalid_boundary_count = session
+        .pointer("/meta/lifecycle_state/invalid_boundary_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let assembly_producer_event_conflicts = session
         .pointer("/meta/producer_event_conflicts")
         .and_then(Value::as_array)
@@ -841,6 +846,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
             && assembly_system_prompt_conflicts == 0
             && assembly_usage_conflicts == 0
             && assembly_tool_execution_conflicts == 0
+            && lifecycle_invalid_boundary_count == 0
             && assembly_producer_event_conflicts == 0
             && rollout_unknown_events == 0
             && capture_dag_present
@@ -858,6 +864,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
             "system_prompt_conflicts": assembly_system_prompt_conflicts,
             "usage_conflicts": assembly_usage_conflicts,
             "tool_execution_conflicts": assembly_tool_execution_conflicts,
+            "lifecycle_invalid_boundary_count": lifecycle_invalid_boundary_count,
             "producer_event_conflicts": assembly_producer_event_conflicts,
             "rollout_unknown_events": rollout_unknown_events,
             "rollout_unmapped_tools": rollout_unmapped_tools,
@@ -1788,6 +1795,14 @@ fn session_closed(session: &Value, messages: &[Value]) -> bool {
         .get("is_final_snapshot")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let latest_epoch_closed = session
+        .pointer("/meta/lifecycle_state/latest_epoch_closed")
+        .and_then(Value::as_bool)
+        .unwrap_or(final_snapshot);
+    let lifecycle_boundaries_valid = session
+        .pointer("/meta/lifecycle_state/invalid_boundary_count")
+        .and_then(Value::as_u64)
+        .is_none_or(|count| count == 0);
     let unresolved_calls = !unresolved_tool_call_ids_for_closure(messages).is_empty();
     let final_assistant = messages.last().is_some_and(|message| {
         string_field(message, "role") == Some("assistant")
@@ -1804,6 +1819,8 @@ fn session_closed(session: &Value, messages: &[Value]) -> bool {
     ) && explicit_termination;
     terminal_status
         && final_snapshot
+        && latest_epoch_closed
+        && lifecycle_boundaries_valid
         && !unresolved_calls
         && (final_assistant || terminal_without_assistant)
 }
@@ -1816,14 +1833,14 @@ fn session_has_terminal_event(session: &Value) -> bool {
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .any(is_terminal_lifecycle_event);
+        .any(is_terminal_event);
     let object_events = session
         .pointer("/meta/lifecycle_event_records")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|event| event.get("type").and_then(Value::as_str))
-        .any(is_terminal_lifecycle_event);
+        .any(is_terminal_event);
     string_events || object_events
 }
 
@@ -1835,14 +1852,14 @@ fn session_has_start_event(session: &Value) -> bool {
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .any(is_start_lifecycle_event);
+        .any(is_start_event);
     let object_events = session
         .pointer("/meta/lifecycle_event_records")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|event| event.get("type").and_then(Value::as_str))
-        .any(is_start_lifecycle_event);
+        .any(is_start_event);
     string_events || object_events
 }
 
@@ -1871,46 +1888,10 @@ fn unresolved_tool_call_ids_for_closure(messages: &[Value]) -> Vec<String> {
     calls.difference(&results).cloned().collect()
 }
 
-fn is_terminal_lifecycle_event(event: &str) -> bool {
-    let normalized = event
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['-', '.', ' ', ':'], "_");
-    matches!(
-        normalized.as_str(),
-        "session_end"
-            | "session_ended"
-            | "task_end"
-            | "task_ended"
-            | "task_completed"
-            | "cancel"
-            | "cancelled"
-            | "canceled"
-            | "terminated"
-            | "abort"
-            | "aborted"
-            | "abandoned"
-    ) || normalized.starts_with("session_cancel")
-        || normalized.starts_with("task_cancel")
-        || normalized.starts_with("session_fail")
-        || normalized.starts_with("task_fail")
-}
-
-fn is_start_lifecycle_event(event: &str) -> bool {
-    matches!(
-        event
-            .trim()
-            .to_ascii_lowercase()
-            .replace(['-', '.', ' ', ':'], "_")
-            .as_str(),
-        "session_start" | "session_started" | "task_start" | "task_started"
-    )
-}
-
 fn session_has_task_start_event(session: &Value) -> bool {
     session_has_lifecycle_event(session, |event| {
         matches!(
-            normalize_lifecycle_event(event).as_str(),
+            normalize_event(event).as_str(),
             "task_start" | "task_started"
         )
     })
@@ -1918,7 +1899,7 @@ fn session_has_task_start_event(session: &Value) -> bool {
 
 fn session_has_task_terminal_event(session: &Value) -> bool {
     session_has_lifecycle_event(session, |event| {
-        let event = normalize_lifecycle_event(event);
+        let event = normalize_event(event);
         matches!(
             event.as_str(),
             "task_end"
@@ -1939,7 +1920,7 @@ fn session_has_task_terminal_event(session: &Value) -> bool {
 fn session_has_session_start_event(session: &Value) -> bool {
     session_has_lifecycle_event(session, |event| {
         matches!(
-            normalize_lifecycle_event(event).as_str(),
+            normalize_event(event).as_str(),
             "session_start" | "session_started"
         )
     })
@@ -1947,7 +1928,7 @@ fn session_has_session_start_event(session: &Value) -> bool {
 
 fn session_has_session_terminal_event(session: &Value) -> bool {
     session_has_lifecycle_event(session, |event| {
-        let event = normalize_lifecycle_event(event);
+        let event = normalize_event(event);
         matches!(
             event.as_str(),
             "session_end"
@@ -1979,13 +1960,6 @@ fn session_has_lifecycle_event(session: &Value, predicate: impl Fn(&str) -> bool
         .flatten()
         .filter_map(|event| event.get("type").and_then(Value::as_str));
     string_events.chain(object_events).any(predicate)
-}
-
-fn normalize_lifecycle_event(event: &str) -> String {
-    event
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['-', '.', ' ', ':'], "_")
 }
 
 fn lifecycle_retry_count(session: &Value) -> u64 {

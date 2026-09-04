@@ -1,5 +1,6 @@
 use crate::capture::{extract_body, validate_stored_capture};
 use crate::jsonl::{JsonlWriter, absolute_path, ensure_safe_relative_path, sha256_file, utc_now};
+use crate::lifecycle::{Boundary, LifecycleState};
 use crate::schema::{FileManifest, RAW_LINEAGE_SCHEMA_VERSION, RawSourceLineage};
 use crate::session_lineage::StockSessionLineage;
 use crate::tool_registry::canonical_runtime_tool_name;
@@ -14,6 +15,8 @@ use std::fs::{self, File};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use walkdir::WalkDir;
 
 pub const MODEL_INTERACTION_SCHEMA_VERSION: &str = "chiptrace.model-interaction.v1";
@@ -253,7 +256,7 @@ pub fn project_interactions(
         config.task_session_id.as_deref(),
         config.session_id.as_deref(),
     )?;
-    captures.sort_by_key(capture_order_key);
+    sort_captures(&mut captures);
     let capture_records = captures.len() as u64;
 
     let CanonicalRecords {
@@ -941,14 +944,27 @@ fn stable_id(prefix: &str, values: &[&str]) -> String {
     format!("{prefix}-{}", hex::encode(digest.finalize()))
 }
 
-fn capture_order_key(value: &Value) -> (String, String) {
+fn sort_captures(captures: &mut [Value]) {
+    if captures
+        .iter()
+        .all(|capture| capture_time(capture).is_some())
+    {
+        captures.sort_by_key(|capture| {
+            (
+                capture_time(capture).unwrap_or_default(),
+                string_field(capture, "captureId").unwrap_or("").to_owned(),
+            )
+        });
+    }
+}
+
+fn capture_time(value: &Value) -> Option<i128> {
     let timestamp = ["startedAt", "receivedAt", "finishedAt"]
         .into_iter()
-        .find_map(|field| string_field(value, field))
-        .unwrap_or("")
-        .to_owned();
-    let capture_id = string_field(value, "captureId").unwrap_or("").to_owned();
-    (timestamp, capture_id)
+        .find_map(|field| string_field(value, field))?;
+    OffsetDateTime::parse(timestamp, &Rfc3339)
+        .ok()
+        .map(OffsetDateTime::unix_timestamp_nanos)
 }
 
 fn sync_tree(root: &Path) -> Result<()> {
@@ -3583,6 +3599,17 @@ fn is_session_lifecycle(value: &Value) -> bool {
         })
 }
 
+fn stock_hook_session_boundary(value: &Value) -> Option<&'static str> {
+    match value
+        .pointer("/lifecycleEvent/source_event_name")
+        .and_then(Value::as_str)
+    {
+        Some("SessionStart") => Some("session_start"),
+        Some("SessionEnd") => Some("session_end"),
+        _ => None,
+    }
+}
+
 fn build_runtime_spans(captures: &[Value], interactions: &[Value]) -> Result<Vec<Value>> {
     let scope_index = RuntimeScopeIndex::with_interactions(captures, interactions);
     let mut spans = build_task_root_spans(captures, &scope_index)?;
@@ -3700,22 +3727,62 @@ fn build_task_root_spans(
         .collect();
     let mut spans = Vec::new();
     for (scope_kind, scope_id, observations) in groups.into_values() {
-        let starts: Vec<&Value> = observations
+        let stock_hook_boundaries = scope_kind == "session"
+            && observations
+                .iter()
+                .any(|capture| stock_hook_session_boundary(capture).is_some());
+        let boundary_observations: Vec<&Value> = observations
+            .iter()
+            .copied()
+            .filter(|capture| {
+                !stock_hook_boundaries || stock_hook_session_boundary(capture).is_some()
+            })
+            .collect();
+        let starts: Vec<&Value> = boundary_observations
             .iter()
             .copied()
             .filter(|capture| root_observation_is_start(capture, scope_kind))
             .collect();
-        let terminals: Vec<&Value> = observations
+        let terminals: Vec<&Value> = boundary_observations
             .iter()
             .copied()
             .filter(|capture| root_observation_is_terminal(capture, scope_kind))
             .collect();
+        let mut lifecycle_state = LifecycleState::new(if stock_hook_boundaries {
+            "stock_codex_hook"
+        } else {
+            "lifecycle_event"
+        });
+        if scope_kind == "session" {
+            for capture in &boundary_observations {
+                let Some(event_type) = capture
+                    .pointer("/lifecycleEvent/type")
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let boundary = if root_observation_is_start(capture, scope_kind) {
+                    Some(Boundary::Start)
+                } else if root_observation_is_terminal(capture, scope_kind) {
+                    Some(Boundary::Terminal)
+                } else {
+                    None
+                };
+                if let Some(boundary) = boundary {
+                    lifecycle_state.observe(
+                        boundary,
+                        event_type,
+                        string_field(capture, "captureId").unwrap_or("missing"),
+                        true,
+                    );
+                }
+            }
+        }
         let first = starts
             .first()
             .copied()
             .or_else(|| observations.first().copied())
             .context("task root group is empty")?;
-        let selected = terminals.last().copied().unwrap_or(first);
         let trace_ids: BTreeSet<&str> = observations
             .iter()
             .filter_map(|capture| {
@@ -3742,17 +3809,33 @@ fn build_task_root_spans(
                 )
             })
             .collect();
-        let root_complete =
-            !starts.is_empty() && !terminals.is_empty() && terminal_statuses.len() == 1;
-        let status = terminals
-            .last()
-            .and_then(|capture| {
-                capture
-                    .pointer("/lifecycleEvent/status")
-                    .and_then(Value::as_str)
-            })
-            .map(|status| normalize_runtime_status(Some(status)))
-            .unwrap_or_else(|| "running".to_owned());
+        let root_complete = if scope_kind == "session" {
+            lifecycle_state.start_count > 0
+                && lifecycle_state.terminal_count > 0
+                && lifecycle_state.invalid_boundary_count == 0
+                && lifecycle_state.latest_epoch_closed
+                && terminal_statuses.len() == 1
+        } else {
+            !starts.is_empty() && !terminals.is_empty() && terminal_statuses.len() == 1
+        };
+        let selected = if scope_kind == "session" && !lifecycle_state.latest_epoch_closed {
+            starts.last().copied().unwrap_or(first)
+        } else {
+            terminals.last().copied().unwrap_or(first)
+        };
+        let status = if scope_kind == "session" && !lifecycle_state.latest_epoch_closed {
+            "running".to_owned()
+        } else {
+            terminals
+                .last()
+                .and_then(|capture| {
+                    capture
+                        .pointer("/lifecycleEvent/status")
+                        .and_then(Value::as_str)
+                })
+                .map(|status| normalize_runtime_status(Some(status)))
+                .unwrap_or_else(|| "running".to_owned())
+        };
         let capture_ids: Vec<&str> = observations
             .iter()
             .filter_map(|capture| string_field(capture, "captureId"))
@@ -3783,13 +3866,15 @@ fn build_task_root_spans(
                 capture.pointer("/lifecycleEvent/occurred_at").and_then(Value::as_str)
                     .or_else(|| string_field(capture, "receivedAt"))
             }),
-            "finished_at":terminals.last().and_then(|capture| {
+            "finished_at":root_complete.then(|| terminals.last()).flatten().and_then(|capture| {
                 capture.pointer("/lifecycleEvent/occurred_at").and_then(Value::as_str)
                     .or_else(|| string_field(capture, "receivedAt"))
             }),
             "arguments":starts.first().and_then(|capture| capture.get("lifecycleEvent")),
-            "result":terminals.last().and_then(|capture| capture.get("lifecycleEvent")),
-            "error":if matches!(status.as_str(), "failed" | "cancelled" | "timeout" | "incomplete") {
+            "result":root_complete.then(|| terminals.last()).flatten()
+                .and_then(|capture| capture.get("lifecycleEvent")),
+            "error":if root_complete
+                && matches!(status.as_str(), "failed" | "cancelled" | "timeout" | "incomplete") {
                 terminals.last().and_then(|capture| capture.get("lifecycleEvent"))
             } else {
                 None
@@ -3797,7 +3882,8 @@ fn build_task_root_spans(
             "tool_schema":Value::Null,
             "raw_capture_refs":capture_ids,
             "extensions":{
-                "state_conflict":terminal_statuses.len() > 1,
+                "state_conflict":terminal_statuses.len() > 1
+                    || lifecycle_state.invalid_boundary_count > 0,
                 "root_complete":root_complete,
                 "scope_root":true,
                 "parent_span_required":scope_kind == "turn",
@@ -3807,6 +3893,11 @@ fn build_task_root_spans(
                     .filter(|capture| record_type(capture) == "api_snapshot").count(),
                 "scope_kind":scope_kind,
                 "scope_id":scope_id,
+                "lifecycle_state":if scope_kind == "session" {
+                    json!(lifecycle_state)
+                } else {
+                    Value::Null
+                },
                 "observed_trace_ids":trace_ids,
                 "observed_native_span_ids":native_span_ids,
                 "lifecycle":observations.iter().filter_map(|capture| capture.get("lifecycleEvent")).cloned().collect::<Vec<_>>(),
@@ -6844,6 +6935,68 @@ mod tests {
         assert_eq!(integrity.metrics["internal_parent_references"], 1);
         assert_eq!(integrity.metrics["resolved_internal_parents"], 1);
         assert_eq!(integrity.metrics["resolved_internal_parent_rate"], 1.0);
+    }
+
+    #[test]
+    fn resumed_stock_session_keeps_runtime_root_open_until_new_session_end() {
+        let lifecycle = |capture_id: &str, event_type: &str, source_event_name: &str| {
+            json!({
+                "recordType":"lifecycle_event",
+                "captureId":capture_id,
+                "sourceNamespace":"stock-codex-cloud",
+                "traceContext":{
+                    "session_id":"session-resumed",
+                    "thread_id":"session-resumed"
+                },
+                "lifecycleEvent":{
+                    "type":event_type,
+                    "status":if event_type == "session_end" {"closed"} else {"started"},
+                    "source_event_name":source_event_name
+                }
+            })
+        };
+        let otlp_start = json!({
+            "recordType":"lifecycle_event",
+            "captureId":"otel-delayed-start",
+            "sourceNamespace":"stock-codex-cloud",
+            "receivedAt":"2026-09-04T00:00:01Z",
+            "traceContext":{
+                "session_id":"session-resumed",
+                "thread_id":"session-resumed"
+            },
+            "lifecycleEvent":{
+                "type":"session_start",
+                "status":"started",
+                "source_event_name":"codex.conversation_starts"
+            }
+        });
+        let first_start = lifecycle("z-first-start", "session_start", "SessionStart");
+        let first_end = lifecycle("a-first-end", "session_end", "SessionEnd");
+        let resumed_start = lifecycle("m-resumed-start", "session_start", "SessionStart");
+        let captures = vec![
+            first_start.clone(),
+            first_end.clone(),
+            resumed_start.clone(),
+            otlp_start.clone(),
+        ];
+        let scope_index = RuntimeScopeIndex::with_interactions(&captures, &[]);
+        let spans = build_task_root_spans(&captures, &scope_index).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["status"], "running");
+        assert_eq!(spans[0]["extensions"]["root_complete"], false);
+        assert_eq!(
+            spans[0]["extensions"]["lifecycle_state"]["latest_boundary"],
+            "session_start"
+        );
+        assert!(!runtime_integrity(&[], &spans, &[]).root_complete);
+
+        let final_end = lifecycle("b-final-end", "session_end", "SessionEnd");
+        let captures = vec![first_start, first_end, resumed_start, otlp_start, final_end];
+        let scope_index = RuntimeScopeIndex::with_interactions(&captures, &[]);
+        let spans = build_task_root_spans(&captures, &scope_index).unwrap();
+        assert_eq!(spans[0]["status"], "closed");
+        assert_eq!(spans[0]["extensions"]["root_complete"], true);
+        assert!(runtime_integrity(&[], &spans, &[]).root_complete);
     }
 
     #[test]

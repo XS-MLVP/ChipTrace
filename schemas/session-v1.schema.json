@@ -466,6 +466,26 @@
         "task_role": {"enum": ["root", "subagent"]},
         "lifecycle_events": {"type": "array", "items": {"type": "string"}},
         "lifecycle_event_records": {"type": "array", "items": {"type": "object"}},
+        "lifecycle_state": {
+          "type": "object",
+          "required": [
+            "boundary_source",
+            "start_count",
+            "terminal_count",
+            "invalid_boundary_count",
+            "latest_epoch_closed"
+          ],
+          "properties": {
+            "boundary_source": {"enum": ["stock_codex_hook", "lifecycle_event", "final_snapshot"]},
+            "start_count": {"type": "integer", "minimum": 0},
+            "terminal_count": {"type": "integer", "minimum": 0},
+            "invalid_boundary_count": {"type": "integer", "minimum": 0},
+            "latest_epoch_closed": {"type": "boolean"},
+            "latest_boundary": {"type": ["string", "null"]},
+            "latest_boundary_capture_id": {"type": ["string", "null"]}
+          },
+          "additionalProperties": false
+        },
         "turn_ids": {"type": "array", "items": {"type": "string"}},
         "previous_response_ids": {"type": "array", "items": {"type": "string"}},
         "tool_executions": {"type": "array", "items": {"type": "object"}},

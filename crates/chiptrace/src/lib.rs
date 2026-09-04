@@ -7,6 +7,7 @@ pub mod collector;
 pub mod enrich;
 pub mod ingest;
 pub mod jsonl;
+mod lifecycle;
 pub mod managed_models;
 pub mod model_interaction;
 pub mod object_store;

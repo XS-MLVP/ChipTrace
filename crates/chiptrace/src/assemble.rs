@@ -2,6 +2,7 @@ use crate::capture::{extract_body, gateway_evidence_fingerprint};
 use crate::jsonl::{
     JsonlWriter, absolute_path, ensure_safe_relative_path, sha256_file, string_field, utc_now,
 };
+use crate::lifecycle::{LifecycleState, is_terminal_event, normalize_event};
 use crate::model_interaction::{abandoned_model_call_ids_from_captures, canonical_trace_summary};
 use crate::schema::{
     FileManifest, RAW_LINEAGE_SCHEMA_VERSION, RawSourceLineage, SESSION_SCHEMA_VERSION,
@@ -81,6 +82,7 @@ struct TaskLinkTarget {
 
 #[derive(Debug, Clone, Default)]
 struct ParsedCapture {
+    source_order: usize,
     capture_id: String,
     record_type: String,
     timestamp: String,
@@ -827,9 +829,14 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
         .map(|summary| summary.runtime_dag.clone());
     let mut parsed: Vec<ParsedCapture> = captures
         .into_iter()
-        .map(parse_capture)
+        .enumerate()
+        .map(|(source_order, capture)| {
+            let mut parsed = parse_capture(capture)?;
+            parsed.source_order = source_order;
+            Ok(parsed)
+        })
         .collect::<Result<Vec<_>>>()?;
-    parsed.sort_by(compare_capture_order);
+    sort_captures(&mut parsed);
     let first = parsed
         .first()
         .ok_or_else(|| anyhow::anyhow!("empty capture group"))?;
@@ -1203,7 +1210,9 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     } else {
         gateway_providers.clone()
     };
-    let final_snapshot = parsed.iter().any(|capture| capture.final_snapshot);
+    let lifecycle_state = session_lifecycle_state(&parsed);
+    let final_snapshot =
+        lifecycle_state.latest_epoch_closed && lifecycle_state.invalid_boundary_count == 0;
     let status = if final_snapshot {
         terminal_session_status(&parsed)
     } else {
@@ -1378,6 +1387,7 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
         "lifecycle_event_records".to_owned(),
         json!(lifecycle_event_records),
     );
+    meta.insert("lifecycle_state".to_owned(), json!(lifecycle_state));
     meta.insert("turn_ids".to_owned(), json!(turn_ids));
     meta.insert(
         "previous_response_ids".to_owned(),
@@ -1531,11 +1541,23 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     Ok((session, orphan, divergences))
 }
 
+fn sort_captures(captures: &mut [ParsedCapture]) {
+    if captures
+        .iter()
+        .all(|capture| capture.timestamp_unix_nanos.is_some())
+    {
+        captures.sort_by(compare_capture_order);
+    } else {
+        captures.sort_by(|left, right| {
+            left.source_order
+                .cmp(&right.source_order)
+                .then(left.capture_id.cmp(&right.capture_id))
+        });
+    }
+}
+
 fn compare_capture_order(left: &ParsedCapture, right: &ParsedCapture) -> std::cmp::Ordering {
-    let time_order = match (left.timestamp_unix_nanos, right.timestamp_unix_nanos) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        _ => left.timestamp.cmp(&right.timestamp),
-    };
+    let time_order = left.timestamp_unix_nanos.cmp(&right.timestamp_unix_nanos);
     if !time_order.is_eq() {
         return time_order;
     }
@@ -1549,10 +1571,68 @@ fn compare_capture_order(left: &ParsedCapture, right: &ParsedCapture) -> std::cm
         {
             left_ordinal
                 .cmp(&right_ordinal)
+                .then(left.source_order.cmp(&right.source_order))
                 .then(left.capture_id.cmp(&right.capture_id))
         }
-        _ => left.capture_id.cmp(&right.capture_id),
+        _ => left
+            .source_order
+            .cmp(&right.source_order)
+            .then(left.capture_id.cmp(&right.capture_id)),
     }
+}
+
+fn session_lifecycle_state(captures: &[ParsedCapture]) -> LifecycleState {
+    let stock_hook_boundaries = captures
+        .iter()
+        .any(|capture| stock_hook_boundary_event(capture).is_some());
+    let mut state = LifecycleState::new(if stock_hook_boundaries {
+        "stock_codex_hook"
+    } else {
+        "lifecycle_event"
+    });
+    for capture in captures {
+        if stock_hook_boundaries {
+            if let Some(event) = stock_hook_boundary_event(capture) {
+                state.observe_event(event, capture.capture_id.as_str(), true);
+            }
+            continue;
+        }
+        let mut recorded = BTreeSet::new();
+        let mut terminal_in_capture = false;
+        for event in &capture.lifecycle_event_records {
+            let Some(event) = event.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+            let normalized = normalize_event(event);
+            if !recorded.insert(normalized.clone()) {
+                continue;
+            }
+            terminal_in_capture |=
+                state.observe_event(&normalized, capture.capture_id.as_str(), false);
+        }
+        for event in &capture.lifecycle_events {
+            let normalized = normalize_event(event);
+            if recorded.contains(&normalized) {
+                continue;
+            }
+            terminal_in_capture |=
+                state.observe_event(&normalized, capture.capture_id.as_str(), false);
+        }
+        if capture.final_snapshot && !terminal_in_capture {
+            state.observe_final_snapshot(capture.capture_id.as_str());
+        }
+    }
+    state
+}
+
+fn stock_hook_boundary_event(capture: &ParsedCapture) -> Option<&'static str> {
+    capture.lifecycle_event_records.iter().find_map(|event| {
+        match event.get("source_event_name").and_then(Value::as_str) {
+            Some("SessionStart") => Some("session_start"),
+            Some("SessionEnd") => Some("session_end"),
+            _ => None,
+        }
+    })
 }
 
 fn native_source_order(event: Option<&Value>) -> Option<(&str, u64)> {
@@ -2747,7 +2827,7 @@ fn parse_capture(value: Value) -> Result<ParsedCapture> {
             .unwrap_or(false)
         || lifecycle_events
             .iter()
-            .any(|event| terminal_lifecycle_event(event));
+            .any(|event| is_terminal_event(event));
     let lifecycle_status = value
         .pointer("/lifecycleEvent/status")
         .and_then(Value::as_str)
@@ -2793,6 +2873,7 @@ fn parse_capture(value: Value) -> Result<ParsedCapture> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     Ok(ParsedCapture {
+        source_order: 0,
         capture_id,
         record_type,
         timestamp,
@@ -4099,7 +4180,7 @@ fn normalize_terminal_status(status: &str) -> String {
         "error" | "errored" | "failed" | "failure" => "failed",
         "cancel" | "cancelled" | "canceled" => "cancelled",
         "abort" | "aborted" | "abandoned" => "cancelled",
-        "terminate" | "terminated" => "terminated",
+        "terminate" | "terminated" | "closed" => "terminated",
         "incomplete" => "incomplete",
         _ => "incomplete",
     }
@@ -5539,11 +5620,12 @@ fn value_empty(value: &Value) -> bool {
 }
 
 fn terminal_session_status(captures: &[ParsedCapture]) -> String {
-    for event in captures
+    let terminal_capture = captures
         .iter()
         .rev()
-        .flat_map(|capture| capture.lifecycle_events.iter().rev())
-    {
+        .find(|capture| capture.final_snapshot)
+        .unwrap_or_else(|| captures.last().expect("parsed capture list is empty"));
+    for event in terminal_capture.lifecycle_events.iter().rev() {
         let event = normalize_event(event);
         if event.contains("cancel") || event.contains("abandon") || event.contains("abort") {
             return "cancelled".to_owned();
@@ -5555,56 +5637,21 @@ fn terminal_session_status(captures: &[ParsedCapture]) -> String {
             return "terminated".to_owned();
         }
     }
-    if let Some(status) = captures
-        .iter()
-        .rev()
-        .find(|capture| capture.final_snapshot)
-        .and_then(|capture| capture.terminal_status.clone())
-    {
-        return status;
-    }
-    let capture = captures.last().expect("parsed capture list is empty");
-    if let Some(status) = &capture.terminal_status {
+    if let Some(status) = &terminal_capture.terminal_status {
         return status.clone();
     }
-    if capture.response_status.is_some_and(|status| status >= 400) {
+    if terminal_capture
+        .response_status
+        .is_some_and(|status| status >= 400)
+    {
         return "failed".to_owned();
     }
-    capture
+    terminal_capture
         .response
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("incomplete")
         .to_owned()
-}
-
-fn normalize_event(event: &str) -> String {
-    event
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['-', '.', ' ', ':'], "_")
-}
-
-fn terminal_lifecycle_event(event: &str) -> bool {
-    let event = normalize_event(event);
-    matches!(
-        event.as_str(),
-        "session_end"
-            | "session_ended"
-            | "task_end"
-            | "task_ended"
-            | "task_completed"
-            | "cancel"
-            | "cancelled"
-            | "canceled"
-            | "terminated"
-            | "abort"
-            | "aborted"
-            | "abandoned"
-    ) || event.starts_with("session_cancel")
-        || event.starts_with("task_cancel")
-        || event.starts_with("session_fail")
-        || event.starts_with("task_fail")
 }
 
 fn unresolved_tool_call_ids(messages: &[Value]) -> Vec<String> {
@@ -8143,6 +8190,140 @@ mod tests {
         let (session, _, _) = assemble_group(vec![capture]).unwrap();
         assert_eq!(session["is_final_snapshot"], false);
         assert_eq!(session["status"], "incomplete");
+    }
+
+    #[test]
+    fn resumed_session_requires_a_new_terminal_boundary() {
+        let lifecycle = |capture_id: &str, event: &str, status: &str| {
+            let source_event_name = match event {
+                "session_start" => "SessionStart",
+                "session_end" => "SessionEnd",
+                _ => "Stop",
+            };
+            json!({
+                "recordType":"lifecycle_event",
+                "captureId":capture_id,
+                "sourceNamespace":"stock-codex-cloud",
+                "traceContext":{"session_id":"session-resumed"},
+                "lifecycleEvent":{
+                    "event_id":format!("event-{capture_id}"),
+                    "type":event,
+                    "status":status,
+                    "source_event_name":source_event_name
+                }
+            })
+        };
+        let first_start = lifecycle("a-first-start", "session_start", "started");
+        let first_end = lifecycle("z-first-end", "session_end", "closed");
+        let resumed_start = lifecycle("b-resumed-start", "session_start", "started");
+        let turn_end = lifecycle("c-turn-end", "turn_end", "closed");
+
+        let (open, _, _) = assemble_group(vec![
+            first_start.clone(),
+            first_end.clone(),
+            resumed_start.clone(),
+            turn_end.clone(),
+        ])
+        .unwrap();
+        assert_eq!(open["is_final_snapshot"], false);
+        assert_eq!(open["status"], "incomplete");
+        assert_eq!(open["meta"]["lifecycle_state"]["start_count"], 2);
+        assert_eq!(open["meta"]["lifecycle_state"]["terminal_count"], 1);
+        assert_eq!(
+            open["meta"]["lifecycle_state"]["boundary_source"],
+            "stock_codex_hook"
+        );
+        assert_eq!(
+            open["meta"]["lifecycle_state"]["latest_boundary"],
+            "session_start"
+        );
+        let open_quality =
+            crate::score::assess_session(&open, crate::score::Profile::BuyerV7, 90.0);
+        assert!(
+            !open_quality
+                .buyer_acceptance
+                .gates
+                .iter()
+                .find(|gate| gate.name == "session_closed")
+                .unwrap()
+                .pass
+        );
+
+        let final_end = lifecycle("d-final-end", "session_end", "closed");
+        let (closed, _, _) = assemble_group(vec![
+            first_start,
+            first_end,
+            resumed_start,
+            turn_end,
+            final_end,
+        ])
+        .unwrap();
+        assert_eq!(closed["is_final_snapshot"], true);
+        assert_eq!(closed["status"], "terminated");
+        assert_eq!(closed["meta"]["lifecycle_state"]["start_count"], 2);
+        assert_eq!(closed["meta"]["lifecycle_state"]["terminal_count"], 2);
+        assert_eq!(
+            closed["meta"]["lifecycle_state"]["latest_boundary"],
+            "session_end"
+        );
+        let closed_quality =
+            crate::score::assess_session(&closed, crate::score::Profile::BuyerV7, 90.0);
+        assert!(
+            closed_quality
+                .buyer_acceptance
+                .gates
+                .iter()
+                .find(|gate| gate.name == "session_closed")
+                .unwrap()
+                .pass
+        );
+
+        let mut inconsistent = closed;
+        inconsistent["meta"]["lifecycle_state"]["latest_epoch_closed"] = json!(false);
+        let inconsistent_quality =
+            crate::score::assess_session(&inconsistent, crate::score::Profile::BuyerV7, 90.0);
+        assert!(
+            !inconsistent_quality
+                .buyer_acceptance
+                .gates
+                .iter()
+                .find(|gate| gate.name == "session_closed")
+                .unwrap()
+                .pass
+        );
+
+        let end_without_start = lifecycle("only-end", "session_end", "closed");
+        let (invalid, _, _) = assemble_group(vec![end_without_start]).unwrap();
+        assert_eq!(invalid["is_final_snapshot"], false);
+        assert_eq!(
+            invalid["meta"]["lifecycle_state"]["invalid_boundary_count"],
+            1
+        );
+        let invalid_quality =
+            crate::score::assess_session(&invalid, crate::score::Profile::BuyerV7, 90.0);
+        assert!(
+            !invalid_quality
+                .buyer_acceptance
+                .gates
+                .iter()
+                .find(|gate| gate.name == "session_closed")
+                .unwrap()
+                .pass
+        );
+
+        let duplicate_start = lifecycle("duplicate-start", "session_start", "started");
+        let final_end = lifecycle("after-duplicate-end", "session_end", "closed");
+        let (invalid, _, _) = assemble_group(vec![
+            lifecycle("new-first-start", "session_start", "started"),
+            duplicate_start,
+            final_end,
+        ])
+        .unwrap();
+        assert_eq!(invalid["is_final_snapshot"], false);
+        assert_eq!(
+            invalid["meta"]["lifecycle_state"]["invalid_boundary_count"],
+            1
+        );
     }
 
     #[test]
