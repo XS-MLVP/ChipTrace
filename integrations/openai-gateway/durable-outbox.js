@@ -28,6 +28,101 @@ const SENSITIVE_NORMALIZED_KEYS = new Set([
   'cookie',
   'setcookie',
 ]);
+const RESPONSES_TERMINAL_EVENTS = new Set([
+  'error',
+  'response.cancelled',
+  'response.canceled',
+  'response.completed',
+  'response.failed',
+  'response.incomplete',
+]);
+const SSE_LINE_PREFIX_LIMIT = 1024;
+
+class ResponsesSseBoundaryTracker {
+  constructor() {
+    this.eventType = '';
+    this.linePrefix = Buffer.alloc(0);
+    this.lineTruncated = false;
+    this.totalBytes = 0;
+    this.lineStartOffset = 0;
+    this.lineEndOffset = 0;
+    this.protocolTerminalEvent = null;
+    this.protocolTerminalByteOffset = null;
+    this.framingDoneObserved = false;
+    this.framingDoneByteOffset = null;
+  }
+
+  observe(chunk) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const chunkStart = this.totalBytes;
+    this.totalBytes += bytes.length;
+    let offset = 0;
+    while (offset < bytes.length) {
+      const newline = bytes.indexOf(0x0a, offset);
+      const end = newline === -1 ? bytes.length : newline;
+      const lineStart = chunkStart + offset;
+      const lineEnd = chunkStart + (newline === -1 ? bytes.length : newline + 1);
+      if (this.linePrefix.length === 0) this.lineStartOffset = lineStart;
+      this.#appendLinePrefix(bytes.subarray(offset, end));
+      this.lineEndOffset = lineEnd;
+      if (newline === -1) break;
+      this.#finishLine(lineEnd);
+      offset = newline + 1;
+    }
+    if (bytes.length === 0 && this.linePrefix.length === 0) {
+      this.lineStartOffset = chunkStart;
+      this.lineEndOffset = chunkStart;
+    }
+    return this.snapshot();
+  }
+
+  #appendLinePrefix(bytes) {
+    const remaining = SSE_LINE_PREFIX_LIMIT - this.linePrefix.length;
+    if (remaining > 0) {
+      this.linePrefix = Buffer.concat([
+        this.linePrefix,
+        bytes.subarray(0, remaining),
+      ]);
+    }
+    if (bytes.length > remaining) this.lineTruncated = true;
+  }
+
+  #finishLine(lineEndOffset) {
+    const line = this.linePrefix.toString('utf8').replace(/\r$/, '');
+    if (line === '') {
+      this.eventType = '';
+    } else if (line.startsWith('event:')) {
+      this.eventType = line.slice('event:'.length).trim();
+    } else if (line.startsWith('data:')) {
+      const data = line.slice('data:'.length).trimStart();
+      if (data.trim() === '[DONE]') {
+        this.framingDoneObserved = true;
+        this.framingDoneByteOffset = lineEndOffset;
+      }
+      const dataType = /^\{\s*"type"\s*:\s*"([^"]+)"/.exec(data)?.[1] || '';
+      const eventType = this.eventType || dataType;
+      if (RESPONSES_TERMINAL_EVENTS.has(eventType)) {
+        this.protocolTerminalEvent = eventType;
+        this.protocolTerminalByteOffset = lineEndOffset;
+      }
+    }
+    this.linePrefix = Buffer.alloc(0);
+    this.lineTruncated = false;
+  }
+
+  snapshot() {
+    return {
+      protocolTerminalObserved: this.protocolTerminalEvent !== null,
+      protocolTerminalEvent: this.protocolTerminalEvent,
+      protocolTerminalByteOffset: this.protocolTerminalByteOffset,
+      framingDoneObserved: this.framingDoneObserved,
+      framingDoneByteOffset: this.framingDoneByteOffset,
+      responseBytesObserved: this.totalBytes,
+      responseBoundaryObserved:
+        this.protocolTerminalEvent !== null || this.framingDoneObserved,
+    };
+  }
+}
 
 function positiveInteger(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
   const parsed = Number(value);
@@ -1011,6 +1106,7 @@ class DurableCaptureOutbox {
 
 module.exports = {
   DurableCaptureOutbox,
+  ResponsesSseBoundaryTracker,
   codexTraceContextFromHeaders,
   sanitizeCaptureRecord,
   retryDelayMs,

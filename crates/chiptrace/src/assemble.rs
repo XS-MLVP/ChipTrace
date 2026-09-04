@@ -2,7 +2,7 @@ use crate::capture::{extract_body, gateway_evidence_fingerprint};
 use crate::jsonl::{
     JsonlWriter, absolute_path, ensure_safe_relative_path, sha256_file, string_field, utc_now,
 };
-use crate::model_interaction::canonical_trace_summary;
+use crate::model_interaction::{abandoned_model_call_ids_from_captures, canonical_trace_summary};
 use crate::schema::{
     FileManifest, RAW_LINEAGE_SCHEMA_VERSION, RawSourceLineage, SESSION_SCHEMA_VERSION,
 };
@@ -817,6 +817,7 @@ fn telemetry_batch_scope(
 }
 
 fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
+    let explicitly_abandoned_model_call_ids = abandoned_model_call_ids_from_captures(&captures)?;
     let canonical_trace = canonical_trace_summary(&captures)?;
     let canonical_runtime_dag = canonical_trace
         .as_ref()
@@ -1458,7 +1459,7 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
             "buyer_v7_codex_runtime_expanded": {
                 "schema_version":"chiptrace.session-quality-projection.v1",
                 "profile_version":"buyer-v7-codex-runtime-expanded",
-                "excluded_model_call_ids":[],
+                "excluded_model_call_ids":explicitly_abandoned_model_call_ids,
                 "parent_model_call_ids":code_mode_parent_call_ids,
                 "runtime_messages":expanded_messages,
                 "runtime_tools":expanded_tools,

@@ -102,6 +102,15 @@ struct SseEvent {
     event: Option<String>,
     data_raw: String,
     data: Option<Value>,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SseByteRange {
+    event_index: usize,
+    byte_start: usize,
+    byte_end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +158,7 @@ struct StreamState {
 struct ResponsesStreamView {
     response: Value,
     events: Value,
+    tool_call_event_ranges: BTreeMap<String, SseByteRange>,
     terminal_outcome: Option<StreamOutcome>,
     protocol_terminal_observed: bool,
     framing_done_observed: bool,
@@ -1297,6 +1307,8 @@ fn parse_sse(raw: &str) -> SseParseResult {
     let mut events = Vec::new();
     let mut event_name: Option<String> = None;
     let mut data_lines = Vec::new();
+    let mut event_start = None;
+    let mut event_end = 0_usize;
     let mut done = false;
     let mut malformed = 0_u64;
     let mut recovered_boundaries = 0_u64;
@@ -1308,11 +1320,15 @@ fn parse_sse(raw: &str) -> SseParseResult {
     // remains visible and fail-closed through `malformed`.
     let flush = |event_name: &mut Option<String>,
                  data_lines: &mut Vec<String>,
+                 event_start: &mut Option<usize>,
+                 event_end: &mut usize,
                  events: &mut Vec<SseEvent>,
                  done: &mut bool,
                  malformed: &mut u64| {
         if data_lines.is_empty() {
             *event_name = None;
+            *event_start = None;
+            *event_end = 0;
             return false;
         }
         let data_raw = data_lines.join("\n");
@@ -1330,19 +1346,33 @@ fn parse_sse(raw: &str) -> SseParseResult {
                 event: event_name.take(),
                 data_raw,
                 data,
+                byte_start: event_start.take().unwrap_or(0),
+                byte_end: *event_end,
             });
             valid
         };
         data_lines.clear();
         *event_name = None;
+        *event_start = None;
+        *event_end = 0;
         valid
     };
-    for line in raw.lines() {
-        let line = line.trim_end_matches('\r');
+    let mut byte_offset = 0_usize;
+    for raw_line in raw.split_inclusive('\n') {
+        let line_start = byte_offset;
+        byte_offset = byte_offset.saturating_add(raw_line.len());
+        let line_end = byte_offset;
+        let line = raw_line
+            .strip_suffix('\n')
+            .unwrap_or(raw_line)
+            .trim_end_matches('\r');
         if line.is_empty() {
+            event_end = line_end;
             let _ = flush(
                 &mut event_name,
                 &mut data_lines,
+                &mut event_start,
+                &mut event_end,
                 &mut events,
                 &mut done,
                 &mut malformed,
@@ -1352,6 +1382,8 @@ fn parse_sse(raw: &str) -> SseParseResult {
                 && flush(
                     &mut event_name,
                     &mut data_lines,
+                    &mut event_start,
+                    &mut event_end,
                     &mut events,
                     &mut done,
                     &mut malformed,
@@ -1359,6 +1391,8 @@ fn parse_sse(raw: &str) -> SseParseResult {
             {
                 recovered_boundaries = recovered_boundaries.saturating_add(1);
             }
+            event_start = Some(line_start);
+            event_end = line_end;
             event_name = Some(value.trim().to_owned());
         } else if let Some(value) = line.strip_prefix("data:") {
             // A few OpenAI-compatible gateways omit the blank separator even
@@ -1381,6 +1415,8 @@ fn parse_sse(raw: &str) -> SseParseResult {
                 && flush(
                     &mut event_name,
                     &mut data_lines,
+                    &mut event_start,
+                    &mut event_end,
                     &mut events,
                     &mut done,
                     &mut malformed,
@@ -1388,12 +1424,18 @@ fn parse_sse(raw: &str) -> SseParseResult {
             {
                 recovered_boundaries = recovered_boundaries.saturating_add(1);
             }
+            event_start.get_or_insert(line_start);
+            event_end = line_end;
             data_lines.push(value.trim_start().to_owned());
+        } else if event_start.is_some() {
+            event_end = line_end;
         }
     }
     let _ = flush(
         &mut event_name,
         &mut data_lines,
+        &mut event_start,
+        &mut event_end,
         &mut events,
         &mut done,
         &mut malformed,
@@ -1416,6 +1458,8 @@ fn sse_events_value(events: &[SseEvent]) -> Value {
                     "event":event.event,
                     "data_raw":event.data_raw,
                     "data":event.data,
+                    "byte_start":event.byte_start,
+                    "byte_end":event.byte_end,
                 })
             })
             .collect(),
@@ -1430,6 +1474,18 @@ fn wire_body_value(body: &WireBody) -> Value {
         "raw_sha256_matches":body.raw_sha256_matches,
         "raw_bytes_match":body.raw_bytes_match,
         "truncated":body.truncated,
+    })
+}
+
+fn client_delivery_boundary(capture: &Value) -> Value {
+    json!({
+        "response_bytes_forwarded":capture.get("responseBytesForwarded"),
+        "response_bytes_forwarded_at_client_close":capture.get("responseBytesForwardedAtClientClose"),
+        "client_response_closed_before_finish":capture.get("clientResponseClosedBeforeFinish"),
+        "protocol_terminal_observed_at_client_close":capture.get("responseProtocolTerminalObservedAtClientClose"),
+        "framing_done_observed_at_client_close":capture.get("responseFramingDoneObservedAtClientClose"),
+        "protocol_terminal_byte_offset":capture.get("responseProtocolTerminalByteOffset"),
+        "framing_done_byte_offset":capture.get("responseFramingDoneByteOffset"),
     })
 }
 
@@ -1528,22 +1584,24 @@ fn child_trace_context(capture: &Value) -> Value {
 }
 
 fn client_delivery_status(capture: &Value) -> &'static str {
-    if capture.get("clientRequestAborted").and_then(Value::as_bool) == Some(true)
-        || capture
-            .get("clientResponseClosedBeforeFinish")
-            .and_then(Value::as_bool)
-            == Some(true)
-    {
+    let request_aborted = capture.get("clientRequestAborted").and_then(Value::as_bool);
+    let response_closed = capture
+        .get("clientResponseClosedBeforeFinish")
+        .and_then(Value::as_bool);
+    let response_finished = capture
+        .get("clientResponseFinished")
+        .and_then(Value::as_bool);
+    if request_aborted == Some(true) {
         "cancelled"
-    } else if capture.get("clientRequestAborted").and_then(Value::as_bool) == Some(false)
-        && capture
-            .get("clientResponseClosedBeforeFinish")
-            .and_then(Value::as_bool)
-            == Some(false)
-    {
-        "delivered"
     } else {
-        "unknown"
+        match (response_finished, response_closed) {
+            (Some(true), Some(false)) => "delivered",
+            (Some(false), Some(true)) => "cancelled",
+            (Some(_), Some(_)) => "unknown",
+            (None, Some(true)) => "cancelled",
+            (None, Some(false)) if request_aborted == Some(false) => "delivered",
+            _ => "unknown",
+        }
     }
 }
 
@@ -1721,6 +1779,10 @@ fn capture_error(capture: &Value, response: &Value, stream_error: Option<&Value>
         "http_status":capture.get("responseStatus"),
         "client_request_aborted":capture.get("clientRequestAborted"),
         "client_response_closed_before_finish":capture.get("clientResponseClosedBeforeFinish"),
+        "client_response_finished":capture.get("clientResponseFinished"),
+        "response_protocol_terminal_observed":capture.get("responseProtocolTerminalObserved"),
+        "response_protocol_terminal_event":capture.get("responseProtocolTerminalEvent"),
+        "response_framing_done_observed":capture.get("responseFramingDoneObserved"),
     })
 }
 
@@ -1786,6 +1848,34 @@ fn interaction_integrity(
         .is_some_and(|value| !value.trim().is_empty())
         && record_type(capture) == "api_snapshot";
     let raw_bytes_complete = raw_body_complete(request) && raw_body_complete(response);
+    let response_finished = capture
+        .get("clientResponseFinished")
+        .and_then(Value::as_bool);
+    let response_closed = capture
+        .get("clientResponseClosedBeforeFinish")
+        .and_then(Value::as_bool);
+    let response_bytes_captured = capture.get("responseBytesCaptured").and_then(Value::as_u64);
+    let response_bytes_forwarded = capture
+        .get("responseBytesForwarded")
+        .and_then(Value::as_u64);
+    let response_bytes_at_close = capture
+        .get("responseBytesForwardedAtClientClose")
+        .and_then(Value::as_u64);
+    let boundary_offsets_consistent = response_bytes_forwarded
+        .zip(response_bytes_captured)
+        .is_none_or(|(forwarded, captured)| forwarded <= captured)
+        && response_bytes_at_close
+            .zip(response_bytes_forwarded)
+            .is_none_or(|(at_close, forwarded)| at_close <= forwarded)
+        && (!matches!(response_closed, Some(true))
+            || (response_bytes_at_close.is_some()
+                && capture
+                    .get("responseProtocolTerminalObservedAtClientClose")
+                    .is_some_and(Value::is_boolean)));
+    let client_delivery_evidence_consistent = !matches!(
+        (response_finished, response_closed),
+        (Some(true), Some(true))
+    ) && boundary_offsets_consistent;
     let status_dimensions_complete = capture
         .get("upstreamResponseCompleted")
         .is_some_and(Value::is_boolean)
@@ -1795,6 +1885,8 @@ fn interaction_integrity(
         && capture
             .get("clientResponseClosedBeforeFinish")
             .is_some_and(Value::is_boolean);
+    let status_dimensions_complete =
+        status_dimensions_complete && client_delivery_evidence_consistent;
     let trace_identity_complete = capture
         .get("fieldEvidenceConflicts")
         .and_then(Value::as_array)
@@ -1823,6 +1915,7 @@ fn interaction_integrity(
         "protocol_complete":protocol_complete,
         "stream_outcome":state.outcome.as_str(),
         "status_dimensions_complete":status_dimensions_complete,
+        "client_delivery_evidence_consistent":client_delivery_evidence_consistent,
         "trace_identity_complete":trace_identity_complete,
         "malformed_sse_events":malformed_events,
         "unknown_item_count":unknown_items,
@@ -2064,43 +2157,23 @@ fn runtime_integrity(
         .collect();
     let cancelled_delivery_call_candidates: BTreeSet<String> = interactions
         .iter()
-        .filter(|interaction| {
-            interaction
-                .pointer("/integrity/protocol_complete")
-                .and_then(Value::as_bool)
-                == Some(true)
-                && interaction
-                    .pointer("/response/model_status")
-                    .and_then(Value::as_str)
-                    == Some("completed")
-                && interaction
-                    .pointer("/response/upstream_transport_status")
-                    .and_then(Value::as_str)
-                    == Some("completed")
-                && interaction
-                    .pointer("/response/client_delivery_status")
-                    .and_then(Value::as_str)
-                    == Some("cancelled")
-        })
         .flat_map(|interaction| {
-            let interaction_id = string_field(interaction, "interaction_id").unwrap_or("missing");
             interaction
                 .get("model_tool_calls")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(move |call| {
-                    call.get("call_id")
-                        .and_then(Value::as_str)
-                        .filter(|call_id| !call_id.trim().is_empty())
-                        .map(|call_id| format!("model-call:{interaction_id}:{call_id}"))
-                })
+                .filter_map(|call| explicitly_abandoned_model_call_node(interaction, call))
         })
         .collect();
     let abandoned_model_call_nodes: BTreeSet<String> = cancelled_delivery_call_candidates
         .difference(&calls_with_results)
         .filter(|node| !calls_with_execution.contains(node.as_str()))
         .cloned()
+        .collect();
+    let abandoned_model_call_ids: BTreeSet<String> = abandoned_model_call_nodes
+        .iter()
+        .filter_map(|node| node.rsplit_once(':').map(|(_, call_id)| call_id.to_owned()))
         .collect();
     let required_model_call_nodes: BTreeSet<String> = model_call_nodes
         .difference(&abandoned_model_call_nodes)
@@ -2170,6 +2243,7 @@ fn runtime_integrity(
             "required_model_tool_calls":required_model_call_nodes.len(),
             "abandoned_model_tool_calls":abandoned_model_call_nodes.len(),
             "abandoned_model_call_nodes":abandoned_model_call_nodes,
+            "abandoned_model_call_ids":abandoned_model_call_ids,
             "model_tool_calls_with_results":model_call_nodes.intersection(&calls_with_results).count(),
             "model_tool_calls_with_execution":model_call_nodes.intersection(&calls_with_execution).count(),
             "calls_without_results":calls_without_results,
@@ -2223,6 +2297,152 @@ fn projection_nodes(interactions: &[Value], runtime_spans: &[Value]) -> HashSet<
     nodes
 }
 
+/// Return a model-call node only when the wire contains explicit byte-offset
+/// evidence that the call was generated after the client connection closed.
+/// Missing offsets are intentionally not interpreted as abandonment: a call
+/// that was visible before the close must remain a hard pairing failure.
+fn explicitly_abandoned_model_call_node(interaction: &Value, call: &Value) -> Option<String> {
+    let response = interaction.get("response")?;
+    if response.get("model_status").and_then(Value::as_str) != Some("completed")
+        || response
+            .get("upstream_transport_status")
+            .and_then(Value::as_str)
+            != Some("completed")
+        || response
+            .get("client_delivery_status")
+            .and_then(Value::as_str)
+            != Some("cancelled")
+        || interaction
+            .pointer("/integrity/protocol_complete")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return None;
+    }
+    let boundary = interaction.pointer("/extensions/wire/client_delivery_boundary")?;
+    if boundary
+        .get("client_response_closed_before_finish")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return None;
+    }
+    if boundary
+        .get("protocol_terminal_observed_at_client_close")
+        .and_then(Value::as_bool)
+        != Some(false)
+    {
+        return None;
+    }
+    let close_offset = boundary
+        .get("response_bytes_forwarded_at_client_close")
+        .and_then(Value::as_u64)?;
+    let start = call.get("source_byte_start").and_then(Value::as_u64)?;
+    let end = call.get("source_byte_end").and_then(Value::as_u64)?;
+    if start < close_offset || end < start {
+        return None;
+    }
+    let interaction_id = string_field(interaction, "interaction_id")?;
+    let call_id = call
+        .get("call_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    Some(format!("model-call:{interaction_id}:{call_id}"))
+}
+
+fn annotate_model_tool_call_delivery_evidence(
+    calls: &mut [Value],
+    capture: &Value,
+    state: &StreamState,
+    event_ranges: &BTreeMap<String, SseByteRange>,
+) {
+    let boundary = client_delivery_boundary(capture);
+    let close_offset = boundary
+        .get("response_bytes_forwarded_at_client_close")
+        .and_then(Value::as_u64);
+    let closed = boundary
+        .get("client_response_closed_before_finish")
+        .and_then(Value::as_bool)
+        == Some(true);
+    let terminal_at_close = boundary
+        .get("protocol_terminal_observed_at_client_close")
+        .and_then(Value::as_bool);
+    for call in calls {
+        let call_id = call
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        let range = call_id.and_then(|id| event_ranges.get(id));
+        let Some(range) = range else {
+            call["delivery_evidence"] = json!({
+                "source":"gateway_response_byte_boundary",
+                "available":false,
+                "abandoned":false,
+            });
+            continue;
+        };
+        let abandoned = state.client_delivery_status == "cancelled"
+            && state.protocol_terminal_observed
+            && state.outcome == StreamOutcome::Completed
+            && closed
+            && close_offset.is_some()
+            && terminal_at_close == Some(false)
+            && close_offset.is_some_and(|offset| {
+                u64::try_from(range.byte_start).is_ok_and(|start| start >= offset)
+            });
+        call["delivery_evidence"] = json!({
+            "source":"gateway_response_byte_boundary",
+            "available":true,
+            "event_index":range.event_index,
+            "response_byte_start":range.byte_start,
+            "response_byte_end":range.byte_end,
+            "client_close_byte_offset":close_offset,
+            "protocol_terminal_observed_at_client_close":terminal_at_close,
+            "abandoned":abandoned,
+        });
+    }
+}
+
+/// Compute deterministic Buyer exclusions from observed post-close byte
+/// evidence. A call is returned only when exactly one interaction proves it;
+/// ambiguous IDs are retained as strict pairing failures.
+pub(crate) fn abandoned_model_call_ids_from_captures(
+    captures: &[Value],
+) -> Result<BTreeSet<String>> {
+    let mut by_call: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for capture in captures
+        .iter()
+        .filter(|capture| record_type(capture) == "api_snapshot")
+    {
+        let interaction = model_interaction_from_capture(capture)?;
+        let Some(interaction_id) = string_field(&interaction, "interaction_id") else {
+            continue;
+        };
+        for call in interaction
+            .get("model_tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if explicitly_abandoned_model_call_node(&interaction, call).is_some()
+                && let Some(call_id) = call
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+            {
+                by_call
+                    .entry(call_id.to_owned())
+                    .or_default()
+                    .insert(interaction_id.to_owned());
+            }
+        }
+    }
+    Ok(by_call
+        .into_iter()
+        .filter_map(|(call_id, interactions)| (interactions.len() == 1).then_some(call_id))
+        .collect())
+}
+
 fn adapt_responses(
     capture: &Value,
     request_body: WireBody,
@@ -2244,12 +2464,19 @@ fn adapt_responses(
         .map(|items| normalized_wire_items(items))
         .unwrap_or_default();
     let tool_definitions = request_tool_definitions(&request);
-    let model_tool_calls = responses_model_tool_calls(
+    let mut model_tool_calls = responses_model_tool_calls(
         response
             .get("output")
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or(&[]),
+        &stream_view.tool_call_event_ranges,
+    );
+    annotate_model_tool_call_delivery_evidence(
+        &mut model_tool_calls,
+        capture,
+        &state,
+        &stream_view.tool_call_event_ranges,
     );
     let tool_results_submitted = responses_submitted_results(request.get("input"));
     let unknown_items = input_items
@@ -2319,6 +2546,7 @@ fn adapt_responses(
                 "request":wire_body_value(&request_body),
                 "response":wire_body_value(&response_body),
                 "sse_events":stream_view.events,
+                "client_delivery_boundary":client_delivery_boundary(capture),
                 "malformed_sse_events":stream_view.malformed_events,
                 "framing_recovered_events":stream_view.framing_recovered_events,
                 "stream_state":stream_state_value(&state),
@@ -2592,7 +2820,10 @@ fn request_tool_definitions(request: &Map<String, Value>) -> Vec<Value> {
         .collect()
 }
 
-fn responses_model_tool_calls(items: &[Value]) -> Vec<Value> {
+fn responses_model_tool_calls(
+    items: &[Value],
+    event_ranges: &BTreeMap<String, SseByteRange>,
+) -> Vec<Value> {
     items
         .iter()
         .enumerate()
@@ -2603,9 +2834,14 @@ fn responses_model_tool_calls(items: &[Value]) -> Vec<Value> {
             )
         })
         .map(|(index, item)| {
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str);
             let name = item.get("name").and_then(Value::as_str).map(|name| {
                 canonical_runtime_tool_name(item.get("namespace").and_then(Value::as_str), name)
             });
+            let range = call_id.and_then(|id| event_ranges.get(id));
             json!({
                 "call_id":item.get("call_id").or_else(|| item.get("id")),
                 "item_id":item.get("id"),
@@ -2613,6 +2849,9 @@ fn responses_model_tool_calls(items: &[Value]) -> Vec<Value> {
                 "arguments":item.get("arguments").or_else(|| item.get("input")),
                 "choice_index":Value::Null,
                 "output_index":index,
+                "source_event_index":range.map(|value| value.event_index),
+                "source_byte_start":range.map(|value| value.byte_start),
+                "source_byte_end":range.map(|value| value.byte_end),
                 "raw":item,
             })
         })
@@ -2825,6 +3064,7 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
         return ResponsesStreamView {
             response: body.parsed.clone(),
             events: json!([]),
+            tool_call_event_ranges: BTreeMap::new(),
             terminal_outcome: None,
             protocol_terminal_observed: true,
             framing_done_observed: true,
@@ -2837,6 +3077,7 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
         return ResponsesStreamView {
             response: body.parsed.clone(),
             events: json!([]),
+            tool_call_event_ranges: BTreeMap::new(),
             terminal_outcome: None,
             protocol_terminal_observed: false,
             framing_done_observed: false,
@@ -2853,6 +3094,8 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
     let mut created = None;
     let mut terminal = None;
     let mut output = BTreeMap::new();
+    let mut tool_call_event_ranges: BTreeMap<String, SseByteRange> = BTreeMap::new();
+    let mut item_call_ids: BTreeMap<String, String> = BTreeMap::new();
     let mut terminal_outcome = None;
     let mut error_event = None;
     for event in &events {
@@ -2864,6 +3107,54 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
             .and_then(Value::as_str)
             .or(event.event.as_deref())
             .unwrap_or("");
+        let mut observed_call_id = value
+            .get("call_id")
+            .or_else(|| value.get("callId"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned);
+        let observed_item_id = value
+            .get("item_id")
+            .or_else(|| value.get("itemId"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        if observed_call_id.is_none() {
+            observed_call_id =
+                observed_item_id.and_then(|item_id| item_call_ids.get(item_id).cloned());
+        }
+        if let Some(item) = value.get("item")
+            && matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call")
+            )
+            && let Some(item_id) = item
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            && let Some(call_id) = item
+                .get("call_id")
+                .or_else(|| item.get("callId"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        {
+            item_call_ids.insert(item_id.to_owned(), call_id.to_owned());
+            observed_call_id = Some(call_id.to_owned());
+        }
+        if let Some(call_id) = observed_call_id.as_deref() {
+            let range = SseByteRange {
+                event_index: event.index,
+                byte_start: event.byte_start,
+                byte_end: event.byte_end,
+            };
+            tool_call_event_ranges
+                .entry(call_id.to_owned())
+                .and_modify(|existing| {
+                    existing.byte_start = existing.byte_start.min(range.byte_start);
+                    existing.byte_end = existing.byte_end.max(range.byte_end);
+                    existing.event_index = existing.event_index.min(range.event_index);
+                })
+                .or_insert(range);
+        }
         if kind == "response.created" {
             created = value.get("response").cloned();
         }
@@ -2879,6 +3170,29 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
             if kind.ends_with("done") || !output.contains_key(&index) {
                 output.insert(index, item.clone());
             }
+            if matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call")
+            ) && let Some(call_id) = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                let range = SseByteRange {
+                    event_index: event.index,
+                    byte_start: event.byte_start,
+                    byte_end: event.byte_end,
+                };
+                tool_call_event_ranges
+                    .entry(call_id.to_owned())
+                    .and_modify(|existing| {
+                        existing.byte_start = existing.byte_start.min(range.byte_start);
+                        existing.byte_end = existing.byte_end.max(range.byte_end);
+                        existing.event_index = existing.event_index.min(range.event_index);
+                    })
+                    .or_insert(range);
+            }
         }
         if matches!(
             kind,
@@ -2888,6 +3202,29 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
                 malformed = malformed.saturating_add(1);
             } else {
                 terminal = value.get("response").cloned();
+                if let Some(items) = value.pointer("/response/output").and_then(Value::as_array) {
+                    for item in items.iter().filter(|item| {
+                        matches!(
+                            item.get("type").and_then(Value::as_str),
+                            Some("function_call" | "custom_tool_call")
+                        )
+                    }) {
+                        if let Some(call_id) = item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                        {
+                            tool_call_event_ranges.entry(call_id.to_owned()).or_insert(
+                                SseByteRange {
+                                    event_index: event.index,
+                                    byte_start: event.byte_start,
+                                    byte_end: event.byte_end,
+                                },
+                            );
+                        }
+                    }
+                }
                 terminal_outcome = Some(match kind {
                     "response.completed" => StreamOutcome::Completed,
                     "response.failed" => StreamOutcome::Failed,
@@ -2914,6 +3251,7 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
     ResponsesStreamView {
         response,
         events: sse_events_value(&events),
+        tool_call_event_ranges,
         terminal_outcome,
         protocol_terminal_observed: terminal_outcome.is_some(),
         framing_done_observed: done,
@@ -5286,8 +5624,12 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_delivery_without_execution_is_abandoned_but_partial_evidence_is_required() {
-        let interaction = |interaction_id: &str, delivery: &str, with_result: bool| {
+    fn cancelled_delivery_is_abandoned_only_with_post_close_byte_evidence() {
+        let interaction = |interaction_id: &str,
+                           delivery: &str,
+                           with_result: bool,
+                           source_start: Option<u64>,
+                           source_end: Option<u64>| {
             json!({
                 "interaction_id":interaction_id,
                 "trace_context":{
@@ -5303,7 +5645,9 @@ mod tests {
                     "call_id":"call-runtime-integrity",
                     "name":"exec",
                     "arguments":{},
-                    "raw":{}
+                    "raw":{},
+                    "source_byte_start":source_start,
+                    "source_byte_end":source_end
                 }],
                 "tool_results_submitted":if with_result {
                     json!([{"call_id":"call-runtime-integrity","output":"observed"}])
@@ -5328,23 +5672,52 @@ mod tests {
             )
         };
 
-        let abandoned = interaction("interaction-abandoned", "cancelled", false);
+        // Without a client-close offset there is no admissible abandonment
+        // fact, even though the response was cancelled and lacks a result.
+        let no_evidence = interaction("interaction-no-evidence", "cancelled", false, None, None);
         let integrity = runtime_integrity(
-            std::slice::from_ref(&abandoned),
+            std::slice::from_ref(&no_evidence),
             std::slice::from_ref(&root),
-            &[interaction_to_root("interaction-abandoned")],
+            &[interaction_to_root("interaction-no-evidence")],
         );
-        assert!(integrity.runtime_complete);
+        assert!(!integrity.runtime_complete);
         assert!(integrity.root_complete);
         assert_eq!(integrity.metrics["model_tool_calls"], 1);
+        assert_eq!(integrity.metrics["required_model_tool_calls"], 1);
+        assert_eq!(integrity.metrics["abandoned_model_tool_calls"], 0);
+
+        let mut post_close = interaction(
+            "interaction-post-close",
+            "cancelled",
+            false,
+            Some(101),
+            Some(140),
+        );
+        post_close["extensions"] = json!({
+            "wire": {
+                "client_delivery_boundary": {
+                    "client_response_closed_before_finish": true,
+                    "response_bytes_forwarded_at_client_close": 100,
+                    "protocol_terminal_observed_at_client_close": false
+                }
+            }
+        });
+        let integrity = runtime_integrity(
+            std::slice::from_ref(&post_close),
+            std::slice::from_ref(&root),
+            &[interaction_to_root("interaction-post-close")],
+        );
+        assert!(integrity.runtime_complete);
         assert_eq!(integrity.metrics["required_model_tool_calls"], 0);
         assert_eq!(integrity.metrics["abandoned_model_tool_calls"], 1);
-        assert_eq!(
-            integrity.metrics["abandoned_model_call_nodes"],
-            json!(["model-call:interaction-abandoned:call-runtime-integrity"])
-        );
 
-        let delivered = interaction("interaction-delivered", "completed", false);
+        let delivered = interaction(
+            "interaction-delivered",
+            "completed",
+            false,
+            Some(101),
+            Some(140),
+        );
         let integrity = runtime_integrity(
             std::slice::from_ref(&delivered),
             std::slice::from_ref(&root),
@@ -5354,7 +5727,22 @@ mod tests {
         assert_eq!(integrity.metrics["required_model_tool_calls"], 1);
         assert_eq!(integrity.metrics["abandoned_model_tool_calls"], 0);
 
-        let partial = interaction("interaction-partial", "cancelled", true);
+        let mut partial = interaction(
+            "interaction-partial",
+            "cancelled",
+            true,
+            Some(101),
+            Some(140),
+        );
+        partial["extensions"] = json!({
+            "wire": {
+                "client_delivery_boundary": {
+                    "client_response_closed_before_finish": true,
+                    "response_bytes_forwarded_at_client_close": 100,
+                    "protocol_terminal_observed_at_client_close": false
+                }
+            }
+        });
         let links = [
             interaction_to_root("interaction-partial"),
             interaction_link(
@@ -5434,14 +5822,17 @@ mod tests {
         assert_eq!(definitions[2]["format"]["syntax"], "lark");
         assert_eq!(definitions[2]["raw"]["name"], "query");
 
-        let calls = responses_model_tool_calls(&[json!({
-            "type":"custom_tool_call",
-            "id":"item-1",
-            "call_id":"call-1",
-            "namespace":"catalog",
-            "name":"query",
-            "input":"part-42"
-        })]);
+        let calls = responses_model_tool_calls(
+            &[json!({
+                "type":"custom_tool_call",
+                "id":"item-1",
+                "call_id":"call-1",
+                "namespace":"catalog",
+                "name":"query",
+                "input":"part-42"
+            })],
+            &BTreeMap::new(),
+        );
         assert_eq!(calls[0]["name"], "catalog.query");
         assert_eq!(calls[0]["arguments"], "part-42");
     }
@@ -5485,6 +5876,7 @@ mod tests {
             "upstreamResponseCompleted":true,
             "clientRequestAborted":false,
             "clientResponseClosedBeforeFinish":false,
+            "clientResponseFinished":true,
             "traceContext":{
                 "task_session_id":"task-golden",
                 "trace_id":TRACE_ID,
@@ -5583,6 +5975,48 @@ mod tests {
         assert_eq!(
             interaction["extensions"]["wire"]["response"]["raw_utf8"],
             RESPONSES_STREAM_RESPONSE
+        );
+        let call = &interaction["model_tool_calls"][0];
+        assert_eq!(call["delivery_evidence"]["available"], true);
+        assert_eq!(call["delivery_evidence"]["abandoned"], false);
+        assert!(
+            call["source_byte_start"].as_u64().unwrap() < call["source_byte_end"].as_u64().unwrap()
+        );
+    }
+
+    #[test]
+    fn responses_stream_marks_only_post_close_calls_as_abandoned() {
+        let mut capture = fixture_capture(
+            "post-close-call",
+            "/v1/responses",
+            true,
+            RESPONSES_STREAM_REQUEST,
+            RESPONSES_STREAM_RESPONSE,
+        );
+        capture["clientResponseClosedBeforeFinish"] = json!(true);
+        capture["clientResponseFinished"] = json!(false);
+        capture["responseBytesForwarded"] = json!(0);
+        capture["responseBytesForwardedAtClientClose"] = json!(0);
+        capture["responseProtocolTerminalObservedAtClientClose"] = json!(false);
+        let interaction = model_interaction_from_capture(&capture).unwrap();
+        assert_eq!(
+            interaction["response"]["client_delivery_status"],
+            "cancelled"
+        );
+        assert_eq!(
+            interaction["model_tool_calls"][0]["delivery_evidence"]["abandoned"],
+            true
+        );
+
+        let call_end = interaction["model_tool_calls"][0]["source_byte_end"]
+            .as_u64()
+            .unwrap();
+        capture["responseBytesForwarded"] = json!(call_end + 1);
+        capture["responseBytesForwardedAtClientClose"] = json!(call_end + 1);
+        let before_close = model_interaction_from_capture(&capture).unwrap();
+        assert_eq!(
+            before_close["model_tool_calls"][0]["delivery_evidence"]["abandoned"],
+            false
         );
     }
 
@@ -5809,6 +6243,11 @@ mod tests {
             RESPONSES_STREAM_RESPONSE,
         );
         capture["clientResponseClosedBeforeFinish"] = json!(true);
+        capture["clientResponseFinished"] = json!(false);
+        capture["responseBytesForwarded"] = json!(RESPONSES_STREAM_RESPONSE.len());
+        capture["responseBytesForwardedAtClientClose"] = json!(RESPONSES_STREAM_RESPONSE.len());
+        capture["responseProtocolTerminalObservedAtClientClose"] = json!(true);
+        capture["responseFramingDoneObservedAtClientClose"] = json!(true);
         let interaction = model_interaction_from_capture(&capture).unwrap();
         assert_eq!(interaction["response"]["model_status"], "completed");
         assert_eq!(
@@ -5821,6 +6260,25 @@ mod tests {
         );
         assert_eq!(interaction["integrity"]["stream_outcome"], "completed");
         assert_eq!(interaction["integrity"]["protocol_complete"], true);
+    }
+
+    #[test]
+    fn contradictory_client_delivery_evidence_fails_closed() {
+        let mut capture = fixture_capture(
+            "contradictory-client-delivery",
+            "/v1/responses",
+            true,
+            RESPONSES_STREAM_REQUEST,
+            RESPONSES_STREAM_RESPONSE,
+        );
+        capture["clientResponseClosedBeforeFinish"] = json!(true);
+        let interaction = model_interaction_from_capture(&capture).unwrap();
+        assert_eq!(interaction["response"]["client_delivery_status"], "unknown");
+        assert_eq!(
+            interaction["integrity"]["client_delivery_evidence_consistent"],
+            false
+        );
+        assert_eq!(interaction["integrity"]["protocol_complete"], false);
     }
 
     #[test]

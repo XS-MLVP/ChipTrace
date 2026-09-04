@@ -47,6 +47,8 @@
     "responseBytesCaptured": {"type": "integer", "minimum": 0},
     "requestBodySha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "responseBodySha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "responseBytesForwarded": {"type": "integer", "minimum": 0},
+    "responseBytesForwardedAtClientClose": {"type": ["integer", "null"], "minimum": 0},
     "requestBodyTextOriginalSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "responseBodyTextOriginalSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "redactedBodyFields": {
@@ -72,7 +74,15 @@
     "responseTruncated": {"type": "boolean"},
     "clientRequestAborted": {"type": "boolean"},
     "clientResponseClosedBeforeFinish": {"type": "boolean"},
+    "clientResponseFinished": {"type": "boolean"},
     "upstreamResponseCompleted": {"type": "boolean"},
+    "responseProtocolTerminalObserved": {"type": ["boolean", "null"]},
+    "responseProtocolTerminalEvent": {"type": ["string", "null"]},
+    "responseProtocolTerminalByteOffset": {"type": ["integer", "null"], "minimum": 0},
+    "responseFramingDoneObserved": {"type": ["boolean", "null"]},
+    "responseFramingDoneByteOffset": {"type": ["integer", "null"], "minimum": 0},
+    "responseProtocolTerminalObservedAtClientClose": {"type": ["boolean", "null"]},
+    "responseFramingDoneObservedAtClientClose": {"type": ["boolean", "null"]},
     "responseStatus": {
       "oneOf": [
         {"type": "integer", "minimum": 100, "maximum": 599},

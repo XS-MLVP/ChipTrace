@@ -1,4 +1,4 @@
-# Install as /etc/codex/requirements.toml after rendering the ingest token.
+# Install as /etc/codex/requirements.toml.
 # SessionStart fails closed when cloud ingest is unavailable.
 allow_managed_hooks_only = true
 
@@ -10,72 +10,54 @@ hooks = true
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]
 type = "command"
-command = "/bin/sh -c '/usr/bin/curl --fail --silent --show-error --max-time 2 -H \"Authorization: Bearer <CHIPTRACE_INGEST_TOKEN>\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null || /usr/bin/printf \"%s\\n\" \"{\\\"continue\\\":false,\\\"stopReason\\\":\\\"ChipTrace cloud ingest unavailable\\\"}\"'"
+command = "/bin/sh -c 'test -n \"$CHIPTRACE_API_KEY\" && test -n \"$CHIPTRACE_INGEST_TOKEN\" && test \"$OTEL_EXPORTER_OTLP_HEADERS\" = \"Authorization=Bearer%20$CHIPTRACE_INGEST_TOKEN\" && /usr/bin/curl --fail --silent --show-error --retry 1 --retry-all-errors --retry-delay 0 --retry-max-time 2 --connect-timeout 0.5 --max-time 1 -H \"Authorization: Bearer $CHIPTRACE_INGEST_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null || /usr/bin/printf \"%s\\n\" \"{\\\"continue\\\":false,\\\"stopReason\\\":\\\"ChipTrace cloud ingest unavailable or configuration incomplete\\\"}\"'"
 timeout = 3
 statusMessage = "验证云端 Trace 采集入口"
 
 [[hooks.SessionEnd]]
 [[hooks.SessionEnd.hooks]]
 type = "command"
-command = "/usr/bin/curl --fail --silent --show-error --max-time 2 -H \"Authorization: Bearer <CHIPTRACE_INGEST_TOKEN>\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null"
+command = "/bin/sh -c 'test -n \"$CHIPTRACE_INGEST_TOKEN\" && /usr/bin/curl --fail --silent --show-error --retry 1 --retry-all-errors --retry-delay 0 --retry-max-time 2 --connect-timeout 0.5 --max-time 1 -H \"Authorization: Bearer $CHIPTRACE_INGEST_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null'"
 timeout = 3
 
 [[hooks.Interrupt]]
 [[hooks.Interrupt.hooks]]
 type = "command"
-command = "/usr/bin/curl --fail --silent --show-error --max-time 2 -H \"Authorization: Bearer <CHIPTRACE_INGEST_TOKEN>\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null"
+command = "/bin/sh -c 'test -n \"$CHIPTRACE_INGEST_TOKEN\" && /usr/bin/curl --fail --silent --show-error --retry 1 --retry-all-errors --retry-delay 0 --retry-max-time 2 --connect-timeout 0.5 --max-time 1 -H \"Authorization: Bearer $CHIPTRACE_INGEST_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null'"
 timeout = 3
 
 [[hooks.UserPromptSubmit]]
 [[hooks.UserPromptSubmit.hooks]]
 type = "command"
-command = "/usr/bin/curl --fail --silent --show-error --retry 2 --retry-all-errors --max-time 8 -H \"Authorization: Bearer <CHIPTRACE_INGEST_TOKEN>\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null"
-timeout = 10
-
-[[hooks.PreToolUse]]
-[[hooks.PreToolUse.hooks]]
-type = "command"
-command = "/usr/bin/curl --fail --silent --show-error --retry 2 --retry-all-errors --max-time 8 -H \"Authorization: Bearer <CHIPTRACE_INGEST_TOKEN>\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null"
-timeout = 10
-
-[[hooks.PostToolUse]]
-[[hooks.PostToolUse.hooks]]
-type = "command"
-command = "/usr/bin/curl --fail --silent --show-error --retry 2 --retry-all-errors --max-time 8 -H \"Authorization: Bearer <CHIPTRACE_INGEST_TOKEN>\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null"
-timeout = 10
-
-[[hooks.PermissionRequest]]
-[[hooks.PermissionRequest.hooks]]
-type = "command"
-command = "/usr/bin/curl --fail --silent --show-error --retry 2 --retry-all-errors --max-time 8 -H \"Authorization: Bearer <CHIPTRACE_INGEST_TOKEN>\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null"
-timeout = 10
+command = "/bin/sh -c 'test -n \"$CHIPTRACE_INGEST_TOKEN\" && /usr/bin/curl --fail --silent --show-error --retry 1 --retry-all-errors --retry-delay 0 --retry-max-time 2 --connect-timeout 0.5 --max-time 1 -H \"Authorization: Bearer $CHIPTRACE_INGEST_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null'"
+timeout = 3
 
 [[hooks.PreCompact]]
 [[hooks.PreCompact.hooks]]
 type = "command"
-command = "/usr/bin/curl --fail --silent --show-error --retry 2 --retry-all-errors --max-time 8 -H \"Authorization: Bearer <CHIPTRACE_INGEST_TOKEN>\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null"
-timeout = 10
+command = "/bin/sh -c 'test -n \"$CHIPTRACE_INGEST_TOKEN\" && /usr/bin/curl --fail --silent --show-error --retry 1 --retry-all-errors --retry-delay 0 --retry-max-time 2 --connect-timeout 0.5 --max-time 1 -H \"Authorization: Bearer $CHIPTRACE_INGEST_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null'"
+timeout = 3
 
 [[hooks.PostCompact]]
 [[hooks.PostCompact.hooks]]
 type = "command"
-command = "/usr/bin/curl --fail --silent --show-error --retry 2 --retry-all-errors --max-time 8 -H \"Authorization: Bearer <CHIPTRACE_INGEST_TOKEN>\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null"
-timeout = 10
+command = "/bin/sh -c 'test -n \"$CHIPTRACE_INGEST_TOKEN\" && /usr/bin/curl --fail --silent --show-error --retry 1 --retry-all-errors --retry-delay 0 --retry-max-time 2 --connect-timeout 0.5 --max-time 1 -H \"Authorization: Bearer $CHIPTRACE_INGEST_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null'"
+timeout = 3
 
 [[hooks.Stop]]
 [[hooks.Stop.hooks]]
 type = "command"
-command = "/usr/bin/curl --fail --silent --show-error --retry 2 --retry-all-errors --max-time 8 -H \"Authorization: Bearer <CHIPTRACE_INGEST_TOKEN>\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null"
-timeout = 10
+command = "/bin/sh -c 'test -n \"$CHIPTRACE_INGEST_TOKEN\" && /usr/bin/curl --fail --silent --show-error --retry 1 --retry-all-errors --retry-delay 0 --retry-max-time 2 --connect-timeout 0.5 --max-time 1 -H \"Authorization: Bearer $CHIPTRACE_INGEST_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null'"
+timeout = 3
 
 [[hooks.SubagentStart]]
 [[hooks.SubagentStart.hooks]]
 type = "command"
-command = "/usr/bin/curl --fail --silent --show-error --retry 2 --retry-all-errors --max-time 8 -H \"Authorization: Bearer <CHIPTRACE_INGEST_TOKEN>\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null"
-timeout = 10
+command = "/bin/sh -c 'test -n \"$CHIPTRACE_INGEST_TOKEN\" && /usr/bin/curl --fail --silent --show-error --retry 1 --retry-all-errors --retry-delay 0 --retry-max-time 2 --connect-timeout 0.5 --max-time 1 -H \"Authorization: Bearer $CHIPTRACE_INGEST_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null'"
+timeout = 3
 
 [[hooks.SubagentStop]]
 [[hooks.SubagentStop.hooks]]
 type = "command"
-command = "/usr/bin/curl --fail --silent --show-error --retry 2 --retry-all-errors --max-time 8 -H \"Authorization: Bearer <CHIPTRACE_INGEST_TOKEN>\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null"
-timeout = 10
+command = "/bin/sh -c 'test -n \"$CHIPTRACE_INGEST_TOKEN\" && /usr/bin/curl --fail --silent --show-error --retry 1 --retry-all-errors --retry-delay 0 --retry-max-time 2 --connect-timeout 0.5 --max-time 1 -H \"Authorization: Bearer $CHIPTRACE_INGEST_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- http://172.28.11.121:18084/hooks/codex >/dev/null'"
+timeout = 3

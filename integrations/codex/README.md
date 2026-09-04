@@ -1,30 +1,30 @@
 # Stock Codex 接入
 
-用户侧只运行未修改的 Stock Codex。管理员下发一个原生配置包：
+用户侧只运行未修改的 Stock Codex。管理员统一下发两个原生配置文件：
 
-| 文件 | 作用 |
-| --- | --- |
-| [managed_config.toml.example](managed_config.toml.example) | 安装为 `/etc/codex/managed_config.toml`，固定 18084 Provider、Responses、OTLP 和 25 次网络重试 |
-| [requirements.toml.example](requirements.toml.example) | 安装为 `/etc/codex/requirements.toml`，固定 required lifecycle Hooks，并在 SessionStart 检查云端入口 |
+| 模板 | 安装位置 | 作用 |
+| --- | --- | --- |
+| [config.toml.example](config.toml.example) | `/etc/codex/config.toml` | 固定 18084 Responses、OTLP 和 25 次网络重试 |
+| [requirements.toml.example](requirements.toml.example) | `/etc/codex/requirements.toml` | 固定 required 生命周期 Hook，并在 SessionStart 执行前置检查 |
 
-将 `<CHIPTRACE_INGEST_TOKEN>` 替换为云端采集 Token，并由主机管理系统写入 Stock Codex 的
-系统配置位置。业务凭据只通过 `CHIPTRACE_API_KEY` 环境变量提供，不写入配置或 Trace。
-用户侧不部署任何 ChipTrace 程序或服务。
-
-`managed_config.toml` 只固定模型网络与 OTLP 路由，`requirements.toml` 固定 required
-Hook 并启用 `allow_managed_hooks_only`，避免用户或项目配置重复采集。下发后用
-`codex --strict-config` 启动，字段不受当前 Stock Codex 支持时直接失败。
-
-云端 `/models` 使用真实模型名 `gpt-5.6-sol` 返回版本化能力元数据，只将 `tool_mode` 固定为
-`direct`。Stock Codex 使用 Provider 业务凭据访问 18084；网关完成业务鉴权后，以内部采集
-凭据读取 Relay 目录。Stock Codex 因而能自动刷新目录，并在真实 Wire 中提供 JSON function
-Tool Schema。模型身份仍以 Wire 与 Sub2API 路由事实为准，不能由目录内容代替。
-
-配置完成后，用户的操作不变：
+业务凭据和采集凭据由主机管理系统注入环境，不写入配置或 Trace：
 
 ```bash
-codex
+export CHIPTRACE_API_KEY='<provider-token>'
+export CHIPTRACE_INGEST_TOKEN='<ingest-token>'
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer%20${CHIPTRACE_INGEST_TOKEN}"
 ```
 
-一次可交付 Session 必须同时收到完整 Wire、OTLP tool result 和 start/end Hook。缺少任一
-来源、字段冲突、工具输出截断或云端验收失败时，只保留 Raw，不进入采购 Release。
+安装文件后保持权限为 `0600`，并用严格配置启动：
+
+```bash
+codex --strict-config
+```
+
+此后用户仍直接运行 `codex`。`SessionStart` 会验证三项环境配置和 18084 Hook 入口；缺失、
+认证失败或入口不可用时，在首个 Turn 前停止。Responses Wire 记录模型事实，
+`codex.tool_result` OTLP 记录真实工具执行，required Hook 只记录 Session、Turn、压缩和子代理
+生命周期。三类事实缺失或冲突时，云端保留 Raw，但拒绝进入采购 Release。
+
+云端 `/models` 必须先验证真实 Provider 凭据，再为真实模型返回 `direct` function 工具目录。
+Tool Schema 只取模型实际收到的 Responses Wire；模型身份以 Wire 与 Sub2API 精确路由为准。

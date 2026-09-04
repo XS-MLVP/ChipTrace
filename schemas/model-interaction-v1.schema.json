@@ -65,6 +65,7 @@
         "protocol_complete",
         "stream_outcome",
         "status_dimensions_complete",
+        "client_delivery_evidence_consistent",
         "trace_identity_complete",
         "malformed_sse_events",
         "unknown_item_count"
@@ -84,6 +85,7 @@
           ]
         },
         "status_dimensions_complete": {"type": "boolean"},
+        "client_delivery_evidence_consistent": {"type": "boolean"},
         "trace_identity_complete": {"type": "boolean"},
         "malformed_sse_events": {"type": "integer", "minimum": 0},
         "unknown_item_count": {"type": "integer", "minimum": 0}
@@ -148,6 +150,23 @@
         "arguments": {},
         "choice_index": {"type": ["integer", "null"], "minimum": 0},
         "output_index": {"type": ["integer", "null"], "minimum": 0},
+        "source_event_index": {"type": ["integer", "null"], "minimum": 0},
+        "source_byte_start": {"type": ["integer", "null"], "minimum": 0},
+        "source_byte_end": {"type": ["integer", "null"], "minimum": 0},
+        "delivery_evidence": {
+          "type": "object",
+          "properties": {
+            "source": {"type": "string"},
+            "available": {"type": "boolean"},
+            "abandoned": {"type": "boolean"},
+            "event_index": {"type": ["integer", "null"], "minimum": 0},
+            "response_byte_start": {"type": ["integer", "null"], "minimum": 0},
+            "response_byte_end": {"type": ["integer", "null"], "minimum": 0},
+            "client_close_byte_offset": {"type": ["integer", "null"], "minimum": 0},
+            "protocol_terminal_observed_at_client_close": {"type": ["boolean", "null"]}
+          },
+          "additionalProperties": true
+        },
         "raw": {}
       },
       "additionalProperties": true

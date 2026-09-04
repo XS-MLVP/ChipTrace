@@ -24,6 +24,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked
       - run: node --test integrations/openai-gateway/durable-outbox.test.js
+      - run: node --test integrations/codex/config-contract.test.js
       - run: cargo run --locked --bin chiptrace -- self-test
       - name: Verify Relay cloud delivery benchmark path
         run: |

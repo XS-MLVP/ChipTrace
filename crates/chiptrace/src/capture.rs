@@ -133,6 +133,7 @@ pub(crate) fn normalize_capture_with_policy(
     validate_telemetry_batch(object)?;
 
     normalize_body_fields(object)?;
+    validate_response_delivery_evidence(object)?;
     promote_protocol_fields(object)?;
     // Protocol promotion may obtain task_session_id from Codex metadata or an
     // explicit correlation header. Validate the record-specific contract only
@@ -367,6 +368,46 @@ fn validate_embedded_raw_body(
     object
         .entry(sha_field.to_owned())
         .or_insert_with(|| Value::String(digest));
+    Ok(())
+}
+
+fn validate_response_delivery_evidence(object: &Map<String, Value>) -> Result<()> {
+    for field in [
+        "responseBytesForwarded",
+        "responseBytesForwardedAtClientClose",
+        "responseProtocolTerminalByteOffset",
+        "responseFramingDoneByteOffset",
+    ] {
+        if object
+            .get(field)
+            .is_some_and(|value| !value.is_null() && value.as_u64().is_none())
+        {
+            bail!("{field} must be a non-negative integer or null");
+        }
+    }
+    for field in [
+        "clientRequestAborted",
+        "clientResponseClosedBeforeFinish",
+        "clientResponseFinished",
+        "responseProtocolTerminalObservedAtClientClose",
+        "responseFramingDoneObservedAtClientClose",
+    ] {
+        if object
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_boolean())
+        {
+            bail!("{field} must be a boolean or null");
+        }
+    }
+    let forwarded = object.get("responseBytesForwarded").and_then(Value::as_u64);
+    let at_close = object
+        .get("responseBytesForwardedAtClientClose")
+        .and_then(Value::as_u64);
+    if let (Some(forwarded), Some(at_close)) = (forwarded, at_close)
+        && at_close > forwarded
+    {
+        bail!("responseBytesForwardedAtClientClose exceeds responseBytesForwarded");
+    }
     Ok(())
 }
 

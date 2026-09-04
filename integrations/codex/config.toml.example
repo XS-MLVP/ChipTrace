@@ -1,0 +1,26 @@
+# Install as /etc/codex/config.toml.
+model = "gpt-5.6-sol"
+model_provider = "ChipTrace"
+
+[model_providers.ChipTrace]
+name = "ChipTrace Gateway"
+base_url = "http://172.28.11.121:18084/"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+request_max_retries = 25
+stream_max_retries = 25
+auth = { command = "printenv", args = ["CHIPTRACE_API_KEY"] }
+
+[features]
+hooks = true
+
+[otel]
+environment = "production"
+log_user_prompt = true
+exporter = { otlp-http = { endpoint = "http://172.28.11.121:18084/otel/v1/logs", protocol = "json" } }
+trace_exporter = { otlp-http = { endpoint = "http://172.28.11.121:18084/otel/v1/traces", protocol = "json" } }
+metrics_exporter = "none"
+
+[otel.tool_result]
+max_bytes = 268435456

@@ -1,4 +1,4 @@
-.PHONY: check test gateway-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
+.PHONY: check test gateway-test codex-config-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
 
 CHIPTRACE_VERSION ?= 0.6.0
 CHIPTRACE_REVISION ?= $(shell git rev-parse HEAD)
@@ -10,9 +10,13 @@ check:
 test:
 	cargo test --workspace --all-targets --locked
 	$(MAKE) gateway-test
+	$(MAKE) codex-config-test
 
 gateway-test:
 	node --test integrations/openai-gateway/durable-outbox.test.js
+
+codex-config-test:
+	node --test integrations/codex/config-contract.test.js
 
 self-test:
 	cargo run --locked --bin chiptrace -- self-test

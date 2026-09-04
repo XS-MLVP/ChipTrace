@@ -10,9 +10,44 @@ const test = require('node:test');
 
 const {
   DurableCaptureOutbox,
+  ResponsesSseBoundaryTracker,
   codexTraceContextFromHeaders,
   validateProviderCredential,
 } = require('./durable-outbox');
+
+test('Responses SSE boundary requires a complete terminal event', () => {
+  const tracker = new ResponsesSseBoundaryTracker();
+  let state = tracker.observe(Buffer.from(
+    'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"response.completed"}\n\n',
+  ));
+  assert.equal(state.protocolTerminalObserved, false);
+  assert.equal(state.responseBoundaryObserved, false);
+
+  state = tracker.observe(Buffer.from('event: response.comp'));
+  assert.equal(state.protocolTerminalObserved, false);
+  state = tracker.observe(Buffer.from(
+    `leted\ndata: {"type":"response.completed","response":{"output":"${'x'.repeat(4096)}"}}`,
+  ));
+  assert.equal(state.protocolTerminalObserved, false);
+  state = tracker.observe(Buffer.from('\n\n: keep-alive\n\n'));
+  assert.equal(state.protocolTerminalObserved, true);
+  assert.equal(state.protocolTerminalEvent, 'response.completed');
+  assert.equal(state.responseBoundaryObserved, true);
+  assert.equal(state.responseBytesObserved > 0, true);
+  assert.equal(typeof state.protocolTerminalByteOffset, 'number');
+  assert.equal(state.framingDoneObserved, false);
+});
+
+test('Responses SSE framing closes transport without inventing protocol completion', () => {
+  const tracker = new ResponsesSseBoundaryTracker();
+  const state = tracker.observe(Buffer.from(
+    'data: {"type":"response.created"}\n\ndata: [DONE]\n\n',
+  ));
+  assert.equal(state.protocolTerminalObserved, false);
+  assert.equal(state.framingDoneObserved, true);
+  assert.equal(typeof state.framingDoneByteOffset, 'number');
+  assert.equal(state.responseBoundaryObserved, true);
+});
 
 test('Stock Codex headers provide exact Session and Turn identity', () => {
   const metadata = JSON.stringify({
