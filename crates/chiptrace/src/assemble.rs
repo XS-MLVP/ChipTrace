@@ -4793,7 +4793,7 @@ fn model_attestation_applicable(capture: &ParsedCapture) -> bool {
     if capture.gateway_evidence.is_some() || capture.response_model.is_some() {
         return true;
     }
-    capture.response_status.is_none_or(|status| status < 400)
+    capture.response_status.is_some_and(|status| status < 400)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7053,6 +7053,47 @@ mod tests {
         assert_eq!(
             session["meta"]["model_evidence"]["proxy_route_verified"],
             false
+        );
+    }
+
+    #[test]
+    fn pre_response_transport_failure_is_excluded_from_attestation_denominator() {
+        let success = multi_source_usage_capture(
+            "cap-attested-success",
+            "api_snapshot",
+            "request-success",
+            "response-success",
+            100,
+        );
+        let mut failed = multi_source_usage_capture(
+            "cap-pre-response-failure",
+            "api_snapshot",
+            "request-failed",
+            "response-failed",
+            100,
+        );
+        failed["responseStatus"] = Value::Null;
+        failed["responseBody"] = json!({"kind":"text","value":""});
+        failed["captureError"] = json!("fetch failed");
+        failed["captureErrorCode"] = json!("UND_ERR_HEADERS_TIMEOUT");
+        failed.as_object_mut().unwrap().remove("actualProvider");
+
+        let (session, _, _) = assemble_group(vec![success, failed]).unwrap();
+        assert_eq!(session["meta"]["model_evidence"]["api_snapshot_count"], 2);
+        assert_eq!(
+            session["meta"]["model_evidence"]["attestation_candidate_count"],
+            1
+        );
+        assert_eq!(
+            session["meta"]["model_evidence"]["non_attestable_api_snapshots"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            session["meta"]["model_evidence"]["provider_identity_attested"],
+            true
         );
     }
 

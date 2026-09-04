@@ -45,21 +45,24 @@ Session 输入以及缺 Tool Schema。
 Stock Codex Session 以 Hook 顺序为边界；最新 `SessionStart` 必须有后续 `SessionEnd`，历史终态、
 `response.completed`、`Stop` 和 OTLP `conversation_starts` 均不能代替该终态。
 
-2026-09-04 已使用未修改的 Stock Codex `0.152.0-alpha.7.2` 完成隔离云端 canary，并用当前
-源码从已提交 Raw Archive 重新验收：
+2026-09-05 已使用未修改的 Stock Codex `0.152.0-alpha.7.2` 完成真实长任务，并从生产
+Collector 的连续 sealed Segment 建立 `complete` Raw Checkpoint，再通过唯一
+`cloud-acceptance` 主线验收：
 
 | 指标 | 结果 |
 | --- | --- |
-| Session | `01a06b4d-d092-7511-8179-9505e97c137a` |
-| Raw | 266 条；60,236,267 bytes；9 个 sealed Segment |
-| Wire / usage | 30 条精确关联的 Sub2API usage evidence |
-| 工具 | 9 个不同工具；9 份完整定义；result/execution 配对率 100% |
-| Runtime / OTLP | `delivery_ready=true`；1 个 root；60/60 内部父引用解析 |
-| Buyer v7 | 29 个有效轮次；score 100；hard gate 全通过；1/1 eligible |
-| 交付 | UTF-8 JSONL `tar.gz`、Manifest 和 SHA-256 复验通过 |
+| Session | `01a06d0f-a725-7e11-bcb3-cec3bbe00945` |
+| Raw lineage | 142,798 条；33,452,748,417 bytes；Checkpoint `complete` |
+| Wire / usage | 51 次 streaming 尝试；42 次完成并精确关联 Sub2API；9 次响应前传输失败完整保留 |
+| 工具 | 38 个必需调用；8 个不同工具；8 份完整定义；result/execution 配对率 100% |
+| 分支 | 2 个调用由客户端关闭字节边界证明为 abandoned，未改写为成功或执行 |
+| Runtime / OTLP | `delivery_ready=true`；1 个 root；91/91 内部父引用解析 |
+| Buyer v7 | 41 个有效轮次；3 个真人交互轮；score 100；hard gate 全通过；1/1 eligible |
+| Token | API 929,396；缓存输入 819,200；规范化语料 53,297；监督输出 11,820 |
+| 交付 | UTF-8 JSONL `tar.gz`、七阶段 Manifest 和 SHA-256 复验通过 |
 
-该结果证明当前源码的云端主线可生成合格产物。隔离结果不能代替线上状态；生产可用性必须
-另外满足 18084、Relay、Collector 健康、attempt 守恒和真实 Stock Codex smoke 通过。
+该结果证明当前源码能从 18084 的真实线上采集生成合格产物。持续生产可用性仍要求 18084、
+Relay、Collector 健康、attempt 守恒，并对每条 Session 独立执行相同的 fail-closed 验收。
 
 ## 历史数据
 

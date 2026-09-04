@@ -1281,7 +1281,14 @@ fn detect_protocol_shape(
         .to_ascii_lowercase();
     let request_object = request.parsed.as_object();
     let response_object = response.parsed.as_object();
-    let stream = capture.get("stream").and_then(Value::as_bool) == Some(true)
+    // The request declares the intended Responses transport before upstream
+    // response headers exist. A pre-header transport failure therefore has
+    // no response content-type from which the gateway can derive `stream`.
+    let stream = request_object
+        .and_then(|object| object.get("stream"))
+        .and_then(Value::as_bool)
+        == Some(true)
+        || capture.get("stream").and_then(Value::as_bool) == Some(true)
         || response.raw_utf8.as_deref().is_some_and(|raw| {
             raw.lines()
                 .any(|line| line.trim_start().starts_with("data:"))
@@ -1911,17 +1918,29 @@ fn interaction_integrity(
             .get("traceContextErrors")
             .and_then(Value::as_array)
             .is_none_or(Vec::is_empty);
-    let protocol_complete = shape.family == "openai"
-        && shape.endpoint == "responses"
-        && shape.transport == "stream"
-        && state.protocol_terminal_observed
+    let protocol_terminal_complete = state.protocol_terminal_observed
         && matches!(
             state.outcome,
             StreamOutcome::Completed
                 | StreamOutcome::Failed
                 | StreamOutcome::Incomplete
                 | StreamOutcome::Cancelled
-        )
+        );
+    // A request can fail before any response headers or protocol bytes exist.
+    // That attempt is fully observed when the gateway records an explicit
+    // transport error and a byte-exact empty response. Partial Responses
+    // streams without a protocol terminal remain incomplete.
+    let pre_response_transport_failure_complete = state.outcome == StreamOutcome::TransportError
+        && explicit_transport_error(capture)
+        && string_field(capture, "captureError").is_some()
+        && capture.get("responseStatus").is_none_or(Value::is_null)
+        && response.declared_bytes == Some(0)
+        && response.raw_utf8.as_deref() == Some("")
+        && !response.truncated;
+    let protocol_complete = shape.family == "openai"
+        && shape.endpoint == "responses"
+        && shape.transport == "stream"
+        && (protocol_terminal_complete || pre_response_transport_failure_complete)
         && malformed_events == 0
         && status_dimensions_complete
         && trace_identity_complete;
@@ -2314,9 +2333,9 @@ fn projection_nodes(interactions: &[Value], runtime_spans: &[Value]) -> HashSet<
 }
 
 /// Return a model-call node only when the wire contains explicit byte-offset
-/// evidence that the call was generated after the client connection closed.
-/// Missing offsets are intentionally not interpreted as abandonment: a call
-/// that was visible before the close must remain a hard pairing failure.
+/// evidence that delivery ended no later than the call event boundary and
+/// before the protocol terminal. Missing offsets and calls followed by bytes
+/// delivered to the client intentionally remain hard pairing failures.
 fn explicitly_abandoned_model_call_node(interaction: &Value, call: &Value) -> Option<String> {
     let response = interaction.get("response")?;
     if response.get("model_status").and_then(Value::as_str) != Some("completed")
@@ -2355,7 +2374,7 @@ fn explicitly_abandoned_model_call_node(interaction: &Value, call: &Value) -> Op
         .and_then(Value::as_u64)?;
     let start = call.get("source_byte_start").and_then(Value::as_u64)?;
     let end = call.get("source_byte_end").and_then(Value::as_u64)?;
-    if start < close_offset || end < start {
+    if end < close_offset || end < start {
         return None;
     }
     let interaction_id = string_field(interaction, "interaction_id")?;
@@ -2403,9 +2422,8 @@ fn annotate_model_tool_call_delivery_evidence(
             && closed
             && close_offset.is_some()
             && terminal_at_close == Some(false)
-            && close_offset.is_some_and(|offset| {
-                u64::try_from(range.byte_start).is_ok_and(|start| start >= offset)
-            });
+            && close_offset
+                .is_some_and(|offset| u64::try_from(range.byte_end).is_ok_and(|end| end >= offset));
         call["delivery_evidence"] = json!({
             "source":"gateway_response_byte_boundary",
             "available":true,
@@ -6108,7 +6126,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_stream_marks_only_post_close_calls_as_abandoned() {
+    fn responses_stream_marks_calls_cut_off_at_client_close_as_abandoned() {
         let mut capture = fixture_capture(
             "post-close-call",
             "/v1/responses",
@@ -6134,6 +6152,14 @@ mod tests {
         let call_end = interaction["model_tool_calls"][0]["source_byte_end"]
             .as_u64()
             .unwrap();
+        capture["responseBytesForwarded"] = json!(call_end);
+        capture["responseBytesForwardedAtClientClose"] = json!(call_end);
+        let at_close = model_interaction_from_capture(&capture).unwrap();
+        assert_eq!(
+            at_close["model_tool_calls"][0]["delivery_evidence"]["abandoned"],
+            true
+        );
+
         capture["responseBytesForwarded"] = json!(call_end + 1);
         capture["responseBytesForwardedAtClientClose"] = json!(call_end + 1);
         let before_close = model_interaction_from_capture(&capture).unwrap();
@@ -6379,6 +6405,29 @@ mod tests {
         );
         assert_eq!(interaction["response"]["model_status"], "incomplete");
         assert_eq!(interaction["integrity"]["protocol_complete"], false);
+    }
+
+    #[test]
+    fn responses_pre_header_transport_error_is_a_complete_stream_attempt() {
+        let mut capture = fixture_capture(
+            "pre-header-transport-error",
+            "/v1/responses",
+            false,
+            RESPONSES_STREAM_REQUEST,
+            "",
+        );
+        capture["responseStatus"] = Value::Null;
+        capture["upstreamResponseCompleted"] = json!(false);
+        capture["captureError"] = json!("fetch failed");
+        capture["captureErrorCode"] = json!("UND_ERR_HEADERS_TIMEOUT");
+        let interaction = model_interaction_from_capture(&capture).unwrap();
+        assert_eq!(interaction["protocol"]["transport"], "stream");
+        assert_eq!(
+            interaction["integrity"]["stream_outcome"],
+            "transport_error"
+        );
+        assert_eq!(interaction["integrity"]["raw_bytes_complete"], true);
+        assert_eq!(interaction["integrity"]["protocol_complete"], true);
     }
 
     #[test]
