@@ -2030,10 +2030,31 @@ mod tests {
                 .status(),
             StatusCode::BAD_REQUEST
         );
+        let current_gateway_capture = Request::builder()
+            .header("content-type", "application/json")
+            .header(AUTHORIZATION, "Bearer test-cloud-token-at-least-32-bytes")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "recordType":"api_snapshot",
+                    "captureId":"cap-current-gateway-without-version",
+                    "sourceNamespace":"router-v2-18084",
+                    "requestBodyText":"{}",
+                    "responseBodyText":"{}",
+                    "responseStatus":200
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(
+            relay_capture(State(state.clone()), current_gateway_capture)
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
         let health = relay.health().await.unwrap();
         // Invalid cloud payloads are retained as an auditable raw batch before
         // the 400 response; they must never enter canonical Release.
-        assert_eq!(health.delivery_records, 1);
+        assert_eq!(health.delivery_records, 2);
         assert!(health.ingest_auth_required);
         let coverage = state
             .ingest_coverage
@@ -2043,7 +2064,8 @@ mod tests {
         assert_eq!(coverage["status"], "partial");
         assert_eq!(coverage["required_sources_observed"], false);
         assert_eq!(coverage["otlp_logs"]["requests"], 1);
-        assert_eq!(coverage["wire"]["requests"], 0);
+        assert_eq!(coverage["wire"]["requests"], 1);
+        assert_eq!(coverage["wire"]["durable_captures"], 1);
         assert_eq!(coverage["quality_errors"], 1);
         assert_eq!(coverage["buyer_eligibility_claimed"], false);
         relay.close().await.unwrap();
