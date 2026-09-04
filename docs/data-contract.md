@@ -57,11 +57,16 @@ response chain           by response_id / previous_response_id
 | 模型完成、失败或取消 | Responses 协议终态 |
 | 上游传输完成或错误 | 18084 转发器 |
 | 客户端完整接收或提前关闭 | 18084 客户连接 |
-| 工具成功或失败 | `codex.tool_result.success` |
+| 工具调度是否返回结果 | `codex.tool_result.success` |
+| `exec_command` / `write_stdin` 子进程状态 | Stock Codex 固定结果头中的退出码或运行中 Session ID |
 | Session/Turn 闭合 | required lifecycle Hook |
 
 SSE `[DONE]` 只是 framing，不代表模型成功。返回文本不能用于推断工具状态。
-`output_truncated != false` 表示工具结果不完整。
+`output_truncated != false` 表示工具结果不完整。`codex.tool_result.success=true` 只证明工具
+调度器成功返回结果，不代表子进程退出码为 0。ChipTrace 仅解析 Stock Codex 在 `Output:`
+之前生成的固定进程结果头，并将其独立保存为 `process_outcome`；`Output:` 后的业务正文不能
+改变任何状态。OTLP Span 状态使用有证据的语义结果，同时以独立属性保留 lifecycle、
+dispatch 和 process 三类事实。
 
 ## Canonical
 

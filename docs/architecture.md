@@ -26,7 +26,8 @@ Stock Codex
 | 事实 | 来源 |
 | --- | --- |
 | 请求、响应、SSE、工具定义、模型调用、结果回传 | 18084 Responses Wire |
-| 工具真实参数、输出、成功失败、截断和耗时 | Stock Codex `codex.tool_result` OTLP log |
+| 工具真实参数、输出、调度状态、截断和耗时 | Stock Codex `codex.tool_result` OTLP log |
+| Shell 子进程退出或运行中状态 | Stock Codex 固定结果头，独立 `process_outcome` |
 | Session、Turn、中断、压缩和子代理生命周期 | Stock Codex required Hook |
 | 模型路由、Provider 和 API Token | Sub2API usage log |
 

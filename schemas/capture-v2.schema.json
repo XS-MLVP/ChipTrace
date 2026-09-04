@@ -445,6 +445,8 @@
         "status": {
           "enum": ["started", "success", "error", "cancelled", "timeout", "unknown"]
         },
+        "status_scope": {"enum": ["tool_dispatch"]},
+        "status_provenance": {"type": "string", "minLength": 1},
         "initiator": {"enum": ["assistant", "runtime", "user"]},
         "arguments": {},
         "result": {},
@@ -466,7 +468,43 @@
         "started_at": {"type": ["string", "null"]},
         "finished_at": {"type": ["string", "null"]},
         "model_call_matched": {"type": "boolean"},
-        "result_content_captured": {"type": "boolean"}
+        "result_content_captured": {"type": "boolean"},
+        "process_outcome": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "required": ["kind", "state", "success", "provenance"],
+              "properties": {
+                "kind": {"const": "process"},
+                "state": {"enum": ["exited", "running"]},
+                "exit_code": {"type": "integer"},
+                "session_id": {"type": "integer"},
+                "success": {"type": ["boolean", "null"]},
+                "provenance": {"type": "string", "minLength": 1}
+              },
+              "allOf": [
+                {
+                  "if": {"properties": {"state": {"const": "exited"}}},
+                  "then": {
+                    "required": ["exit_code"],
+                    "properties": {"success": {"type": "boolean"}},
+                    "not": {"required": ["session_id"]}
+                  }
+                },
+                {
+                  "if": {"properties": {"state": {"const": "running"}}},
+                  "then": {
+                    "required": ["session_id"],
+                    "properties": {"success": {"type": "null"}},
+                    "not": {"required": ["exit_code"]}
+                  }
+                }
+              ],
+              "additionalProperties": false
+            }
+          ]
+        }
       },
       "allOf": [
         {

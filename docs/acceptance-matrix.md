@@ -10,7 +10,7 @@
 | Raw 完整性 | WAL、sealed Segment、OSS Manifest/Checkpoint | complete；逐对象和逐行 SHA-256 通过 |
 | Wire 完整性 | 18084 原字节 Capture | 请求/响应长度与 SHA 一致；Responses 有协议终态 |
 | Session 身份 | Stock Codex headers、OTLP、required Hook | 显式 `session_id`；start/end 闭合；无冲突 |
-| Runtime | `codex.tool_result` + lifecycle | 输出未截断；状态明确；无 open/conflict span |
+| Runtime | `codex.tool_result` + lifecycle | 输出未截断；调度状态明确；Shell 进程结果独立；无 open/conflict span |
 | 调用关联 | ModelInteraction、RuntimeSpan、InteractionLink | call/result/execution 精确配对；内部父引用 100% |
 | Tool Schema | Responses Wire direct function tools | 每个被调用工具有 name、description、parameters |
 | 模型路由 | Wire + Sub2API usage | request ID 精确匹配；模型和 Provider 一致 |
@@ -43,20 +43,21 @@ Session 输入以及缺 Tool Schema。
 生产部署前必须使用未修改的 Stock Codex 和普通 `codex` 命令完成一条自然长任务。该任务
 必须经隔离 18084、Relay、Collector、OSS Raw 和 `cloud-acceptance`，且满足上表全部条件。
 
-2026-09-03 已使用未修改的 Stock Codex `0.152.0-alpha.7.2` 完成隔离云端 canary：
+2026-09-04 已使用未修改的 Stock Codex `0.152.0-alpha.7.2` 完成隔离云端 canary，并用当前
+源码从已提交 Raw Archive 重新验收：
 
 | 指标 | 结果 |
 | --- | --- |
-| Session | `01a062c0-33d4-78c1-9418-4776deef3b55` |
-| Raw | 527 条；71,825,218 bytes；9 个 sealed Segment |
-| Wire / usage | 32 次 Responses；32/32 Sub2API 精确关联 |
-| 工具 | 29 次调用；7 个不同工具；29/29 result/execution 配对 |
-| Runtime / OTLP | `delivery_ready=true`；1 个 root；64/64 内部父引用解析 |
-| Buyer v7 | 31 个有效轮次；score 100；hard gate 全通过；1/1 eligible |
+| Session | `01a06b4d-d092-7511-8179-9505e97c137a` |
+| Raw | 266 条；60,236,267 bytes；9 个 sealed Segment |
+| Wire / usage | 30 条精确关联的 Sub2API usage evidence |
+| 工具 | 9 个不同工具；9 份完整定义；result/execution 配对率 100% |
+| Runtime / OTLP | `delivery_ready=true`；1 个 root；60/60 内部父引用解析 |
+| Buyer v7 | 29 个有效轮次；score 100；hard gate 全通过；1/1 eligible |
 | 交付 | UTF-8 JSONL `tar.gz`、Manifest 和 SHA-256 复验通过 |
 
-该结果证明当前源码的云端主线可生成合格产物。热 18084 尚未升级，因此生产状态仍应明确
-报告为“隔离真实 canary 通过，生产部署待批准”，不能用隔离结果代替线上健康和流量证明。
+该结果证明当前源码的云端主线可生成合格产物。隔离结果不能代替线上状态；生产可用性必须
+另外满足 18084、Relay、Collector 健康、attempt 守恒和真实 Stock Codex smoke 通过。
 
 ## 历史数据
 

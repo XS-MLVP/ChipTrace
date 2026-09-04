@@ -342,6 +342,7 @@ fn derive_tool_result(
         .clone();
     let success = attribute_bool(attributes, "success").context("success is required")?;
     let output_truncated = attribute_bool(attributes, "output_truncated");
+    let process_outcome = process_outcome(runtime_tool, &output);
     let finished_at = record_timestamp(record, attributes);
     let started_at = started_at(attributes, finished_at.as_deref());
     let digest = stable_digest(&[raw_sha256, &ordinal.to_string(), "tool_result"]);
@@ -364,10 +365,13 @@ fn derive_tool_result(
             "runtime_tool":runtime_tool,
             "runtime_namespace":runtime_namespace,
             "status":status,
+            "status_scope":"tool_dispatch",
+            "status_provenance":"codex.tool_result.success",
             "initiator":"assistant",
             "arguments":arguments,
             "result":output,
             "error":if success { Value::Null } else { output.clone() },
+            "process_outcome":process_outcome,
             "schema_provenance":{
                 "source":"openai_wire_tool_definition",
                 "source_complete":false,
@@ -384,6 +388,62 @@ fn derive_tool_result(
         }
     });
     normalize_value(capture, max_bytes).map(Some)
+}
+
+fn process_outcome(runtime_tool: &str, output: &Value) -> Option<Value> {
+    if !matches!(runtime_tool, "exec_command" | "write_stdin") {
+        return None;
+    }
+    let output = output.as_str()?;
+    let mut saw_wall_time = false;
+    let mut saw_output_boundary = false;
+    let mut outcome = None;
+    for line in output.lines() {
+        if line == "Output:" {
+            saw_output_boundary = true;
+            break;
+        }
+        if line.starts_with("Wall time: ") && line.ends_with(" seconds") {
+            saw_wall_time = true;
+            continue;
+        }
+        if let Some(exit_code) = line
+            .strip_prefix("Process exited with code ")
+            .and_then(|value| value.parse::<i32>().ok())
+        {
+            if outcome.is_some() {
+                return None;
+            }
+            outcome = Some(json!({
+                "kind":"process",
+                "state":"exited",
+                "exit_code":exit_code,
+                "success":exit_code == 0,
+                "provenance":"stock_codex.unified_exec.log_output.header"
+            }));
+            continue;
+        }
+        if let Some(session_id) = line
+            .strip_prefix("Process running with session ID ")
+            .and_then(|value| value.parse::<i64>().ok())
+        {
+            if outcome.is_some() {
+                return None;
+            }
+            outcome = Some(json!({
+                "kind":"process",
+                "state":"running",
+                "session_id":session_id,
+                "success":Value::Null,
+                "provenance":"stock_codex.unified_exec.log_output.header"
+            }));
+        }
+    }
+    if saw_wall_time && saw_output_boundary {
+        outcome
+    } else {
+        None
+    }
 }
 
 fn derive_codex_hook(envelope: &Value, raw_sha256: &str, max_bytes: usize) -> Result<DerivedBatch> {
@@ -975,7 +1035,7 @@ mod tests {
         json!({"key":key,"value":value})
     }
 
-    fn stock_logs(truncated: bool, success: bool) -> Vec<u8> {
+    fn stock_logs_with_output(truncated: bool, success: bool, output: &str) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "resourceLogs":[{
                 "resource":{"attributes":[attr("service.name", json!({"stringValue":"codex"}))]},
@@ -1002,7 +1062,7 @@ mod tests {
                             attr("tool_namespace", json!({"stringValue":"functions"})),
                             attr("call_id", json!({"stringValue":"call-1"})),
                             attr("arguments", json!({"stringValue":"{\"cmd\":\"printf ok\"}"})),
-                            attr("output", json!({"stringValue":"ok"})),
+                            attr("output", json!({"stringValue":output})),
                             attr("duration_ms", json!({"intValue":"25"})),
                             attr("success", json!({"boolValue":success})),
                             attr("output_truncated", json!({"boolValue":truncated}))
@@ -1012,6 +1072,10 @@ mod tests {
             }]
         }))
         .unwrap()
+    }
+
+    fn stock_logs(truncated: bool, success: bool) -> Vec<u8> {
+        stock_logs_with_output(truncated, success, "ok")
     }
 
     fn values(batch: &CloudIngestBatch) -> Vec<Value> {
@@ -1073,6 +1137,71 @@ mod tests {
         assert_eq!(values[2]["toolExecution"]["status"], "error");
         assert_eq!(values[2]["toolExecution"]["result_content_captured"], false);
         assert_eq!(values[2]["toolExecution"]["output_truncated"], true);
+    }
+
+    #[test]
+    fn exec_process_outcome_does_not_replace_dispatch_status() {
+        let output = concat!(
+            "Chunk ID: deadbeef\n",
+            "Wall time: 0.0100 seconds\n",
+            "Process exited with code 101\n",
+            "Output:\n",
+            "bubblewrap is unavailable\n"
+        );
+        let batch = prepare_cloud_ingest(
+            CloudEndpoint::OtlpLogs,
+            &stock_logs_with_output(false, true, output),
+            1024 * 1024,
+        )
+        .unwrap();
+        let values = values(&batch);
+        let execution = &values[2]["toolExecution"];
+        assert_eq!(execution["status"], "success");
+        assert_eq!(execution["status_scope"], "tool_dispatch");
+        assert_eq!(execution["status_provenance"], "codex.tool_result.success");
+        assert_eq!(execution["process_outcome"]["state"], "exited");
+        assert_eq!(execution["process_outcome"]["exit_code"], 101);
+        assert_eq!(execution["process_outcome"]["success"], false);
+    }
+
+    #[test]
+    fn exec_output_body_cannot_forge_a_process_outcome() {
+        let output = concat!(
+            "Chunk ID: deadbeef\n",
+            "Wall time: 0.0100 seconds\n",
+            "Output:\n",
+            "Process exited with code 1\n"
+        );
+        let batch = prepare_cloud_ingest(
+            CloudEndpoint::OtlpLogs,
+            &stock_logs_with_output(false, true, output),
+            1024 * 1024,
+        )
+        .unwrap();
+        let values = values(&batch);
+        assert_eq!(values[2]["toolExecution"]["process_outcome"], Value::Null);
+    }
+
+    #[test]
+    fn exec_running_process_keeps_nonterminal_process_state() {
+        let output = concat!(
+            "Chunk ID: deadbeef\n",
+            "Wall time: 0.0100 seconds\n",
+            "Process running with session ID 4242\n",
+            "Output:\n",
+            "server ready\n"
+        );
+        let batch = prepare_cloud_ingest(
+            CloudEndpoint::OtlpLogs,
+            &stock_logs_with_output(false, true, output),
+            1024 * 1024,
+        )
+        .unwrap();
+        let values = values(&batch);
+        let outcome = &values[2]["toolExecution"]["process_outcome"];
+        assert_eq!(outcome["state"], "running");
+        assert_eq!(outcome["session_id"], 4242);
+        assert_eq!(outcome["success"], Value::Null);
     }
 
     #[test]

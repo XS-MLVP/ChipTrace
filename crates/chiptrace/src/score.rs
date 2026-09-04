@@ -1277,7 +1277,15 @@ fn merge_runtime_call_evidence(existing: &mut Value, runtime: &Value) {
 }
 
 fn merge_runtime_result_evidence(existing: &mut Value, runtime: &Value) {
-    for field in ["status", "is_error", "status_source", "status_conflict"] {
+    for field in [
+        "status",
+        "is_error",
+        "status_source",
+        "status_conflict",
+        "status_scope",
+        "status_provenance",
+        "process_outcome",
+    ] {
         if let Some(value) = runtime.get(field).filter(|value| !value.is_null()) {
             existing[field] = value.clone();
         }
@@ -1363,9 +1371,13 @@ fn collect_tool_results(messages: &[Value], profile: Profile) -> Vec<ToolResult>
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let failed = message
-                .get("is_error")
+                .pointer("/process_outcome/success")
                 .and_then(Value::as_bool)
-                .unwrap_or(false)
+                == Some(false)
+                || message
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
                 || string_field(message, "status").is_some_and(|status| {
                     matches!(
                         status.to_ascii_lowercase().as_str(),
@@ -2544,6 +2556,30 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn process_failure_is_counted_without_rewriting_dispatch_status() {
+        let messages = vec![json!({
+            "role":"tool",
+            "tool_call_id":"call-process",
+            "content":"Process exited with code 7",
+            "status":"success",
+            "is_error":false,
+            "status_scope":"tool_dispatch",
+            "process_outcome":{
+                "kind":"process",
+                "state":"exited",
+                "exit_code":7,
+                "success":false,
+                "provenance":"stock_codex.unified_exec.log_output.header"
+            }
+        })];
+        let results = collect_tool_results(&messages, Profile::BuyerV7);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].valid);
+        assert!(results[0].explicit_status);
+        assert!(results[0].failed);
     }
 
     #[test]

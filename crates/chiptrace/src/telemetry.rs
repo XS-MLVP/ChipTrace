@@ -581,6 +581,10 @@ fn runtime_otlp(span: &Value, parent_span_id: Option<&str>) -> Value {
         "LLM" => "chat",
         _ => "execute_tool",
     };
+    let lifecycle_status = string_field(span, "status").unwrap_or("unknown");
+    let semantic_status = span
+        .pointer("/extensions/semantic_status")
+        .and_then(Value::as_str);
     let mut attributes = vec![
         otlp_attr("openinference.span.kind", json!(openinference_kind)),
         otlp_attr("session.id", json!(session_id(span))),
@@ -637,6 +641,28 @@ fn runtime_otlp(span: &Value, parent_span_id: Option<&str>) -> Value {
                 .cloned()
                 .unwrap_or(Value::Null),
         ),
+        otlp_attr(
+            "chiptrace.runtime.semantic_status_provenance",
+            span.pointer("/extensions/semantic_status_provenance")
+                .cloned()
+                .unwrap_or(Value::Null),
+        ),
+        otlp_attr(
+            "chiptrace.runtime.dispatch_status",
+            span.pointer("/extensions/dispatch_status")
+                .cloned()
+                .unwrap_or(Value::Null),
+        ),
+        otlp_attr(
+            "chiptrace.runtime.dispatch_status_provenance",
+            span.pointer("/extensions/dispatch_status_provenance")
+                .cloned()
+                .unwrap_or(Value::Null),
+        ),
+        otlp_attr(
+            "chiptrace.runtime.process_outcome",
+            bounded_payload_value(span.pointer("/extensions/process_outcome")),
+        ),
     ];
     if openinference_kind != "TOOL" {
         attributes.retain(|attribute| {
@@ -645,15 +671,16 @@ fn runtime_otlp(span: &Value, parent_span_id: Option<&str>) -> Value {
                 .is_none_or(|key| !key.starts_with("tool.") && !key.starts_with("gen_ai.tool."))
         });
     }
-    let lifecycle_status = string_field(span, "status").unwrap_or("unknown");
-    let otlp_status = if openinference_kind == "TOOL"
-        && lifecycle_status == "completed"
-        && span
-            .pointer("/extensions/semantic_status")
-            .and_then(Value::as_str)
-            == Some("unknown")
-    {
-        "unknown"
+    let otlp_status = if openinference_kind == "TOOL" {
+        match semantic_status {
+            Some("success" | "completed") => "completed",
+            Some("error" | "failed") => "failed",
+            Some("cancelled") => "cancelled",
+            Some("timeout") => "timeout",
+            Some("running") => "running",
+            Some("unknown") if lifecycle_status == "completed" => "unknown",
+            _ => lifecycle_status,
+        }
     } else {
         lifecycle_status
     };
@@ -1030,6 +1057,61 @@ mod tests {
         assert_eq!(output["startTimeUnixNano"], "100");
         assert_eq!(output["endTimeUnixNano"], "200");
         assert_eq!(output["status"]["code"], "STATUS_CODE_OK");
+    }
+
+    #[test]
+    fn tool_otlp_uses_semantic_failure_without_losing_dispatch_or_process_facts() {
+        let span = json!({
+            "span_id":"runtime-process-failure",
+            "trace_context":{"session_id":"session-1"},
+            "span_kind":"tool_execution",
+            "name":"exec_command",
+            "call_id":"call-1",
+            "status":"completed",
+            "started_at":"100",
+            "finished_at":"200",
+            "raw_capture_refs":["capture-1"],
+            "extensions":{
+                "dispatch_status":"success",
+                "dispatch_status_provenance":"codex.tool_result.success",
+                "semantic_status":"error",
+                "semantic_status_provenance":"stock_codex.unified_exec.log_output.header",
+                "process_outcome":{
+                    "kind":"process",
+                    "state":"exited",
+                    "exit_code":101,
+                    "success":false,
+                    "provenance":"stock_codex.unified_exec.log_output.header"
+                }
+            }
+        });
+
+        let projected = runtime_otlp(&span, None);
+        let output = &projected["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(output["status"]["code"], "STATUS_CODE_ERROR");
+        assert_eq!(output["status"]["message"], "failed");
+        let attributes = output["attributes"].as_array().unwrap();
+        let attribute = |key: &str| {
+            attributes
+                .iter()
+                .find(|attribute| attribute["key"] == key)
+                .map(|attribute| &attribute["value"])
+                .unwrap()
+        };
+        assert_eq!(
+            attribute("chiptrace.runtime.lifecycle_status")["stringValue"].as_str(),
+            Some("completed")
+        );
+        assert_eq!(
+            attribute("chiptrace.runtime.dispatch_status")["stringValue"].as_str(),
+            Some("success")
+        );
+        assert!(
+            attribute("chiptrace.runtime.process_outcome")["stringValue"]
+                .as_str()
+                .unwrap()
+                .contains("\"exit_code\":101")
+        );
     }
 
     #[test]

@@ -1238,6 +1238,15 @@ fn validate_tool_execution(object: &Map<String, Value>) -> Result<()> {
     ) {
         bail!("unsupported toolExecution.status {status:?}");
     }
+    if execution
+        .get("status_scope")
+        .and_then(Value::as_str)
+        .is_some_and(|scope| scope != "tool_dispatch")
+    {
+        bail!("toolExecution.status_scope must be tool_dispatch");
+    }
+    validate_optional_string(execution, "status_provenance")?;
+    validate_process_outcome(execution)?;
     for field in ["parent_call_id", "started_at", "finished_at", "initiator"] {
         validate_optional_string(execution, field)?;
     }
@@ -1304,6 +1313,55 @@ fn validate_tool_execution(object: &Map<String, Value>) -> Result<()> {
         (None, Some(format)) => validate_tool_format(format)?,
     }
     validate_tool_execution_result(execution, status)
+}
+
+fn validate_process_outcome(execution: &Map<String, Value>) -> Result<()> {
+    let Some(outcome) = execution.get("process_outcome") else {
+        return Ok(());
+    };
+    if outcome.is_null() {
+        return Ok(());
+    }
+    let outcome = outcome.as_object().ok_or_else(|| {
+        anyhow::anyhow!("toolExecution.process_outcome must be an object or null")
+    })?;
+    if outcome.get("kind").and_then(Value::as_str) != Some("process") {
+        bail!("toolExecution.process_outcome.kind must be process");
+    }
+    outcome
+        .get("provenance")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("toolExecution.process_outcome.provenance is required"))?;
+    match outcome.get("state").and_then(Value::as_str) {
+        Some("exited") => {
+            let exit_code = outcome
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("exited toolExecution.process_outcome requires exit_code")
+                })?;
+            let success = outcome
+                .get("success")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("exited toolExecution.process_outcome requires success")
+                })?;
+            if success != (exit_code == 0) || outcome.get("session_id").is_some() {
+                bail!("exited toolExecution.process_outcome is inconsistent");
+            }
+        }
+        Some("running") => {
+            if outcome.get("session_id").and_then(Value::as_i64).is_none()
+                || outcome.get("success").is_none_or(|value| !value.is_null())
+                || outcome.get("exit_code").is_some()
+            {
+                bail!("running toolExecution.process_outcome is inconsistent");
+            }
+        }
+        _ => bail!("unsupported toolExecution.process_outcome.state"),
+    }
+    Ok(())
 }
 
 fn validate_tool_parameters(parameters: &Value) -> Result<()> {
@@ -1855,6 +1913,39 @@ mod tests {
         assert_eq!(
             native["toolExecution"]["schema"]["format"]["syntax"],
             "lark"
+        );
+
+        let process_tool = json!({
+            "recordType":"tool_execution",
+            "captureId":"cap-tool-process-1",
+            "sourceNamespace":"test",
+            "traceContext":{"task_session_id":"task-1"},
+            "toolExecution":{
+                "call_id":"call-process-1",
+                "name":"exec_command",
+                "runtime_tool":"exec_command",
+                "status":"success",
+                "status_scope":"tool_dispatch",
+                "status_provenance":"codex.tool_result.success",
+                "initiator":"assistant",
+                "arguments":{"cmd":"exit 7"},
+                "schema_provenance":{"source":"wire","source_complete":false},
+                "result":"Process exited with code 7",
+                "process_outcome":{
+                    "kind":"process",
+                    "state":"exited",
+                    "exit_code":7,
+                    "success":false,
+                    "provenance":"stock_codex.unified_exec.log_output.header"
+                }
+            }
+        });
+        normalize_capture(&serde_json::to_vec(&process_tool).unwrap(), 4096).unwrap();
+        let mut inconsistent_process = process_tool;
+        inconsistent_process["captureId"] = json!("cap-tool-process-invalid");
+        inconsistent_process["toolExecution"]["process_outcome"]["success"] = json!(true);
+        assert!(
+            normalize_capture(&serde_json::to_vec(&inconsistent_process).unwrap(), 4096).is_err()
         );
 
         let mut invalid_native = native_tool;

@@ -4222,13 +4222,39 @@ fn build_tool_runtime_spans(
                 .and_then(Value::as_str)
                 == Some("item_completed")
         });
-        let semantic_status = string_field(execution, "status").unwrap_or("unknown");
+        let dispatch_status = string_field(execution, "status").unwrap_or("unknown");
+        let process_outcome = execution
+            .get("process_outcome")
+            .filter(|value| !value.is_null());
+        let semantic_status = match (
+            process_outcome.and_then(|value| string_field(value, "state")),
+            process_outcome.and_then(|value| value.get("success").and_then(Value::as_bool)),
+        ) {
+            (Some("exited"), Some(true)) => "success",
+            (Some("exited"), Some(false)) => "error",
+            (Some("running"), _) => "running",
+            _ => dispatch_status,
+        };
+        let dispatch_status_provenance = string_field(execution, "status_provenance").unwrap_or(
+            if string_field(execution, "source_event_name") == Some("codex.tool_result") {
+                "codex.tool_result.success"
+            } else {
+                "codex_rollout_runtime_item.status"
+            },
+        );
+        let semantic_status_provenance = process_outcome
+            .and_then(|value| string_field(value, "provenance"))
+            .unwrap_or(if dispatch_status == "unknown" {
+                "not_reported_by_runtime_item"
+            } else {
+                dispatch_status_provenance
+            });
         let status = if terminal.is_empty() {
             "running".to_owned()
-        } else if semantic_status == "unknown" && lifecycle_terminal {
+        } else if dispatch_status == "unknown" && lifecycle_terminal {
             "completed".to_owned()
         } else {
-            normalize_runtime_status(Some(semantic_status))
+            normalize_runtime_status(Some(dispatch_status))
         };
         let parent_call_ids: BTreeSet<String> = captures
             .iter()
@@ -4260,6 +4286,12 @@ fn build_tool_runtime_spans(
             .filter_map(|capture| string_field(&capture["toolExecution"], "status"))
             .filter(|status| !matches!(*status, "started" | "unknown"))
             .collect();
+        let process_outcomes: BTreeSet<Vec<u8>> = captures
+            .iter()
+            .filter_map(|capture| capture["toolExecution"].get("process_outcome"))
+            .filter(|value| !value.is_null())
+            .filter_map(|value| serde_json::to_vec(value).ok())
+            .collect();
         let capture_ids: Vec<String> = captures
             .iter()
             .filter_map(|capture| string_field(capture, "captureId").map(str::to_owned))
@@ -4286,6 +4318,7 @@ fn build_tool_runtime_spans(
                     && model_names.is_disjoint(&authoritative_names))
         });
         let conflict = authoritative_statuses.len() > 1
+            || process_outcomes.len() > 1
             || authoritative_names.len() > 1
             || model_name_conflict
             || parent_call_ids.len() > 1;
@@ -4327,11 +4360,10 @@ fn build_tool_runtime_spans(
                 "output_truncated":execution.get("output_truncated"),
                 "lifecycle_terminal":lifecycle_terminal,
                 "semantic_status":semantic_status,
-                "semantic_status_provenance":if semantic_status == "unknown" {
-                    "not_reported_by_runtime_item"
-                } else {
-                    "codex_rollout_runtime_item.status"
-                },
+                "semantic_status_provenance":semantic_status_provenance,
+                "dispatch_status":dispatch_status,
+                "dispatch_status_provenance":dispatch_status_provenance,
+                "process_outcome":process_outcome,
                 "runtime_tool_name":runtime_name,
                 "observed_tool_name_aliases":names,
                 "authoritative_runtime_tool_names":authoritative_names,
@@ -6181,6 +6213,55 @@ mod tests {
             integrity.metrics["unresolved_parent_call_span_ids"],
             json!([])
         );
+    }
+
+    #[test]
+    fn runtime_span_separates_dispatch_success_from_process_failure() {
+        let capture = json!({
+            "recordType":"tool_execution",
+            "captureId":"cap-process-failed",
+            "sourceNamespace":"stock-codex-cloud",
+            "receivedAt":"2026-09-04T00:00:01Z",
+            "traceContext":{
+                "session_id":"session-process",
+                "thread_id":"session-process",
+                "root_turn_id":"turn-process",
+                "turn_id":"turn-process"
+            },
+            "toolExecution":{
+                "call_id":"call-process",
+                "name":"exec_command",
+                "status":"success",
+                "status_scope":"tool_dispatch",
+                "status_provenance":"codex.tool_result.success",
+                "source_event_name":"codex.tool_result",
+                "started_at":"2026-09-04T00:00:00Z",
+                "finished_at":"2026-09-04T00:00:01Z",
+                "arguments":{"cmd":"exit 101"},
+                "result":"Process exited with code 101",
+                "process_outcome":{
+                    "kind":"process",
+                    "state":"exited",
+                    "exit_code":101,
+                    "success":false,
+                    "provenance":"stock_codex.unified_exec.log_output.header"
+                }
+            }
+        });
+
+        let spans = build_runtime_spans(&[capture], &[]).unwrap();
+        let span = spans
+            .iter()
+            .find(|span| span["call_id"] == "call-process")
+            .unwrap();
+        assert_eq!(span["status"], "completed");
+        assert_eq!(span["extensions"]["dispatch_status"], "success");
+        assert_eq!(span["extensions"]["semantic_status"], "error");
+        assert_eq!(
+            span["extensions"]["semantic_status_provenance"],
+            "stock_codex.unified_exec.log_output.header"
+        );
+        assert_eq!(span["extensions"]["process_outcome"]["exit_code"], 101);
     }
 
     #[test]

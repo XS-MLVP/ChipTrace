@@ -4019,6 +4019,11 @@ fn project_tool_execution(
             "status":normalized_status,
             "source":"executor_span",
         });
+        for field in ["status_scope", "status_provenance", "process_outcome"] {
+            if let Some(value) = execution.get(field).filter(|value| !value.is_null()) {
+                result[field] = value.clone();
+            }
+        }
         if normalized_status != "unknown" {
             result["is_error"] = json!(normalized_status != "success");
         }
@@ -7499,6 +7504,41 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn executor_span_keeps_process_outcome_separate_from_dispatch_status() {
+        let execution = json!({
+            "call_id":"call-process",
+            "name":"exec_command",
+            "initiator":"assistant",
+            "status":"success",
+            "status_scope":"tool_dispatch",
+            "status_provenance":"codex.tool_result.success",
+            "arguments":{"cmd":"exit 7"},
+            "result":"Process exited with code 7",
+            "process_outcome":{
+                "kind":"process",
+                "state":"exited",
+                "exit_code":7,
+                "success":false,
+                "provenance":"stock_codex.unified_exec.log_output.header"
+            }
+        });
+        let mut messages = Vec::new();
+        let mut tools = BTreeMap::new();
+        let mut schema_conflicts = BTreeSet::new();
+
+        assert_eq!(
+            project_tool_execution(&mut messages, &mut tools, &mut schema_conflicts, &execution,),
+            0
+        );
+        annotate_tool_call_statuses(&mut messages);
+        assert_eq!(messages[0]["tool_calls"][0]["execution_status"], "executed");
+        assert_eq!(messages[1]["status"], "success");
+        assert_eq!(messages[1]["is_error"], false);
+        assert_eq!(messages[1]["process_outcome"]["exit_code"], 7);
+        assert_eq!(messages[1]["process_outcome"]["success"], false);
     }
 
     #[test]
