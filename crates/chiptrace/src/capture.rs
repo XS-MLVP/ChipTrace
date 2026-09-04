@@ -54,8 +54,11 @@ pub fn normalize_wire_capture(raw: &[u8], max_bytes: usize) -> Result<CaptureRec
     let object = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("Wire Capture envelope must be a JSON object"))?;
-    if object.get("version").and_then(Value::as_str) != Some(CAPTURE_SCHEMA_VERSION) {
-        bail!("Wire Capture version must be {CAPTURE_SCHEMA_VERSION}");
+    if object
+        .get("version")
+        .is_some_and(|value| value.as_str() != Some(CAPTURE_SCHEMA_VERSION))
+    {
+        bail!("explicit Wire Capture version must be {CAPTURE_SCHEMA_VERSION}");
     }
     if object.get("recordType").and_then(Value::as_str) != Some("api_snapshot") {
         bail!("Wire Capture recordType must be api_snapshot");
@@ -1898,8 +1901,21 @@ mod tests {
 
         let mut missing_version = wire.clone();
         missing_version.as_object_mut().unwrap().remove("version");
+        let raw = serde_json::to_vec(&missing_version).unwrap();
+        let normalized = normalize_wire_capture(&raw, 4096).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&normalized.canonical).unwrap()["version"],
+            CAPTURE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            normalized.legacy_raw_sha256,
+            Some(hex::encode(Sha256::digest(&raw)))
+        );
+
+        let mut wrong_version = wire.clone();
+        wrong_version["version"] = json!("chiptrace.capture.v1");
         assert!(
-            normalize_wire_capture(&serde_json::to_vec(&missing_version).unwrap(), 4096).is_err()
+            normalize_wire_capture(&serde_json::to_vec(&wrong_version).unwrap(), 4096).is_err()
         );
 
         for (record_type, field, value) in [

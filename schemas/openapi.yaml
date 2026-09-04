@@ -18,7 +18,7 @@ paths:
   /capture:
     post:
       summary: 持久化一条网关 Wire Capture
-      description: 仅接收当前版 api_snapshot；生命周期、工具执行、评价和历史生产者格式返回 400。
+      description: 仅接收当前 api_snapshot；显式错误版本及其他事实来源返回 400。
       security:
         - cloudBearer: []
       requestBody:
@@ -122,7 +122,7 @@ components:
       allOf:
         - $ref: ./capture-v2.schema.json
         - type: object
-          required: [version, recordType, sourceNamespace]
+          required: [recordType, sourceNamespace]
           properties:
             version: {const: chiptrace.capture.v2}
             recordType: {const: api_snapshot}
