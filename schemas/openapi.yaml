@@ -132,16 +132,9 @@ components:
               - required: [evaluationEvidence]
               - required: [evaluation_evidence]
               - required: [lifecycleEvent]
-              - required: [producerEvent]
-              - required: [producerModel]
-              - required: [rolloutEvent]
-              - required: [rolloutMessages]
-              - required: [rolloutUsage]
               - required: [runtimeToolObservation]
               - required: [telemetryBatch]
               - required: [toolExecution]
-              - required: [toolRegistry]
-              - required: [toolRegistrySha256]
   securitySchemes:
     businessBearer:
       type: http

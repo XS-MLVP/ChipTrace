@@ -1576,13 +1576,27 @@ async fn self_test() -> Result<Value> {
                     })
             });
     let cloud_runtime_audit_pass = delivered
-        .pointer("/meta/producer_event_conflicts")
-        .and_then(Value::as_array)
-        .is_some_and(Vec::is_empty)
+        .pointer("/meta/runtime_dag/source")
+        .and_then(Value::as_str)
+        == Some("canonical_model_interaction:cloud_evidence")
         && delivered
-            .pointer("/meta/producer_streams")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty);
+            .pointer("/meta/runtime_dag/evidence_event_count")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0)
+        && [
+            "active_quality_projection",
+            "code_mode_message_projection",
+            "producer_event_conflicts",
+            "producer_streams",
+            "quality_projections",
+            "rollout_events",
+            "rollout_unknown_events",
+            "rollout_unmapped_tools",
+            "rollout_usage_evidence",
+            "tool_registry_evidence",
+        ]
+        .into_iter()
+        .all(|field| delivered.pointer(&format!("/meta/{field}")).is_none());
     let published_object_root = temporary.path().join("object-store");
     let publish_config = PublishConfig {
         source: PublishSource::Release(release_root),

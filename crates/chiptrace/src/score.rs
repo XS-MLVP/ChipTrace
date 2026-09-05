@@ -416,16 +416,19 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         .pointer("/meta/lifecycle_state/invalid_boundary_count")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let assembly_producer_event_conflicts = session
-        .pointer("/meta/producer_event_conflicts")
+    let assembly_runtime_evidence_conflicts = session
+        .pointer("/meta/runtime_evidence_conflicts")
+        .or_else(|| session.pointer("/meta/producer_event_conflicts"))
         .and_then(Value::as_array)
         .map_or(0, |conflicts| conflicts.len() as u64);
-    let rollout_unknown_events = session
-        .pointer("/meta/rollout_unknown_events")
+    let runtime_unknown_events = session
+        .pointer("/meta/runtime_unknown_events")
+        .or_else(|| session.pointer("/meta/rollout_unknown_events"))
         .and_then(Value::as_array)
         .map_or(0, |events| events.len() as u64);
-    let rollout_unmapped_tools = session
-        .pointer("/meta/rollout_unmapped_tools")
+    let runtime_unmapped_tools = session
+        .pointer("/meta/runtime_unmapped_tools")
+        .or_else(|| session.pointer("/meta/rollout_unmapped_tools"))
         .and_then(Value::as_array)
         .map_or(0, |events| events.len() as u64);
     let capture_dag_present = session
@@ -434,35 +437,18 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
     let runtime_dag_present = session
         .pointer("/meta/runtime_dag")
         .is_some_and(Value::is_object);
-    let stock_runtime_events_present = session
-        .pointer("/meta/rollout_events")
-        .and_then(Value::as_array)
-        .is_some_and(|events| {
-            events
-                .iter()
-                .any(|event| string_field(event, "source") == Some("codex_rollout_jsonl"))
-        });
-    let legacy_runtime_events_present = session
-        .pointer("/meta/rollout_events")
-        .and_then(Value::as_array)
-        .is_some_and(|events| {
-            events
-                .iter()
-                .any(|event| string_field(event, "source") == Some("codex_rollout_trace_bundle"))
-        });
-    let native_runtime_events_present =
-        stock_runtime_events_present || legacy_runtime_events_present;
-    let runtime_dag_applicable = session
-        .pointer("/meta/runtime_dag/applicable")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || native_runtime_events_present;
+    let runtime_dag_applicable = profile == Profile::BuyerV7
+        || session
+            .pointer("/meta/runtime_dag/applicable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     let runtime_dag_complete = session
         .pointer("/meta/runtime_dag/complete")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let runtime_dag_native_events = session
-        .pointer("/meta/runtime_dag/native_event_count")
+    let runtime_dag_evidence_events = session
+        .pointer("/meta/runtime_dag/evidence_event_count")
+        .or_else(|| session.pointer("/meta/runtime_dag/native_event_count"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let runtime_dag_open_nodes = session
@@ -480,10 +466,8 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
     let runtime_dag_source = session
         .pointer("/meta/runtime_dag/source")
         .and_then(Value::as_str);
-    let runtime_dag_source_matches = (!stock_runtime_events_present
-        || runtime_dag_source == Some("canonical_model_interaction:codex_rollout_jsonl"))
-        && (!legacy_runtime_events_present
-            || runtime_dag_source == Some("codex_rollout_trace_bundle"));
+    let runtime_dag_source_matches = !runtime_dag_applicable
+        || runtime_dag_source == Some("canonical_model_interaction:cloud_evidence");
     let artifact_valid = session
         .pointer("/meta/trace_readiness/artifact_valid")
         .and_then(Value::as_bool)
@@ -645,16 +629,16 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         assembly_system_prompt_conflicts,
         assembly_usage_conflicts,
         assembly_tool_execution_conflicts,
-        assembly_producer_event_conflicts,
-        rollout_unknown_events,
-        rollout_unmapped_tools,
+        assembly_runtime_evidence_conflicts,
+        runtime_unknown_events,
+        runtime_unmapped_tools,
         response_dag_cycle,
         response_dag_unresolved_parents,
         capture_dag_present,
         runtime_dag_present,
         runtime_dag_applicable,
         runtime_dag_complete,
-        runtime_dag_native_events,
+        runtime_dag_evidence_events,
         runtime_dag_open_nodes,
         runtime_dag_unresolved_nodes,
         runtime_dag_status_conflicts,
@@ -847,8 +831,8 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
             && assembly_usage_conflicts == 0
             && assembly_tool_execution_conflicts == 0
             && lifecycle_invalid_boundary_count == 0
-            && assembly_producer_event_conflicts == 0
-            && rollout_unknown_events == 0
+            && assembly_runtime_evidence_conflicts == 0
+            && runtime_unknown_events == 0
             && capture_dag_present
             && task_dag_present
             && !response_dag_cycle
@@ -865,9 +849,9 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
             "usage_conflicts": assembly_usage_conflicts,
             "tool_execution_conflicts": assembly_tool_execution_conflicts,
             "lifecycle_invalid_boundary_count": lifecycle_invalid_boundary_count,
-            "producer_event_conflicts": assembly_producer_event_conflicts,
-            "rollout_unknown_events": rollout_unknown_events,
-            "rollout_unmapped_tools": rollout_unmapped_tools,
+            "runtime_evidence_conflicts": assembly_runtime_evidence_conflicts,
+            "runtime_unknown_events": runtime_unknown_events,
+            "runtime_unmapped_tools": runtime_unmapped_tools,
             "response_dag_cycle": response_dag_cycle,
             "response_dag_unresolved_parents": response_dag_unresolved_parents,
             "capture_dag_present": capture_dag_present,
@@ -878,7 +862,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
             "task_terminal_event_present": task_terminal_event_present,
             "task_boundary_attested": task_boundary_attested,
         }),
-        "no message, tool schema, status, trace, system prompt, usage, unknown rollout, or unmapped runtime-tool conflicts; buyer-v7 also requires an explicitly bounded task Session",
+        "no message, tool schema, status, trace, system prompt, usage, or Runtime evidence conflicts; buyer-v7 also requires an explicitly bounded task Session",
         Some(
             "an assembly conflict or inferred-only task boundary is never compensated by the numeric score",
         ),
@@ -887,7 +871,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         || (runtime_dag_present
             && runtime_dag_source_matches
             && runtime_dag_complete
-            && runtime_dag_native_events > 0
+            && runtime_dag_evidence_events > 0
             && runtime_dag_open_nodes == 0
             && runtime_dag_unresolved_nodes == 0
             && runtime_dag_status_conflicts == 0);
@@ -901,15 +885,15 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
             "applicable": runtime_dag_applicable,
             "source": runtime_dag_source,
             "source_matches_evidence": runtime_dag_source_matches,
-            "native_events": runtime_dag_native_events,
+            "evidence_events": runtime_dag_evidence_events,
             "complete": runtime_dag_complete,
             "open_nodes": runtime_dag_open_nodes,
             "unresolved_nodes": runtime_dag_unresolved_nodes,
             "status_conflicts": runtime_dag_status_conflicts,
         }),
-        "when native Codex rollout evidence is present, the canonical runtime DAG must be complete with at least one native event and zero open, unresolved, or terminal-status-conflict nodes",
+        "when Runtime evidence is present, the canonical runtime DAG must use cloud evidence, contain at least one event, and have no open, unresolved, or terminal-status-conflict nodes",
         Some(
-            "API-only Sessions are not reclassified as runtime-complete; Stock rollout and legacy bundle evidence cannot be omitted to bypass this gate",
+            "API-only Sessions are not reclassified as runtime-complete; missing Runtime evidence cannot be bypassed by a Buyer score",
         ),
     );
     push_gate(
@@ -1063,11 +1047,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         || session.pointer("/meta/system_prompt_conflicts").is_none()
         || session.pointer("/meta/usage_conflicts").is_none()
         || session.pointer("/meta/tool_execution_conflicts").is_none()
-        || session.pointer("/meta/producer_streams").is_none()
-        || session.pointer("/meta/producer_event_conflicts").is_none()
         || session.pointer("/meta/usage_evidence").is_none()
-        || session.pointer("/meta/rollout_unknown_events").is_none()
-        || session.pointer("/meta/rollout_unmapped_tools").is_none()
         || session.pointer("/meta/capture_dag").is_none()
         || session.pointer("/meta/task_dag").is_none()
         || session
@@ -1082,7 +1062,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
     if lifecycle_retries == 0 && failed_results == 0 && corrections == 0 {
         warnings.push("no_realism_recovery_signal".to_owned());
     }
-    if rollout_unmapped_tools > 0 {
+    if runtime_unmapped_tools > 0 {
         warnings.push("unmapped_runtime_tools_present".to_owned());
     }
 
@@ -1133,101 +1113,137 @@ pub fn materialize_profile_session(session: &Value, profile: Profile) -> Value {
     if profile != Profile::BuyerV7 {
         return session.clone();
     }
+    let mut materialized = session.clone();
     if session
         .pointer("/meta/active_quality_projection/profile_version")
         .and_then(Value::as_str)
         == Some(Profile::BuyerV7.version())
     {
-        return session.clone();
+        strip_internal_projection_metadata(&mut materialized);
+        return materialized;
     }
-    let Some(projection) =
-        session.pointer("/meta/quality_projections/buyer_v7_codex_runtime_expanded")
-    else {
-        return session.clone();
-    };
-    if projection.get("profile_version").and_then(Value::as_str) != Some(Profile::BuyerV7.version())
-    {
-        return session.clone();
-    }
-
-    let excluded: HashSet<&str> = projection
-        .get("excluded_model_call_ids")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    let mut messages = Vec::new();
-    for message in session
-        .get("messages")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if string_field(message, "role") == Some("tool")
-            && string_field(message, "tool_call_id")
-                .is_some_and(|call_id| excluded.contains(call_id))
+    let projection = session
+        .pointer("/meta/quality_projections/buyer_v7")
+        .or_else(|| session.pointer("/meta/quality_projections/buyer_v7_codex_runtime_expanded"));
+    if let Some(projection) = projection.filter(|projection| {
+        projection.get("profile_version").and_then(Value::as_str)
+            == Some(Profile::BuyerV7.version())
+    }) {
+        let excluded: HashSet<&str> = projection
+            .get("excluded_model_call_ids")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let mut messages = Vec::new();
+        for message in session
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
         {
-            continue;
-        }
-        let mut message = message.clone();
-        if string_field(&message, "role") == Some("assistant")
-            && let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut)
-        {
-            calls.retain(|call| {
-                !string_field(call, "id").is_some_and(|call_id| excluded.contains(call_id))
-            });
-            if calls.is_empty() {
-                message
-                    .as_object_mut()
-                    .map(|object| object.remove("tool_calls"));
+            if string_field(message, "role") == Some("tool")
+                && string_field(message, "tool_call_id")
+                    .is_some_and(|call_id| excluded.contains(call_id))
+            {
+                continue;
+            }
+            let mut message = message.clone();
+            if string_field(&message, "role") == Some("assistant")
+                && let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut)
+            {
+                calls.retain(|call| {
+                    !string_field(call, "id").is_some_and(|call_id| excluded.contains(call_id))
+                });
+                if calls.is_empty() {
+                    message
+                        .as_object_mut()
+                        .map(|object| object.remove("tool_calls"));
+                }
+            }
+            let empty = string_field(&message, "role") == Some("assistant")
+                && message.get("tool_calls").is_none()
+                && !assistant_substantive(&message);
+            if !empty {
+                messages.push(message);
             }
         }
-        let empty = string_field(&message, "role") == Some("assistant")
-            && message.get("tool_calls").is_none()
-            && !assistant_substantive(&message);
-        if !empty {
-            messages.push(message);
+        for runtime_message in projection
+            .get("runtime_messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            merge_runtime_projection_message(&mut messages, runtime_message);
+        }
+
+        let mut tools = BTreeMap::new();
+        for tool in session
+            .get("tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .chain(
+                projection
+                    .get("runtime_tools")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten(),
+            )
+        {
+            let nested = tool.get("function").unwrap_or(tool);
+            let Some(name) = string_field(nested, "name") else {
+                continue;
+            };
+            tools.insert(name.to_owned(), tool.clone());
+        }
+
+        materialized["messages"] = Value::Array(messages);
+        materialized["tools"] = Value::Array(tools.into_values().collect());
+    }
+    strip_internal_projection_metadata(&mut materialized);
+    materialized
+}
+
+fn strip_internal_projection_metadata(session: &mut Value) {
+    let Some(meta) = session.get_mut("meta").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for field in [
+        "active_quality_projection",
+        "code_mode_message_projection",
+        "producer_event_conflicts",
+        "producer_streams",
+        "quality_projections",
+        "rollout_events",
+        "rollout_unknown_events",
+        "rollout_unmapped_tools",
+        "rollout_usage_evidence",
+        "tool_registry_evidence",
+    ] {
+        meta.remove(field);
+    }
+    if let Some(runtime) = meta.get_mut("runtime_dag").and_then(Value::as_object_mut) {
+        if runtime.get("source").and_then(Value::as_str)
+            == Some("canonical_model_interaction:producer_events")
+        {
+            runtime.insert(
+                "source".to_owned(),
+                json!("canonical_model_interaction:cloud_evidence"),
+            );
+        }
+        if !runtime.contains_key("evidence_event_count")
+            && let Some(value) = runtime.remove("native_event_count")
+        {
+            runtime.insert("evidence_event_count".to_owned(), value);
+        }
+        if !runtime.contains_key("terminal_root_ids")
+            && let Some(value) = runtime.remove("terminal_rollout_ids")
+        {
+            runtime.insert("terminal_root_ids".to_owned(), value);
         }
     }
-    for runtime_message in projection
-        .get("runtime_messages")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        merge_runtime_projection_message(&mut messages, runtime_message);
-    }
-
-    let mut tools = BTreeMap::new();
-    for tool in session
-        .get("tools")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .chain(
-            projection
-                .get("runtime_tools")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten(),
-        )
-    {
-        let nested = tool.get("function").unwrap_or(tool);
-        let Some(name) = string_field(nested, "name") else {
-            continue;
-        };
-        tools.insert(name.to_owned(), tool.clone());
-    }
-
-    let mut materialized = session.clone();
-    materialized["messages"] = Value::Array(messages);
-    materialized["tools"] = Value::Array(tools.into_values().collect());
-    materialized["meta"]["active_quality_projection"] = json!({
-        "profile_version":Profile::BuyerV7.version(),
-        "source":"meta.quality_projections.buyer_v7_codex_runtime_expanded",
-    });
-    materialized
 }
 
 fn merge_runtime_projection_message(messages: &mut Vec<Value>, runtime: &Value) {
@@ -2580,9 +2596,9 @@ mod tests {
                 "system_prompt_conflicts":[],
                 "usage_conflicts":[],
                 "tool_execution_conflicts":[],
-                "producer_event_conflicts":[],
-                "rollout_unknown_events":[],
-                "rollout_unmapped_tools":["cap-runtime-unlinked"],
+                "runtime_evidence_conflicts":[],
+                "runtime_unknown_events":[],
+                "runtime_unmapped_tools":["cap-runtime-unlinked"],
                 "capture_dag":{},
                 "task_dag":{"complete":true}
             }
@@ -2626,11 +2642,10 @@ mod tests {
             "messages":[{"role":"system","content":"system"}],
             "usage":{},
             "meta":{
-                "rollout_events":[{"source":"codex_rollout_jsonl"}],
                 "runtime_dag":{
                     "applicable":true,
-                    "source":"canonical_model_interaction:codex_rollout_jsonl",
-                    "native_event_count":4,
+                    "source":"canonical_model_interaction:cloud_evidence",
+                    "evidence_event_count":4,
                     "complete":false,
                     "open_node_ids":["trace:tool:open"],
                     "unresolved_node_ids":[]
@@ -2667,7 +2682,7 @@ mod tests {
             .unwrap();
         assert!(gate.pass);
 
-        session["meta"]["runtime_dag"]["source"] = json!("codex_rollout_trace_bundle");
+        session["meta"]["runtime_dag"]["source"] = json!("historical_runtime_source");
         let mismatched = assess_session(&session, Profile::BuyerV7, 90.0);
         let gate = mismatched
             .buyer_acceptance
@@ -2678,7 +2693,7 @@ mod tests {
         assert!(!gate.pass);
         assert_eq!(gate.observed["source_matches_evidence"], false);
         session["meta"]["runtime_dag"]["source"] =
-            json!("canonical_model_interaction:codex_rollout_jsonl");
+            json!("canonical_model_interaction:cloud_evidence");
 
         session["meta"]["runtime_dag"]["complete"] = json!(false);
         session["meta"]["runtime_dag"]["status_conflict_node_ids"] = json!(["tool-1"]);
@@ -2730,7 +2745,7 @@ mod tests {
             "meta":{
                 "runtime_dag":{
                     "applicable":true,
-                    "native_event_count":1,
+                    "evidence_event_count":1,
                     "complete":true,
                     "open_node_ids":[],
                     "unresolved_node_ids":[]
@@ -3241,7 +3256,7 @@ mod tests {
     }
 
     #[test]
-    fn producer_or_tool_state_conflicts_are_hard_failures() {
+    fn runtime_or_tool_state_conflicts_are_hard_failures() {
         let session = json!({
             "trajectory_id":"t", "session_id":"s", "provider":"OpenAI", "model":"gpt-5.6-sol",
             "created_at":"2026-08-29T00:00:00Z", "status":"completed", "is_final_snapshot":true,
@@ -3254,7 +3269,7 @@ mod tests {
                 "system_prompt_conflicts":[],
                 "usage_conflicts":[],
                 "tool_execution_conflicts":["call-1:missing_started_event"],
-                "producer_event_conflicts":["dispatcher:stream-1:sequence_gap"],
+                "runtime_evidence_conflicts":["dispatcher:stream-1:sequence_gap"],
                 "capture_dag":{},
                 "task_dag":{}
             }
@@ -3278,7 +3293,7 @@ mod tests {
             assessment
                 .buyer_acceptance
                 .metrics
-                .assembly_producer_event_conflicts,
+                .assembly_runtime_evidence_conflicts,
             1
         );
     }

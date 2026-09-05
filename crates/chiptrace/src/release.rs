@@ -1313,6 +1313,23 @@ mod tests {
             json!({"role":"user","content":"verify the result"}),
             json!({"role":"assistant","content":"Verification passed."}),
         ]);
+        let runtime_dag = json!({
+            "schema_version":"chiptrace.runtime-dag.v1",
+            "source":"canonical_model_interaction:cloud_evidence",
+            "evidence_event_count":1,
+            "roots":["root"],
+            "root_mode":"single_turn",
+            "task_session_ids":[],
+            "session_ids":[id],
+            "open_node_ids":[],
+            "unresolved_node_ids":[],
+            "status_conflict_node_ids":[],
+            "terminal_root_ids":["root"],
+            "canonical_metrics":{},
+            "root_complete":true,
+            "complete":true,
+            "applicable":true
+        });
         json!({
             "schema_version":"chiptrace.session.v1",
             "trajectory_id":format!("traj-{id}"),
@@ -1337,15 +1354,15 @@ mod tests {
                 "system_prompt_conflicts":[],
                 "usage_conflicts":[],
                 "tool_execution_conflicts":[],
-                "producer_event_conflicts":[],
-                "rollout_unknown_events":[],
-                "rollout_unmapped_tools":[],
+                "runtime_evidence_conflicts":[],
+                "runtime_unknown_events":[],
+                "runtime_unmapped_tools":[],
                 "capture_dag":{
                     "has_cycle":false,
                     "unresolved_parent_response_ids":[],
                     "unresolved_parent_span_ids":[]
                 },
-                "runtime_dag":{"applicable":false,"complete":false},
+                "runtime_dag":runtime_dag,
                 "task_dag":{"complete":true},
                 "inference_api_conservation":{"applicable":false,"complete":true},
                 "model_evidence":{

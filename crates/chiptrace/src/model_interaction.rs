@@ -3,7 +3,7 @@ use crate::jsonl::{JsonlWriter, absolute_path, ensure_safe_relative_path, sha256
 use crate::lifecycle::{Boundary, LifecycleState};
 use crate::schema::{FileManifest, RAW_LINEAGE_SCHEMA_VERSION, RawSourceLineage};
 use crate::session_lineage::StockSessionLineage;
-use crate::tool_registry::canonical_runtime_tool_name;
+use crate::tool_schema::canonical_runtime_tool_name;
 use crate::wire_tools::request_tool_definitions as captured_request_tool_definitions;
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
@@ -423,44 +423,13 @@ fn build_canonical_records(captures: &[Value]) -> Result<CanonicalRecords> {
 }
 
 pub(crate) fn canonical_trace_summary(captures: &[Value]) -> Result<Option<CanonicalTraceSummary>> {
-    let stock_event_count = captures
-        .iter()
-        .filter(|capture| {
-            capture
-                .pointer("/rolloutEvent/source")
-                .and_then(Value::as_str)
-                == Some("codex_rollout_jsonl")
-        })
-        .count();
-    let legacy_event_count = captures
-        .iter()
-        .filter(|capture| {
-            capture
-                .pointer("/rolloutEvent/source")
-                .and_then(Value::as_str)
-                == Some("codex_rollout_trace_bundle")
-        })
-        .count();
-    let producer_runtime_event_count = captures
+    let cloud_runtime_event_count = captures
         .iter()
         .filter(|capture| {
             capture.get("lifecycleEvent").is_some() || capture.get("toolExecution").is_some()
         })
         .count();
-    let (runtime_source, source_event_count) = match (stock_event_count, legacy_event_count) {
-        (stock, 0) if stock > 0 => ("canonical_model_interaction:codex_rollout_jsonl", stock),
-        (0, legacy) if legacy > 0 => ("codex_rollout_trace_bundle", legacy),
-        (stock, legacy) if stock > 0 && legacy > 0 => (
-            "canonical_model_interaction:mixed_runtime_sources",
-            stock.saturating_add(legacy),
-        ),
-        _ if producer_runtime_event_count > 0 => (
-            "canonical_model_interaction:producer_events",
-            producer_runtime_event_count,
-        ),
-        _ => ("", 0),
-    };
-    if source_event_count == 0 {
+    if cloud_runtime_event_count == 0 {
         return Ok(None);
     }
 
@@ -503,8 +472,8 @@ pub(crate) fn canonical_trace_summary(captures: &[Value]) -> Result<Option<Canon
     let complete = integrity.runtime_complete && integrity.root_complete;
     let runtime_dag = json!({
         "schema_version":"chiptrace.runtime-dag.v1",
-        "source":runtime_source,
-        "native_event_count":source_event_count,
+        "source":"canonical_model_interaction:cloud_evidence",
+        "evidence_event_count":cloud_runtime_event_count,
         "roots":roots,
         "root_mode":if roots.len() > 1 { "session_scoped_turn_forest" } else { "single_turn" },
         "task_session_ids":task_session_ids,
@@ -512,7 +481,7 @@ pub(crate) fn canonical_trace_summary(captures: &[Value]) -> Result<Option<Canon
         "open_node_ids":open_nodes,
         "unresolved_node_ids":unresolved,
         "status_conflict_node_ids":status_conflicts,
-        "terminal_rollout_ids":terminal_roots,
+        "terminal_root_ids":terminal_roots,
         "canonical_metrics":metrics,
         "root_complete":integrity.root_complete,
         "complete":complete,

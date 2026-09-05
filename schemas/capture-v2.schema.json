@@ -7,7 +7,7 @@
   "properties": {
     "version": {"const": "chiptrace.capture.v2"},
     "recordType": {
-      "enum": ["api_snapshot", "lifecycle_event", "tool_execution", "evaluation", "rollout_event", "telemetry_batch"]
+      "enum": ["api_snapshot", "lifecycle_event", "tool_execution", "evaluation", "telemetry_batch"]
     },
     "captureId": {
       "type": "string",
@@ -94,27 +94,8 @@
     "captureError": {"type": ["string", "null"]},
     "captureErrorCode": {"type": ["string", "null"]},
     "isFinalSnapshot": {"type": "boolean"},
-    "producerModel": {"type": ["string", "null"]},
     "requestedModelAlias": {"type": ["string", "null"]},
-    "systemPrompt": {"type": ["string", "null"]},
-    "rolloutMessages": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["role", "content"],
-        "properties": {
-          "role": {"enum": ["system", "user", "assistant", "tool"]},
-          "content": {}
-        },
-        "additionalProperties": true
-      }
-    },
-    "rolloutUsage": {"type": "object"},
     "runtimeToolObservation": {"type": "object"},
-    "producerEvent": {"$ref": "#/$defs/producerEvent"},
-    "toolRegistry": {"$ref": "tool-registry-v1.schema.json"},
-    "toolRegistrySha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "rolloutEvent": {"$ref": "#/$defs/rolloutEvent"},
     "traceContext": {
       "type": "object",
       "properties": {
@@ -175,38 +156,6 @@
     "gatewayEvidenceJoin": {"$ref": "#/$defs/gatewayEvidenceJoin"}
   },
   "$defs": {
-    "producerEvent": {
-      "type": "object",
-      "required": [
-        "schema_version",
-        "event_id",
-        "producer",
-        "producer_version",
-        "identity_scheme",
-        "stream_id",
-        "sequence"
-      ],
-      "properties": {
-        "schema_version": {"const": "chiptrace.producer-event.v1"},
-        "event_id": {
-          "type": "string",
-          "pattern": "^[A-Za-z0-9._:-]+$",
-          "maxLength": 256
-        },
-        "producer": {"type": "string", "minLength": 1},
-        "producer_version": {"type": "string", "minLength": 1},
-        "identity_scheme": {
-          "enum": ["chiptrace.deterministic-capture.v1", "source-native"]
-        },
-        "stream_id": {
-          "type": "string",
-          "pattern": "^[A-Za-z0-9._:-]+$",
-          "maxLength": 256
-        },
-        "sequence": {"type": "integer", "minimum": 0}
-      },
-      "additionalProperties": false
-    },
     "capturedBody": {
       "oneOf": [
         {"type": "null"},
@@ -224,77 +173,6 @@
         {"type": "number"},
         {"type": "boolean"}
       ]
-    },
-    "rolloutEvent": {
-      "type": "object",
-      "required": [
-        "schema_version",
-        "source",
-        "source_session_id",
-        "source_ordinal",
-        "source_line",
-        "source_line_sha256",
-        "classification"
-      ],
-      "properties": {
-        "schema_version": {"const": "chiptrace.codex-rollout.v1"},
-        "source": {"enum": ["codex_rollout_jsonl", "codex_rollout_trace_bundle"]},
-        "source_session_id": {"type": "string", "minLength": 1},
-        "source_ordinal": {"type": "integer", "minimum": 0},
-        "source_cli_version": {"type": ["string", "null"]},
-        "source_line": {"type": "string"},
-        "source_line_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "raw_event_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "bundle_trace_id": {"type": ["string", "null"]},
-        "bundle_manifest_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
-        "bundle_manifest_raw": {"type": ["string", "null"]},
-        "bundle_manifest_mirror_path": {"type": ["string", "null"]},
-        "bundle_root_thread_id": {"type": ["string", "null"]},
-        "raw_event_mirror_path": {"type": ["string", "null"]},
-        "payloads": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["raw_payload_id", "path", "sha256", "bytes", "mirror_path", "raw_json"],
-            "properties": {
-              "raw_payload_id": {"type": "string", "minLength": 1},
-              "path": {"type": "string", "minLength": 1},
-              "kind": {},
-              "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-              "bytes": {"type": "integer", "minimum": 0},
-              "mirror_path": {"type": "string", "minLength": 1},
-              "raw_json": {"type": "string"},
-              "content": {}
-            },
-            "additionalProperties": true
-          }
-        },
-        "top_level_type": {"type": ["string", "null"]},
-        "event_type": {"type": ["string", "null"]},
-        "item_type": {"type": ["string", "null"]},
-        "classification": {"enum": ["known", "unknown"]},
-        "projection": {"type": "string"},
-        "unmapped_tool": {"type": "boolean"},
-        "runtime_call_correlation": {
-          "enum": [
-            "matched_model_call",
-            "runtime_tool_call",
-            "missing_registry",
-            "missing_model_call",
-            "missing_tool_start",
-            "missing_call_id",
-            "tool_name_mismatch",
-            null
-          ]
-        },
-        "tool_registry_sha256": {"type": ["string", "null"]},
-        "parent_agent_thread_id": {"type": ["string", "null"]},
-        "agent_path": {"type": ["string", "null"]},
-        "thread_source": {"type": ["object", "string", "null"]},
-        "bundle_complete": {"type": "boolean"},
-        "open_runtime_objects": {"type": "integer", "minimum": 0}
-      },
-      "additionalProperties": true
     },
     "fieldEvidence": {
       "type": "object",
@@ -625,13 +503,20 @@
       "then": {"anyOf": [{"required": ["evaluationEvidence"]}, {"required": ["evaluation_evidence"]}]}
     },
     {
-      "if": {"properties": {"recordType": {"const": "rollout_event"}}, "required": ["recordType"]},
-      "then": {"required": ["rolloutEvent"]}
-    },
-    {
       "if": {"properties": {"recordType": {"const": "telemetry_batch"}}, "required": ["recordType"]},
       "then": {"required": ["telemetryBatch"]}
     }
   ],
+  "not": {
+    "anyOf": [
+      {"required": ["producerEvent"]},
+      {"required": ["producerModel"]},
+      {"required": ["rolloutEvent"]},
+      {"required": ["rolloutMessages"]},
+      {"required": ["rolloutUsage"]},
+      {"required": ["toolRegistry"]},
+      {"required": ["toolRegistrySha256"]}
+    ]
+  },
   "additionalProperties": true
 }

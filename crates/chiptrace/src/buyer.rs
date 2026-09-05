@@ -642,6 +642,7 @@ fn validate_buyer_record(
     minimum_score: f64,
     assessment_schemas: &AssessmentSchemaValidators,
 ) -> Result<BuyerAssessment> {
+    validate_buyer_session_surface(session)?;
     let assessment: BuyerAssessment = serde_json::from_value(
         session
             .pointer("/quality/buyer_acceptance")
@@ -665,6 +666,42 @@ fn validate_buyer_record(
         bail!("buyer archive Session quality does not match its canonical content");
     }
     Ok(assessment)
+}
+
+fn validate_buyer_session_surface(session: &Value) -> Result<()> {
+    let meta = session
+        .get("meta")
+        .and_then(Value::as_object)
+        .context("buyer Session has no meta object")?;
+    for field in [
+        "active_quality_projection",
+        "code_mode_message_projection",
+        "producer_event_conflicts",
+        "producer_streams",
+        "quality_projections",
+        "rollout_events",
+        "rollout_unknown_events",
+        "rollout_unmapped_tools",
+        "rollout_usage_evidence",
+        "tool_registry_evidence",
+    ] {
+        if meta.contains_key(field) {
+            bail!("buyer Session contains internal metadata field {field}");
+        }
+    }
+    if let Some(runtime) = meta.get("runtime_dag").and_then(Value::as_object) {
+        for field in ["native_event_count", "terminal_rollout_ids"] {
+            if runtime.contains_key(field) {
+                bail!("buyer Session Runtime DAG contains historical field {field}");
+            }
+        }
+        if runtime.get("source").and_then(Value::as_str)
+            != Some("canonical_model_interaction:cloud_evidence")
+        {
+            bail!("buyer Session Runtime DAG does not use canonical cloud evidence");
+        }
+    }
+    Ok(())
 }
 
 fn write_outer_checksums(root: &Path, manifest: &BuyerPackageManifest) -> Result<()> {
@@ -761,6 +798,34 @@ mod tests {
         FileManifest, LEGACY_ASSESSMENT_SCHEMA_VERSION, RELEASE_SCHEMA_VERSION, ReleaseCounts,
     };
     use serde_json::json;
+
+    #[test]
+    fn buyer_surface_rejects_internal_collection_metadata() {
+        let base = json!({"meta":{"runtime_dag":{
+            "source":"canonical_model_interaction:cloud_evidence"
+        }}});
+        validate_buyer_session_surface(&base).unwrap();
+
+        for field in [
+            "active_quality_projection",
+            "code_mode_message_projection",
+            "producer_event_conflicts",
+            "producer_streams",
+            "quality_projections",
+            "rollout_events",
+            "rollout_unknown_events",
+            "rollout_unmapped_tools",
+            "rollout_usage_evidence",
+            "tool_registry_evidence",
+        ] {
+            let mut invalid = base.clone();
+            invalid["meta"][field] = json!({});
+            assert!(
+                validate_buyer_session_surface(&invalid).is_err(),
+                "accepted internal field {field}"
+            );
+        }
+    }
 
     #[test]
     fn new_buyer_package_rejects_legacy_v1_assessment_reports() {

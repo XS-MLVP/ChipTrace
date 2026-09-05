@@ -8,9 +8,8 @@ use crate::schema::{
     FileManifest, RAW_LINEAGE_SCHEMA_VERSION, RawSourceLineage, SESSION_SCHEMA_VERSION,
 };
 use crate::session_lineage::StockSessionLineage;
-use crate::tool_registry::{
-    canonical_runtime_tool_name, canonical_tool_registry_sha256, canonical_tool_schema_sha256,
-    tool_definition_source_complete,
+use crate::tool_schema::{
+    canonical_runtime_tool_name, canonical_tool_schema_sha256, tool_definition_source_complete,
 };
 use crate::wire_tools::{
     projected_tool_definition_key, request_tool_definitions as captured_request_tool_definitions,
@@ -30,6 +29,27 @@ use time::format_description::well_known::Rfc3339;
 use walkdir::WalkDir;
 
 pub const ASSEMBLY_SCHEMA_VERSION: &str = "chiptrace.assembly-manifest.v1";
+
+fn session_schema_validator() -> Result<jsonschema::Validator> {
+    let schema: Value =
+        serde_json::from_str(include_str!("../../../schemas/session-v1.schema.json"))?;
+    jsonschema::draft202012::new(&schema)
+        .map_err(|error| anyhow::anyhow!("compile Session JSON Schema: {error}"))
+}
+
+fn validate_session_schema(
+    validator: &jsonschema::Validator,
+    session: &Value,
+    source: &str,
+) -> Result<()> {
+    if let Err(error) = validator.validate(session) {
+        bail!(
+            "Session JSON Schema validation failed in {source} at {}: {error}",
+            error.instance_path()
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct AssembleConfig {
@@ -110,8 +130,6 @@ struct ParsedCapture {
     lifecycle_event_records: Vec<Value>,
     evaluation_evidence: Vec<Value>,
     tool_execution: Option<Value>,
-    producer_event: Option<Value>,
-    tool_registry_evidence: Option<Value>,
     final_snapshot: bool,
     messages: Vec<Value>,
     response_messages: Vec<Value>,
@@ -120,9 +138,6 @@ struct ParsedCapture {
     system_prompt_sources: Vec<Value>,
     usage: UsageObservation,
     rollout_event: Option<Value>,
-    rollout_usage: Option<Value>,
-    rollout_unknown: bool,
-    rollout_unmapped_tool: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -479,6 +494,7 @@ pub fn verify_assembly(root: &Path) -> Result<AssemblyManifest> {
     for source in &manifest.raw_sources {
         validate_raw_source(source)?;
     }
+    let session_schema = session_schema_validator()?;
     let mut sessions = 0_u64;
     let mut expected_files = HashSet::from(["manifest.json".to_owned()]);
     for part in &manifest.parts {
@@ -506,6 +522,7 @@ pub fn verify_assembly(root: &Path) -> Result<AssemblyManifest> {
                 continue;
             }
             let session: Value = serde_json::from_slice(&line)?;
+            validate_session_schema(&session_schema, &session, &part.file)?;
             if string_field(&session, "schema_version") != Some(SESSION_SCHEMA_VERSION)
                 || string_field(&session, "session_id").is_none()
             {
@@ -597,8 +614,10 @@ fn process_partition(
         sessions.push(session);
     }
     attach_task_dags(&mut sessions)?;
+    let session_schema = session_schema_validator()?;
     let mut uncompressed = 0_u64;
     for session in sessions {
+        validate_session_schema(&session_schema, &session, &relative)?;
         uncompressed = uncompressed.saturating_add(writer.write_value(&session)?);
     }
     writer.finish()?;
@@ -823,9 +842,6 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     let canonical_trace = canonical_trace_summary(&captures)?;
     let canonical_runtime_dag = canonical_trace
         .as_ref()
-        .filter(|summary| {
-            string_field(&summary.runtime_dag, "source") != Some("codex_rollout_trace_bundle")
-        })
         .map(|summary| summary.runtime_dag.clone());
     let mut parsed: Vec<ParsedCapture> = captures
         .into_iter()
@@ -840,7 +856,6 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     let first = parsed
         .first()
         .ok_or_else(|| anyhow::anyhow!("empty capture group"))?;
-    let code_mode_parent_call_ids = native_code_mode_parent_call_ids(&parsed);
     let session_identity = first.session_identity.clone();
     let identity_source = first.session_identity_source.clone();
     if parsed.iter().any(|capture| {
@@ -866,10 +881,6 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     let mut messages = Vec::new();
     let mut tools_by_identity: BTreeMap<String, Value> = BTreeMap::new();
     let mut schema_conflicts: BTreeSet<String> = BTreeSet::new();
-    let mut rollout_events = Vec::new();
-    let mut rollout_usage_evidence = Vec::new();
-    let mut rollout_unknown_events = BTreeSet::new();
-    let mut rollout_unmapped_tools = BTreeSet::new();
     let mut lifecycle = Vec::new();
     let mut lifecycle_event_records = Vec::new();
     let mut evaluation_evidence = Vec::new();
@@ -892,7 +903,6 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     let mut parent_span_ids = BTreeSet::new();
     let mut trace_ids = BTreeSet::new();
     let mut traceparents = BTreeSet::new();
-    let mut tool_registry_evidence = Vec::new();
     let mut field_evidence = Vec::new();
     let mut protocol_conflicts = Vec::new();
     let mut gateway_evidence_records = Vec::new();
@@ -928,9 +938,6 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
                 tool.clone(),
             );
         }
-        if let Some(registry) = &capture.tool_registry_evidence {
-            tool_registry_evidence.push(registry.clone());
-        }
         field_evidence.extend(capture.field_evidence.clone());
         for conflict in &capture.protocol_conflicts {
             protocol_conflicts.push(json!({
@@ -959,21 +966,6 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
             if capture.record_type == "api_snapshot" {
                 proxy_route_evidence_count = proxy_route_evidence_count.saturating_add(verified);
             }
-        }
-        if let Some(event) = &capture.rollout_event {
-            rollout_events.push(event.clone());
-            if capture.rollout_unknown {
-                rollout_unknown_events.insert(capture.capture_id.clone());
-            }
-            if capture.rollout_unmapped_tool {
-                rollout_unmapped_tools.insert(capture.capture_id.clone());
-            }
-        }
-        if let Some(rollout_usage) = &capture.rollout_usage {
-            rollout_usage_evidence.push(json!({
-                "capture_id":capture.capture_id,
-                "usage":rollout_usage,
-            }));
         }
         lifecycle.extend(capture.lifecycle_events.clone());
         lifecycle_event_records.extend(capture.lifecycle_event_records.clone());
@@ -1099,7 +1091,6 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
         system_prompt_evidence.extend(capture.system_prompt_sources.clone());
     }
     let (tool_executions, tool_execution_conflicts) = reconcile_tool_executions(&parsed);
-    let (producer_streams, producer_event_conflicts) = audit_producer_streams(&parsed);
     let (usage, usage_evidence, usage_settlement_evidence, usage_conflicts) =
         reconcile_session_usage(&parsed);
     if task_scoped_system_prompts.len() > 1 {
@@ -1246,14 +1237,9 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
         .flatten();
     let mut expanded_messages = Vec::new();
     let mut expanded_tools_by_identity = tools_by_identity.clone();
-    let wire_observed_schema_conflicts = schema_conflicts.clone();
     let mut expanded_schema_conflicts = schema_conflicts.clone();
-    let mut runtime_only_child_execution_ids = Vec::new();
     for execution in &tool_executions {
         if !runtime_execution_is_model_visible(execution) {
-            if let Some(call_id) = string_field(execution, "call_id") {
-                runtime_only_child_execution_ids.push(call_id.to_owned());
-            }
             continue;
         }
         divergences += project_tool_execution(
@@ -1268,13 +1254,9 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
     expanded_messages.extend(lifecycle_result_messages.iter().cloned());
     annotate_tool_call_statuses(&mut expanded_messages);
     let mut expanded_view = messages.clone();
-    let code_mode_message_projection =
-        preserve_code_mode_parent_messages(&expanded_view, &code_mode_parent_call_ids);
     expanded_view.extend(expanded_messages.iter().cloned());
     let (schema_conflicts, uncalled_schema_conflicts) =
         partition_schema_conflicts(&expanded_view, &expanded_schema_conflicts);
-    let (wire_schema_conflicts, wire_uncalled_schema_conflicts) =
-        partition_schema_conflicts(&messages, &wire_observed_schema_conflicts);
     let tools: Vec<Value> = tools_by_identity.into_values().collect();
     let expanded_tools: Vec<Value> = expanded_tools_by_identity.into_values().collect();
     annotate_tool_call_statuses(&mut messages);
@@ -1398,15 +1380,6 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
         "tool_execution_conflicts".to_owned(),
         json!(tool_execution_conflicts),
     );
-    meta.insert("producer_streams".to_owned(), json!(producer_streams));
-    meta.insert(
-        "producer_event_conflicts".to_owned(),
-        json!(producer_event_conflicts),
-    );
-    meta.insert(
-        "tool_registry_evidence".to_owned(),
-        json!(tool_registry_evidence),
-    );
     meta.insert("field_evidence".to_owned(), json!(field_evidence));
     meta.insert("protocol_conflicts".to_owned(), json!(protocol_conflicts));
     meta.insert(
@@ -1446,38 +1419,15 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
         json!(usage_settlement_evidence),
     );
     meta.insert("usage_conflicts".to_owned(), json!(usage_conflicts));
-    meta.insert("rollout_events".to_owned(), json!(rollout_events));
-    meta.insert(
-        "rollout_usage_evidence".to_owned(),
-        json!(rollout_usage_evidence),
-    );
-    meta.insert(
-        "rollout_unknown_events".to_owned(),
-        json!(rollout_unknown_events),
-    );
-    meta.insert(
-        "rollout_unmapped_tools".to_owned(),
-        json!(rollout_unmapped_tools),
-    );
-    meta.insert(
-        "code_mode_message_projection".to_owned(),
-        code_mode_message_projection.clone(),
-    );
     meta.insert(
         "quality_projections".to_owned(),
         json!({
-            "buyer_v7_codex_runtime_expanded": {
+            "buyer_v7": {
                 "schema_version":"chiptrace.session-quality-projection.v1",
                 "profile_version":"buyer-v7-codex-runtime-expanded",
                 "excluded_model_call_ids":explicitly_abandoned_model_call_ids,
-                "parent_model_call_ids":code_mode_parent_call_ids,
                 "runtime_messages":expanded_messages,
                 "runtime_tools":expanded_tools,
-                "runtime_only_child_execution_ids":runtime_only_child_execution_ids,
-                "lifecycle_result_evidence_count":lifecycle_result_messages.len(),
-                "code_mode_audit":code_mode_message_projection,
-                "wire_schema_conflicts":wire_schema_conflicts,
-                "wire_uncalled_schema_conflicts":wire_uncalled_schema_conflicts,
             }
         }),
     );
@@ -1644,59 +1594,6 @@ fn native_source_order(event: Option<&Value>) -> Option<(&str, u64)> {
         string_field(event, "bundle_trace_id")?,
         event.get("source_ordinal")?.as_u64()?,
     ))
-}
-
-fn native_code_mode_parent_call_ids(captures: &[ParsedCapture]) -> BTreeSet<String> {
-    captures
-        .iter()
-        .filter_map(|capture| capture.rollout_event.as_ref())
-        .filter(|event| string_field(event, "source") == Some("codex_rollout_trace_bundle"))
-        .filter_map(|event| string_field(event, "source_line"))
-        .filter_map(|source_line| serde_json::from_str::<Value>(source_line).ok())
-        .filter_map(|event| {
-            let payload = event.get("payload")?;
-            (string_field(payload, "type") == Some("code_cell_started"))
-                .then(|| string_field(payload, "model_visible_call_id"))
-                .flatten()
-                .map(str::to_owned)
-        })
-        .collect()
-}
-
-fn preserve_code_mode_parent_messages(
-    messages: &[Value],
-    parent_call_ids: &BTreeSet<String>,
-) -> Value {
-    let observed_parent_tool_calls = messages
-        .iter()
-        .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
-        .flatten()
-        .filter(|call| {
-            string_field(call, "id").is_some_and(|call_id| parent_call_ids.contains(call_id))
-        })
-        .count();
-    let observed_parent_tool_results = messages
-        .iter()
-        .filter(|message| string_field(message, "role") == Some("tool"))
-        .filter(|message| {
-            string_field(message, "tool_call_id")
-                .is_some_and(|call_id| parent_call_ids.contains(call_id))
-        })
-        .count();
-
-    json!({
-        "schema_version":"chiptrace.code-mode-message-projection.v1",
-        "evidence":"codex_rollout_trace_bundle.code_cell_started.model_visible_call_id",
-        "retained_parent_call_ids":parent_call_ids,
-        "observed_parent_tool_calls":observed_parent_tool_calls,
-        "observed_parent_tool_results":observed_parent_tool_results,
-        "excluded_parent_call_ids":[],
-        "excluded_tool_calls":0,
-        "excluded_tool_results":0,
-        "excluded_empty_messages":0,
-        "model_calls_rewritten":false,
-        "raw_runtime_events_retained":true,
-    })
 }
 
 fn partition_schema_conflicts(
@@ -2286,19 +2183,22 @@ fn build_runtime_dag(captures: &[ParsedCapture]) -> Value {
         && status_conflict_nodes.is_empty();
     json!({
         "schema_version":"chiptrace.runtime-dag.v1",
-        "source":"codex_rollout_trace_bundle",
-        "native_event_count":native_events,
+        "source":"canonical_model_interaction:cloud_evidence",
+        "evidence_event_count":native_events,
         "nodes":nodes.into_values().collect::<Vec<_>>(),
         "edges":edges.into_values().collect::<Vec<_>>(),
         "roots":roots,
-        "root_mode":if roots.len() > 1 { "task_scoped_rollout_forest" } else { "single_rollout" },
+        "root_mode":if roots.len() > 1 { "session_scoped_turn_forest" } else { "single_turn" },
         "task_session_ids":task_session_ids,
+        "session_ids":[],
         "open_node_ids":open_nodes,
         "unresolved_node_ids":unresolved,
         "status_conflict_node_ids":status_conflict_nodes,
-        "terminal_rollout_ids":terminal_rollouts,
+        "terminal_root_ids":terminal_rollouts,
         "kind_counts":kind_counts,
         "disposition_counts":disposition_counts,
+        "canonical_metrics":{},
+        "root_complete":task_binds_all_roots && terminal_rollouts == roots,
         "complete":complete,
         "applicable":native_events > 0,
     })
@@ -2652,48 +2552,13 @@ fn parse_capture(value: Value) -> Result<ParsedCapture> {
     let model = request_object
         .get("model")
         .and_then(Value::as_str)
-        .or_else(|| string_field(&value, "producerModel"))
         .map(str::to_owned);
     let response_model = response_object
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let (mut messages, mut tools, request_system_prompt, mut system_prompt_sources) =
+    let (mut messages, tools, request_system_prompt, mut system_prompt_sources) =
         parse_request(&request_object, &provider);
-    let tool_registry_evidence = if let Some(registry) = value.get("toolRegistry") {
-        for entry in registry
-            .get("tools")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if let Some(tool) = normalize_registry_tool_entry(entry) {
-                tools.push(tool);
-            }
-        }
-        Some(json!({
-            "capture_id":capture_id.clone(),
-            "sha256":value.get("toolRegistrySha256").and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| canonical_tool_registry_sha256(registry).ok()),
-            "schema_version":registry.get("schema_version"),
-            "producer":registry.get("producer"),
-            "producer_version":registry.get("producer_version"),
-            "captured_at":registry.get("captured_at"),
-            "tool_count":registry.get("tools").and_then(Value::as_array).map(Vec::len),
-        }))
-    } else {
-        None
-    };
-    messages.extend(
-        value
-            .get("rolloutMessages")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|message| message.is_object())
-            .cloned(),
-    );
     let response_system_prompt = response_object
         .get("instructions")
         .and_then(|value| content_text(Some(value)))
@@ -2707,20 +2572,7 @@ fn parse_capture(value: Value) -> Result<ParsedCapture> {
             "selected":true,
         }));
     }
-    let rollout_system_prompt = string_field(&value, "systemPrompt").map(str::to_owned);
-    if let Some(prompt) = &rollout_system_prompt {
-        system_prompt_sources.push(json!({
-            "source":"codex_rollout.session_meta.base_instructions",
-            "producer":"codex_cli",
-            "authority":"runtime_attested",
-            "content":prompt,
-            "selected":true,
-        }));
-    }
-    let system_prompt = merge_system_prompts(
-        merge_system_prompts(response_system_prompt, request_system_prompt),
-        rollout_system_prompt,
-    );
+    let system_prompt = merge_system_prompts(response_system_prompt, request_system_prompt);
     set_system_message(&mut messages, system_prompt.as_deref());
     let response_messages = parse_response_messages(&response, &provider);
     let usage = parse_usage(response_object.get("usage"));
@@ -2837,7 +2689,6 @@ fn parse_capture(value: Value) -> Result<ParsedCapture> {
         .unwrap_or("api_snapshot")
         .to_owned();
     let tool_execution = value.get("toolExecution").cloned();
-    let producer_event = value.get("producerEvent").cloned();
     let field_evidence = value
         .get("fieldEvidence")
         .and_then(Value::as_array)
@@ -2861,17 +2712,6 @@ fn parse_capture(value: Value) -> Result<ParsedCapture> {
     let gateway_evidence = value.get("gatewayEvidence").cloned();
     let gateway_evidence_join = value.get("gatewayEvidenceJoin").cloned();
     let rollout_event = value.get("rolloutEvent").cloned();
-    let rollout_usage = value.get("rolloutUsage").cloned();
-    let rollout_unknown = rollout_event
-        .as_ref()
-        .and_then(|event| event.get("classification"))
-        .and_then(Value::as_str)
-        == Some("unknown");
-    let rollout_unmapped_tool = rollout_event
-        .as_ref()
-        .and_then(|event| event.get("unmapped_tool"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     Ok(ParsedCapture {
         source_order: 0,
         capture_id,
@@ -2901,8 +2741,6 @@ fn parse_capture(value: Value) -> Result<ParsedCapture> {
         lifecycle_event_records,
         evaluation_evidence,
         tool_execution,
-        producer_event,
-        tool_registry_evidence,
         final_snapshot,
         messages,
         response_messages,
@@ -2911,9 +2749,6 @@ fn parse_capture(value: Value) -> Result<ParsedCapture> {
         system_prompt_sources,
         usage,
         rollout_event,
-        rollout_usage,
-        rollout_unknown,
-        rollout_unmapped_tool,
     })
 }
 
@@ -3492,17 +3327,6 @@ fn normalize_tool_definition(value: &Value) -> Option<Value> {
     normalize_tool_definition_with_namespace(value, None)
 }
 
-fn normalize_registry_tool_entry(entry: &Value) -> Option<Value> {
-    let mut tool = entry.get("tool")?.clone();
-    if let Some(runtime_tool) = string_field(entry, "runtime_tool") {
-        tool["runtime_tool"] = json!(runtime_tool);
-    }
-    if let Some(runtime_namespace) = string_field(entry, "runtime_namespace") {
-        tool["runtime_namespace"] = json!(runtime_namespace);
-    }
-    normalize_tool_definition(&tool)
-}
-
 fn normalize_tool_definition_with_namespace(
     value: &Value,
     inherited_namespace: Option<&str>,
@@ -3739,14 +3563,6 @@ fn reconcile_tool_executions(captures: &[ParsedCapture]) -> (Vec<Value>, Vec<Str
                     != Some("unknown")
             })
             .collect();
-        let producer_event_count = events
-            .iter()
-            .filter(|capture| capture.producer_event.is_some())
-            .count();
-        let producer_state_machine = producer_event_count > 0;
-        if producer_state_machine && producer_event_count != events.len() {
-            conflicts.insert(format!("{call_id}:mixed_producer_and_composite_evidence"));
-        }
         let mut evidence_sources: BTreeMap<String, Vec<&ParsedCapture>> = BTreeMap::new();
         for event in &events {
             evidence_sources
@@ -3789,42 +3605,6 @@ fn reconcile_tool_executions(captures: &[ParsedCapture]) -> (Vec<Value>, Vec<Str
         if terminal.is_empty() {
             conflicts.insert(format!("{call_id}:missing_terminal_event"));
         }
-        if producer_state_machine {
-            if started.len() != 1 {
-                conflicts.insert(format!("{call_id}:missing_started_event"));
-            }
-            for field in ["name", "initiator", "arguments"] {
-                if tool_event_field_variants(&events, field, false) > 1 {
-                    conflicts.insert(format!("{call_id}:field_mismatch:{field}"));
-                }
-            }
-            for field in ["parent_call_id", "schema", "started_at"] {
-                if tool_event_field_variants(&events, field, true) > 1 {
-                    conflicts.insert(format!("{call_id}:field_mismatch:{field}"));
-                }
-            }
-        }
-
-        if let (Some(start), Some(finish)) = (started.first(), terminal.first()) {
-            match (
-                producer_event_identity(start.producer_event.as_ref()),
-                producer_event_identity(finish.producer_event.as_ref()),
-            ) {
-                (
-                    Some((start_producer, start_stream, start_sequence)),
-                    Some((end_producer, end_stream, end_sequence)),
-                ) if start_producer == end_producer && start_stream == end_stream => {
-                    if end_sequence <= start_sequence {
-                        conflicts.insert(format!("{call_id}:producer_sequence_not_increasing"));
-                    }
-                }
-                (None, _) | (_, None) if producer_state_machine => {
-                    conflicts.insert(format!("{call_id}:producer_identity_incomplete"));
-                }
-                _ => {}
-            }
-        }
-
         let selected = terminal
             .iter()
             .copied()
@@ -3874,20 +3654,8 @@ fn reconcile_tool_executions(captures: &[ParsedCapture]) -> (Vec<Value>, Vec<Str
             ),
         );
         selected.insert(
-            "producer_event_ids".to_owned(),
-            json!(
-                events
-                    .iter()
-                    .filter_map(|capture| capture.producer_event.as_ref())
-                    .filter_map(|event| string_field(event, "event_id"))
-                    .collect::<Vec<_>>()
-            ),
-        );
-        selected.insert(
             "evidence_mode".to_owned(),
-            json!(if producer_state_machine {
-                "producer_state_machine"
-            } else if evidence_sources.len() > 1 {
+            json!(if evidence_sources.len() > 1 {
                 "multi_source_runtime_evidence"
             } else {
                 "composite_runtime_span"
@@ -3914,13 +3682,6 @@ fn tool_execution_status(capture: &ParsedCapture) -> Option<&str> {
 }
 
 fn tool_execution_evidence_source(capture: &ParsedCapture) -> String {
-    if let Some(event) = capture.producer_event.as_ref() {
-        return format!(
-            "producer:{}:{}",
-            string_field(event, "producer").unwrap_or("unknown"),
-            string_field(event, "stream_id").unwrap_or("unknown")
-        );
-    }
     match capture
         .tool_execution
         .as_ref()
@@ -3941,107 +3702,6 @@ fn tool_event_field_variants(events: &[&ParsedCapture], field: &str, ignore_null
         .filter_map(|value| serde_json::to_vec(value).ok())
         .collect::<BTreeSet<_>>()
         .len()
-}
-
-fn producer_event_identity(event: Option<&Value>) -> Option<(&str, &str, u64)> {
-    let event = event?;
-    Some((
-        string_field(event, "producer")?,
-        string_field(event, "stream_id")?,
-        event.get("sequence")?.as_u64()?,
-    ))
-}
-
-fn audit_producer_streams(captures: &[ParsedCapture]) -> (Vec<Value>, Vec<String>) {
-    type StreamKey = (String, String);
-    type StreamEvent = (u64, String, String, String);
-    let mut streams: BTreeMap<StreamKey, Vec<StreamEvent>> = BTreeMap::new();
-    let mut conflicts = BTreeSet::new();
-    for capture in captures {
-        let Some(event) = capture.producer_event.as_ref() else {
-            continue;
-        };
-        let Some(producer) = string_field(event, "producer") else {
-            conflicts.insert(format!("{}:producer_missing_name", capture.capture_id));
-            continue;
-        };
-        let Some(stream_id) = string_field(event, "stream_id") else {
-            conflicts.insert(format!("{}:producer_missing_stream_id", capture.capture_id));
-            continue;
-        };
-        let Some(sequence) = event.get("sequence").and_then(Value::as_u64) else {
-            conflicts.insert(format!("{}:producer_missing_sequence", capture.capture_id));
-            continue;
-        };
-        let Some(event_id) = string_field(event, "event_id") else {
-            conflicts.insert(format!("{}:producer_missing_event_id", capture.capture_id));
-            continue;
-        };
-        let Some(producer_version) = string_field(event, "producer_version") else {
-            conflicts.insert(format!("{}:producer_missing_version", capture.capture_id));
-            continue;
-        };
-        if string_field(event, "schema_version") != Some("chiptrace.producer-event.v1") {
-            conflicts.insert(format!("{}:producer_schema_version", capture.capture_id));
-        }
-        streams
-            .entry((producer.to_owned(), stream_id.to_owned()))
-            .or_default()
-            .push((
-                sequence,
-                event_id.to_owned(),
-                capture.capture_id.clone(),
-                producer_version.to_owned(),
-            ));
-    }
-
-    let mut output = Vec::with_capacity(streams.len());
-    for ((producer, stream_id), mut events) in streams {
-        events.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-        let versions: BTreeSet<&str> = events.iter().map(|event| event.3.as_str()).collect();
-        let event_ids: BTreeSet<&str> = events.iter().map(|event| event.1.as_str()).collect();
-        let mut duplicate_sequences = BTreeSet::new();
-        let mut gaps = Vec::new();
-        for pair in events.windows(2) {
-            if pair[0].0 == pair[1].0 {
-                duplicate_sequences.insert(pair[0].0);
-            } else if pair[1].0 > pair[0].0.saturating_add(1) {
-                gaps.push(json!({
-                    "after":pair[0].0,
-                    "before":pair[1].0,
-                    "missing":pair[1].0.saturating_sub(pair[0].0).saturating_sub(1),
-                }));
-            }
-        }
-        let duplicate_event_ids = event_ids.len() != events.len();
-        if versions.len() != 1 {
-            conflicts.insert(format!("{producer}:{stream_id}:producer_version_changed"));
-        }
-        if !duplicate_sequences.is_empty() {
-            conflicts.insert(format!("{producer}:{stream_id}:duplicate_sequence"));
-        }
-        if !gaps.is_empty() {
-            conflicts.insert(format!("{producer}:{stream_id}:sequence_gap"));
-        }
-        if duplicate_event_ids {
-            conflicts.insert(format!("{producer}:{stream_id}:duplicate_event_id"));
-        }
-        let contiguous = duplicate_sequences.is_empty() && !duplicate_event_ids && gaps.is_empty();
-        output.push(json!({
-            "producer":producer,
-            "stream_id":stream_id,
-            "producer_versions":versions,
-            "first_sequence":events.first().map(|event| event.0),
-            "last_sequence":events.last().map(|event| event.0),
-            "event_count":events.len(),
-            "capture_ids":events.iter().map(|event| event.2.as_str()).collect::<Vec<_>>(),
-            "duplicate_sequences":duplicate_sequences,
-            "duplicate_event_ids":duplicate_event_ids,
-            "gaps":gaps,
-            "contiguous":contiguous,
-        }));
-    }
-    (output, conflicts.into_iter().collect())
 }
 
 fn project_tool_execution(
@@ -5978,7 +5638,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_terminal_rollouts_form_a_complete_task_scoped_runtime_forest() {
+    fn historical_runtime_roots_use_the_canonical_session_forest_shape() {
         let captures = vec![
             retarget_native_runtime_capture(
                 native_runtime_capture(1, json!({"type":"rollout_started"}), None, None, None),
@@ -6017,7 +5677,7 @@ mod tests {
         assert_eq!(session["meta"]["runtime_dag"]["complete"], true);
         assert_eq!(
             session["meta"]["runtime_dag"]["root_mode"],
-            "task_scoped_rollout_forest"
+            "session_scoped_turn_forest"
         );
         assert_eq!(
             session["meta"]["runtime_dag"]["task_session_ids"],
@@ -6574,134 +6234,6 @@ mod tests {
     }
 
     #[test]
-    fn code_mode_parent_call_is_excluded_only_with_native_cell_evidence() {
-        let api = json!({
-            "recordType":"api_snapshot",
-            "captureId":"cap-code-mode-api",
-            "sourceNamespace":"fixture",
-            "receivedAt":"2026-08-29T00:00:00Z",
-            "traceContext":{"task_session_id":"task-native"},
-            "requestBody":{"kind":"json","value":{
-                "model":"gpt-5.6-sol",
-                "instructions":"system",
-                "input":[
-                    {"type":"message","id":"user-1","role":"user","content":"run checks"},
-                    {"type":"custom_tool_call","id":"outer-item","call_id":"outer-exec","name":"exec","input":"tools.exec_command({cmd:'true'})"},
-                    {"type":"custom_tool_call_output","id":"outer-result-1","call_id":"outer-exec","output":"first notification"},
-                    {"type":"custom_tool_call_output","id":"outer-result-2","call_id":"outer-exec","output":"second notification"}
-                ]
-            }},
-            "responseBody":{"kind":"json","value":{
-                "id":"response-code-mode",
-                "model":"gpt-5.6-sol",
-                "status":"completed",
-                "output":[
-                    {"type":"custom_tool_call","id":"outer-item","call_id":"outer-exec","name":"exec","input":"tools.exec_command({cmd:'true'})"}
-                ]
-            }}
-        });
-        let cell = native_runtime_capture(
-            1,
-            json!({
-                "type":"code_cell_started",
-                "runtime_cell_id":"cell-1",
-                "model_visible_call_id":"outer-exec"
-            }),
-            Some("root"),
-            Some("turn-1"),
-            None,
-        );
-        let inner = json!({
-            "recordType":"tool_execution",
-            "captureId":"cap-code-mode-inner",
-            "sourceNamespace":"fixture",
-            "receivedAt":"2026-08-29T00:00:01Z",
-            "traceContext":{"task_session_id":"task-native"},
-            "toolExecution":{
-                "call_id":"inner-call",
-                "parent_call_id":"outer-exec",
-                "name":"exec_command",
-                "initiator":"assistant",
-                "status":"success",
-                "arguments":{"cmd":"true"},
-                "result":{"exit_code":0},
-                "schema":{
-                    "name":"exec_command",
-                    "description":"Run a command.",
-                    "parameters":{
-                        "type":"object",
-                        "properties":{"cmd":{"type":"string","description":"Command."}},
-                        "required":["cmd"]
-                    }
-                }
-            }
-        });
-
-        let (session, _, _) = assemble_group(vec![api, cell, inner]).unwrap();
-        let messages = session["messages"].as_array().unwrap();
-        let calls: Vec<&Value> = messages
-            .iter()
-            .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
-            .flatten()
-            .collect();
-        assert_eq!(calls.len(), 2);
-        assert!(calls.iter().all(|call| call["id"] == "outer-exec"));
-        let results: Vec<&Value> = messages
-            .iter()
-            .filter(|message| message["role"] == "tool")
-            .collect();
-        assert_eq!(results.len(), 2);
-        assert!(
-            results
-                .iter()
-                .all(|result| result["tool_call_id"] == "outer-exec")
-        );
-        let expanded =
-            crate::score::materialize_profile_session(&session, crate::score::Profile::BuyerV7);
-        let expanded_calls: Vec<&Value> = expanded["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
-            .flatten()
-            .collect();
-        assert_eq!(expanded_calls.len(), 2);
-        assert!(expanded_calls.iter().all(|call| call["id"] == "outer-exec"));
-        let expanded_results: Vec<&Value> = expanded["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|message| message["role"] == "tool")
-            .collect();
-        assert_eq!(expanded_results.len(), 2);
-        assert!(
-            expanded_results
-                .iter()
-                .all(|result| result["tool_call_id"] == "outer-exec")
-        );
-        assert_eq!(
-            session["meta"]["quality_projections"]["buyer_v7_codex_runtime_expanded"]["runtime_only_child_execution_ids"],
-            json!(["inner-call"])
-        );
-        assert_eq!(
-            session["meta"]["code_mode_message_projection"]["retained_parent_call_ids"],
-            json!(["outer-exec"])
-        );
-        assert_eq!(
-            session["meta"]["code_mode_message_projection"]["excluded_tool_calls"],
-            0
-        );
-        assert_eq!(
-            session["meta"]["code_mode_message_projection"]["excluded_tool_results"],
-            0
-        );
-        assert_eq!(
-            session["meta"]["runtime_dag"]["kind_counts"]["code_cell"],
-            1
-        );
-    }
-
-    #[test]
     fn subagent_started_is_exact_status_evidence_for_the_spawn_result() {
         let messages = vec![
             json!({
@@ -6732,30 +6264,6 @@ mod tests {
             })],
         );
         assert!(unmatched.is_empty());
-    }
-
-    #[test]
-    fn custom_tool_call_is_not_filtered_without_native_cell_evidence() {
-        let messages = vec![
-            json!({
-                "role":"assistant",
-                "content":"",
-                "tool_calls":[{
-                    "id":"custom-call",
-                    "type":"function",
-                    "function":{"name":"exec","arguments":"{}"}
-                }]
-            }),
-            json!({
-                "role":"tool",
-                "tool_call_id":"custom-call",
-                "content":"observed output"
-            }),
-        ];
-        let audit = preserve_code_mode_parent_messages(&messages, &BTreeSet::new());
-        assert_eq!(messages.len(), 2);
-        assert_eq!(audit["excluded_tool_calls"], 0);
-        assert_eq!(audit["excluded_tool_results"], 0);
     }
 
     #[test]
@@ -7128,34 +6636,6 @@ mod tests {
                 .unwrap()
                 .len()
                 >= 2
-        );
-    }
-
-    #[test]
-    fn task_scoped_prompt_changes_remain_visible_as_conflicts() {
-        let mut first = multi_source_usage_capture(
-            "cap-task-prompt-first",
-            "api_snapshot",
-            "request-task-prompt-first",
-            "response-task-prompt-first",
-            100,
-        );
-        let mut second = multi_source_usage_capture(
-            "cap-task-prompt-second",
-            "api_snapshot",
-            "request-task-prompt-second",
-            "response-task-prompt-second",
-            100,
-        );
-        first["systemPrompt"] = json!("task prompt one");
-        second["systemPrompt"] = json!("task prompt two");
-        let (session, _, _) = assemble_group(vec![first, second]).unwrap();
-        assert!(
-            session["meta"]["system_prompt_conflicts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == "across_task_scoped_captures")
         );
     }
 
@@ -7630,88 +7110,6 @@ mod tests {
     }
 
     #[test]
-    fn producer_tool_state_and_stream_sequences_are_audited() {
-        let producer = |event_id: &str, sequence: u64| {
-            json!({
-                "schema_version":"chiptrace.producer-event.v1",
-                "event_id":event_id,
-                "producer":"tool-dispatcher",
-                "producer_version":"1.2.3",
-                "identity_scheme":"chiptrace.deterministic-capture.v1",
-                "stream_id":"dispatcher-task-a",
-                "sequence":sequence,
-            })
-        };
-        let schema = json!({
-            "name":"run_tests","description":"Run workspace tests.","parameters":{
-                "type":"object","properties":{
-                    "target":{"type":"string","description":"Workspace target."}
-                },"required":["target"]
-            }
-        });
-        let start = json!({
-            "recordType":"tool_execution","captureId":"cap-audit-start","sourceNamespace":"fixture",
-            "traceContext":{"task_session_id":"task-audit"},
-            "producerEvent":producer("call-1-start", 10),
-            "toolExecution":{
-                "call_id":"call-1","name":"run_tests","initiator":"assistant","status":"started",
-                "arguments":{"target":"workspace"},"schema":schema,
-                "started_at":"2026-08-29T00:00:00Z"
-            }
-        });
-        let finish = json!({
-            "recordType":"tool_execution","captureId":"cap-audit-finish","sourceNamespace":"fixture",
-            "traceContext":{"task_session_id":"task-audit"},
-            "producerEvent":producer("call-1-finish", 11),
-            "toolExecution":{
-                "call_id":"call-1","name":"run_tests","initiator":"assistant","status":"success",
-                "arguments":{"target":"workspace"},"schema":schema,
-                "started_at":"2026-08-29T00:00:00Z","finished_at":"2026-08-29T00:00:01Z",
-                "result":"passed"
-            }
-        });
-        let (session, _, divergence) = assemble_group(vec![start.clone(), finish.clone()]).unwrap();
-        assert_eq!(divergence, 0);
-        assert!(
-            session["meta"]["tool_execution_conflicts"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            session["meta"]["producer_event_conflicts"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(session["meta"]["tool_executions"][0]["state"], "closed");
-        assert_eq!(
-            session["meta"]["tool_executions"][0]["evidence_mode"],
-            "producer_state_machine"
-        );
-        assert_eq!(session["meta"]["producer_streams"][0]["contiguous"], true);
-
-        let mut invalid_finish = finish;
-        invalid_finish["producerEvent"]["sequence"] = json!(12);
-        invalid_finish["toolExecution"]["arguments"] = json!({"target":"other"});
-        let (invalid, _, _) = assemble_group(vec![start, invalid_finish]).unwrap();
-        assert!(
-            invalid["meta"]["producer_event_conflicts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|conflict| conflict.as_str().unwrap().ends_with(":sequence_gap"))
-        );
-        assert!(
-            invalid["meta"]["tool_execution_conflicts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|conflict| conflict == "call-1:field_mismatch:arguments")
-        );
-    }
-
-    #[test]
     fn stock_hook_and_otlp_tool_evidence_merge_without_fabricated_conflicts() {
         let trace = json!({
             "session_id":"session-cloud","root_turn_id":"turn-cloud",
@@ -7807,52 +7205,6 @@ mod tests {
                 .unwrap()
                 .len(),
             2
-        );
-    }
-
-    #[test]
-    fn task_registry_snapshot_supplies_versioned_tool_definitions() {
-        let registry = json!({
-            "recordType":"lifecycle_event","captureId":"cap-registry","sourceNamespace":"fixture",
-            "receivedAt":"2026-08-28T00:00:00Z",
-            "traceContext":{"task_session_id":"task-registry","root_session_id":"task-registry"},
-            "lifecycleEvent":{"event_id":"start","type":"task_start","status":"started",
-                "occurred_at":"2026-08-28T00:00:00Z"},
-            "toolRegistry":{
-                "schema_version":"chiptrace.tool-registry.v1","producer":"codex-cli",
-                "producer_version":"0.150.0-alpha.9","captured_at":"2026-08-28T00:00:00Z",
-                "tools":[{"runtime_item_type":"CommandExecution","tool":{
-                    "name":"exec_command","description":"Execute a command.",
-                    "parameters":{"type":"object","properties":{
-                        "cmd":{"type":"string","description":"Command to execute."}
-                    },"required":["cmd"]}
-                }}]
-            }
-        });
-        let api = json!({
-            "recordType":"api_snapshot","captureId":"cap-registry-api","sourceNamespace":"fixture",
-            "startedAt":"2026-08-28T00:00:01Z",
-            "traceContext":{"task_session_id":"task-registry","root_session_id":"task-registry"},
-            "requestBody":{"kind":"json","value":{"model":"gpt-5.6-sol","instructions":"system",
-                "input":[{"type":"message","role":"user","content":"run command"}]}},
-            "responseBody":{"kind":"json","value":{"id":"response-registry","model":"gpt-5.6-sol",
-                "status":"completed","output":[{"type":"function_call","call_id":"call-registry",
-                    "name":"exec_command","arguments":"{\"cmd\":\"true\"}"}]}}
-        });
-        let (session, _, _) = assemble_group(vec![registry, api]).unwrap();
-        assert_eq!(session["tools"][0]["name"], "exec_command");
-        assert_eq!(
-            session["meta"]["tool_registry_evidence"][0]["producer_version"],
-            "0.150.0-alpha.9"
-        );
-        assert_eq!(
-            session["meta"]["tool_registry_evidence"][0]["tool_count"],
-            1
-        );
-        assert!(
-            session["meta"]["tool_registry_evidence"][0]["sha256"]
-                .as_str()
-                .is_some_and(|digest| digest.len() == 64)
         );
     }
 

@@ -104,17 +104,20 @@ pub struct AcceptanceMetrics {
     pub assembly_usage_conflicts: u64,
     #[serde(default)]
     pub assembly_tool_execution_conflicts: u64,
-    #[serde(default)]
-    pub assembly_producer_event_conflicts: u64,
-    pub rollout_unknown_events: u64,
-    pub rollout_unmapped_tools: u64,
+    #[serde(default, alias = "assembly_producer_event_conflicts")]
+    pub assembly_runtime_evidence_conflicts: u64,
+    #[serde(default, alias = "rollout_unknown_events")]
+    pub runtime_unknown_events: u64,
+    #[serde(default, alias = "rollout_unmapped_tools")]
+    pub runtime_unmapped_tools: u64,
     pub response_dag_cycle: bool,
     pub response_dag_unresolved_parents: u64,
     pub capture_dag_present: bool,
     pub runtime_dag_present: bool,
     pub runtime_dag_applicable: bool,
     pub runtime_dag_complete: bool,
-    pub runtime_dag_native_events: u64,
+    #[serde(default, alias = "runtime_dag_native_events")]
+    pub runtime_dag_evidence_events: u64,
     pub runtime_dag_open_nodes: u64,
     pub runtime_dag_unresolved_nodes: u64,
     #[serde(default)]
@@ -360,24 +363,6 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    struct LocalSchemaRetriever {
-        tool_registry: Value,
-    }
-
-    impl jsonschema::Retrieve for LocalSchemaRetriever {
-        fn retrieve(
-            &self,
-            uri: &jsonschema::Uri<String>,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-            if uri.as_str()
-                == "https://github.com/XS-MLVP/ChipTrace/schemas/tool-registry-v1.schema.json"
-            {
-                return Ok(self.tool_registry.clone());
-            }
-            Err(format!("unexpected schema URI: {uri}").into())
-        }
-    }
-
     #[test]
     fn public_json_schemas_are_valid_json_documents() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas");
@@ -400,7 +385,6 @@ mod tests {
             "raw-checkpoint-v1.schema.json",
             "raw-lineage-v1.schema.json",
             "session-v1.schema.json",
-            "tool-registry-v1.schema.json",
             "runtime-span-v1.schema.json",
         ];
         for name in expected {
@@ -429,13 +413,7 @@ mod tests {
         let schema: Value =
             serde_json::from_slice(&fs::read(root.join("capture-v2.schema.json")).unwrap())
                 .unwrap();
-        let tool_registry: Value =
-            serde_json::from_slice(&fs::read(root.join("tool-registry-v1.schema.json")).unwrap())
-                .unwrap();
-        let validator = jsonschema::options()
-            .with_retriever(LocalSchemaRetriever { tool_registry })
-            .build(&schema)
-            .unwrap();
+        let validator = jsonschema::draft202012::new(&schema).unwrap();
         let record = |trace_context: Value| {
             serde_json::json!({
                 "version":"chiptrace.capture.v2",
@@ -450,20 +428,36 @@ mod tests {
         assert!(validator.is_valid(&record(serde_json::json!({"session_id":"session-1"}))));
         assert!(validator.is_valid(&record(serde_json::json!({"thread_id":"thread-1"}))));
         assert!(!validator.is_valid(&record(serde_json::json!({}))));
+        for field in [
+            "producerEvent",
+            "producerModel",
+            "rolloutEvent",
+            "rolloutMessages",
+            "rolloutUsage",
+            "toolRegistry",
+            "toolRegistrySha256",
+        ] {
+            let mut invalid = record(serde_json::json!({"session_id":"session-1"}));
+            invalid[field] = Value::Null;
+            assert!(
+                !validator.is_valid(&invalid),
+                "accepted legacy field {field}"
+            );
+        }
     }
 
     #[test]
-    fn session_v1_runtime_contract_uses_canonical_summary_for_stock_rollout() {
+    fn session_v1_runtime_contract_uses_cloud_evidence_summary() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas");
         let schema: Value =
             serde_json::from_slice(&fs::read(root.join("session-v1.schema.json")).unwrap())
                 .unwrap();
         let runtime_schema = schema.pointer("/$defs/runtimeDag").unwrap();
         let validator = jsonschema::draft202012::new(runtime_schema).unwrap();
-        let stock = serde_json::json!({
+        let runtime = serde_json::json!({
             "schema_version":"chiptrace.runtime-dag.v1",
-            "source":"canonical_model_interaction:codex_rollout_jsonl",
-            "native_event_count":12,
+            "source":"canonical_model_interaction:cloud_evidence",
+            "evidence_event_count":12,
             "roots":["root-1"],
             "root_mode":"single_turn",
             "task_session_ids":[],
@@ -471,13 +465,13 @@ mod tests {
             "open_node_ids":[],
             "unresolved_node_ids":[],
             "status_conflict_node_ids":[],
-            "terminal_rollout_ids":["root-1"],
+            "terminal_root_ids":["root-1"],
             "canonical_metrics":{},
             "root_complete":true,
             "complete":true,
             "applicable":true
         });
-        assert!(validator.is_valid(&stock));
+        assert!(validator.is_valid(&runtime));
 
         let legacy_without_graph = serde_json::json!({
             "schema_version":"chiptrace.runtime-dag.v1",

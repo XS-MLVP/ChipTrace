@@ -165,7 +165,7 @@
               "node_id": {"type": "string"},
               "capture_id": {"type": "string"},
               "record_type": {
-                "enum": ["api_snapshot", "lifecycle_event", "tool_execution", "evaluation", "rollout_event"]
+                "enum": ["api_snapshot", "lifecycle_event", "tool_execution", "evaluation", "telemetry_batch"]
               },
               "response_id": {"type": ["string", "null"]},
               "previous_response_id": {"type": ["string", "null"]},
@@ -196,92 +196,33 @@
       "required": [
         "schema_version",
         "source",
-        "native_event_count",
+        "evidence_event_count",
         "roots",
         "open_node_ids",
         "unresolved_node_ids",
         "status_conflict_node_ids",
-        "terminal_rollout_ids",
+        "terminal_root_ids",
         "complete",
         "applicable"
       ],
       "properties": {
         "schema_version": {"const": "chiptrace.runtime-dag.v1"},
-        "source": {
-          "enum": [
-            "codex_rollout_trace_bundle",
-            "canonical_model_interaction:codex_rollout_jsonl"
-          ]
-        },
-        "native_event_count": {"type": "integer", "minimum": 0},
-        "nodes": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["node_id", "node_type", "source_id", "trace_id", "status", "disposition"],
-            "properties": {
-              "node_id": {"type": "string", "minLength": 1},
-              "node_type": {
-                "enum": ["rollout", "thread", "turn", "inference", "code_cell", "tool", "compaction"]
-              },
-              "source_id": {"type": "string", "minLength": 1},
-              "trace_id": {"type": "string", "minLength": 1},
-              "status": {
-                "enum": ["running", "completed", "failed", "cancelled", "aborted", "terminated", "timeout", "incomplete"]
-              },
-              "disposition": {"enum": ["executed", "retry", "abandoned", "open_tail"]},
-              "started_seq": {"type": "integer", "minimum": 0},
-              "ended_seq": {"type": "integer", "minimum": 0}
-            },
-            "additionalProperties": true
-          }
-        },
-        "edges": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["from", "to", "kind"],
-            "properties": {
-              "from": {"type": "string", "minLength": 1},
-              "to": {"type": "string", "minLength": 1},
-              "kind": {"type": "string", "minLength": 1}
-            },
-            "additionalProperties": true
-          }
-        },
+        "source": {"const": "canonical_model_interaction:cloud_evidence"},
+        "evidence_event_count": {"type": "integer", "minimum": 0},
         "roots": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
-        "root_mode": {
-          "enum": ["single_rollout", "task_scoped_rollout_forest", "single_turn", "session_scoped_turn_forest"]
-        },
+        "root_mode": {"enum": ["single_turn", "session_scoped_turn_forest"]},
         "task_session_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
         "session_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
         "open_node_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
         "unresolved_node_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
         "status_conflict_node_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
-        "terminal_rollout_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
-        "kind_counts": {"type": "object"},
-        "disposition_counts": {"type": "object"},
+        "terminal_root_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
         "canonical_metrics": {"type": "object"},
         "root_complete": {"type": "boolean"},
         "complete": {"type": "boolean"},
         "applicable": {"type": "boolean"}
       },
-      "allOf": [
-        {
-          "if": {"properties": {"source": {"const": "codex_rollout_trace_bundle"}}},
-          "then": {
-            "required": ["nodes", "edges", "kind_counts", "disposition_counts"]
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "source": {"const": "canonical_model_interaction:codex_rollout_jsonl"}
-            }
-          },
-          "then": {"required": ["canonical_metrics", "root_complete"]}
-        }
-      ],
+      "allOf": [{"required": ["canonical_metrics", "root_complete"]}],
       "additionalProperties": true
     },
     "inferenceApiConservation": {
@@ -371,18 +312,12 @@
         "lifecycle_events",
         "tool_executions",
         "tool_execution_conflicts",
-        "producer_streams",
-        "producer_event_conflicts",
         "evaluation_evidence",
         "schema_conflicts",
         "trace_conflicts",
         "usage_evidence",
         "usage_settlement_evidence",
         "usage_conflicts",
-        "rollout_events",
-        "rollout_usage_evidence",
-        "rollout_unknown_events",
-        "rollout_unmapped_tools",
         "merge_divergences",
         "model_evidence",
         "trace"
@@ -490,48 +425,6 @@
         "previous_response_ids": {"type": "array", "items": {"type": "string"}},
         "tool_executions": {"type": "array", "items": {"type": "object"}},
         "tool_execution_conflicts": {"type": "array", "items": {"type": "string"}},
-        "producer_streams": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": [
-              "producer",
-              "stream_id",
-              "first_sequence",
-              "last_sequence",
-              "event_count",
-              "capture_ids",
-              "duplicate_sequences",
-              "duplicate_event_ids",
-              "gaps",
-              "contiguous"
-            ],
-            "properties": {
-              "producer": {"type": "string", "minLength": 1},
-              "stream_id": {"type": "string", "minLength": 1},
-              "producer_versions": {
-                "type": "array",
-                "items": {"type": "string"},
-                "uniqueItems": true
-              },
-              "first_sequence": {"type": "integer", "minimum": 0},
-              "last_sequence": {"type": "integer", "minimum": 0},
-              "event_count": {"type": "integer", "minimum": 1},
-              "capture_ids": {"type": "array", "items": {"type": "string"}},
-              "duplicate_sequences": {
-                "type": "array",
-                "items": {"type": "integer", "minimum": 0},
-                "uniqueItems": true
-              },
-              "duplicate_event_ids": {"type": "boolean"},
-              "gaps": {"type": "array", "items": {"type": "object"}},
-              "contiguous": {"type": "boolean"}
-            },
-            "additionalProperties": true
-          }
-        },
-        "producer_event_conflicts": {"type": "array", "items": {"type": "string"}},
-        "tool_registry_evidence": {"type": "array", "items": {"type": "object"}},
         "field_evidence": {"type": "array", "items": {"type": "object"}},
         "protocol_conflicts": {"type": "array", "items": {"type": "object"}},
         "system_prompt_evidence": {"type": "array", "items": {"type": "object"}},
@@ -545,54 +438,24 @@
         "usage_evidence": {"type": "array", "items": {"type": "object"}},
         "usage_settlement_evidence": {"type": "array", "items": {"type": "object"}},
         "usage_conflicts": {"type": "array", "items": {"type": "string"}},
-        "rollout_events": {"type": "array", "items": {"type": "object"}},
-        "rollout_usage_evidence": {"type": "array", "items": {"type": "object"}},
-        "rollout_unknown_events": {"type": "array", "items": {"type": "string"}},
-        "rollout_unmapped_tools": {"type": "array", "items": {"type": "string"}},
-        "code_mode_message_projection": {
-          "type": "object",
-          "required": [
-            "schema_version",
-            "evidence",
-            "excluded_parent_call_ids",
-            "excluded_tool_calls",
-            "excluded_tool_results",
-            "excluded_empty_messages",
-            "raw_runtime_events_retained"
-          ],
-          "properties": {
-            "schema_version": {"const": "chiptrace.code-mode-message-projection.v1"},
-            "evidence": {"const": "codex_rollout_trace_bundle.code_cell_started.model_visible_call_id"},
-            "excluded_parent_call_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
-            "excluded_tool_calls": {"type": "integer", "minimum": 0},
-            "excluded_tool_results": {"type": "integer", "minimum": 0},
-            "excluded_empty_messages": {"type": "integer", "minimum": 0},
-            "raw_runtime_events_retained": {"const": true}
-          },
-          "additionalProperties": false
-        },
         "quality_projections": {
           "type": "object",
           "properties": {
-            "buyer_v7_codex_runtime_expanded": {
+            "buyer_v7": {
               "type": "object",
               "required": [
                 "schema_version",
                 "profile_version",
                 "excluded_model_call_ids",
                 "runtime_messages",
-                "runtime_tools",
-                "code_mode_audit"
+                "runtime_tools"
               ],
               "properties": {
                 "schema_version": {"const": "chiptrace.session-quality-projection.v1"},
                 "profile_version": {"const": "buyer-v7-codex-runtime-expanded"},
                 "excluded_model_call_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
                 "runtime_messages": {"type": "array", "items": {"$ref": "#/$defs/message"}},
-                "runtime_tools": {"type": "array", "items": {"$ref": "#/$defs/toolDefinition"}},
-                "code_mode_audit": {"type": "object"},
-                "wire_schema_conflicts": {"type": "array", "items": {"type": "string"}},
-                "wire_uncalled_schema_conflicts": {"type": "array", "items": {"type": "string"}}
+                "runtime_tools": {"type": "array", "items": {"$ref": "#/$defs/toolDefinition"}}
               },
               "additionalProperties": false
             }
@@ -638,6 +501,18 @@
           "additionalProperties": true
         },
         "trace": {"type": "object"}
+      },
+      "not": {
+        "anyOf": [
+          {"required": ["code_mode_message_projection"]},
+          {"required": ["producer_event_conflicts"]},
+          {"required": ["producer_streams"]},
+          {"required": ["rollout_events"]},
+          {"required": ["rollout_unknown_events"]},
+          {"required": ["rollout_unmapped_tools"]},
+          {"required": ["rollout_usage_evidence"]},
+          {"required": ["tool_registry_evidence"]}
+        ]
       },
       "additionalProperties": true
     }

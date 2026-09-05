@@ -1,4 +1,4 @@
-use crate::tool_registry::canonical_runtime_tool_name;
+use crate::tool_schema::canonical_runtime_tool_name;
 use serde_json::Value;
 
 /// One tool definition exactly as observed on the OpenAI-compatible wire,

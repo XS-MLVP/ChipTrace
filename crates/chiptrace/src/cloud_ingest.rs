@@ -1,5 +1,5 @@
 use crate::capture::{CaptureRecord, normalize_capture};
-use crate::tool_registry::canonical_runtime_tool_name;
+use crate::tool_schema::canonical_runtime_tool_name;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};

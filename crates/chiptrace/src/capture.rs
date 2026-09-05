@@ -1,6 +1,4 @@
-use crate::tool_registry::{
-    canonical_runtime_tool_name, canonical_tool_registry_sha256, validate_tool_registry_value,
-};
+use crate::tool_schema::canonical_runtime_tool_name;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde_json::{Map, Value, json};
@@ -170,7 +168,6 @@ pub(crate) fn normalize_capture_with_policy(
     }
     validate_lifecycle_event(object)?;
     validate_tool_execution(object)?;
-    validate_tool_registry_snapshot(object)?;
     validate_evaluation_evidence(object)?;
     validate_rollout_event(object)?;
     validate_telemetry_batch(object)?;
@@ -1495,23 +1492,6 @@ fn validate_tool_execution_result(execution: &Map<String, Value>, status: &str) 
         && execution.get("error").is_none_or(Value::is_null)
     {
         bail!("failed toolExecution requires result or error");
-    }
-    Ok(())
-}
-
-fn validate_tool_registry_snapshot(object: &Map<String, Value>) -> Result<()> {
-    let Some(registry) = object.get("toolRegistry") else {
-        return Ok(());
-    };
-    validate_tool_registry_value(registry)?;
-    let digest = canonical_tool_registry_sha256(registry)?;
-    if let Some(observed) = object.get("toolRegistrySha256") {
-        let observed = observed
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("toolRegistrySha256 must be a string"))?;
-        if observed != digest {
-            bail!("toolRegistrySha256 does not match toolRegistry");
-        }
     }
     Ok(())
 }
