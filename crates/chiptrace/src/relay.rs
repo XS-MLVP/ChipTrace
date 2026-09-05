@@ -37,6 +37,7 @@ const INFLIGHT_DELIVERIES: TableDefinition<&str, &[u8]> =
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const DELIVERY_SCHEMA_VERSION: &str = "chiptrace.delivery-ledger.v1";
 const DELIVERY_COUNTERS_KEY: &str = "delivery_counters_v1";
+const INGEST_COVERAGE_FRESHNESS_WINDOW_MS: u64 = 5 * 60 * 1_000;
 
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
@@ -1190,6 +1191,8 @@ struct RouteCoverage {
     durable_captures: u64,
     duplicates: u64,
     last_at: Option<String>,
+    first_observed_millis: Option<u64>,
+    last_observed_millis: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1222,10 +1225,15 @@ impl IngestCoverageState {
         if durable == 0 {
             return;
         }
+        let observed_millis = unix_millis();
         self.wire.requests = self.wire.requests.saturating_add(1);
         self.wire.source_records = self.wire.source_records.saturating_add(durable);
         self.wire.durable_captures = self.wire.durable_captures.saturating_add(durable);
         self.wire.duplicates = self.wire.duplicates.saturating_add(duplicates);
+        self.wire
+            .first_observed_millis
+            .get_or_insert(observed_millis);
+        self.wire.last_observed_millis = Some(observed_millis);
         self.wire.last_at = Some(utc_now());
     }
 
@@ -1247,6 +1255,9 @@ impl IngestCoverageState {
         route.source_records = route.source_records.saturating_add(summary.source_records);
         route.durable_captures = route.durable_captures.saturating_add(durable_captures);
         route.duplicates = route.duplicates.saturating_add(duplicates);
+        let observed_millis = unix_millis();
+        route.first_observed_millis.get_or_insert(observed_millis);
+        route.last_observed_millis = Some(observed_millis);
         route.last_at = Some(utc_now());
         self.lifecycle_events = self.lifecycle_events.saturating_add(lifecycle_events);
         self.tool_executions = self.tool_executions.saturating_add(tool_executions);
@@ -1257,6 +1268,10 @@ impl IngestCoverageState {
     }
 
     fn snapshot(&self) -> Value {
+        self.snapshot_at(unix_millis())
+    }
+
+    fn snapshot_at(&self, now_millis: u64) -> Value {
         let sources_observed = self.wire.requests > 0
             && self.otlp_logs.requests > 0
             && self.otlp_traces.requests > 0
@@ -1265,7 +1280,45 @@ impl IngestCoverageState {
             || self.otlp_logs.requests > 0
             || self.otlp_traces.requests > 0
             || self.hooks.requests > 0;
-        let status = if sources_observed {
+        let wire_age_ms = self
+            .wire
+            .last_observed_millis
+            .map(|last| now_millis.saturating_sub(last));
+        let wire_active = wire_age_ms.is_some_and(|age| age <= INGEST_COVERAGE_FRESHNESS_WINDOW_MS);
+        let wire_observed_long_enough = self.wire.first_observed_millis.is_some_and(|first| {
+            now_millis.saturating_sub(first) > INGEST_COVERAGE_FRESHNESS_WINDOW_MS
+        });
+        let required_routes = [
+            ("otlp_logs", &self.otlp_logs),
+            ("otlp_traces", &self.otlp_traces),
+            ("hooks", &self.hooks),
+        ];
+        let missing_sources: Vec<&str> = required_routes
+            .iter()
+            .filter_map(|(name, route)| (route.requests == 0).then_some(*name))
+            .collect();
+        let stale_sources: Vec<&str> = self
+            .wire
+            .last_observed_millis
+            .map(|wire_last| {
+                required_routes
+                    .iter()
+                    .filter_map(|(name, route)| {
+                        route.last_observed_millis.and_then(|last| {
+                            (wire_last.saturating_sub(last) > INGEST_COVERAGE_FRESHNESS_WINDOW_MS)
+                                .then_some(*name)
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let required_sources_fresh = sources_observed && (!wire_active || stale_sources.is_empty());
+        let degraded = wire_active
+            && (!stale_sources.is_empty()
+                || (wire_observed_long_enough && !missing_sources.is_empty()));
+        let status = if degraded {
+            "degraded"
+        } else if sources_observed && required_sources_fresh {
             "complete"
         } else if any_observed {
             "partial"
@@ -1277,6 +1330,17 @@ impl IngestCoverageState {
             "started_at":self.started_at,
             "status":status,
             "required_sources_observed":sources_observed,
+            "required_sources_fresh":required_sources_fresh,
+            "freshness_applicable":wire_active,
+            "freshness_window_ms":INGEST_COVERAGE_FRESHNESS_WINDOW_MS,
+            "wire_age_ms":wire_age_ms,
+            "missing_sources":missing_sources,
+            "stale_sources":stale_sources,
+            "source_lag_ms":{
+                "otlp_logs":source_lag_ms(&self.wire, &self.otlp_logs),
+                "otlp_traces":source_lag_ms(&self.wire, &self.otlp_traces),
+                "hooks":source_lag_ms(&self.wire, &self.hooks),
+            },
             "buyer_eligibility_claimed":false,
             "wire":route_coverage_value(&self.wire),
             "otlp_logs":route_coverage_value(&self.otlp_logs),
@@ -1299,6 +1363,13 @@ fn route_coverage_value(route: &RouteCoverage) -> Value {
         "duplicates":route.duplicates,
         "last_at":route.last_at,
     })
+}
+
+fn source_lag_ms(wire: &RouteCoverage, source: &RouteCoverage) -> Option<u64> {
+    Some(
+        wire.last_observed_millis?
+            .saturating_sub(source.last_observed_millis?),
+    )
 }
 
 fn derived_record_counts(records: &[CaptureRecord]) -> (u64, u64) {
@@ -2099,9 +2170,81 @@ mod tests {
         let snapshot = coverage.snapshot();
         assert_eq!(snapshot["status"], "complete");
         assert_eq!(snapshot["required_sources_observed"], true);
+        assert_eq!(snapshot["required_sources_fresh"], true);
+        assert_eq!(snapshot["freshness_applicable"], true);
+        assert_eq!(snapshot["missing_sources"], json!([]));
+        assert_eq!(snapshot["stale_sources"], json!([]));
         assert_eq!(snapshot["buyer_eligibility_claimed"], false);
         assert_eq!(snapshot["derived"]["lifecycle_events"], 1);
         assert_eq!(snapshot["derived"]["tool_executions"], 1);
+    }
+
+    #[test]
+    fn ingest_coverage_degrades_when_runtime_sources_lag_active_wire() {
+        let mut coverage = IngestCoverageState::new();
+        coverage.observe_wire(1, 0);
+        for endpoint in [
+            CloudEndpoint::OtlpLogs,
+            CloudEndpoint::OtlpTraces,
+            CloudEndpoint::CodexHook,
+        ] {
+            coverage.observe_cloud(
+                endpoint,
+                &crate::cloud_ingest::CloudIngestSummary {
+                    endpoint: "test".to_owned(),
+                    source_records: 1,
+                    derived_captures: 1,
+                    unknown_events: 0,
+                    attributed_quality_errors: 0,
+                    conversion_errors: Vec::new(),
+                },
+                1,
+                0,
+                0,
+                0,
+            );
+        }
+        let latest_runtime = [
+            coverage.otlp_logs.last_observed_millis.unwrap(),
+            coverage.otlp_traces.last_observed_millis.unwrap(),
+            coverage.hooks.last_observed_millis.unwrap(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
+        let latest_wire = latest_runtime + INGEST_COVERAGE_FRESHNESS_WINDOW_MS + 1;
+        coverage.wire.last_observed_millis = Some(latest_wire);
+
+        let snapshot = coverage.snapshot_at(latest_wire);
+        assert_eq!(snapshot["status"], "degraded");
+        assert_eq!(snapshot["required_sources_observed"], true);
+        assert_eq!(snapshot["required_sources_fresh"], false);
+        assert_eq!(snapshot["freshness_applicable"], true);
+        assert_eq!(snapshot["missing_sources"], json!([]));
+        assert_eq!(
+            snapshot["stale_sources"],
+            json!(["otlp_logs", "otlp_traces", "hooks"])
+        );
+    }
+
+    #[test]
+    fn ingest_coverage_degrades_when_active_wire_never_gets_runtime_sources() {
+        let mut coverage = IngestCoverageState::new();
+        coverage.observe_wire(1, 0);
+        let first_wire = coverage.wire.first_observed_millis.unwrap();
+        let latest_wire = first_wire + INGEST_COVERAGE_FRESHNESS_WINDOW_MS + 1;
+        coverage.wire.last_observed_millis = Some(latest_wire);
+
+        let snapshot = coverage.snapshot_at(latest_wire);
+        assert_eq!(snapshot["status"], "degraded");
+        assert_eq!(snapshot["required_sources_observed"], false);
+        assert_eq!(snapshot["required_sources_fresh"], false);
+        assert_eq!(snapshot["freshness_applicable"], true);
+        assert_eq!(
+            snapshot["missing_sources"],
+            json!(["otlp_logs", "otlp_traces", "hooks"])
+        );
+        assert_eq!(snapshot["stale_sources"], json!([]));
     }
 
     #[test]

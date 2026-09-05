@@ -77,5 +77,7 @@ Relay durable ACK 后返回。Relay 和 Collector 使用确定性 Capture ID、W
 在采集入口不可达时阻止任务开始；运行中缺失的 Session 保留作取证，但不会进入 Release。
 
 Relay `/health` 分开报告传输健康与 `ingest_coverage`。后者只统计当前 Relay 进程观察到的
-Wire、OTLP logs、OTLP traces 和 Hook 活动；`complete` 表示四路均有真实请求，不代表任何
-Session 已通过 Buyer 验收。Session 是否可交付仍只由 `cloud-acceptance` 判定。
+Wire、OTLP logs、OTLP traces 和 Hook 活动；当 Wire 持续活跃而任一 Runtime 来源缺失或相对
+最新 Wire 落后超过 5 分钟时，状态为 `degraded`，并列出 `missing_sources`、`stale_sources`
+和 `source_lag_ms`。`complete` 只表示四路当前同步，不代表任何 Session 已通过 Buyer 验收。
+Session 是否可交付仍只由 `cloud-acceptance` 判定。

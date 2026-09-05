@@ -103,7 +103,7 @@ paths:
         "503": {description: 背压或存储不可用}
   /health:
     get:
-      summary: WAL、队列、投递守恒与当前进程四路采集覆盖
+      summary: WAL、队列、投递守恒与当前进程四路采集覆盖及五分钟新鲜度
       responses:
         "200": {description: 就绪}
         "503": {description: 未就绪}
