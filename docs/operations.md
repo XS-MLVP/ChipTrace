@@ -44,7 +44,23 @@ codex
 
 ## 云端验收
 
-先封存 WAL 并提交 Raw Archive，再导出同一时间窗的 Sub2API usage log。随后只运行：
+先确认目标 Session 的 `SessionEnd` 已到达 Collector，且该 Session 的 Wire、OTLP 和
+Hook 均已持久化。网关 outbox 和 Relay 的待投递队列需要排空；持续业务流量下，全局
+计数器不能代替目标 Session 的完整性校验。
+
+Collector 支持在线封存，不需要停止热服务。在本机管理地址调用：
+
+```bash
+curl -fsS -X POST http://127.0.0.1:3011/flush
+```
+
+`3011` 是 router_v2 部署的 Collector 映射端口，其他部署按实际映射调整。返回
+`ok=true`、`sealed=true` 后，当前段已成为不可变文件，服务继续向新 open 段写入。
+归档应固定此次封存边界内、每个 shard 从 Segment 1 开始的连续 sealed 文件集合，
+通过重复的 `--input <sealed-file>` 传入。不要把持续写入的目录直接作为完整快照：新
+open 段一旦非空，`archive-raw` 会拒绝该目录；未封存尾段也不会被离线投影读取。
+
+提交 Raw Archive 后，再导出同一时间窗的 Sub2API usage log。随后只运行：
 
 ```bash
 chiptrace cloud-acceptance \
@@ -77,7 +93,14 @@ chiptrace verify-cloud-acceptance \
 - Session start/end、模型调用/结果/执行、内部父引用的完整率。
 - Buyer v7 失败原因、合格 Session 数和四种 Token 口径。
 
+生命周期 Hook 不是心跳。单个 Turn 超过 5 分钟且没有新的生命周期边界时，可能出现
+`stale_sources=["hooks"]`；这是需要核对的来源新鲜度告警，不单独证明数据丢失。
+应检查目标 Session 的起始 Hook、持续 OTLP，以及结束后的 `SessionEnd` 和投影完整性。
+
 ## 回滚
+
+发布和回滚时同时更新部署环境文件中的 `CHIPTRACE_IMAGE`，使后续 Compose 重建使用
+已验收的不可变镜像；仅在单次命令中设置环境变量不会更新持久部署配置。
 
 回滚只恢复上一个不可变云端镜像和 18084 路由。WAL、OSS Checkpoint、Release 和失败证据
 不删除、不回退；旧版本不理解的新事件继续保持 Raw-only。
