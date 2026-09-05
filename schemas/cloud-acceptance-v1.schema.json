@@ -8,7 +8,7 @@
     "quality_profile", "minimum_score", "score", "hard_gate_pass", "delivery_ready",
     "effective_turns", "distinct_tool_names", "complete_tool_definitions",
     "pairing_rate_after_open_tail", "eligible_sessions", "api_total_tokens",
-    "normalized_corpus_tokens", "root_spans", "internal_parent_references",
+    "normalized_corpus_tokens", "source_coverage", "root_spans", "internal_parent_references",
     "resolved_internal_parents", "raw_records", "raw_bytes", "artifacts",
     "validation_status"
   ],
@@ -18,7 +18,7 @@
     "archive_id": {"type": "string", "minLength": 1},
     "session_id": {"type": "string", "minLength": 1},
     "release_id": {"type": "string", "minLength": 1},
-    "quality_profile": {"const": "buyer-v7-codex-runtime-expanded"},
+    "quality_profile": {"const": "buyer-v7"},
     "minimum_score": {"type": "number", "minimum": 90, "maximum": 100},
     "score": {"type": "number", "minimum": 90, "maximum": 100},
     "hard_gate_pass": {"const": true},
@@ -30,6 +30,19 @@
     "eligible_sessions": {"const": 1},
     "api_total_tokens": {"type": "integer", "minimum": 0},
     "normalized_corpus_tokens": {"type": "integer", "minimum": 1},
+    "source_coverage": {
+      "type": "object",
+      "required": ["wire", "otlp_logs", "otlp_traces", "hooks", "missing_sources", "complete"],
+      "properties": {
+        "wire": {"type": "integer", "minimum": 1},
+        "otlp_logs": {"type": "integer", "minimum": 1},
+        "otlp_traces": {"type": "integer", "minimum": 1},
+        "hooks": {"type": "integer", "minimum": 1},
+        "missing_sources": {"type": "array", "maxItems": 0},
+        "complete": {"const": true}
+      },
+      "additionalProperties": false
+    },
     "root_spans": {"const": 1},
     "internal_parent_references": {"type": "integer", "minimum": 0},
     "resolved_internal_parents": {"type": "integer", "minimum": 0},

@@ -452,7 +452,7 @@
               ],
               "properties": {
                 "schema_version": {"const": "chiptrace.session-quality-projection.v1"},
-                "profile_version": {"const": "buyer-v7-codex-runtime-expanded"},
+                "profile_version": {"const": "buyer-v7"},
                 "excluded_model_call_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
                 "runtime_messages": {"type": "array", "items": {"$ref": "#/$defs/message"}},
                 "runtime_tools": {"type": "array", "items": {"$ref": "#/$defs/toolDefinition"}}

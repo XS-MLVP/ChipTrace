@@ -1424,7 +1424,7 @@ fn assemble_group(captures: Vec<Value>) -> Result<(Value, bool, u64)> {
         json!({
             "buyer_v7": {
                 "schema_version":"chiptrace.session-quality-projection.v1",
-                "profile_version":"buyer-v7-codex-runtime-expanded",
+                "profile_version":"buyer-v7",
                 "excluded_model_call_ids":explicitly_abandoned_model_call_ids,
                 "runtime_messages":expanded_messages,
                 "runtime_tools":expanded_tools,

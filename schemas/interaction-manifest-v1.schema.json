@@ -16,6 +16,7 @@
     "protocol_counts",
     "transport_counts",
     "distinct_model_tool_names",
+    "source_coverage",
     "integrity",
     "metrics",
     "parts",
@@ -35,6 +36,23 @@
     "protocol_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
     "transport_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
     "distinct_model_tool_names": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "source_coverage": {
+      "type": "object",
+      "required": ["wire", "otlp_logs", "otlp_traces", "hooks", "missing_sources", "complete"],
+      "properties": {
+        "wire": {"type": "integer", "minimum": 0},
+        "otlp_logs": {"type": "integer", "minimum": 0},
+        "otlp_traces": {"type": "integer", "minimum": 0},
+        "hooks": {"type": "integer", "minimum": 0},
+        "missing_sources": {
+          "type": "array",
+          "items": {"enum": ["wire", "otlp_logs", "otlp_traces", "hooks"]},
+          "uniqueItems": true
+        },
+        "complete": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
     "integrity": {
       "type": "object",
       "required": [

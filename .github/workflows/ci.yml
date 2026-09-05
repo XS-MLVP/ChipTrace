@@ -61,12 +61,13 @@ jobs:
           assert result["collection_submission"]["otlp_replay_duplicates"] == 7
           assert result["checks"]["cloud_source_isolation"] is True
           assert result["checks"]["cloud_runtime_evidence"] is True
+          assert result["checks"]["cloud_source_coverage"] is True
           assert result["checks"]["cloud_acceptance"] is True
           assert result["cloud_acceptance_tamper_detected"] is True
           assert result["checks"]["cloud_tool_execution_evidence"] is True
           assert result["acceptance"]["source_capture_count"] == 20
           assert result["assembly"]["capture_schema_versions"] == ["chiptrace.capture.v2"]
-          assert result["buyer_package"]["buyer_profile"] == "buyer-v7-codex-runtime-expanded"
+          assert result["buyer_package"]["buyer_profile"] == "buyer-v7"
           assert result["buyer_package"]["minimum_score"] >= 90
           assert result["buyer_package"]["eligible_sessions"] == 1
           assert result["buyer_tamper_detected"] is True

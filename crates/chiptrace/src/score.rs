@@ -2,8 +2,7 @@ use crate::jsonl::{canonical_bytes, string_field, u64_field};
 use crate::lifecycle::{is_start_event, is_terminal_event, normalize_event};
 use crate::schema::{
     ASSESSMENT_SCHEMA_VERSION, AcceptanceMetrics, BuyerAssessment, CaptureCompleteness, GateResult,
-    LEGACY_ASSESSMENT_SCHEMA_VERSION, QualityEnvelope, SemanticQuality, TokenCounts,
-    TrainingReadiness,
+    QualityEnvelope, SemanticQuality, TokenCounts, TrainingReadiness,
 };
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
@@ -19,8 +18,6 @@ static GPT_VERSION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)gpt[-_ ]?(\d+)(?:[._-](\d+))?").unwrap());
 static CLAUDE_VERSION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)(?:claude|sonnet|opus)[-_ ]?(\d+)(?:[._-](\d+))?").unwrap());
-static GEMINI_VERSION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)gemini[-_ ]?(\d+)(?:[._-](\d+))?").unwrap());
 static DEEPSEEK_VERSION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)deepseek[-_ ]?(?:v)?(\d+)(?:[._-](\d+))?").unwrap());
 static GLM_VERSION: LazyLock<Regex> =
@@ -38,9 +35,7 @@ static ENVIRONMENT_SIGNAL: LazyLock<Regex> = LazyLock::new(|| {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Profile {
-    #[value(name = "buyer-v6")]
-    BuyerV6,
-    #[value(name = "buyer-v7-codex-runtime-expanded", alias = "buyer-v7")]
+    #[value(name = "buyer-v7")]
     BuyerV7,
 }
 
@@ -62,17 +57,12 @@ pub struct ScoreSummary {
 }
 
 pub struct AssessmentSchemaValidators {
-    legacy: jsonschema::Validator,
     current: jsonschema::Validator,
 }
 
 impl AssessmentSchemaValidators {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            legacy: compile_assessment_schema(
-                "assessment-v1.schema.json",
-                include_str!("../../../schemas/assessment-v1.schema.json"),
-            )?,
             current: compile_assessment_schema(
                 "assessment-v2.schema.json",
                 include_str!("../../../schemas/assessment-v2.schema.json"),
@@ -85,11 +75,10 @@ impl AssessmentSchemaValidators {
             .pointer("/quality/buyer_acceptance/schema_version")
             .and_then(Value::as_str)
             .context("assessment record has no quality.buyer_acceptance.schema_version")?;
-        let validator = match schema_version {
-            LEGACY_ASSESSMENT_SCHEMA_VERSION => &self.legacy,
-            ASSESSMENT_SCHEMA_VERSION => &self.current,
-            _ => bail!("unsupported assessment schema {schema_version}"),
-        };
+        if schema_version != ASSESSMENT_SCHEMA_VERSION {
+            bail!("unsupported assessment schema {schema_version}");
+        }
+        let validator = &self.current;
         if let Err(error) = validator.validate(record) {
             bail!(
                 "{schema_version} validation failed at {}: {error}",
@@ -243,38 +232,23 @@ fn discover_score_inputs(inputs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
 
 impl Profile {
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::BuyerV6 => "buyer-v6",
-            Self::BuyerV7 => "buyer-v7-codex-runtime-expanded",
-        }
+        "buyer-v7"
     }
 
     pub fn version(self) -> &'static str {
-        match self {
-            Self::BuyerV6 => "buyer-v6.0-2026-05",
-            Self::BuyerV7 => "buyer-v7-codex-runtime-expanded",
-        }
+        "buyer-v7"
     }
 
     fn minimum_effective_turns(self) -> u64 {
-        match self {
-            Self::BuyerV6 => 2,
-            Self::BuyerV7 => 10,
-        }
+        10
     }
 
     fn minimum_tool_calls(self) -> u64 {
-        match self {
-            Self::BuyerV6 => 1,
-            Self::BuyerV7 => 5,
-        }
+        5
     }
 
     fn minimum_valid_results(self) -> u64 {
-        match self {
-            Self::BuyerV6 => 1,
-            Self::BuyerV7 => 2,
-        }
+        2
     }
 }
 
@@ -303,6 +277,7 @@ enum UserTurnKind {
 }
 
 pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> QualityEnvelope {
+    let unsupported_collection_metadata = unsupported_collection_metadata(session);
     let projected_session = materialize_profile_session(session, profile);
     let session = &projected_session;
     let messages = session
@@ -316,7 +291,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let calls = collect_tool_calls(messages);
-    let results = collect_tool_results(messages, profile);
+    let results = collect_tool_results(messages);
     let result_by_id = results_by_id(&results);
     let last_message_index = messages.len().saturating_sub(1);
     let required_calls: Vec<&ToolCall> = calls
@@ -363,7 +338,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         .filter(|name| {
             definition_map
                 .get(*name)
-                .is_some_and(|value| tool_definition_complete(value, profile))
+                .is_some_and(|tool| tool_definition_complete(tool))
         })
         .count() as u64;
     let generic_called_names = called_names.iter().any(|name| generic_tool_name(name));
@@ -418,17 +393,14 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         .unwrap_or(0);
     let assembly_runtime_evidence_conflicts = session
         .pointer("/meta/runtime_evidence_conflicts")
-        .or_else(|| session.pointer("/meta/producer_event_conflicts"))
         .and_then(Value::as_array)
         .map_or(0, |conflicts| conflicts.len() as u64);
     let runtime_unknown_events = session
         .pointer("/meta/runtime_unknown_events")
-        .or_else(|| session.pointer("/meta/rollout_unknown_events"))
         .and_then(Value::as_array)
         .map_or(0, |events| events.len() as u64);
     let runtime_unmapped_tools = session
         .pointer("/meta/runtime_unmapped_tools")
-        .or_else(|| session.pointer("/meta/rollout_unmapped_tools"))
         .and_then(Value::as_array)
         .map_or(0, |events| events.len() as u64);
     let capture_dag_present = session
@@ -437,18 +409,13 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
     let runtime_dag_present = session
         .pointer("/meta/runtime_dag")
         .is_some_and(Value::is_object);
-    let runtime_dag_applicable = profile == Profile::BuyerV7
-        || session
-            .pointer("/meta/runtime_dag/applicable")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+    let runtime_dag_applicable = true;
     let runtime_dag_complete = session
         .pointer("/meta/runtime_dag/complete")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let runtime_dag_evidence_events = session
         .pointer("/meta/runtime_dag/evidence_event_count")
-        .or_else(|| session.pointer("/meta/runtime_dag/native_event_count"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let runtime_dag_open_nodes = session
@@ -737,8 +704,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
             .all(|call| call.id.is_some() && call.name.is_some())
         && invalid_tool_arguments == 0
         && !duplicate_call_ids
-        && (profile != Profile::BuyerV7
-            || called_names.len() as u64 >= profile.minimum_tool_calls());
+        && called_names.len() as u64 >= profile.minimum_tool_calls();
     push_gate(
         &mut gates,
         "structured_tool_calls",
@@ -753,11 +719,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         &format!(
             ">= {} calls with unique IDs{}",
             profile.minimum_tool_calls(),
-            if profile == Profile::BuyerV7 {
-                " and distinct tool names"
-            } else {
-                ""
-            }
+            " and distinct tool names"
         ),
         None,
     );
@@ -768,11 +730,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
         true,
         json!(valid_results),
         &format!(">= {} non-empty results", profile.minimum_valid_results()),
-        Some(if profile == Profile::BuyerV7 {
-            "buyer-v7 also requires an explicit status or is_error flag"
-        } else {
-            "buyer-v6 accepts a non-empty result because its published example omits status"
-        }),
+        Some("buyer-v7 requires an explicit status or is_error flag"),
     );
     let definitions_pass = !called_names.is_empty()
         && complete_called_definitions == called_names.len() as u64
@@ -839,7 +797,8 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
             && response_dag_unresolved_parents == 0
             && task_dag_complete
             && conflicting_tool_results == 0
-            && (profile != Profile::BuyerV7 || task_boundary_attested),
+            && task_boundary_attested
+            && unsupported_collection_metadata.is_empty(),
         true,
         json!({
             "merge_divergences": assembly_merge_divergences,
@@ -861,6 +820,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
             "task_start_event_present": task_start_event_present,
             "task_terminal_event_present": task_terminal_event_present,
             "task_boundary_attested": task_boundary_attested,
+            "unsupported_collection_metadata": unsupported_collection_metadata,
         }),
         "no message, tool schema, status, trace, system prompt, usage, or Runtime evidence conflicts; buyer-v7 also requires an explicitly bounded task Session",
         Some(
@@ -933,7 +893,7 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
             "matching uses exact upstream request or response IDs; task, time, model, and thread proximity are never accepted as substitutes",
         ),
     );
-    let model_result = model_eligible(session, profile);
+    let model_result = model_eligible(session);
     push_gate(
         &mut gates,
         "model",
@@ -1109,22 +1069,50 @@ pub fn assess_session(session: &Value, profile: Profile, minimum_score: f64) -> 
     }
 }
 
-pub fn materialize_profile_session(session: &Value, profile: Profile) -> Value {
-    if profile != Profile::BuyerV7 {
-        return session.clone();
+fn unsupported_collection_metadata(session: &Value) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    for field in [
+        "producerEvent",
+        "producerModel",
+        "rolloutEvent",
+        "rolloutMessages",
+        "rolloutUsage",
+        "toolRegistry",
+        "toolRegistrySha256",
+    ] {
+        if session.get(field).is_some() {
+            fields.push(field);
+        }
     }
+    for field in [
+        "active_quality_projection",
+        "code_mode_message_projection",
+        "producer_event_conflicts",
+        "producer_streams",
+        "rollout_events",
+        "rollout_unknown_events",
+        "rollout_unmapped_tools",
+        "rollout_usage_evidence",
+        "tool_registry_evidence",
+    ] {
+        if session.pointer(&format!("/meta/{field}")).is_some() {
+            fields.push(field);
+        }
+    }
+    for field in ["native_event_count", "terminal_rollout_ids"] {
+        if session
+            .pointer(&format!("/meta/runtime_dag/{field}"))
+            .is_some()
+        {
+            fields.push(field);
+        }
+    }
+    fields
+}
+
+pub fn materialize_profile_session(session: &Value, _profile: Profile) -> Value {
     let mut materialized = session.clone();
-    if session
-        .pointer("/meta/active_quality_projection/profile_version")
-        .and_then(Value::as_str)
-        == Some(Profile::BuyerV7.version())
-    {
-        strip_internal_projection_metadata(&mut materialized);
-        return materialized;
-    }
-    let projection = session
-        .pointer("/meta/quality_projections/buyer_v7")
-        .or_else(|| session.pointer("/meta/quality_projections/buyer_v7_codex_runtime_expanded"));
+    let projection = session.pointer("/meta/quality_projections/buyer_v7");
     if let Some(projection) = projection.filter(|projection| {
         projection.get("profile_version").and_then(Value::as_str)
             == Some(Profile::BuyerV7.version())
@@ -1223,26 +1211,6 @@ fn strip_internal_projection_metadata(session: &mut Value) {
         "tool_registry_evidence",
     ] {
         meta.remove(field);
-    }
-    if let Some(runtime) = meta.get_mut("runtime_dag").and_then(Value::as_object_mut) {
-        if runtime.get("source").and_then(Value::as_str)
-            == Some("canonical_model_interaction:producer_events")
-        {
-            runtime.insert(
-                "source".to_owned(),
-                json!("canonical_model_interaction:cloud_evidence"),
-            );
-        }
-        if !runtime.contains_key("evidence_event_count")
-            && let Some(value) = runtime.remove("native_event_count")
-        {
-            runtime.insert("evidence_event_count".to_owned(), value);
-        }
-        if !runtime.contains_key("terminal_root_ids")
-            && let Some(value) = runtime.remove("terminal_rollout_ids")
-        {
-            runtime.insert("terminal_root_ids".to_owned(), value);
-        }
     }
 }
 
@@ -1369,7 +1337,7 @@ fn collect_tool_calls(messages: &[Value]) -> Vec<ToolCall> {
     calls
 }
 
-fn collect_tool_results(messages: &[Value], profile: Profile) -> Vec<ToolResult> {
+fn collect_tool_results(messages: &[Value]) -> Vec<ToolResult> {
     messages
         .iter()
         .filter(|message| string_field(message, "role") == Some("tool"))
@@ -1412,9 +1380,7 @@ fn collect_tool_results(messages: &[Value], profile: Profile) -> Vec<ToolResult>
                     .or_else(|| string_field(message, "call_id"))
                     .or_else(|| string_field(message, "tool_use_id"))
                     .map(str::to_owned),
-                valid: content_valid
-                    && !status_conflict
-                    && (profile == Profile::BuyerV6 || explicit_status),
+                valid: content_valid && !status_conflict && explicit_status,
                 failed,
                 explicit_status,
                 conflict: status_conflict,
@@ -1444,7 +1410,7 @@ fn tool_definition_map(tools: &[Value]) -> HashMap<String, &Value> {
     definitions
 }
 
-fn tool_definition_complete(tool: &Value, profile: Profile) -> bool {
+fn tool_definition_complete(tool: &Value) -> bool {
     let nested = tool.get("function").unwrap_or(tool);
     if nested
         .pointer("/schema_provenance/source_complete")
@@ -1456,11 +1422,10 @@ fn tool_definition_complete(tool: &Value, profile: Profile) -> bool {
     // A generated adapter is useful for lossless inspection, but it is not an
     // original tool schema. Buyer-v7 requires the schema supplied by the
     // producer (or a native schema that has not been rewritten).
-    if profile == Profile::BuyerV7
-        && nested
-            .pointer("/schema_provenance/generated_adapter")
-            .and_then(Value::as_bool)
-            == Some(true)
+    if nested
+        .pointer("/schema_provenance/generated_adapter")
+        .and_then(Value::as_bool)
+        == Some(true)
     {
         return false;
     }
@@ -1651,7 +1616,7 @@ fn has_system_prompt(session: &Value, messages: &[Value]) -> bool {
         })
 }
 
-fn model_eligible(session: &Value, profile: Profile) -> (bool, &'static str) {
+fn model_eligible(session: &Value) -> (bool, &'static str) {
     let model = string_field(session, "model")
         .unwrap_or("")
         .to_ascii_lowercase();
@@ -1663,36 +1628,21 @@ fn model_eligible(session: &Value, profile: Profile) -> (bool, &'static str) {
         .pointer("/meta/model_evidence/provider_identity_attested")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let (eligible, expected_provider) = match profile {
-        Profile::BuyerV6 => {
-            if version_at_least(&GPT_VERSION, &model, 5, 0) {
-                (true, "openai")
-            } else if version_at_least(&CLAUDE_VERSION, &model, 4, 5) {
-                (true, "anthropic")
-            } else if version_at_least(&GEMINI_VERSION, &model, 3, 0) {
-                (true, "google")
-            } else {
-                (false, "")
-            }
-        }
-        Profile::BuyerV7 => {
-            if version_at_least(&GPT_VERSION, &model, 5, 5) {
-                (true, "openai")
-            } else if version_at_least(&CLAUDE_VERSION, &model, 4, 6)
-                && !model.contains("haiku")
-                && (!model.contains("sonnet") || version_at_least(&CLAUDE_VERSION, &model, 5, 0))
-            {
-                (true, "anthropic")
-            } else if version_at_least(&DEEPSEEK_VERSION, &model, 4, 0) {
-                (true, "deepseek")
-            } else if version_at_least(&GLM_VERSION, &model, 5, 2) {
-                (true, "zhipu")
-            } else if version_at_least(&KIMI_K_VERSION, &model, 3, 0) {
-                (true, "moonshot")
-            } else {
-                (false, "")
-            }
-        }
+    let (eligible, expected_provider) = if version_at_least(&GPT_VERSION, &model, 5, 5) {
+        (true, "openai")
+    } else if version_at_least(&CLAUDE_VERSION, &model, 4, 6)
+        && !model.contains("haiku")
+        && (!model.contains("sonnet") || version_at_least(&CLAUDE_VERSION, &model, 5, 0))
+    {
+        (true, "anthropic")
+    } else if version_at_least(&DEEPSEEK_VERSION, &model, 4, 0) {
+        (true, "deepseek")
+    } else if version_at_least(&GLM_VERSION, &model, 5, 2) {
+        (true, "zhipu")
+    } else if version_at_least(&KIMI_K_VERSION, &model, 3, 0) {
+        (true, "moonshot")
+    } else {
+        (false, "")
     };
     let provider_consistent = eligible
         && (provider.contains(expected_provider)
@@ -1700,19 +1650,9 @@ fn model_eligible(session: &Value, profile: Profile) -> (bool, &'static str) {
             || (expected_provider == "zhipu" && provider.contains("glm"))
             || (expected_provider == "moonshot"
                 && (provider.contains("kimi") || provider.contains("moonshot"))));
-    let expectation = match profile {
-        Profile::BuyerV6 => {
-            "GPT-5+, Gemini-3+, or Claude-4.5+ with consistent provider/model evidence"
-        }
-        Profile::BuyerV7 => {
-            "GPT-5.5+, eligible Claude, DeepSeek-v4+, GLM-5.2+, or K3+; no Gemini/Haiku"
-        }
-    };
+    let expectation = "GPT-5.5+, eligible Claude, DeepSeek-v4+, GLM-5.2+, or K3+; no Gemini/Haiku";
     (
-        eligible
-            && provider_consistent
-            && evidence_consistent
-            && (profile != Profile::BuyerV7 || provider_identity_attested),
+        eligible && provider_consistent && evidence_consistent && provider_identity_attested,
         expectation,
     )
 }
@@ -2363,30 +2303,8 @@ pub fn recompute_assessment_for_version(
     minimum_score: f64,
     schema_version: &str,
 ) -> Option<BuyerAssessment> {
-    let mut assessment = assess_session(session, profile, minimum_score).buyer_acceptance;
-    match schema_version {
-        ASSESSMENT_SCHEMA_VERSION => Some(assessment),
-        LEGACY_ASSESSMENT_SCHEMA_VERSION => {
-            assessment.schema_version = LEGACY_ASSESSMENT_SCHEMA_VERSION.to_owned();
-            assessment
-                .gates
-                .retain(|gate| gate.name != "trace_delivery_ready");
-            assessment.hard_gate_pass = assessment
-                .gates
-                .iter()
-                .filter(|gate| gate.required)
-                .all(|gate| gate.pass);
-            assessment.eligible = assessment.hard_gate_pass && assessment.score >= minimum_score;
-            assessment.failure_reasons = assessment
-                .gates
-                .iter()
-                .filter(|gate| gate.required && !gate.pass)
-                .map(|gate| gate.name.clone())
-                .collect();
-            Some(assessment)
-        }
-        _ => None,
-    }
+    (schema_version == ASSESSMENT_SCHEMA_VERSION)
+        .then(|| assess_session(session, profile, minimum_score).buyer_acceptance)
 }
 
 pub fn assessment_contract_valid(
@@ -2394,25 +2312,7 @@ pub fn assessment_contract_valid(
     profile: Profile,
     minimum_score: f64,
 ) -> bool {
-    const REQUIRED_GATES_V1: [&str; 16] = [
-        "required_fields",
-        "message_roles",
-        "first_message_role",
-        "system_prompt",
-        "effective_turns",
-        "structured_tool_calls",
-        "valid_tool_results",
-        "tool_definitions",
-        "tool_pairing_after_open_tail",
-        "machine_turn_ratio",
-        "assembly_integrity",
-        "runtime_dag_integrity",
-        "inference_api_conservation",
-        "model",
-        "session_closed",
-        "content_domain",
-    ];
-    const REQUIRED_GATES_V2: [&str; 17] = [
+    const REQUIRED_GATES: [&str; 17] = [
         "required_fields",
         "message_roles",
         "first_message_role",
@@ -2431,11 +2331,10 @@ pub fn assessment_contract_valid(
         "session_closed",
         "content_domain",
     ];
-    let required_gates: &[&str] = match assessment.schema_version.as_str() {
-        ASSESSMENT_SCHEMA_VERSION => &REQUIRED_GATES_V2,
-        LEGACY_ASSESSMENT_SCHEMA_VERSION => &REQUIRED_GATES_V1,
-        _ => return false,
-    };
+    if assessment.schema_version != ASSESSMENT_SCHEMA_VERSION {
+        return false;
+    }
+    let required_gates: &[&str] = &REQUIRED_GATES;
     let observed: BTreeSet<&str> = assessment
         .gates
         .iter()
@@ -2479,29 +2378,8 @@ pub fn assessment_contract_valid(
         && assessment.failure_reasons == expected_failures
 }
 
-pub fn normalize_assessment_profile(assessment: &mut BuyerAssessment, profile: Profile) {
-    if profile == Profile::BuyerV7
-        && matches!(
-            assessment.profile.as_str(),
-            "buyer-v7" | "buyer-v7-codex-runtime-expanded"
-        )
-        && matches!(
-            assessment.profile_version.as_str(),
-            "buyer-v7.0-user-supplied" | "buyer-v7-codex-runtime-expanded"
-        )
-    {
-        assessment.profile = profile.as_str().to_owned();
-        assessment.profile_version = profile.version().to_owned();
-    }
-}
-
 fn profile_metadata_compatible(assessment: &BuyerAssessment, profile: Profile) -> bool {
-    if assessment.profile == profile.as_str() && assessment.profile_version == profile.version() {
-        return true;
-    }
-    profile == Profile::BuyerV7
-        && assessment.profile == "buyer-v7"
-        && assessment.profile_version == "buyer-v7.0-user-supplied"
+    assessment.profile == profile.as_str() && assessment.profile_version == profile.version()
 }
 
 fn gate_weight(name: &str) -> f64 {
@@ -2534,6 +2412,61 @@ fn round(value: f64, places: u32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::ValueEnum;
+
+    #[test]
+    fn buyer_v7_is_the_only_quality_profile() {
+        assert_eq!(Profile::from_str("buyer-v7", false), Ok(Profile::BuyerV7));
+        assert_eq!(Profile::value_variants(), &[Profile::BuyerV7]);
+    }
+
+    #[test]
+    fn historical_client_metadata_cannot_pass_the_assembly_gate() {
+        let base = json!({
+            "trajectory_id":"historical-client",
+            "session_id":"historical-client",
+            "provider":"OpenAI",
+            "model":"gpt-5.6-sol",
+            "created_at":"2026-09-05T00:00:00Z",
+            "status":"completed",
+            "is_final_snapshot":true,
+            "source_request_count":1,
+            "system_prompt":"system",
+            "tools":[],
+            "messages":[{"role":"system","content":"system"}],
+            "usage":{},
+            "meta":{}
+        });
+        for (path, field) in [
+            ("top", "producerEvent"),
+            ("top", "rolloutEvent"),
+            ("top", "toolRegistry"),
+            ("meta", "producer_streams"),
+            ("meta", "rollout_events"),
+            ("meta", "tool_registry_evidence"),
+        ] {
+            let mut session = base.clone();
+            if path == "top" {
+                session[field] = json!({});
+            } else {
+                session["meta"][field] = json!({});
+            }
+            let quality = assess_session(&session, Profile::BuyerV7, 90.0);
+            let gate = quality
+                .buyer_acceptance
+                .gates
+                .iter()
+                .find(|gate| gate.name == "assembly_integrity")
+                .unwrap();
+            assert!(!gate.pass, "accepted {path}.{field}");
+            assert!(
+                gate.observed["unsupported_collection_metadata"]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|item| item == field)),
+                "did not report {path}.{field}"
+            );
+        }
+    }
 
     fn tool(name: &str) -> Value {
         json!({
@@ -2565,7 +2498,7 @@ mod tests {
                 "provenance":"stock_codex.unified_exec.log_output.header"
             }
         })];
-        let results = collect_tool_results(&messages, Profile::BuyerV7);
+        let results = collect_tool_results(&messages);
         assert_eq!(results.len(), 1);
         assert!(results[0].valid);
         assert!(results[0].explicit_status);
@@ -2682,7 +2615,27 @@ mod tests {
             .unwrap();
         assert!(gate.pass);
 
-        session["meta"]["runtime_dag"]["source"] = json!("historical_runtime_source");
+        session["meta"]["runtime_dag"]["source"] =
+            json!("canonical_model_interaction:producer_events");
+        session["meta"]["runtime_dag"]
+            .as_object_mut()
+            .unwrap()
+            .remove("evidence_event_count");
+        session["meta"]["runtime_dag"]["native_event_count"] = json!(4);
+        let materialized = materialize_profile_session(&session, Profile::BuyerV7);
+        assert_eq!(
+            materialized.pointer("/meta/runtime_dag/source"),
+            Some(&json!("canonical_model_interaction:producer_events"))
+        );
+        assert_eq!(
+            materialized.pointer("/meta/runtime_dag/native_event_count"),
+            Some(&json!(4))
+        );
+        assert!(
+            materialized
+                .pointer("/meta/runtime_dag/evidence_event_count")
+                .is_none()
+        );
         let mismatched = assess_session(&session, Profile::BuyerV7, 90.0);
         let gate = mismatched
             .buyer_acceptance
@@ -2692,8 +2645,10 @@ mod tests {
             .unwrap();
         assert!(!gate.pass);
         assert_eq!(gate.observed["source_matches_evidence"], false);
+        assert_eq!(gate.observed["evidence_events"], 0);
         session["meta"]["runtime_dag"]["source"] =
             json!("canonical_model_interaction:cloud_evidence");
+        session["meta"]["runtime_dag"]["evidence_event_count"] = json!(4);
 
         session["meta"]["runtime_dag"]["complete"] = json!(false);
         session["meta"]["runtime_dag"]["status_conflict_node_ids"] = json!(["tool-1"]);
@@ -2915,37 +2870,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_assessment_contract_is_read_only_compatible() {
-        let session = json!({
-            "trajectory_id":"legacy-v1","session_id":"legacy-v1",
-            "provider":"OpenAI","model":"gpt-5.6-sol",
-            "created_at":"2026-09-01T00:00:00Z","status":"completed",
-            "is_final_snapshot":true,"source_request_count":1,
-            "system_prompt":"system","tools":[],
-            "messages":[{"role":"system","content":"system"}],"usage":{}
-        });
-        let legacy = recompute_assessment_for_version(
-            &session,
-            Profile::BuyerV7,
-            90.0,
-            LEGACY_ASSESSMENT_SCHEMA_VERSION,
-        )
-        .unwrap();
-        assert_eq!(legacy.schema_version, LEGACY_ASSESSMENT_SCHEMA_VERSION);
-        assert_eq!(legacy.gates.len(), 16);
-        assert!(
-            legacy
-                .gates
-                .iter()
-                .all(|gate| gate.name != "trace_delivery_ready")
-        );
-        assert!(assessment_contract_valid(&legacy, Profile::BuyerV7, 90.0));
-        assert!(
-            recompute_assessment_for_version(&session, Profile::BuyerV7, 90.0, "unknown").is_none()
-        );
-    }
-
-    #[test]
     fn assessment_v2_schema_rejects_weak_or_inconsistent_quality() {
         let session = json!({
             "trajectory_id":"schema-v2","session_id":"schema-v2",
@@ -3046,50 +2970,13 @@ mod tests {
             ],
             "usage": {}
         });
-        let quality = assess_session(&session, Profile::BuyerV6, 0.0);
+        let quality = assess_session(&session, Profile::BuyerV7, 0.0);
         assert_eq!(quality.buyer_acceptance.metrics.invalid_tool_arguments, 1);
         assert!(
             quality
                 .buyer_acceptance
                 .failure_reasons
                 .contains(&"structured_tool_calls".to_owned())
-        );
-    }
-
-    #[test]
-    fn buyer_v6_requires_two_human_user_assistant_turns() {
-        let session = json!({
-            "trajectory_id": "traj-v6-turns",
-            "session_id": "session-v6-turns",
-            "provider": "OpenAI",
-            "model": "gpt-5",
-            "created_at": "2026-08-27T00:00:00Z",
-            "status": "completed",
-            "is_final_snapshot": true,
-            "source_request_count": 1,
-            "system_prompt": "system",
-            "tools": [tool("run_tests")],
-            "messages": [
-                {"role": "system", "content": "system"},
-                {"role": "user", "content": "Run the tests."},
-                {"role": "assistant", "content": "", "tool_calls": [{
-                    "id": "call-1", "name": "run_tests", "arguments": {}
-                }]},
-                {"role": "tool", "tool_call_id": "call-1", "content": "passed"},
-                {"role": "assistant", "content": "The tests passed."}
-            ],
-            "usage": {}
-        });
-        let quality = assess_session(&session, Profile::BuyerV6, 0.0);
-        assert_eq!(
-            quality.buyer_acceptance.metrics.human_user_assistant_turns,
-            1
-        );
-        assert!(
-            quality
-                .buyer_acceptance
-                .failure_reasons
-                .contains(&"effective_turns".to_owned())
         );
     }
 
@@ -3195,7 +3082,7 @@ mod tests {
                 {"role":"assistant","content":"done"}
             ]
         });
-        let assessment = assess_session(&session, Profile::BuyerV6, 90.0);
+        let assessment = assess_session(&session, Profile::BuyerV7, 90.0);
         let gate = assessment
             .buyer_acceptance
             .gates
@@ -3357,10 +3244,10 @@ mod tests {
                 }}
             })
         }
-        assert!(model_eligible(&session("claude-opus-4-6"), Profile::BuyerV7).0);
-        assert!(model_eligible(&session("claude-sonnet-5"), Profile::BuyerV7).0);
-        assert!(!model_eligible(&session("claude-sonnet-4-6"), Profile::BuyerV7).0);
-        assert!(!model_eligible(&session("claude-haiku-5"), Profile::BuyerV7).0);
+        assert!(model_eligible(&session("claude-opus-4-6")).0);
+        assert!(model_eligible(&session("claude-sonnet-5")).0);
+        assert!(!model_eligible(&session("claude-sonnet-4-6")).0);
+        assert!(!model_eligible(&session("claude-haiku-5")).0);
     }
 
     #[test]
@@ -3374,9 +3261,9 @@ mod tests {
                 "provider_identity_attested":false
             }}
         });
-        assert!(!model_eligible(&session, Profile::BuyerV7).0);
+        assert!(!model_eligible(&session).0);
         session["meta"]["model_evidence"]["provider_identity_attested"] = json!(true);
-        assert!(model_eligible(&session, Profile::BuyerV7).0);
+        assert!(model_eligible(&session).0);
     }
 
     #[test]
@@ -3387,8 +3274,7 @@ mod tests {
             "source_complete":true,
             "generated_adapter":true
         });
-        assert!(tool_definition_complete(&definition, Profile::BuyerV6));
-        assert!(!tool_definition_complete(&definition, Profile::BuyerV7));
+        assert!(!tool_definition_complete(&definition));
     }
 
     #[test]
@@ -3415,7 +3301,7 @@ mod tests {
             ],
             "usage":{}
         });
-        let quality = assess_session(&session, Profile::BuyerV6, 0.0);
+        let quality = assess_session(&session, Profile::BuyerV7, 0.0);
         assert_eq!(quality.buyer_acceptance.metrics.tool_calls, 1);
         assert_eq!(quality.buyer_acceptance.metrics.valid_tool_results, 1);
         assert_eq!(
@@ -3450,7 +3336,7 @@ mod tests {
             ],
             "usage":{}
         });
-        let quality = assess_session(&session, Profile::BuyerV6, 0.0);
+        let quality = assess_session(&session, Profile::BuyerV7, 0.0);
         assert!(
             !quality
                 .buyer_acceptance
@@ -3486,7 +3372,7 @@ mod tests {
             "meta":{"lifecycle_events":["task_end"]},
             "usage":{}
         });
-        let quality = assess_session(&session, Profile::BuyerV6, 0.0);
+        let quality = assess_session(&session, Profile::BuyerV7, 0.0);
         assert!(
             quality
                 .buyer_acceptance

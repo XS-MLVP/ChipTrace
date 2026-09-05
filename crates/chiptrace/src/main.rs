@@ -301,7 +301,7 @@ struct ScoreArgs {
     input: Vec<PathBuf>,
     #[arg(long)]
     output: PathBuf,
-    #[arg(long, value_enum, default_value = "buyer-v7-codex-runtime-expanded")]
+    #[arg(long, value_enum, default_value = "buyer-v7")]
     profile: Profile,
     #[arg(long, default_value_t = 90.0)]
     minimum_score: f64,
@@ -339,7 +339,7 @@ struct ReleaseArgs {
     output: PathBuf,
     #[arg(long)]
     release_id: String,
-    #[arg(long, value_enum, default_value = "buyer-v7-codex-runtime-expanded")]
+    #[arg(long, value_enum, default_value = "buyer-v7")]
     profile: Profile,
     #[arg(long, default_value_t = 90.0)]
     minimum_score: f64,
@@ -1193,6 +1193,22 @@ async fn self_test() -> Result<Value> {
         "captures":otlp_capture_count,
     }));
 
+    let otlp_trace_result = submit_self_test_cloud_json(
+        &client,
+        relay_bind,
+        "/otel/v1/traces",
+        serde_json::to_vec(&self_test_otlp_traces())?,
+    )
+    .await?;
+    let otlp_trace_capture_count = otlp_trace_result
+        .pointer("/chiptrace/captures")
+        .and_then(Value::as_u64)
+        .context("self-test OTLP trace response omitted capture count")?;
+    submission_routes.push(json!({
+        "route":"/otel/v1/traces",
+        "captures":otlp_trace_capture_count,
+    }));
+
     let mut hook_payloads = vec![json!({
         "hook_event_name":"SessionStart","session_id":"thread-self-test",
         "transcript_path":Value::Null,"cwd":"/workspace","model":"gpt-5.6-sol",
@@ -1241,9 +1257,10 @@ async fn self_test() -> Result<Value> {
     {
         bail!("self-test OTLP replay was not idempotent: {replay_result}");
     }
-    let expected_relay_records = captures.len() as u64 + otlp_capture_count + hook_capture_count;
+    let expected_relay_records =
+        captures.len() as u64 + otlp_capture_count + otlp_trace_capture_count + hook_capture_count;
     let expected_collector_records = expected_relay_records.saturating_add(1);
-    let raw_batch_count = 8_u64;
+    let raw_batch_count = 9_u64;
     let canonical_capture_count = expected_collector_records.saturating_sub(raw_batch_count);
     let non_api_capture_count =
         expected_collector_records.saturating_sub(api_snapshot_count as u64);
@@ -1658,7 +1675,7 @@ async fn self_test() -> Result<Value> {
     .await?;
     let self_test_checks = json!({
         "buyer_v7_session_eligible":release.counts.eligible_sessions == 1
-            && release.buyer_profile == "buyer-v7-codex-runtime-expanded"
+            && release.buyer_profile == "buyer-v7"
             && score == 100.0
             && hard_gate_pass,
         "task_and_provider_evidence":task_dag_complete
@@ -1668,6 +1685,11 @@ async fn self_test() -> Result<Value> {
         "tool_projection":completed_tool_calls == 5 && failed_tool_calls == 1,
         "cloud_tool_execution_evidence":tool_execution_audit_pass,
         "cloud_runtime_evidence":cloud_runtime_audit_pass,
+        "cloud_source_coverage":interaction.source_coverage.complete
+            && interaction.source_coverage.wire == 6
+            && interaction.source_coverage.otlp_logs == 1
+            && interaction.source_coverage.otlp_traces == 1
+            && interaction.source_coverage.hooks == 7,
         "cloud_source_isolation":relay_source_isolation
             && relay_health.pointer("/ingest_coverage/wire/durable_captures")
                 .and_then(Value::as_u64) == Some(api_snapshot_count as u64),
@@ -1876,6 +1898,33 @@ fn self_test_otlp_logs() -> Value {
                 self_test_otlp_attribute("service.name", json!({"stringValue":"codex"}))
             ]},
             "scopeLogs":[{"scope":{"name":"codex_otel"},"logRecords":records}]
+        }]
+    })
+}
+
+fn self_test_otlp_traces() -> Value {
+    json!({
+        "resourceSpans":[{
+            "resource":{"attributes":[
+                self_test_otlp_attribute("service.name", json!({"stringValue":"codex"}))
+            ]},
+            "scopeSpans":[{
+                "scope":{"name":"codex_otel"},
+                "spans":[{
+                    "traceId":"0123456789abcdef0123456789abcdef",
+                    "spanId":"1111111111111111",
+                    "parentSpanId":"",
+                    "name":"codex.session",
+                    "startTimeUnixNano":"1787788800000000000",
+                    "endTimeUnixNano":"1787788815000000000",
+                    "attributes":[
+                        self_test_otlp_attribute(
+                            "conversation.id",
+                            json!({"stringValue":"thread-self-test"})
+                        )
+                    ]
+                }]
+            }]
         }]
     })
 }

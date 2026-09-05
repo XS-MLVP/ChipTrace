@@ -51,12 +51,23 @@ pub struct InteractionProjectionManifest {
     pub protocol_counts: BTreeMap<String, u64>,
     pub transport_counts: BTreeMap<String, u64>,
     pub distinct_model_tool_names: BTreeSet<String>,
+    pub source_coverage: CloudSourceCoverage,
     pub integrity: DeliveryIntegrity,
     pub metrics: Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub raw_sources: Vec<RawSourceLineage>,
     pub parts: Vec<FileManifest>,
     pub validation_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CloudSourceCoverage {
+    pub wire: u64,
+    pub otlp_logs: u64,
+    pub otlp_traces: u64,
+    pub hooks: u64,
+    pub missing_sources: Vec<String>,
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -258,6 +269,7 @@ pub fn project_interactions(
     )?;
     sort_captures(&mut captures);
     let capture_records = captures.len() as u64;
+    let source_coverage = cloud_source_coverage(&captures);
 
     let CanonicalRecords {
         interactions,
@@ -350,6 +362,7 @@ pub fn project_interactions(
         protocol_counts,
         transport_counts,
         distinct_model_tool_names,
+        source_coverage,
         validation_status: if integrity.delivery_ready {
             "delivery_ready".to_owned()
         } else {
@@ -531,10 +544,34 @@ pub fn verify_interaction_projection(root: &Path) -> Result<InteractionProjectio
 
 pub(crate) fn verify_interaction_artifacts(root: &Path) -> Result<InteractionProjectionManifest> {
     let manifest_path = root.join("manifest.json");
-    let manifest: InteractionProjectionManifest =
-        serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let manifest_value: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let manifest_schema: Value = serde_json::from_str(include_str!(
+        "../../../schemas/interaction-manifest-v1.schema.json"
+    ))?;
+    let raw_lineage_schema: Value =
+        serde_json::from_str(include_str!("../../../schemas/raw-lineage-v1.schema.json"))?;
+    let schema_registry = jsonschema::Registry::new()
+        .add(
+            "https://github.com/XS-MLVP/ChipTrace/schemas/raw-lineage-v1.schema.json",
+            raw_lineage_schema,
+        )?
+        .prepare()?;
+    let manifest_validator = jsonschema::options()
+        .with_registry(&schema_registry)
+        .build(&manifest_schema)
+        .map_err(|error| anyhow::anyhow!("compile Interaction manifest JSON Schema: {error}"))?;
+    if let Err(error) = manifest_validator.validate(&manifest_value) {
+        bail!(
+            "Interaction manifest JSON Schema validation failed at {}: {error}",
+            error.instance_path()
+        );
+    }
+    let manifest: InteractionProjectionManifest = serde_json::from_value(manifest_value)?;
     if manifest.schema_version != INTERACTION_PROJECTION_SCHEMA_VERSION {
         bail!("unsupported interaction projection manifest");
+    }
+    if !cloud_source_coverage_consistent(&manifest.source_coverage) {
+        bail!("interaction projection source coverage is inconsistent");
     }
     for source in &manifest.raw_sources {
         validate_raw_source(source)?;
@@ -818,12 +855,7 @@ fn select_projection_captures(
         if !available_tasks.contains(requested) {
             bail!("task_session_id {requested:?} was not found in Capture inputs");
         }
-        captures.retain(|capture| {
-            capture
-                .pointer("/traceContext/task_session_id")
-                .and_then(Value::as_str)
-                == Some(requested)
-        });
+        captures.retain(|capture| capture_matches_task(capture, requested));
         return Ok((captures, Some(requested.to_owned()), None));
     }
 
@@ -836,7 +868,7 @@ fn select_projection_captures(
             bail!("session_id {requested:?} was not found in Capture inputs");
         }
         let selection = session_lineage.selection(requested)?;
-        captures.retain(|capture| selection.contains(capture));
+        captures.retain(|capture| capture_matches_session(capture, &selection));
         for capture in &mut captures {
             selection.canonicalize(capture)?;
         }
@@ -847,12 +879,7 @@ fn select_projection_captures(
         0 => {}
         1 => {
             let selected = available_tasks.into_iter().next().unwrap_or_default();
-            captures.retain(|capture| {
-                capture
-                    .pointer("/traceContext/task_session_id")
-                    .and_then(Value::as_str)
-                    == Some(selected.as_str())
-            });
+            captures.retain(|capture| capture_matches_task(capture, &selected));
             return Ok((captures, Some(selected), None));
         }
         count => {
@@ -866,7 +893,7 @@ fn select_projection_captures(
         1 => {
             let selected = top_level_sessions.into_iter().next().unwrap_or_default();
             let selection = session_lineage.selection(&selected)?;
-            captures.retain(|capture| selection.contains(capture));
+            captures.retain(|capture| capture_matches_session(capture, &selection));
             for capture in &mut captures {
                 selection.canonicalize(capture)?;
             }
@@ -876,6 +903,170 @@ fn select_projection_captures(
             "Capture inputs contain {count} Stock Codex Sessions; select one with --session-id"
         ),
     }
+}
+
+fn capture_matches_task(capture: &Value, selected: &str) -> bool {
+    capture
+        .pointer("/traceContext/task_session_id")
+        .and_then(Value::as_str)
+        == Some(selected)
+        || telemetry_batch_identities(capture).0.contains(selected)
+}
+
+fn capture_matches_session(
+    capture: &Value,
+    selection: &crate::session_lineage::StockSessionSelection,
+) -> bool {
+    selection.contains(capture)
+        || telemetry_batch_identities(capture)
+            .1
+            .iter()
+            .any(|session_id| selection.allows_session_id(session_id))
+}
+
+fn telemetry_batch_identities(capture: &Value) -> (BTreeSet<String>, BTreeSet<String>) {
+    if record_type(capture) != "telemetry_batch" {
+        return (BTreeSet::new(), BTreeSet::new());
+    }
+    let Some(raw) = capture
+        .pointer("/telemetryBatch/raw_json")
+        .and_then(Value::as_str)
+    else {
+        return (BTreeSet::new(), BTreeSet::new());
+    };
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return (BTreeSet::new(), BTreeSet::new());
+    };
+    let mut task_ids = BTreeSet::new();
+    let mut session_ids = BTreeSet::new();
+    match capture
+        .pointer("/telemetryBatch/endpoint")
+        .and_then(Value::as_str)
+    {
+        Some("codex_hook") => {
+            for key in ["task_session_id", "taskSessionId"] {
+                insert_nonempty_string(value.get(key), &mut task_ids);
+            }
+            for key in [
+                "session_id",
+                "sessionId",
+                "conversation_id",
+                "conversationId",
+            ] {
+                insert_nonempty_string(value.get(key), &mut session_ids);
+            }
+        }
+        Some("otlp_logs" | "otlp_traces") => {
+            collect_telemetry_attribute_identities(&value, &mut task_ids, &mut session_ids);
+        }
+        _ => {}
+    }
+    (task_ids, session_ids)
+}
+
+fn collect_telemetry_attribute_identities(
+    value: &Value,
+    task_ids: &mut BTreeSet<String>,
+    session_ids: &mut BTreeSet<String>,
+) {
+    match value {
+        Value::Object(object) => {
+            if let Some(key) = object.get("key").and_then(Value::as_str) {
+                let destination = match key {
+                    "task.session.id" | "task_session_id" | "codex.task_session_id" => {
+                        Some(&mut *task_ids)
+                    }
+                    "session.id" | "conversation.id" | "conversation_id" | "codex.session_id" => {
+                        Some(&mut *session_ids)
+                    }
+                    _ => None,
+                };
+                if let Some(destination) = destination {
+                    let attribute = object.get("value").and_then(telemetry_attribute_string);
+                    insert_nonempty_str(attribute, destination);
+                }
+            }
+            for child in object.values() {
+                collect_telemetry_attribute_identities(child, task_ids, session_ids);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_telemetry_attribute_identities(child, task_ids, session_ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn telemetry_attribute_string(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.get("stringValue").and_then(Value::as_str))
+}
+
+fn insert_nonempty_string(value: Option<&Value>, output: &mut BTreeSet<String>) {
+    insert_nonempty_str(value.and_then(Value::as_str), output);
+}
+
+fn insert_nonempty_str(value: Option<&str>, output: &mut BTreeSet<String>) {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        output.insert(value.to_owned());
+    }
+}
+
+fn cloud_source_coverage(captures: &[Value]) -> CloudSourceCoverage {
+    let mut coverage = CloudSourceCoverage {
+        wire: 0,
+        otlp_logs: 0,
+        otlp_traces: 0,
+        hooks: 0,
+        missing_sources: Vec::new(),
+        complete: false,
+    };
+    for capture in captures {
+        match record_type(capture) {
+            "api_snapshot" => coverage.wire = coverage.wire.saturating_add(1),
+            "telemetry_batch" => match capture
+                .pointer("/telemetryBatch/endpoint")
+                .and_then(Value::as_str)
+            {
+                Some("otlp_logs") => coverage.otlp_logs = coverage.otlp_logs.saturating_add(1),
+                Some("otlp_traces") => {
+                    coverage.otlp_traces = coverage.otlp_traces.saturating_add(1)
+                }
+                Some("codex_hook") => coverage.hooks = coverage.hooks.saturating_add(1),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    for (name, count) in [
+        ("wire", coverage.wire),
+        ("otlp_logs", coverage.otlp_logs),
+        ("otlp_traces", coverage.otlp_traces),
+        ("hooks", coverage.hooks),
+    ] {
+        if count == 0 {
+            coverage.missing_sources.push(name.to_owned());
+        }
+    }
+    coverage.complete = coverage.missing_sources.is_empty();
+    coverage
+}
+
+fn cloud_source_coverage_consistent(coverage: &CloudSourceCoverage) -> bool {
+    let expected: Vec<String> = [
+        ("wire", coverage.wire),
+        ("otlp_logs", coverage.otlp_logs),
+        ("otlp_traces", coverage.otlp_traces),
+        ("hooks", coverage.hooks),
+    ]
+    .into_iter()
+    .filter(|(_, count)| *count == 0)
+    .map(|(name, _)| name.to_owned())
+    .collect();
+    coverage.missing_sources == expected && coverage.complete == expected.is_empty()
 }
 
 fn model_interaction_from_capture(capture: &Value) -> Result<Value> {
@@ -7438,5 +7629,96 @@ mod tests {
         assert_eq!(child["traceContext"]["session_id"], "session-root");
         assert_eq!(child["traceContext"]["source_session_id"], "session-child");
         assert_eq!(child["traceContext"]["root_turn_id"], "turn-child");
+    }
+
+    #[test]
+    fn session_cloud_source_coverage_requires_all_four_raw_sources() {
+        let batch = |capture_id: &str, endpoint: &str, raw: Value| {
+            json!({
+                "recordType":"telemetry_batch",
+                "captureId":capture_id,
+                "telemetryBatch":{
+                    "endpoint":endpoint,
+                    "raw_json":serde_json::to_string(&raw).unwrap()
+                }
+            })
+        };
+        let wire = json!({
+            "recordType":"api_snapshot",
+            "captureId":"cap-wire",
+            "traceContext":{"session_id":"session-cloud"}
+        });
+        let logs = batch(
+            "cap-logs",
+            "otlp_logs",
+            json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[{
+                "key":"conversation.id","value":{"stringValue":"session-cloud"}
+            }]}]}]}]}),
+        );
+        let traces = batch(
+            "cap-traces",
+            "otlp_traces",
+            json!({"resourceSpans":[{"scopeSpans":[{"spans":[{"attributes":[{
+                "key":"session.id","value":{"stringValue":"session-cloud"}
+            }]}]}]}]}),
+        );
+        let hook = batch(
+            "cap-hook",
+            "codex_hook",
+            json!({"hook_event_name":"SessionStart","session_id":"session-cloud"}),
+        );
+        let unrelated = batch(
+            "cap-unrelated",
+            "otlp_traces",
+            json!({"resourceSpans":[{"scopeSpans":[{"spans":[{"attributes":[{
+                "key":"conversation.id","value":{"stringValue":"other-session"}
+            }]}]}]}]}),
+        );
+        let body_lookalike = batch(
+            "cap-body-lookalike",
+            "otlp_traces",
+            json!({
+                "session_id":"session-cloud",
+                "resourceSpans":[{"scopeSpans":[{"spans":[{"attributes":[]}]}]}]
+            }),
+        );
+
+        let (selected, _, _) = select_projection_captures(
+            vec![
+                wire.clone(),
+                logs.clone(),
+                traces,
+                hook.clone(),
+                unrelated,
+                body_lookalike,
+            ],
+            None,
+            Some("session-cloud"),
+        )
+        .unwrap();
+        let coverage = cloud_source_coverage(&selected);
+        assert!(coverage.complete);
+        assert!(
+            selected.iter().all(|capture| {
+                string_field(capture, "captureId") != Some("cap-body-lookalike")
+            })
+        );
+        assert_eq!(coverage.missing_sources, Vec::<String>::new());
+        assert_eq!(
+            (
+                coverage.wire,
+                coverage.otlp_logs,
+                coverage.otlp_traces,
+                coverage.hooks
+            ),
+            (1, 1, 1, 1)
+        );
+
+        let (without_traces, _, _) =
+            select_projection_captures(vec![wire, logs, hook], None, Some("session-cloud"))
+                .unwrap();
+        let incomplete = cloud_source_coverage(&without_traces);
+        assert!(!incomplete.complete);
+        assert_eq!(incomplete.missing_sources, ["otlp_traces"]);
     }
 }

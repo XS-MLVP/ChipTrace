@@ -7,7 +7,7 @@ use crate::score::{
     AssessmentSchemaValidators, Profile, assess_session, assessment_contract_valid,
     assessment_record_from_session, eligible_assessment_contract_valid, exact_content_fingerprint,
     is_contiguous_subsequence, materialize_profile_session, message_fingerprints,
-    normalize_assessment_profile, recompute_assessment_for_version,
+    recompute_assessment_for_version,
 };
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
@@ -352,11 +352,13 @@ pub fn verify_release(root: &Path, require_pass: bool) -> Result<ReleaseManifest
     if !manifest.minimum_score.is_finite() || !(0.0..=100.0).contains(&manifest.minimum_score) {
         bail!("release minimum_score must be between 0 and 100");
     }
-    let profile = match manifest.buyer_profile.as_str() {
-        "buyer-v6" => Profile::BuyerV6,
-        "buyer-v7" | "buyer-v7-codex-runtime-expanded" => Profile::BuyerV7,
-        value => bail!("unsupported release buyer profile {value:?}"),
-    };
+    if manifest.buyer_profile != Profile::BuyerV7.as_str() {
+        bail!(
+            "unsupported release buyer profile {:?}",
+            manifest.buyer_profile
+        );
+    }
+    let profile = Profile::BuyerV7;
     let assessment_schemas = AssessmentSchemaValidators::new()?;
     if require_pass && manifest.validation_status != "pass" {
         bail!(
@@ -641,9 +643,7 @@ fn validate_embedded_acceptance(
         &assessment.schema_version,
     )
     .context("release Session uses an unsupported assessment schema")?;
-    let mut comparable = assessment.clone();
-    normalize_assessment_profile(&mut comparable, profile);
-    if recomputed != comparable {
+    if recomputed != assessment {
         bail!("release Session quality does not match its canonical content");
     }
     Ok(assessment)
@@ -794,17 +794,17 @@ fn score_partition(
             continue;
         }
         let candidate: Value = serde_json::from_slice(&line)?;
-        let session = candidate
+        let source_session = candidate
             .get("session")
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("candidate session missing"))?;
-        let session = materialize_profile_session(&session, config.profile);
+        let session = materialize_profile_session(&source_session, config.profile);
         let fingerprint = exact_content_fingerprint(&session);
         if !exact_fingerprints.insert(fingerprint.clone()) {
             result.exact_removed += 1;
             continue;
         }
-        let quality = assess_session(&session, config.profile, config.minimum_score);
+        let quality = assess_session(&source_session, config.profile, config.minimum_score);
         result.assessed += 1;
         result
             .assessed_tokens
@@ -1227,8 +1227,6 @@ fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::LEGACY_ASSESSMENT_SCHEMA_VERSION;
-    use crate::score::recompute_assessment_for_version;
     use serde_json::json;
 
     fn complete_raw_lineage() -> RawSourceLineage {
@@ -1525,6 +1523,38 @@ mod tests {
     }
 
     #[test]
+    fn strict_release_rejects_historical_client_metadata_before_projection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("sessions.jsonl");
+        let output = temporary.path().join("release");
+        let mut session = eligible_session("historical-client");
+        assert!(
+            assess_session(&session, Profile::BuyerV7, 90.0)
+                .buyer_acceptance
+                .eligible
+        );
+        session["meta"]["producer_streams"] = json!({"old-client": {}});
+        fs::write(&input, format!("{session}\n")).unwrap();
+
+        let error = build_release(ReleaseConfig {
+            inputs: vec![input],
+            output: output.clone(),
+            release_id: "historical-client".to_owned(),
+            profile: Profile::BuyerV7,
+            minimum_score: 90.0,
+            target_part_bytes: 1024 * 1024,
+            dedup_partitions: 1,
+            zstd_level: 1,
+            workers: 1,
+            replace: false,
+            require_pass: true,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("Release failed closed"));
+        assert!(!output.exists());
+    }
+
+    #[test]
     fn release_rejects_mixed_raw_lineage_inputs() {
         let temporary = tempfile::tempdir().unwrap();
         let raw = temporary.path().join("raw");
@@ -1569,35 +1599,6 @@ mod tests {
                 .to_string()
                 .contains("cannot mix Raw-lineaged and unlineaged Session inputs")
         );
-    }
-
-    #[test]
-    fn release_read_only_verifier_accepts_a_legacy_v1_assessment() {
-        let mut session = eligible_session("legacy-release");
-        let current = assess_session(&session, Profile::BuyerV7, 90.0);
-        assert!(
-            current.buyer_acceptance.eligible,
-            "current assessment failures: {:?}",
-            current.buyer_acceptance.failure_reasons
-        );
-        let legacy = recompute_assessment_for_version(
-            &session,
-            Profile::BuyerV7,
-            90.0,
-            LEGACY_ASSESSMENT_SCHEMA_VERSION,
-        )
-        .unwrap();
-        assert!(legacy.eligible);
-        session["quality"] = json!({
-            "capture_completeness":current.capture_completeness,
-            "buyer_acceptance":legacy,
-            "semantic_quality":current.semantic_quality,
-        });
-
-        let validators = AssessmentSchemaValidators::new().unwrap();
-        let verified =
-            validate_embedded_acceptance(&session, Profile::BuyerV7, 90.0, &validators).unwrap();
-        assert_eq!(verified.schema_version, LEGACY_ASSESSMENT_SCHEMA_VERSION);
     }
 
     #[test]

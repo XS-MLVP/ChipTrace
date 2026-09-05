@@ -27,7 +27,7 @@
     "format": {"type": "string", "minLength": 1},
     "encoding": {"const": "UTF-8"},
     "archive_format": {"type": "string", "pattern": "^tar\\.gz; gzip-[0-9]$"},
-    "buyer_profile": {"enum": ["buyer-v7", "buyer-v7-codex-runtime-expanded"]},
+    "buyer_profile": {"const": "buyer-v7"},
     "minimum_score": {"type": "number", "minimum": 90, "maximum": 100},
     "source_release_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "lineage_status": {"const": "complete"},

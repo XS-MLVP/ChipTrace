@@ -428,10 +428,7 @@ async fn validate_committed_artifact(
                 || manifest.release_id != artifact_id
                 || manifest.validation_status != "pass"
                 || manifest.lineage_status != "complete"
-                || !matches!(
-                    manifest.buyer_profile.as_str(),
-                    "buyer-v7" | "buyer-v7-codex-runtime-expanded"
-                )
+                || manifest.buyer_profile != crate::score::Profile::BuyerV7.as_str()
                 || manifest.minimum_score < 90.0
             {
                 bail!("published buyer package manifest is not an accepted delivery");
@@ -520,6 +517,7 @@ mod tests {
     use super::*;
     use crate::schema::{ReleaseCounts, ReleaseManifest};
     use crate::score::{Profile, assess_session, exact_content_fingerprint};
+    use serde_json::Value;
     use std::collections::BTreeMap;
     use std::fs;
 
@@ -530,6 +528,97 @@ mod tests {
         let object_root = temporary.path().join("objects");
         fs::create_dir_all(&release).unwrap();
         fs::create_dir_all(&object_root).unwrap();
+        let tool_names = [
+            "repository_search",
+            "file_read",
+            "shell_execute",
+            "source_patch",
+            "test_run",
+        ];
+        let tools: Vec<Value> = tool_names
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "description": format!("Execute {name}."),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": "string", "description": "Input value."}
+                        }
+                    }
+                })
+            })
+            .collect();
+        let mut messages = vec![
+            serde_json::json!({"role": "system", "content": "You are a coding agent."}),
+            serde_json::json!({"role": "user", "content": "Inspect the repository."}),
+            serde_json::json!({"role": "assistant", "content": "I will inspect it."}),
+        ];
+        for index in 0..8 {
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": format!("call-{index}"),
+                    "type": "function",
+                    "function": {
+                        "name": tool_names[index % tool_names.len()],
+                        "arguments": format!("{{\"value\":\"{index}\"}}")
+                    }
+                }]
+            }));
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": format!("call-{index}"),
+                "content": format!("result-{index}"),
+                "status": "success",
+                "is_error": false
+            }));
+        }
+        messages.extend([
+            serde_json::json!({"role": "user", "content": "Verify the result."}),
+            serde_json::json!({"role": "assistant", "content": "Verification passed."}),
+        ]);
+        let runtime_dag = serde_json::json!({
+            "schema_version": "chiptrace.runtime-dag.v1",
+            "source": "canonical_model_interaction:cloud_evidence",
+            "evidence_event_count": 1,
+            "roots": ["root"],
+            "root_mode": "single_turn",
+            "task_session_ids": [],
+            "session_ids": ["publish-fixture"],
+            "open_node_ids": [],
+            "unresolved_node_ids": [],
+            "status_conflict_node_ids": [],
+            "terminal_root_ids": ["root"],
+            "canonical_metrics": {},
+            "root_complete": true,
+            "complete": true,
+            "applicable": true
+        });
+        let trace_readiness = serde_json::json!({
+            "schema_version": "chiptrace.trace-readiness.v1",
+            "artifact_valid": true,
+            "raw_bytes_complete": true,
+            "protocol_complete": true,
+            "runtime_complete": true,
+            "root_complete": true,
+            "wire_ready": true,
+            "runtime_ready": true,
+            "delivery_ready": true
+        });
+        let model_evidence = serde_json::json!({
+            "request_models": ["gpt-5.6-sol"],
+            "response_models": ["gpt-5.6-sol"],
+            "providers": ["OpenAI"],
+            "attested": true,
+            "consistent": true,
+            "provider_identity_attested": true,
+            "api_snapshot_count": 1,
+            "attestation_candidate_count": 1,
+            "non_attestable_api_snapshots": []
+        });
         let mut session = serde_json::json!({
             "schema_version": "chiptrace.session.v1",
             "trajectory_id": "publish-fixture",
@@ -542,60 +631,35 @@ mod tests {
             "is_final_snapshot": true,
             "source_request_count": 1,
             "system_prompt": "You are a coding agent.",
-            "tools": [{
-                "name": "run_test",
-                "description": "Run a focused test.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "target": {"type": "string", "description": "Test target."}
-                    }
-                }
-            }],
-            "messages": [
-                {"role": "system", "content": "You are a coding agent."},
-                {"role": "user", "content": "Run the focused test in /workspace/repo."},
-                {"role": "assistant", "content": "Running it.", "tool_calls": [{
-                    "id": "call-1", "name": "run_test", "arguments": {"target": "unit"}
-                }]},
-                {"role": "tool", "tool_call_id": "call-1", "content": "passed", "status": "success"},
-                {"role": "assistant", "content": "The focused test passed."},
-                {"role": "user", "content": "Now summarize the result and the changed files."},
-                {"role": "assistant", "content": "The test passed and no files were changed."}
-            ],
+            "tools": tools,
+            "messages": messages,
             "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
             "meta": {
                 "merge_divergences": 0,
                 "schema_conflicts": [],
                 "trace_conflicts": [],
                 "system_prompt_conflicts": [],
+                "usage_conflicts": [],
+                "tool_execution_conflicts": [],
+                "runtime_evidence_conflicts": [],
+                "runtime_unknown_events": [],
+                "runtime_unmapped_tools": [],
+                "trace": {"session_id": "publish-fixture"},
+                "lifecycle_events": ["session_start", "session_end"],
                 "capture_dag": {
                     "has_cycle": false,
                     "unresolved_parent_response_ids": [],
                     "unresolved_parent_span_ids": []
                 },
-                "trace_readiness": {
-                    "schema_version": "chiptrace.trace-readiness.v1",
-                    "artifact_valid": true,
-                    "raw_bytes_complete": true,
-                    "protocol_complete": true,
-                    "runtime_complete": true,
-                    "root_complete": true,
-                    "wire_ready": true,
-                    "runtime_ready": true,
-                    "delivery_ready": true
-                },
+                "runtime_dag": runtime_dag,
+                "inference_api_conservation": {"applicable": false, "complete": true},
+                "trace_readiness": trace_readiness,
                 "task_dag": {"complete": true},
                 "task_type": "code",
-                "model_evidence": {
-                    "request_models": ["gpt-5.6-sol"],
-                    "response_models": ["gpt-5.6-sol"],
-                    "providers": ["OpenAI"],
-                    "attested": true
-                }
+                "model_evidence": model_evidence
             }
         });
-        let quality = assess_session(&session, Profile::BuyerV6, 90.0);
+        let quality = assess_session(&session, Profile::BuyerV7, 90.0);
         assert!(quality.buyer_acceptance.eligible);
         let eligible_tokens = quality.buyer_acceptance.tokens.clone();
         session["quality"] = serde_json::to_value(&quality).unwrap();
@@ -647,7 +711,7 @@ mod tests {
             format: "test".to_owned(),
             session_atomic: true,
             session_split_count: 0,
-            buyer_profile: "buyer-v6".to_owned(),
+            buyer_profile: "buyer-v7".to_owned(),
             minimum_score: 90.0,
             tokenizer: "test".to_owned(),
             compression: "zstd-1".to_owned(),

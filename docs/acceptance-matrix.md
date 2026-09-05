@@ -8,6 +8,7 @@
 | 验收项 | 实现 | 通过条件 |
 | --- | --- | --- |
 | Raw 完整性 | WAL、sealed Segment、OSS Manifest/Checkpoint | complete；逐对象和逐行 SHA-256 通过 |
+| 云端来源 | Wire、OTLP logs、OTLP traces、required Hook | 四路均精确归属当前 Session；缺一路即拒绝 |
 | Wire 完整性 | 18084 原字节 Capture | 请求/响应长度与 SHA 一致；Responses 有协议终态 |
 | Session 身份 | Stock Codex headers、OTLP、required Hook | 显式 `session_id`；start/end 闭合；无冲突 |
 | Runtime | `codex.tool_result` + lifecycle | 输出未截断；调度状态明确；Shell 进程结果独立；无 open/conflict span |
@@ -27,7 +28,7 @@
 | --- | --- |
 | Relay/Collector | attempt 守恒，pending/inflight 为 0 |
 | Raw | Archive、Verify、Restore 全通过 |
-| Canonical | Schema 全通过，`delivery_ready=true` |
+| Canonical | Schema 全通过，四源齐全，`delivery_ready=true` |
 | OTLP | 1 个 root，内部父引用解析率 100% |
 | Buyer v7 | 10 个有效轮次、5 个不同工具、5 份完整 Schema、配对率 100% |
 | Release | score 100、hard gate 全通过、1/1 eligible |
@@ -53,6 +54,7 @@ Collector 的连续 sealed Segment 建立 `complete` Raw Checkpoint，再通过�
 | --- | --- |
 | Session | `01a06d0f-a725-7e11-bcb3-cec3bbe00945` |
 | Raw lineage | 142,798 条；33,452,748,417 bytes；Checkpoint `complete` |
+| 云端来源 | Wire 51；OTLP logs 190；OTLP traces 62；Hook 6；缺失 0 |
 | Wire / usage | 51 次 streaming 尝试；42 次完成并精确关联 Sub2API；9 次响应前传输失败完整保留 |
 | 工具 | 38 个必需调用；8 个不同工具；8 份完整定义；result/execution 配对率 100% |
 | 分支 | 2 个调用由客户端关闭字节边界证明为 abandoned，未改写为成功或执行 |

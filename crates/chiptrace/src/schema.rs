@@ -3,7 +3,6 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub const SESSION_SCHEMA_VERSION: &str = "chiptrace.session.v1";
-pub const LEGACY_ASSESSMENT_SCHEMA_VERSION: &str = "chiptrace.assessment.v1";
 pub const ASSESSMENT_SCHEMA_VERSION: &str = "chiptrace.assessment.v2";
 pub const RELEASE_SCHEMA_VERSION: &str = "chiptrace.jsonl-release.v1";
 pub const OBJECT_COMMIT_SCHEMA_VERSION: &str = "chiptrace.object-commit.v1";
@@ -367,7 +366,6 @@ mod tests {
     fn public_json_schemas_are_valid_json_documents() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas");
         let expected = [
-            "assessment-v1.schema.json",
             "assessment-v2.schema.json",
             "buyer-archive-v1.schema.json",
             "buyer-package-v1.schema.json",
@@ -395,16 +393,6 @@ mod tests {
                 Some("https://json-schema.org/draft/2020-12/schema")
             );
         }
-    }
-
-    #[test]
-    fn legacy_assessment_v1_schema_remains_byte_stable() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../schemas/assessment-v1.schema.json");
-        assert_eq!(
-            crate::jsonl::sha256_bytes(&fs::read(path).unwrap()),
-            "2b08d6b338793baa8ba252ada70df9836592176f3ff8fc4bd1ff1ceba0ecbba0"
-        );
     }
 
     #[test]

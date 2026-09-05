@@ -93,6 +93,8 @@ interactions/
 写出和复验时逐条执行 Draft 2020-12 JSON Schema。完整性分为
 `artifact_valid`、`raw_bytes_complete`、`protocol_complete`、`runtime_complete`、
 `root_complete` 和 `delivery_ready`；最后一项只在前五项全部通过时为 true。
+`source_coverage` 另行证明所选 Session 同时存在 Wire、OTLP logs、OTLP traces 和 required
+Hook；它不把 OTLP trace 重写成第二套 Runtime 真相，缺一路时云端采购验收直接失败。
 
 ## Tool Schema
 

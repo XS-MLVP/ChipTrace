@@ -5,8 +5,7 @@ use crate::schema::{
 };
 use crate::score::{
     AssessmentSchemaValidators, Profile, assessment_record_from_session,
-    eligible_assessment_contract_valid, normalize_assessment_profile,
-    recompute_assessment_for_version,
+    eligible_assessment_contract_valid, recompute_assessment_for_version,
 };
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
@@ -103,11 +102,7 @@ pub fn package_buyer_release(config: BuyerPackageConfig) -> Result<BuyerPackageM
     if source.parts.is_empty() {
         bail!("verified Release has no eligible Session parts");
     }
-    if !matches!(
-        source.buyer_profile.as_str(),
-        "buyer-v7" | "buyer-v7-codex-runtime-expanded"
-    ) || source.minimum_score < 90.0
-    {
+    if source.buyer_profile != Profile::BuyerV7.as_str() || source.minimum_score < 90.0 {
         bail!("buyer package requires buyer-v7 with minimum_score >= 90");
     }
     if source.raw_sources.is_empty() {
@@ -216,9 +211,7 @@ fn require_current_assessments(release: &Path, manifest: &ReleaseManifest) -> Re
                 .and_then(Value::as_str)
                 != Some(ASSESSMENT_SCHEMA_VERSION)
             {
-                bail!(
-                    "new buyer packages require {ASSESSMENT_SCHEMA_VERSION}; legacy assessments are read-only"
-                );
+                bail!("buyer packages require {ASSESSMENT_SCHEMA_VERSION}");
             }
         }
     }
@@ -241,10 +234,7 @@ pub fn verify_buyer_package(root: &Path) -> Result<BuyerPackageManifest> {
     if manifest.validation_status != "pass"
         || manifest.encoding != "UTF-8"
         || !gzip_level_valid
-        || !matches!(
-            manifest.buyer_profile.as_str(),
-            "buyer-v7" | "buyer-v7-codex-runtime-expanded"
-        )
+        || manifest.buyer_profile != Profile::BuyerV7.as_str()
         || !manifest.minimum_score.is_finite()
         || !(90.0..=100.0).contains(&manifest.minimum_score)
         || manifest.release_id.trim().is_empty()
@@ -660,9 +650,7 @@ fn validate_buyer_record(
         &assessment.schema_version,
     )
     .context("buyer Session uses an unsupported assessment schema")?;
-    let mut comparable = assessment.clone();
-    normalize_assessment_profile(&mut comparable, Profile::BuyerV7);
-    if recomputed != comparable {
+    if recomputed != assessment {
         bail!("buyer archive Session quality does not match its canonical content");
     }
     Ok(assessment)
@@ -793,10 +781,6 @@ fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jsonl::JsonlWriter;
-    use crate::schema::{
-        FileManifest, LEGACY_ASSESSMENT_SCHEMA_VERSION, RELEASE_SCHEMA_VERSION, ReleaseCounts,
-    };
     use serde_json::json;
 
     #[test]
@@ -825,59 +809,5 @@ mod tests {
                 "accepted internal field {field}"
             );
         }
-    }
-
-    #[test]
-    fn new_buyer_package_rejects_legacy_v1_assessment_reports() {
-        let temporary = tempfile::tempdir().unwrap();
-        let report_path = temporary
-            .path()
-            .join("reports/assessments-part-00001.jsonl.zst");
-        let mut writer = JsonlWriter::create(&report_path, 1).unwrap();
-        writer
-            .write_value(&json!({
-                "quality":{"buyer_acceptance":{
-                    "schema_version":LEGACY_ASSESSMENT_SCHEMA_VERSION
-                }}
-            }))
-            .unwrap();
-        writer.finish().unwrap();
-        let report = FileManifest {
-            file: "reports/assessments-part-00001.jsonl.zst".to_owned(),
-            sha256: sha256_file(&report_path).unwrap(),
-            bytes: report_path.metadata().unwrap().len(),
-            records: Some(1),
-            uncompressed_bytes: None,
-            oversized_session: None,
-        };
-        let manifest = ReleaseManifest {
-            schema_version: RELEASE_SCHEMA_VERSION.to_owned(),
-            release_id: "legacy-assessment".to_owned(),
-            created_at_utc: "2026-09-01T00:00:00Z".to_owned(),
-            format: "jsonl".to_owned(),
-            session_atomic: true,
-            session_split_count: 0,
-            buyer_profile: "buyer-v7-codex-runtime-expanded".to_owned(),
-            minimum_score: 90.0,
-            tokenizer: String::new(),
-            compression: "zstd".to_owned(),
-            processing_workers: 1,
-            target_part_bytes: 1,
-            raw_sources: Vec::new(),
-            counts: ReleaseCounts::default(),
-            eligible_tokens: TokenCounts::default(),
-            assessed_tokens: TokenCounts::default(),
-            failure_reason_counts: BTreeMap::new(),
-            parts: Vec::new(),
-            reports: vec![report],
-            validation_status: "pass".to_owned(),
-        };
-
-        let error = require_current_assessments(temporary.path(), &manifest).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("legacy assessments are read-only")
-        );
     }
 }

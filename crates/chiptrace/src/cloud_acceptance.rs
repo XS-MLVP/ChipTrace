@@ -5,7 +5,8 @@ use crate::jsonl::{
     absolute_path, ensure_safe_relative_path, open_jsonl_reader, sha256_file, utc_now,
 };
 use crate::model_interaction::{
-    InteractionProjectConfig, project_interactions, verify_interaction_projection,
+    CloudSourceCoverage, InteractionProjectConfig, project_interactions,
+    verify_interaction_projection,
 };
 use crate::object_store::Backend;
 use crate::raw_archive::{
@@ -73,6 +74,7 @@ pub struct CloudAcceptanceManifest {
     pub eligible_sessions: u64,
     pub api_total_tokens: u64,
     pub normalized_corpus_tokens: u64,
+    pub source_coverage: CloudSourceCoverage,
     pub root_spans: u64,
     pub internal_parent_references: u64,
     pub resolved_internal_parents: u64,
@@ -195,8 +197,12 @@ async fn run_pipeline(
         || interaction.session_id.as_deref() != Some(config.session_id.as_str())
         || interaction.validation_status != "delivery_ready"
         || !interaction.integrity.delivery_ready
+        || !interaction.source_coverage.complete
     {
-        bail!("selected Stock Codex Session is not delivery-ready");
+        bail!(
+            "selected Stock Codex Session is not delivery-ready; missing cloud sources: {:?}",
+            interaction.source_coverage.missing_sources
+        );
     }
 
     let otlp_root = output.join("otlp");
@@ -323,6 +329,7 @@ async fn run_pipeline(
         eligible_sessions: buyer.eligible_sessions,
         api_total_tokens: buyer.eligible_tokens.api_total_tokens,
         normalized_corpus_tokens: buyer.eligible_tokens.normalized_corpus_tokens,
+        source_coverage: interaction.source_coverage,
         root_spans: otlp.root_spans,
         internal_parent_references: otlp.internal_parent_references,
         resolved_internal_parents: otlp.resolved_internal_parents,
@@ -363,6 +370,12 @@ pub fn verify_cloud_acceptance(root: &Path) -> Result<CloudAcceptanceManifest> {
         || manifest.complete_tool_definitions < 5
         || manifest.pairing_rate_after_open_tail != 1.0
         || manifest.eligible_sessions != 1
+        || !manifest.source_coverage.complete
+        || manifest.source_coverage.wire == 0
+        || manifest.source_coverage.otlp_logs == 0
+        || manifest.source_coverage.otlp_traces == 0
+        || manifest.source_coverage.hooks == 0
+        || !manifest.source_coverage.missing_sources.is_empty()
         || manifest.root_spans != 1
         || manifest.internal_parent_references != manifest.resolved_internal_parents
     {

@@ -68,7 +68,7 @@ chiptrace verify-cloud-acceptance \
 
 ## 监控
 
-- 业务 Responses 增长时，Wire、OTLP 和 Hook 三源是否同时增长。
+- 业务 Responses 增长时，Wire、OTLP logs、OTLP traces 和 Hook 四源是否同时增长。
 - Relay `ingest_coverage.status` 必须保持 `complete`。`partial` 表示启动预热或来源尚未出现；
   `degraded` 表示 Wire 活跃时 Runtime 来源缺失或落后超过 5 分钟，应按 `missing_sources`、
   `stale_sources` 和 `source_lag_ms` 检查 Stock Codex 受管配置。
