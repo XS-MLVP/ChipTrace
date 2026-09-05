@@ -36,8 +36,9 @@ test('Responses and OTLP routes are complete without embedded credentials', () =
   assert.match(config, /18084\/otel\/v1\/logs/);
   assert.match(config, /18084\/otel\/v1\/traces/);
   assert.match(config, /^log_user_prompt = true$/m);
+  assert.match(config, /^\[otel\.tool_result\]$/m);
+  assert.match(config, /^max_bytes = 268435456$/m);
   assert.doesNotMatch(config, /Authorization|CHIPTRACE_INGEST_TOKEN/);
-  assert.doesNotMatch(config, /^\[otel\.tool_result\]$/m);
   assert.match(readme, /OTEL_EXPORTER_OTLP_HEADERS/);
   assert.match(readme, /Authorization=Bearer%20\$\{CHIPTRACE_INGEST_TOKEN\}/);
 });

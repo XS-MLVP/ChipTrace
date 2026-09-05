@@ -31,5 +31,6 @@ Release。
 Provider 使用 command auth，确保 Stock Codex 会刷新该目录。Tool Schema 只取模型实际收到的
 Responses Wire；模型身份以 Wire 与 Sub2API 精确路由为准。
 
-配置只使用跨版本核心字段。工具结果日志上限由 Codex 默认值或版本支持的本地配置管理，
-不作为云端采集契约的一部分。
+受管主机要求 Stock Codex 0.150 或更高版本，并使用 `--strict-config`。`otel.tool_result.max_bytes`
+固定为 256 MiB；低版本不识别该字段时必须在首个 Turn 前失败，不能以默认 2 KiB 截断结果后
+继续产生不可交付的 Session。云端仍以每条事件实际报告的 `output_truncated=false` 为准。
