@@ -59,7 +59,9 @@ Responses Wire；模型身份以 Wire 与 Sub2API 精确路由为准。
 当前 Provider 约束已使用未修改的 Stock Codex `0.163.0` 在断网、只读根文件系统的
 容器中验证。其他版本需要重新运行配置回归和真实 Canary，不能仅凭版本号较新或
 `--strict-config` 未报错认定约束生效。`otel.tool_result.max_bytes` 固定为 256 MiB；
-客户端必须支持该字段，云端仍以每条事件实际报告的 `output_truncated=false` 为准。
+受管主机要求 Stock Codex `0.150` 或更高版本，并使用 `--strict-config`；客户端必须支持该字段，
+低版本不识别时必须在首个 Turn 前失败，不能以默认 2 KiB 截断结果后继续产生不可交付的 Session。
+云端仍以每条事件实际报告的 `output_truncated=false` 为准。
 
 正式版 `0.163.0` 已独立执行合成模型双轮采集，仍因来源上下文缺口拒绝交付。
 `stock-release-context` CI 保存该已知拒绝的精简诊断，不声明生产版本支持；命令、固定
