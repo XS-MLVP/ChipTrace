@@ -30,3 +30,6 @@ Release。
 云端 `/models` 必须先验证真实 Provider 凭据，再为真实模型返回 `direct` function 工具目录。
 Provider 使用 command auth，确保 Stock Codex 会刷新该目录。Tool Schema 只取模型实际收到的
 Responses Wire；模型身份以 Wire 与 Sub2API 精确路由为准。
+
+配置只使用跨版本核心字段。工具结果日志上限由 Codex 默认值或版本支持的本地配置管理，
+不作为云端采集契约的一部分。

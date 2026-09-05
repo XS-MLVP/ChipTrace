@@ -53,6 +53,14 @@ fn build_catalog() -> Result<ManagedModelCatalog> {
             bail!("managed model metadata is missing {required}");
         }
     }
+    for required in [
+        "supports_reasoning_summaries",
+        "supports_parallel_tool_calls",
+    ] {
+        if !model.get(required).is_some_and(Value::is_boolean) {
+            bail!("managed model metadata requires boolean {required}");
+        }
+    }
     let digest = hex::encode(Sha256::digest(CATALOG_BYTES));
     Ok(ManagedModelCatalog {
         bytes: CATALOG_BYTES,
@@ -74,6 +82,8 @@ mod tests {
         assert!(model.get("apply_patch_tool_type").is_none());
         assert_eq!(model["multi_agent_version"], "v2");
         assert_eq!(model["supports_search_tool"], true);
+        assert_eq!(model["supports_reasoning_summaries"], true);
+        assert_eq!(model["supports_parallel_tool_calls"], true);
         assert!(model["model_messages"]["instructions_template"].is_string());
         assert!(catalog.etag.starts_with("\"sha256-"));
     }

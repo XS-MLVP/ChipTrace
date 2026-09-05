@@ -22,6 +22,3 @@ log_user_prompt = true
 exporter = { otlp-http = { endpoint = "http://172.28.11.121:18084/otel/v1/logs", protocol = "json" } }
 trace_exporter = { otlp-http = { endpoint = "http://172.28.11.121:18084/otel/v1/traces", protocol = "json" } }
 metrics_exporter = "none"
-
-[otel.tool_result]
-max_bytes = 268435456

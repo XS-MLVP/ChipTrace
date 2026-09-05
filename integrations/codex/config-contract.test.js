@@ -36,10 +36,22 @@ test('Responses and OTLP routes are complete without embedded credentials', () =
   assert.match(config, /18084\/otel\/v1\/logs/);
   assert.match(config, /18084\/otel\/v1\/traces/);
   assert.match(config, /^log_user_prompt = true$/m);
-  assert.match(config, /^max_bytes = 268435456$/m);
   assert.doesNotMatch(config, /Authorization|CHIPTRACE_INGEST_TOKEN/);
+  assert.doesNotMatch(config, /^\[otel\.tool_result\]$/m);
   assert.match(readme, /OTEL_EXPORTER_OTLP_HEADERS/);
   assert.match(readme, /Authorization=Bearer%20\$\{CHIPTRACE_INGEST_TOKEN\}/);
+});
+
+test('model catalog keeps fields required by legacy and current Stock Codex', () => {
+  const catalog = JSON.parse(
+    fs.readFileSync(path.join(integrationRoot, 'managed-models.json'), 'utf8'),
+  );
+  assert.equal(catalog.models.length, 1);
+  const model = catalog.models[0];
+  assert.equal(model.tool_mode, 'direct');
+  assert.equal(model.supports_reasoning_summaries, true);
+  assert.equal(model.supports_parallel_tool_calls, true);
+  assert.equal(Object.hasOwn(model, 'include_apps_usage_instructions'), true);
 });
 
 test('required Hooks contain lifecycle only and fail closed at SessionStart', () => {

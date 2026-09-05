@@ -71,6 +71,7 @@
         }
       },
       "include_skills_usage_instructions": false,
+      "supports_reasoning_summaries": true,
       "include_plugin_usage_instructions": true,
       "include_apps_usage_instructions": true,
       "default_reasoning_summary": "none",
@@ -92,6 +93,7 @@
         "image"
       ],
       "supports_search_tool": true,
+      "supports_parallel_tool_calls": true,
       "use_responses_lite": true,
       "node_repl_auto_review_required": false,
       "node_repl_disabled": false,
