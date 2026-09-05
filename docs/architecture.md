@@ -42,7 +42,7 @@ Raw 继续保留，但 Session 为 incomplete。
 
 ## 工具定义
 
-云端 `/models` 为真实模型名 `gpt-5.6-sol` 返回版本化模型能力，并将 `tool_mode` 固定为
+云端 `/models` 为真实模型名 `gpt-5.6-sol`、`gpt-6-astra` 返回版本化模型能力，并将 `tool_mode` 固定为
 `direct`。18084 网关验证 Provider 业务凭据，再用内部采集凭据读取 Relay 目录；业务凭据
 不会传给 Relay。Stock Codex 因而在真实 Responses 请求中发送 JSON function tools 和完整
 `parameters`；这份 Wire 是 Tool Schema 的唯一依据。运行时结果只能关联已有模型调用，

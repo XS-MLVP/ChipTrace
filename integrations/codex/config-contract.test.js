@@ -47,12 +47,14 @@ test('model catalog keeps fields required by legacy and current Stock Codex', ()
   const catalog = JSON.parse(
     fs.readFileSync(path.join(integrationRoot, 'managed-models.json'), 'utf8'),
   );
-  assert.equal(catalog.models.length, 1);
-  const model = catalog.models[0];
-  assert.equal(model.tool_mode, 'direct');
-  assert.equal(model.supports_reasoning_summaries, true);
-  assert.equal(model.supports_parallel_tool_calls, true);
-  assert.equal(Object.hasOwn(model, 'include_apps_usage_instructions'), true);
+  assert.deepEqual(catalog.models.map((model) => model.slug), ['gpt-5.6-sol', 'gpt-6-astra']);
+  for (const model of catalog.models) {
+    assert.equal(model.tool_mode, 'direct');
+    assert.equal(model.supports_reasoning_summaries, true);
+    assert.equal(model.supports_parallel_tool_calls, true);
+    assert.equal(Object.hasOwn(model, 'include_apps_usage_instructions'), true);
+    assert.equal(Object.hasOwn(model, 'apply_patch_tool_type'), false);
+  }
 });
 
 test('required Hooks contain lifecycle only and fail closed at SessionStart', () => {
