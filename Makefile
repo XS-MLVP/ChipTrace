@@ -20,6 +20,7 @@ gateway-host-test:
 
 codex-config-test:
 	node --test integrations/codex/config-contract.test.js
+	node --test scripts/ci/upstream-context.test.js
 
 native-context-test:
 	cargo build --locked --bin chiptrace

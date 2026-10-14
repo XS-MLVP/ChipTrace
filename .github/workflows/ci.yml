@@ -14,6 +14,13 @@ defaults:
 jobs:
   upstream-context:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_BUILD_JOBS: "4"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
       - name: Check out the pinned Stock Codex source
@@ -30,7 +37,50 @@ jobs:
           git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-sse-context.patch"
           git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-sse-context.patch"
           git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-sse-context-test.patch"
+          git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-sse-context-test.patch"
           git -C .ci-codex-source diff --check
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .ci-codex-source/codex-rs -> target
+          prefix-key: upstream-context
+      - name: Reconcile only the pinned tag's local package release versions
+        working-directory: .ci-codex-source/codex-rs
+        run: |
+          cargo metadata --format-version 1 --no-deps > "$RUNNER_TEMP/producer-metadata.json"
+          node "$GITHUB_WORKSPACE/scripts/ci/check-producer-lock.js" \
+            "$GITHUB_WORKSPACE/.ci-codex-source" "$RUNNER_TEMP/producer-metadata.json" \
+            0.163.0-alpha.11 | tee "$RUNNER_TEMP/producer-lock-check.json"
+      - name: Compile and test detached callbacks and successful/failed/parallel stream terminals
+        working-directory: .ci-codex-source/codex-rs
+        run: |
+          cargo test -p codex-core --lib --locked creation_scope_ends \
+            2>&1 | tee "$RUNNER_TEMP/producer-callbacks.log"
+          cargo test -p codex-core --lib --locked parallel_response_terminals_keep_their_creation_spans \
+            2>&1 | tee "$RUNNER_TEMP/producer-parallel.log"
+          node "$GITHUB_WORKSPACE/scripts/ci/check-producer-regressions.js" \
+            "$RUNNER_TEMP/producer-callbacks.log" "$RUNNER_TEMP/producer-parallel.log" \
+            | tee "$RUNNER_TEMP/producer-regression-check.json"
+          cargo test -p codex-core --lib --locked client::tests \
+            2>&1 | tee "$RUNNER_TEMP/producer-client.log"
+      - name: Build the patched CLI from the exact producer source
+        working-directory: .ci-codex-source/codex-rs
+        run: cargo build -p codex-cli --bin codex --locked
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: producer-context-report
+          path: |
+            ${{ runner.temp }}/producer-lock-check.json
+            ${{ runner.temp }}/producer-callbacks.log
+            ${{ runner.temp }}/producer-parallel.log
+            ${{ runner.temp }}/producer-regression-check.json
+            ${{ runner.temp }}/producer-client.log
 
   rust:
     runs-on: ubuntu-latest
@@ -49,6 +99,7 @@ jobs:
       - run: cargo test --workspace --all-targets --locked
       - run: node --test integrations/openai-gateway/durable-outbox.test.js
       - run: node --test integrations/codex/config-contract.test.js
+      - run: node --test scripts/ci/upstream-context.test.js
       - run: cargo run --locked --bin chiptrace -- self-test
       - name: Build the CLI used by the platform integration path
         run: cargo build --locked --bin chiptrace

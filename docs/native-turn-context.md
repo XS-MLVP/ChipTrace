@@ -81,24 +81,59 @@ span 无法精确确定 Session 身份，以前的 Session 未归属计数没有
 具体证据；仍需要验证实际异步回调发射及 OTLP 导出，不能仅以 join 的正例宣布修复。
 
 [来源端补丁草案](upstream-sse-context.patch) 在 `ApiTelemetry` 创建时捕获请求 Span，
-仅在同步 SSE 日志回调期间重新进入它。该草案尚未在固定的 `0.163.0-alpha.11` 源码上
-编译、完成回调隔离测试或经过真实客户端验证，不能作为已修复证明；它也没有解决其余
-未归属 span 的作用域问题。
-在完整的 Codex `0.150.0-alpha.9` 源码工作树上，已应用该补丁和
-[回调回归测试](upstream-sse-context-test.patch)，使用离线缓存执行
-`cargo test -p codex-core sse_callback_reenters_the_request_span_after_creation_scope_ends`，
-结果为 1 个测试通过。测试创建请求 Span、退出创建作用域、再进入另一个 Span 后触发
-SSE 回调，并观察 `codex_otel.log_only` 事件的当前 Span。这个结果证明补丁机制在完整
-代码上成立。2026-10-15 已从 tag 固定到
-`5425d3e625daa58eea3ad1de27c087eb3b2ffbd3` 的源码树上顺序执行两个补丁的
-`git apply --check`，均通过。使用 CLI Git fetch 拉齐依赖后，在该 exact 源码树中执行
-`cargo test -p codex-core sse_callback_reenters_the_request_span_after_creation_scope_ends --offline`，
-结果为 1 个测试通过；第一次 `--locked` 尝试因该 tag 的 Cargo.lock 需要更新而停止，
-所以该结果使用临时解析后的锁文件，不能替代上游发布版本的锁文件与构建证明。
-这仍只证明来源端补丁机制，不能证明未修改发行版或真实多 Turn Canary 已修复。
-GitHub CI 的 `upstream-context` job 固定同一 commit 并重复该顺序检查。
+并在同步 SSE 回调期间重新进入它。HTTP 和 WebSocket 工厂还将创建时的请求 Span
+传给异步 stream mapper，成功和失败终态日志只在同步发射期间进入这个 Span，不把
+entered guard 保持到 `.await` 之后。补丁不修改业务正文、原生身份或完成状态。
+
+2026-10-15 在固定的 `5425d3e625daa58eea3ad1de27c087eb3b2ffbd3` 源码上完成
+[回调和终态回归](upstream-sse-context-test.patch)：SSE 回调、成功终态、失败终态和
+并行请求交错完成共 4 项通过。测试在退出创建作用域后触发事件，并保留没有 Span 的
+日志事件，避免把缺失上下文误当成没有发射日志。临时移除成功终态的上下文恢复时，
+该测试实际退出 101，观察结果为 `None`；恢复补丁后再次通过。
+同一源码的 `client::tests` 全部 37 项通过，包含 HTTP/WebSocket 请求、鉴权恢复、
+interceptor、丢弃流和背压取消；CI 也执行这组回归。
+`cargo build -p codex-cli --bin codex --locked --offline` 也通过。
+两个补丁又在另一个干净的同 commit 工作树中顺序 apply/check，通过；未纳入临时锁文件
+或其他源码修改。
+
+该 tag 的 Cargo.toml 已使用 `0.163.0-alpha.11`，Cargo.lock 中 160 个本地 workspace
+包仍为 `0.0.0`。本次临时解析后的差异仅为这些本地包版本；外部依赖版本、来源、校验和、
+依赖边及其余锁文件字节保持不变。[锁文件检查](../scripts/ci/check-producer-lock.js)
+复验了这个限制，之后的测试和 CLI 构建均使用 `--locked`。原始锁文件 SHA-256 为
+`0da7b7298c7e50d05f0d59b2b801afbaf3c3cf74c36d4e66ac6b51c21f60a4df`，临时协调后的
+SHA-256 为 `0b2af1620da0832300973f59c3f0ff9de1547fd18098bce9ef8f9daa6505416c`。
+这不是上游官方发行构建证明。
+
+GitHub CI 的 `upstream-context` job 现在固定同一 commit，顺序应用两个补丁、复验上述
+锁文件限制、编译并执行 4 项回归，再构建 CLI。CI 另检查每个指定测试确实执行且通过，
+零项匹配、重复测试或依赖变化均不能获得通过报告。日志、锁文件摘要和测试摘要作为
+Artifact 保存。工作流定义和本地检查不能代替该提交的远端 Actions 结果。
 [上游问题草稿](upstream-turn-context-issue.md)
 仅作为可审查材料保存在本仓库，尚未向其他项目发消息、创建 Issue 或提交 PR。
+
+## 2026-10-15 的补丁实验与剩余作用域
+
+隔离真实 Provider Canary 使用上述修改后的 CLI；版本基线为 `0.163.0-alpha.11`，
+不是未修改的 Stock Codex。Session `01a13b67-bcff-79d0-b131-cb28e1e8b4d6` 退出 0，
+1 个原生 Turn 和 Session epoch 均闭合；Wire 5、OTLP logs 12 批、traces 4 批、Hook 4。
+真实工具读取、故意 exit 7 和 sleep/write_stdin 结果均保留。每个 Turn 四源齐全，
+但 Session `delivery_ready=false`；这是短采集实验，不满足采购规模。
+
+| 来源 | 记录总数 | Turn 精确归属 | 已知 Session 级 | 未归属 Turn | Session 未知 |
+| --- | --- | --- | --- | --- | --- |
+| OTLP logs | 326 | 321 | 3 | 1 | 1 |
+| OTLP spans | 1265 | 1071 | 0 | 159 | 35 |
+
+未归属 Turn 总计 160，另有 36 条记录没有精确 Session 身份；不能把后者包含在前者中
+或默认为无关。原始 sealed Segment SHA-256 为
+`5285f05e1813795d22cd291d92d726dab4faba3393fe2fa3fe4535a4c2d27721`，证据保留在
+运维目录 `/var/tmp/chiptrace-native-patched-a62a74`，不将完整 Raw、日志正文或鉴权数据提交到 Git。
+
+只读定位样本确认 159 个 span 分布于两个没有原生 Turn 的 Trace：启动链 139 个、
+Session 循环/关闭链 20 个。启动链包括 `thread/start -> thread_spawn -> session_init`，
+Session 循环根有真实 UUID `thread_id`；两者都没有 Turn 边界，不能用同名文件操作或
+最近 Turn 把它们关联到业务 Turn。具体来源路径与下一轮修复约束见
+[Session 作用域审计](session-scope-audit.md)。当前分类和门禁保持严格，未将它们自动豁免。
 
 下一步应在生产者的请求/Turn 上下文创建时保存不可变关联信息，并在异步 SSE 回调和派生
 span 中继续传递；同时核实 Session 级 span 的原始作用域。补丁原型应在独立环境验证，

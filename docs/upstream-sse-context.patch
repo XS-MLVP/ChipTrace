@@ -1,7 +1,86 @@
 diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index 9ef4c05..128b340 100644
 --- a/codex-rs/core/src/client.rs
 +++ b/codex-rs/core/src/client.rs
-@@ -2937,6 +2937,7 @@
+@@ -1892,8 +1892,9 @@ impl ResponsesHttpExecutor<'_> {
+                         request_session_telemetry,
+                         inference_trace_attempt,
+                         Arc::clone(&self.client.state.provider),
+                         interceptors,
++                        tracing::Span::current(),
+                     );
+                     return Ok(stream);
+                 }
+                 Err(ApiError::Transport(unauthorized_transport))
+@@ -2238,8 +2239,9 @@ impl ModelClientSession {
+                 request_session_telemetry,
+                 inference_trace_attempt,
+                 Arc::clone(&self.client.state.provider),
+                 interceptors,
++                tracing::Span::current(),
+             );
+             self.websocket_session.last_response_rx = Some(last_request_rx);
+             return Ok(WebsocketStreamOutcome::Stream(stream));
+         }
+@@ -2494,8 +2496,9 @@ fn map_response_stream(
+     session_telemetry: SessionTelemetry,
+     inference_trace_attempt: InferenceTraceAttempt,
+     provider: SharedModelProvider,
+     interceptors: Vec<Box<dyn codex_extension_api::ModelResponseInterceptor>>,
++    completion_span: tracing::Span,
+ ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
+     let upstream_request_id = api_stream.upstream_request_id.take();
+     let interrupt = api_stream.interrupt.take();
+     let (mut stream, last_response) = map_response_events(
+@@ -2503,8 +2506,9 @@ fn map_response_stream(
+         crate::model_request::intercept_stream(Box::pin(api_stream), interceptors),
+         session_telemetry,
+         inference_trace_attempt,
+         provider,
++        completion_span,
+     );
+     stream.interrupt = interrupt;
+     (stream, last_response)
+ }
+@@ -2514,8 +2518,9 @@ fn map_response_events<S>(
+     api_stream: S,
+     session_telemetry: SessionTelemetry,
+     inference_trace_attempt: InferenceTraceAttempt,
+     provider: SharedModelProvider,
++    completion_span: tracing::Span,
+ ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
+ where
+     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
+         + Unpin
+@@ -2576,9 +2581,11 @@ where
+                     end_turn,
+                 }) => {
+                     feedback_tags!(last_model_response_id = &response_id);
+                     if let Some(usage) = &token_usage {
+-                        session_telemetry.sse_event_completed(usage, ttft_ms);
++                        completion_span.in_scope(|| {
++                            session_telemetry.sse_event_completed(usage, ttft_ms);
++                        });
+                     }
+                     inference_trace_attempt.record_completed(
+                         &response_id,
+                         upstream_request_id,
+@@ -2633,9 +2640,11 @@ where
+                         upstream_request_id,
+                         &items_added,
+                     );
+                     if !logged_error {
+-                        session_telemetry.see_event_completed_failed(&mapped);
++                        completion_span.in_scope(|| {
++                            session_telemetry.see_event_completed_failed(&mapped);
++                        });
+                         logged_error = true;
+                     }
+                     if tx_event.send(Err(mapped)).await.is_err() {
+                         return;
+@@ -2935,8 +2944,9 @@ fn api_error_http_status(error: &ApiError) -> Option<u16> {
+ }
+
  struct ApiTelemetry {
      session_telemetry: SessionTelemetry,
 +    sse_span: tracing::Span,
@@ -9,7 +88,9 @@ diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
      request_route_telemetry: RequestRouteTelemetry,
      auth_env_telemetry: AuthEnvTelemetry,
  }
-@@ -2951,6 +2952,7 @@
+@@ -2949,8 +2959,9 @@ impl ApiTelemetry {
+         auth_env_telemetry: AuthEnvTelemetry,
+     ) -> Self {
          Self {
              session_telemetry,
 +            sse_span: tracing::Span::current(),
@@ -17,7 +98,8 @@ diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
              request_route_telemetry,
              auth_env_telemetry,
          }
-@@ -3025,6 +3027,8 @@
+@@ -3024,9 +3035,11 @@ impl SseTelemetry for ApiTelemetry {
+             tokio::time::error::Elapsed,
          >,
          duration: Duration,
      ) {
@@ -27,3 +109,5 @@ diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
 +        });
      }
  }
+
+ impl WebsocketTelemetry for ApiTelemetry {

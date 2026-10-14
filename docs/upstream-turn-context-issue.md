@@ -28,18 +28,23 @@ request's creation Span. The
 [SSE emission path](https://github.com/openai/codex/blob/5425d3e625daa58eea3ad1de27c087eb3b2ffbd3/codex-rs/otel/src/events/session_telemetry.rs#L1057)
 does not explicitly include native Turn or response identity either.
 
-The proposed investigation is to retain immutable request/Turn context when
-the telemetry adapter is constructed and restore it inside synchronous SSE
-callbacks. The attached [patch draft](upstream-sse-context.patch) preserves a
-`tracing::Span` and enters it for `on_sse_poll`. It applies cleanly to the
-pinned `0.163.0-alpha.11` source and to the current inspected upstream source.
-The patch plus [regression test](upstream-sse-context-test.patch) compiled and
-passed on a complete `0.150.0-alpha.9` source worktree. On 2026-10-15 the same
-patch sequence also compiled against the pinned `0.163.0-alpha.11` tree and the
-callback test passed once after resolving that temporary source tree's lock file.
-It has not yet been validated by a new unmodified-client canary. In particular,
-the adapter's construction sites must
-be checked to ensure the captured Span is request or Turn scoped.
+The attached [patch draft](upstream-sse-context.patch) retains the creation
+`tracing::Span` for synchronous SSE callbacks and passes the original request
+Span into the detached HTTP/WebSocket response mapper. Both successful and
+failed terminal telemetry re-enter that Span only during synchronous emission.
+The [regressions](upstream-sse-context-test.patch) cover callbacks after leaving
+the creation scope, successful/failed terminals, and parallel requests completing
+in reverse order. All four passed on the pinned `0.163.0-alpha.11` source, and
+the exact patched CLI built successfully. Removing successful-terminal context
+restoration made its test fail with exit 101 and an observed `None` Span.
+The release tag's lock reconciliation was verified to change only 160 local
+workspace package versions; external dependency lock entries were unchanged.
+Tests and the CLI build then used `--locked`.
+
+A real-provider isolated run of the modified CLI retained native boundaries and
+tool outcomes, but still rejected Session delivery: one log and 159 spans lacked
+an exact Turn join. Another log and 35 spans had no exact Session owner. This is
+evidence for the patch mechanism, not an unmodified-release acceptance claim.
 
 Suggested regression coverage:
 
@@ -50,7 +55,8 @@ Suggested regression coverage:
 - Verify original Wire W3C context and exported Span ancestry still establish
   an unambiguous native Session/Turn join.
 
-The collector also observed 159 other spans without an exact Turn join. That
-is a separate scope-audit item, not evidence that this draft fixes all native
-telemetry. Raw records remain preserved and strict delivery remains rejected.
+The 159 remaining spans belong to startup (139) and Session-loop/shutdown (20)
+Traces. These are a separate [scope-audit item](session-scope-audit.md), not
+evidence that this draft fixes all native telemetry. Raw records remain
+preserved and strict delivery remains rejected.
 No provider credential, conversation body or complete Raw archive is attached.

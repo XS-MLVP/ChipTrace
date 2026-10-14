@@ -1,8 +1,9 @@
 diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
-index 46ac895..c5f4b60 100644
+index 46ac895..fcb7458 100644
 --- a/codex-rs/core/src/client_tests.rs
 +++ b/codex-rs/core/src/client_tests.rs
-@@ -21,6 +21,7 @@ use base64::Engine;
+@@ -20,8 +20,9 @@ use crate::test_support::responses_metadata as test_responses_metadata;
+ use base64::Engine;
  use codex_api::AgentIdentityTelemetry;
  use codex_api::ApiError;
  use codex_api::ResponseEvent;
@@ -10,18 +11,23 @@ index 46ac895..c5f4b60 100644
  use codex_api::TransportError;
  use codex_history::HistoryInitialization;
  use codex_http_client::HttpClientFactory;
-@@ -94,6 +95,7 @@ use tokio::sync::Notify;
+ use codex_http_client::OutboundProxyPolicy;
+@@ -91,8 +92,10 @@ use std::task::Poll;
+ use std::time::Duration;
+ use tempfile::TempDir;
+ use tokio::sync::Notify;
  use tracing::Event;
++use tracing::Id;
++use tracing::Instrument;
  use tracing::Subscriber;
  use tracing::field::Visit;
-+use tracing::Id;
  use tracing_subscriber::Layer;
  use tracing_subscriber::layer::Context as LayerContext;
- use tracing_subscriber::layer::SubscriberExt;
-@@ -1188,6 +1190,38 @@ fn test_session_telemetry() -> SessionTelemetry {
+@@ -1187,8 +1190,166 @@ fn test_session_telemetry() -> SessionTelemetry {
+         SessionSource::Cli,
      )
  }
- 
+
 +#[test]
 +fn sse_callback_reenters_the_request_span_after_creation_scope_ends() {
 +    let collector = OtlpSpanCollector::default();
@@ -40,7 +46,12 @@ index 46ac895..c5f4b60 100644
 +    let unrelated_span = tracing::info_span!("unrelated_turn", turn_id = "turn-2");
 +    let _guard = unrelated_span.enter();
 +    let response: std::result::Result<
-+        Option<std::result::Result<eventsource_stream::Event, eventsource_stream::EventStreamError<TransportError>>>,
++        Option<
++            std::result::Result<
++                eventsource_stream::Event,
++                eventsource_stream::EventStreamError<TransportError>,
++            >,
++        >,
 +        tokio::time::error::Elapsed,
 +    > = Ok(Some(Ok(eventsource_stream::Event {
 +        event: "response.created".to_string(),
@@ -50,20 +61,143 @@ index 46ac895..c5f4b60 100644
 +    })));
 +    telemetry.on_sse_poll(&response, Duration::from_millis(1));
 +    let observed = collector.span_ids.lock().unwrap();
-+    assert_eq!(observed.as_slice(), &[request_span.id().expect("request span id")]);
-+    assert_ne!(observed.as_slice(), &[unrelated_span.id().expect("unrelated span id")]);
++    assert_eq!(observed.as_slice(), &[request_span.id()]);
++    assert_ne!(observed.as_slice(), &[unrelated_span.id()]);
++}
++
++async fn assert_terminal_event_request_span(
++    event: std::result::Result<ResponseEvent, ApiError>,
++    expected_success: bool,
++) {
++    let collector = OtlpSpanCollector::default();
++    let _subscriber = tracing_subscriber::registry()
++        .with(collector.clone())
++        .set_default();
++    let request_span = tracing::info_span!("native_turn_request", turn_id = "turn-1");
++    assert!(request_span.id().is_some());
++    let (mut stream, _) = request_span.in_scope(|| {
++        super::map_response_events(
++            Some("req-original".to_string()),
++            futures::stream::iter([event]),
++            test_session_telemetry(),
++            InferenceTraceAttempt::disabled(),
++            test_model_provider(),
++            tracing::Span::current(),
++        )
++    });
++    // Poll only after leaving the creation scope. Another Turn's context must
++    // not become the owner when the detached mapper emits terminal telemetry.
++    let unrelated_span = tracing::info_span!("unrelated_turn", turn_id = "turn-2");
++    let mapped = stream
++        .next()
++        .instrument(unrelated_span.clone())
++        .await
++        .expect("terminal event");
++    assert_eq!(mapped.is_ok(), expected_success);
++    assert_eq!(
++        collector.span_ids.lock().unwrap().as_slice(),
++        &[request_span.id()]
++    );
++    assert_ne!(request_span.id(), unrelated_span.id());
++}
++
++#[tokio::test(flavor = "current_thread")]
++async fn response_completed_reenters_the_request_span_after_creation_scope_ends() {
++    assert_terminal_event_request_span(
++        Ok(ResponseEvent::Completed {
++            response_id: "resp-original".to_string(),
++            token_usage: Some(Default::default()),
++            usage_metadata: None,
++            end_turn: Some(true),
++        }),
++        true,
++    )
++    .await;
++}
++
++#[tokio::test(flavor = "current_thread")]
++async fn response_failure_reenters_the_request_span_after_creation_scope_ends() {
++    assert_terminal_event_request_span(
++        Err(ApiError::Stream("provider failure".to_string())),
++        false,
++    )
++    .await;
++}
++
++#[tokio::test(flavor = "current_thread")]
++async fn parallel_response_terminals_keep_their_creation_spans() {
++    let collector = OtlpSpanCollector::default();
++    let _subscriber = tracing_subscriber::registry()
++        .with(collector.clone())
++        .set_default();
++    let first_span = tracing::info_span!("first_request", turn_id = "turn-1");
++    let second_span = tracing::info_span!("second_request", turn_id = "turn-2");
++    assert!(first_span.id().is_some());
++    assert_ne!(first_span.id(), second_span.id());
++    let (first_tx, first_rx) = tokio::sync::oneshot::channel();
++    let (second_tx, second_rx) = tokio::sync::oneshot::channel();
++    let make_stream = |span: &tracing::Span, receiver: tokio::sync::oneshot::Receiver<()>| {
++        span.in_scope(|| {
++            super::map_response_events(
++                None,
++                futures::stream::once(async move {
++                    receiver.await.expect("release provider event");
++                    Ok(ResponseEvent::Completed {
++                        response_id: "resp".to_string(),
++                        token_usage: Some(Default::default()),
++                        usage_metadata: None,
++                        end_turn: Some(true),
++                    })
++                })
++                .boxed(),
++                test_session_telemetry(),
++                InferenceTraceAttempt::disabled(),
++                test_model_provider(),
++                tracing::Span::current(),
++            )
++            .0
++        })
++    };
++    let mut first = make_stream(&first_span, first_rx);
++    let mut second = make_stream(&second_span, second_rx);
++    // Both mapper tasks are live. Complete the second request first while the
++    // consumer is in the other Turn, then do the reverse for the first request.
++    second_tx.send(()).expect("release second request");
++    assert!(
++        second
++            .next()
++            .instrument(first_span.clone())
++            .await
++            .unwrap()
++            .is_ok()
++    );
++    first_tx.send(()).expect("release first request");
++    assert!(
++        first
++            .next()
++            .instrument(second_span.clone())
++            .await
++            .unwrap()
++            .is_ok()
++    );
++    assert_eq!(
++        collector.span_ids.lock().unwrap().as_slice(),
++        &[second_span.id(), first_span.id()]
++    );
 +}
 +
  #[test]
  fn websocket_continuation_reset_reason_survives_failed_reconnect_and_turn_boundary() {
      for (reason, later_reason) in [
-@@ -1378,6 +1412,24 @@ impl Visit for TagCollectorVisitor {
+         ("connection_closed", "other"),
+@@ -1377,8 +1538,27 @@ impl Visit for TagCollectorVisitor {
+             .insert(field.name().to_string(), format!("{value:?}"));
      }
  }
- 
+
 +#[derive(Clone, Default)]
 +struct OtlpSpanCollector {
-+    span_ids: Arc<Mutex<Vec<Id>>>,
++    span_ids: Arc<Mutex<Vec<Option<Id>>>>,
 +}
 +
 +impl<S> Layer<S> for OtlpSpanCollector
@@ -71,10 +205,11 @@ index 46ac895..c5f4b60 100644
 +    S: Subscriber + for<'a> LookupSpan<'a>,
 +{
 +    fn on_event(&self, event: &Event<'_>, ctx: LayerContext<'_, S>) {
-+        if event.metadata().target() == "codex_otel.log_only"
-+            && let Some(span_id) = ctx.current_span().id()
-+        {
-+            self.span_ids.lock().unwrap().push(span_id.clone());
++        if event.metadata().target() == "codex_otel.log_only" {
++            self.span_ids
++                .lock()
++                .unwrap()
++                .push(ctx.current_span().id().cloned());
 +        }
 +    }
 +}
@@ -82,3 +217,44 @@ index 46ac895..c5f4b60 100644
  #[derive(Clone)]
  struct TagCollectorLayer {
      tags: Arc<Mutex<BTreeMap<String, String>>>,
+ }
+@@ -1637,8 +1817,9 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
+         api_stream,
+         test_session_telemetry(),
+         attempt,
+         test_model_provider(),
++        tracing::Span::none(),
+     );
+
+     let observed = stream
+         .next()
+@@ -1688,8 +1869,9 @@ async fn response_stream_records_last_model_feedback_ids() {
+         api_stream,
+         test_session_telemetry(),
+         InferenceTraceAttempt::disabled(),
+         test_model_provider(),
++        tracing::Span::none(),
+     );
+
+     while stream.next().await.is_some() {}
+
+@@ -1911,8 +2093,9 @@ async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
+         api_stream,
+         test_session_telemetry(),
+         attempt,
+         test_model_provider(),
++        tracing::Span::none(),
+     );
+
+     // Fill the mapper channel with non-terminal events, then yield one output
+     // item. The mapper has observed that item and is blocked trying to send it
+@@ -2209,8 +2392,9 @@ async fn intercepted_output_reaches_trace_and_websocket_bookkeeping() -> anyhow:
+         test_session_telemetry(),
+         attempt,
+         test_model_provider(),
+         vec![Box::new(ReplaceOutput)],
++        tracing::Span::none(),
+     );
+     let mut delivered = Vec::new();
+     while let Some(event) = stream.next().await {
+         if let ResponseEvent::OutputItemDone(item) = event? {
