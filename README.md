@@ -38,6 +38,19 @@ Wire、OTLP 和 Hook 使用 Stock Codex 自带的 Session、Turn、call ID 和 W
 `audit-session-context` 提供只读的上下文缺口统计和有界定位样本；CI 使用精简的真实
 客户端元数据回归，完整对话和原始取证档保留在运维侧。
 
+截至 2026-10-15，最新隔离的 patched Canary 已用真实 `0.163.0-alpha.11` 上游客户端完成
+两个 Native Turn、resume、失败工具进程和延迟 `write_stdin` 场景；四路来源齐全，审计
+计数守恒，仓库门禁输出 `native_turns=2`、`selected_audit_records=3621`、
+`delivery_ready=true`。这是带生产者上下文补丁的隔离证据，不是未修改 Stock Codex 的发布
+证明；脱敏 fixture 只保存元数据，不包含 Raw 或对话正文。
+
+同日线上只读检查显示 18084、3011、3012 返回 200，Relay 已投递 1,021,950 条且
+`pending=0`、`failed=0`、`conservation_ok=true`，但 Collector/Relay 仍运行旧镜像
+`chiptrace:0.6.0-readiness-r2-20260905`。18084 报告有 3 个 open transaction、293 个
+历史失败文件（约 267 MB），旧 Relay 的 freshness 检查仍显示 `freshness_applicable=false`；
+18086 当前没有监听。因而传输闭环可用不等于每个 Session 已达到可交付标准，最新分支修复
+仍需先完成远端 CI、真实 OSS 账号验收和隔离 Canary 后再部署。
+
 ## 构建
 
 要求 Rust 1.91+。

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const SOURCE_CONTEXT_AUDIT_SCHEMA_VERSION: &str = "chiptrace.source-context-audit.v1";
+pub const SOURCE_CONTEXT_AUDIT_SCHEMA_VERSION: &str = "chiptrace.source-context-audit.v2";
 const MAX_GROUPS: usize = 128;
 pub const MAX_CONTEXT_SAMPLES: usize = 1000;
 
@@ -17,6 +17,7 @@ pub struct SourceContextCounts {
     pub total_records: u64,
     pub turn_assigned_records: u64,
     pub session_level_records: u64,
+    pub process_level_records: u64,
     pub unscoped_turn_records: u64,
     pub other_session_records: u64,
     pub unknown_session_records: u64,
@@ -103,6 +104,10 @@ pub(crate) fn audit_selected_source_context(
                     .related_sessions
                     .iter()
                     .any(|s| allowed.contains(s));
+            if observed.process_scoped {
+                counts.process_level_records += 1;
+                return Ok(());
+            }
             let disposition = if in_session && observed.turn_id.is_some() {
                 counts.turn_assigned_records += 1;
                 return Ok(());
@@ -225,7 +230,7 @@ mod tests {
         }
         let result = audit_selected_source_context(captures, session, &global, 0, limit).unwrap();
         let schema: Value = serde_json::from_str(include_str!(
-            "../../../schemas/source-context-audit-v1.schema.json"
+            "../../../schemas/source-context-audit-v2.schema.json"
         ))
         .unwrap();
         let validator = jsonschema::draft202012::new(&schema).unwrap();
@@ -272,6 +277,7 @@ mod tests {
                 total_records: 4,
                 turn_assigned_records: 2,
                 session_level_records: 2,
+                process_level_records: 0,
                 ..Default::default()
             }
         );
@@ -281,6 +287,7 @@ mod tests {
                 total_records: 4,
                 turn_assigned_records: 1,
                 session_level_records: 1,
+                process_level_records: 0,
                 unscoped_turn_records: 1,
                 unknown_session_records: 1,
                 ..Default::default()
@@ -304,6 +311,7 @@ mod tests {
                 total_records: 3,
                 turn_assigned_records: 1,
                 session_level_records: 1,
+                process_level_records: 0,
                 unscoped_turn_records: 1,
                 other_session_records: 0,
                 unknown_session_records: 0,
@@ -315,6 +323,7 @@ mod tests {
                 total_records: 26,
                 turn_assigned_records: 10,
                 session_level_records: 0,
+                process_level_records: 0,
                 unscoped_turn_records: 15,
                 other_session_records: 0,
                 unknown_session_records: 1,

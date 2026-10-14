@@ -1,0 +1,603 @@
+diff --git a/codex-rs/app-server/src/app_server_tracing.rs b/codex-rs/app-server/src/app_server_tracing.rs
+index ddc0441..2ab157a 100644
+--- a/codex-rs/app-server/src/app_server_tracing.rs
++++ b/codex-rs/app-server/src/app_server_tracing.rs
+@@ -50,6 +50,7 @@ pub(crate) fn request_span(
+         })
+     });
+     attach_parent_context(&span, method, &request.id, parent_trace.as_ref());
++    record_process_scope_for_method(&span, method);
+ 
+     span
+ }
+@@ -79,6 +80,7 @@ pub(crate) fn typed_request_span(
+     );
+ 
+     attach_parent_context(&span, method, request.id(), /*parent_trace*/ None);
++    record_process_scope_for_method(&span, method);
+     span
+ }
+ 
+@@ -124,6 +126,12 @@ fn record_client_info(span: &Span, client_name: Option<&str>, client_version: Op
+     }
+ }
+ 
++fn record_process_scope_for_method(span: &Span, method: &str) {
++    if matches!(method, "initialize" | "model/list") {
++        span.record("codex.context_scope", "process");
++    }
++}
++
+ fn attach_parent_context(
+     span: &Span,
+     method: &str,
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index c9858cd..f56eeec 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -979,6 +979,15 @@ impl MessageProcessor {
+         {
+             return Err(invalid_request(experimental_required_message(reason)));
+         }
++        match &codex_request {
++            ClientRequest::ThreadRead { params, .. } => {
++                request_context.record_session_id(&params.thread_id);
++            }
++            ClientRequest::ThreadUnsubscribe { params, .. } => {
++                request_context.record_session_id(&params.thread_id);
++            }
++            _ => {}
++        }
+         let connection_id = connection_request_id.connection_id;
+         self.initialize_processor.track_initialized_request(
+             connection_id,
+diff --git a/codex-rs/app-server/src/message_processor_tracing_tests.rs b/codex-rs/app-server/src/message_processor_tracing_tests.rs
+index c2a4b85..9b4bd34 100644
+--- a/codex-rs/app-server/src/message_processor_tracing_tests.rs
++++ b/codex-rs/app-server/src/message_processor_tracing_tests.rs
+@@ -702,92 +702,94 @@ fn thread_start_jsonrpc_span_exports_server_span_and_parents_children() -> Resul
+     )
+ }
+ 
+-#[tokio::test(flavor = "current_thread")]
++#[test]
+ #[serial(app_server_tracing)]
+-async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
+-    let mut harness = TracingHarness::new().await?;
+-    let thread_start_response = harness.start_thread(/*request_id*/ 2, /*trace*/ None).await;
+-    let thread_id = thread_start_response.thread.id.clone();
+-
+-    harness.reset_tracing();
+-
+-    let RemoteTrace {
+-        trace_id: remote_trace_id,
+-        parent_span_id: remote_parent_span_id,
+-        context: remote_trace,
+-    } = RemoteTrace::new("00000000000000000000000000000077", "0000000000000088");
+-    let turn_start_response: TurnStartResponse = harness
+-        .request(
+-            ClientRequest::TurnStart {
+-                request_id: RequestId::Integer(3),
+-                params: TurnStartParams {
+-                    disabled_plugin_ids: None,
+-                    environments: None,
+-                    thread_id,
+-                    client_user_message_id: None,
+-                    input: vec![UserInput::Text {
+-                        text: "hello".to_string(),
+-                        text_elements: Vec::new(),
+-                    }],
+-                    turn_trigger: None,
+-                    parent_turn_id: None,
+-                    root_turn_id: None,
+-                    tool_output: None,
+-                    responsesapi_client_metadata: None,
+-                    additional_context: None,
+-                    cwd: None,
+-                    runtime_workspace_roots: None,
+-                    approval_policy: None,
+-                    sandbox_policy: None,
+-                    permissions: None,
+-                    approvals_reviewer: None,
+-                    model: None,
+-                    service_tier: None,
+-                    service_tier_for_turn: None,
+-                    effort: None,
+-                    summary: None,
+-                    personality: None,
+-                    output_schema: None,
+-                    collaboration_mode: None,
+-                    multi_agent_mode: None,
+-                    cyber_access_program: None,
++fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
++    run_current_thread_test_with_stack("turn_start_jsonrpc_span_parents_core_turn_spans", async {
++        let mut harness = TracingHarness::new().await?;
++        let thread_start_response = harness.start_thread(/*request_id*/ 2, /*trace*/ None).await;
++        let thread_id = thread_start_response.thread.id.clone();
++
++        harness.reset_tracing();
++
++        let RemoteTrace {
++            trace_id: remote_trace_id,
++            parent_span_id: remote_parent_span_id,
++            context: remote_trace,
++        } = RemoteTrace::new("00000000000000000000000000000077", "0000000000000088");
++        let turn_start_response: TurnStartResponse = harness
++            .request(
++                ClientRequest::TurnStart {
++                    request_id: RequestId::Integer(3),
++                    params: TurnStartParams {
++                        disabled_plugin_ids: None,
++                        environments: None,
++                        thread_id,
++                        client_user_message_id: None,
++                        input: vec![UserInput::Text {
++                            text: "hello".to_string(),
++                            text_elements: Vec::new(),
++                        }],
++                        turn_trigger: None,
++                        parent_turn_id: None,
++                        root_turn_id: None,
++                        tool_output: None,
++                        responsesapi_client_metadata: None,
++                        additional_context: None,
++                        cwd: None,
++                        runtime_workspace_roots: None,
++                        approval_policy: None,
++                        sandbox_policy: None,
++                        permissions: None,
++                        approvals_reviewer: None,
++                        model: None,
++                        service_tier: None,
++                        service_tier_for_turn: None,
++                        effort: None,
++                        summary: None,
++                        personality: None,
++                        output_schema: None,
++                        collaboration_mode: None,
++                        multi_agent_mode: None,
++                        cyber_access_program: None,
++                    },
+                 },
+-            },
+-            Some(remote_trace),
+-        )
+-        .await;
+-    let spans = wait_for_exported_spans(harness.tracing, |spans| {
+-        spans.iter().any(|span| {
+-            span.span_kind == SpanKind::Server
+-                && span_attr(span, "rpc.method") == Some("turn/start")
+-                && span.span_context.trace_id() == remote_trace_id
+-        }) && spans.iter().any(|span| {
+-            span_attr(span, "codex.op") == Some("turn_input")
+-                && span.span_context.trace_id() == remote_trace_id
++                Some(remote_trace),
++            )
++            .await;
++        let spans = wait_for_exported_spans(harness.tracing, |spans| {
++            spans.iter().any(|span| {
++                span.span_kind == SpanKind::Server
++                    && span_attr(span, "rpc.method") == Some("turn/start")
++                    && span.span_context.trace_id() == remote_trace_id
++            }) && spans.iter().any(|span| {
++                span_attr(span, "codex.op") == Some("turn_input")
++                    && span.span_context.trace_id() == remote_trace_id
++            })
+         })
+-    })
+-    .await;
+-
+-    let server_request_span =
+-        find_rpc_span_with_trace(&spans, SpanKind::Server, "turn/start", remote_trace_id);
+-    let core_turn_span =
+-        find_span_with_trace(&spans, remote_trace_id, "codex.op=turn_input", |span| {
+-            span_attr(span, "codex.op") == Some("turn_input")
+-        });
+-
+-    assert_eq!(server_request_span.parent_span_id, remote_parent_span_id);
+-    assert!(server_request_span.parent_span_is_remote);
+-    assert_eq!(server_request_span.span_context.trace_id(), remote_trace_id);
+-    assert_eq!(
+-        span_attr(server_request_span, "turn.id"),
+-        Some(turn_start_response.turn.id.as_str())
+-    );
+-    assert_eq!(
+-        span_attr(server_request_span, "codex.context_scope"),
+-        Some("turn")
+-    );
+-    assert_span_descends_from(&spans, core_turn_span, server_request_span);
+-    harness.shutdown().await;
++        .await;
+ 
+-    Ok(())
++        let server_request_span =
++            find_rpc_span_with_trace(&spans, SpanKind::Server, "turn/start", remote_trace_id);
++        let core_turn_span =
++            find_span_with_trace(&spans, remote_trace_id, "codex.op=turn_input", |span| {
++                span_attr(span, "codex.op") == Some("turn_input")
++            });
++
++        assert_eq!(server_request_span.parent_span_id, remote_parent_span_id);
++        assert!(server_request_span.parent_span_is_remote);
++        assert_eq!(server_request_span.span_context.trace_id(), remote_trace_id);
++        assert_eq!(
++            span_attr(server_request_span, "turn.id"),
++            Some(turn_start_response.turn.id.as_str())
++        );
++        assert_eq!(
++            span_attr(server_request_span, "codex.context_scope"),
++            Some("turn")
++        );
++        assert_span_descends_from(&spans, core_turn_span, server_request_span);
++        harness.shutdown().await;
++
++        Ok(())
++    })
+ }
+diff --git a/codex-rs/app-server/src/model_catalog.rs b/codex-rs/app-server/src/model_catalog.rs
+index 54d7ff8..b25b746 100644
+--- a/codex-rs/app-server/src/model_catalog.rs
++++ b/codex-rs/app-server/src/model_catalog.rs
+@@ -29,6 +29,7 @@ impl ModelCatalog {
+         }
+     }
+ 
++    #[tracing::instrument(name = "model_catalog.list_models", level = "trace", skip_all)]
+     pub(crate) async fn list_models(
+         &self,
+         refresh_strategy: RefreshStrategy,
+diff --git a/codex-rs/app-server/src/models_refresh_worker.rs b/codex-rs/app-server/src/models_refresh_worker.rs
+index 794aa7f..af54416 100644
+--- a/codex-rs/app-server/src/models_refresh_worker.rs
++++ b/codex-rs/app-server/src/models_refresh_worker.rs
+@@ -4,6 +4,7 @@ use std::time::Duration;
+ use codex_models_manager::manager::RefreshStrategy;
+ use tokio::task::JoinHandle;
+ use tokio_util::sync::CancellationToken;
++use tracing::Instrument;
+ 
+ use crate::model_catalog::ModelCatalog;
+ 
+@@ -38,26 +39,35 @@ fn spawn_with_interval(
+     let model_catalog = Arc::downgrade(model_catalog);
+     let shutdown = CancellationToken::new();
+     let worker_shutdown = shutdown.clone();
+-    let task = tokio::spawn(async move {
+-        loop {
+-            if worker_shutdown.is_cancelled() {
+-                break;
+-            }
+-            let Some(model_catalog) = model_catalog.upgrade() else {
+-                break;
+-            };
+-            if let Err(err) = model_catalog.list_models(RefreshStrategy::Online).await {
+-                // Parser diagnostics can include provider credentials from the source TOML.
+-                tracing::warn!(error_kind = ?err.kind(), "model catalog refresh blocked by provider requirements");
+-            }
+-            drop(model_catalog);
++    let task = tokio::spawn(
++        async move {
++            loop {
++                if worker_shutdown.is_cancelled() {
++                    break;
++                }
++                let Some(model_catalog) = model_catalog.upgrade() else {
++                    break;
++                };
++                if let Err(err) = model_catalog.list_models(RefreshStrategy::Online).await {
++                    // Parser diagnostics can include provider credentials from the source TOML.
++                    tracing::warn!(
++                        error_kind = ?err.kind(),
++                        "model catalog refresh blocked by provider requirements"
++                    );
++                }
++                drop(model_catalog);
+ 
+-            tokio::select! {
+-                _ = worker_shutdown.cancelled() => break,
+-                _ = tokio::time::sleep(refresh_interval) => {}
++                tokio::select! {
++                    _ = worker_shutdown.cancelled() => break,
++                    _ = tokio::time::sleep(refresh_interval) => {}
++                }
+             }
+         }
+-    });
++        .instrument(tracing::info_span!(
++            "models_refresh_worker",
++            codex.context_scope = "process"
++        )),
++    );
+     ModelsRefreshWorker {
+         shutdown,
+         _task: task,
+diff --git a/codex-rs/app-server/src/outgoing_message.rs b/codex-rs/app-server/src/outgoing_message.rs
+index 9f7af20..e76f38a 100644
+--- a/codex-rs/app-server/src/outgoing_message.rs
++++ b/codex-rs/app-server/src/outgoing_message.rs
+@@ -113,6 +113,11 @@ impl RequestContext {
+         self.span.record("codex.context_scope", "turn");
+     }
+ 
++    pub(crate) fn record_session_id(&self, session_id: &str) {
++        self.span.record("conversation.id", session_id);
++        self.span.record("codex.context_scope", "session");
++    }
++
+     fn record_response_context(&self, response: &ClientResponsePayload) {
+         let thread_id = match response {
+             ClientResponsePayload::ThreadStart(response) => Some(response.thread.id.as_str()),
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+index 9563a25..7aad4a6 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -1238,6 +1238,7 @@ impl ThreadRequestProcessor {
+             turn_cost_worker: self.turn_cost_worker.clone(),
+         };
+         let request_trace = request_context.request_trace();
++        let request_context_for_task = request_context.clone();
+         let config_manager = self.config_manager.clone();
+         let thread_store = Arc::clone(&self.thread_store);
+         let initial_config_warnings = Arc::clone(&self.initial_config_warnings);
+@@ -1266,6 +1267,7 @@ impl ThreadRequestProcessor {
+                 allow_provider_model_fallback,
+                 experimental_raw_events,
+                 request_trace,
++                request_context,
+                 initial_config_warnings,
+             )
+             .await
+@@ -1274,7 +1276,7 @@ impl ThreadRequestProcessor {
+             }
+         };
+         self.background_tasks
+-            .spawn(thread_start_task.instrument(request_context.span()))
++            .spawn(thread_start_task.instrument(request_context_for_task.span()))
+             .await
+             .map_err(|_| internal_error("thread startup task stopped before completing"))?;
+         Ok(())
+@@ -1348,6 +1350,7 @@ impl ThreadRequestProcessor {
+         allow_provider_model_fallback: bool,
+         experimental_raw_events: bool,
+         request_trace: Option<W3cTraceContext>,
++        request_context: RequestContext,
+         initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
+     ) -> Result<(), JSONRPCErrorError> {
+         let thread_start_started_at = std::time::Instant::now();
+@@ -1499,6 +1502,7 @@ impl ThreadRequestProcessor {
+         };
+         let thread_id = reserved_thread_id
+             .unwrap_or_else(|| listener_task_context.thread_manager.reserve_thread_id());
++        request_context.record_session_id(&thread_id.to_string());
+         start_options.reserved_thread_id = Some(thread_id);
+         // Startup can prewarm the Responses socket before start_thread returns.
+         // Register the creating client first so that handshake can request attestation.
+diff --git a/codex-rs/app-server/src/request_serialization.rs b/codex-rs/app-server/src/request_serialization.rs
+index 390896a..fdfcf85 100644
+--- a/codex-rs/app-server/src/request_serialization.rs
++++ b/codex-rs/app-server/src/request_serialization.rs
+@@ -225,7 +225,25 @@ impl RequestSerializationQueues {
+ 
+         if should_spawn {
+             let queues = self.clone();
+-            let span = tracing::debug_span!("app_server.serialized_request_queue", ?key);
++            let span = match &key {
++                RequestSerializationQueueKey::Thread { thread_id }
++                | RequestSerializationQueueKey::FuzzyFileSearchSession {
++                    session_id: thread_id,
++                } => tracing::debug_span!(
++                    "app_server.serialized_request_queue",
++                    ?key,
++                    conversation.id = %thread_id,
++                    codex.context_scope = "session",
++                ),
++                RequestSerializationQueueKey::ThreadPath { .. } => {
++                    tracing::debug_span!("app_server.serialized_request_queue", ?key)
++                }
++                _ => tracing::debug_span!(
++                    "app_server.serialized_request_queue",
++                    ?key,
++                    codex.context_scope = "process",
++                ),
++            };
+             tokio::spawn(async move { queues.drain(key).await }.instrument(span));
+         }
+     }
+diff --git a/codex-rs/core/src/realtime_conversation.rs b/codex-rs/core/src/realtime_conversation.rs
+index d1c1fb1..e61e745 100644
+--- a/codex-rs/core/src/realtime_conversation.rs
++++ b/codex-rs/core/src/realtime_conversation.rs
+@@ -577,9 +577,16 @@ impl RealtimeConversationManager {
+     #[tracing::instrument(
+         name = "realtime_conversation.running_state",
+         level = "trace",
+-        skip_all
++        skip_all,
++        fields(
++            conversation.id = %conversation_id,
++            codex.context_scope = "session",
++        )
+     )]
+-    pub(crate) async fn running_state(&self) -> Option<()> {
++    pub(crate) async fn running_state(
++        &self,
++        conversation_id: impl std::fmt::Display,
++    ) -> Option<()> {
+         let state = self.state.lock().await;
+         state
+             .conversation
+@@ -1880,7 +1884,12 @@ pub(crate) async fn handle_audio(
+ ) {
+     if let Err(err) = sess.conversation.audio_in(params.frame).await {
+         error!("failed to append realtime audio: {err}");
+-        if sess.conversation.running_state().await.is_some() {
++        if sess
++            .conversation
++            .running_state(&sess.thread_id)
++            .await
++            .is_some()
++        {
+             warn!("realtime audio input failed while the session was already ending");
+         } else {
+             send_conversation_error(sess, sub_id, err.to_string(), CodexErrorInfo::BadRequest)
+@@ -2002,7 +2011,12 @@ pub(crate) async fn handle_text(
+     debug!(text = %params.text, "[realtime-text] appending realtime conversation text input");
+     if let Err(err) = sess.conversation.text_in(params).await {
+         error!("failed to append realtime text: {err}");
+-        if sess.conversation.running_state().await.is_some() {
++        if sess
++            .conversation
++            .running_state(&sess.thread_id)
++            .await
++            .is_some()
++        {
+             warn!("realtime text input failed while the session was already ending");
+         } else {
+             send_conversation_error(sess, sub_id, err.to_string(), CodexErrorInfo::BadRequest)
+@@ -2019,7 +2033,12 @@ pub(crate) async fn handle_speech(
+     debug!("[realtime-text] appending realtime speech");
+     if let Err(err) = sess.conversation.append_speech(params.text).await {
+         error!("failed to append realtime speech: {err}");
+-        if sess.conversation.running_state().await.is_some() {
++        if sess
++            .conversation
++            .running_state(&sess.thread_id)
++            .await
++            .is_some()
++        {
+             warn!("realtime speech append failed while the session was already ending");
+         } else {
+             send_conversation_error(sess, sub_id, err.to_string(), CodexErrorInfo::BadRequest)
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 45b32c0..753b3f5 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -1524,7 +1524,17 @@ impl Session {
+     }
+ 
+     /// Flush rollout writes and return the final durability-barrier result.
+-    #[instrument(name = "session.flush_rollout", level = "trace", skip_all)]
++    #[instrument(
++        name = "session.flush_rollout",
++        level = "trace",
++        skip_all,
++        fields(
++            conversation.id = %self.thread_id,
++            codex.context_scope = tracing::field::Empty,
++            turn.id = tracing::field::Empty,
++        )
++    )]
+     pub(crate) async fn flush_rollout(&self) -> std::io::Result<()> {
++        self.record_persistence_scope().await;
+         if let Some(live_thread) = self.live_thread() {
+             live_thread.flush().await.map_err(std::io::Error::other)
+@@ -2582,7 +2587,12 @@ impl Session {
+     }
+ 
+     async fn maybe_mirror_event_text_to_realtime(&self, msg: &EventMsg) {
+-        if self.conversation.running_state().await.is_none() {
++        if self
++            .conversation
++            .running_state(&self.thread_id)
++            .await
++            .is_none()
++        {
+             return;
+         }
+         match msg {
+@@ -4730,7 +4745,17 @@ impl Session {
+         (updates, snapshot)
+     }
+ 
+-    #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
++    #[tracing::instrument(
++        level = "trace",
++        skip_all,
++        fields(
++            item_count = items.len(),
++            conversation.id = %self.thread_id,
++            codex.context_scope = tracing::field::Empty,
++            turn.id = tracing::field::Empty,
++        )
++    )]
+     pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) -> bool {
++        self.record_persistence_scope().await;
+         if let Some(live_thread) = self.live_thread()
+             && let Err(e) = live_thread.append_items(items).await
+@@ -4741,6 +4766,25 @@ impl Session {
+         true
+     }
+ 
++    /// Persistence can run from session initialization, shutdown, or a detached turn task.
++    /// Preserve the immutable scope at the producer instead of relying on a task's ambient span.
++    async fn record_persistence_scope(&self) {
++        let turn_id = {
++            let active_turn = self.active_turn.lock().await;
++            active_turn
++                .as_ref()
++                .and_then(|active| active.task.as_ref())
++                .map(|task| task.turn_context.sub_id.clone())
++        };
++        let span = tracing::Span::current();
++        if let Some(turn_id) = turn_id {
++            span.record("turn.id", turn_id.as_str());
++            span.record("codex.context_scope", "turn");
++        } else {
++            span.record("codex.context_scope", "session");
++        }
++    }
++
+     pub(crate) async fn clone_history(&self) -> ContextManager {
+         let state = self.state.lock().await;
+         state.clone_history()
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+index e679427..56c29c7 100644
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -1189,14 +1189,21 @@ impl Session {
+                 let auth_for_prewarm = auth.clone();
+                 // Fetch the catalog while MCP and plugin/skill initialization continue.
+                 // Context construction still handles filtering and prompt insertion.
+-                tokio::spawn(async move {
+-                    plugins_manager_for_prewarm
+-                        .recommended_plugins_mode_for_config(
+-                            &plugins_config,
+-                            auth_for_prewarm.as_ref(),
+-                        )
+-                        .await;
+-                });
++                tokio::spawn(
++                    async move {
++                        plugins_manager_for_prewarm
++                            .recommended_plugins_mode_for_config(
++                                &plugins_config,
++                                auth_for_prewarm.as_ref(),
++                            )
++                            .await;
++                    }
++                    .instrument(tracing::info_span!(
++                        "session_init.plugin_recommendations",
++                        codex.context_scope = "session",
++                        conversation.id = %thread_id,
++                    )),
++                );
+             }
+             let mcp_projection = mcp_manager_for_mcp
+                 .runtime_config_for_step(
+diff --git a/codex-rs/core/src/session/turn_context.rs b/codex-rs/core/src/session/turn_context.rs
+index 40cf765..ce6ae1e 100644
+--- a/codex-rs/core/src/session/turn_context.rs
++++ b/codex-rs/core/src/session/turn_context.rs
+@@ -1367,7 +1367,11 @@ impl Session {
+                 })
+                 .collect(),
+         );
+-        turn_context.realtime_active = self.conversation.running_state().await.is_some();
++        turn_context.realtime_active = self
++            .conversation
++            .running_state(&self.thread_id)
++            .await
++            .is_some();
+ 
+         turn_context.final_output_json_schema = options.final_output_json_schema;
+         turn_context.cyber_access_program = cyber_access_program::for_provider(

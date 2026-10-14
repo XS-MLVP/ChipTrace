@@ -9,6 +9,7 @@ type SpanKey = (String, String);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ScopeKind {
+    Process,
     Session,
     Turn,
 }
@@ -17,6 +18,7 @@ enum ScopeKind {
 /// A Session boundary without its native identity remains unresolved.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SourceScope {
+    Process,
     Session(Option<String>),
     Turn,
 }
@@ -25,6 +27,7 @@ pub(crate) enum SourceScope {
 struct TraceScope {
     sessions: BTreeSet<String>,
     turns: BTreeSet<String>,
+    process: bool,
 }
 
 #[derive(Default)]
@@ -60,6 +63,7 @@ impl ExactTurnIndex {
                     TraceScope {
                         sessions: scope.sessions.clone(),
                         turns: scope.turns.clone(),
+                        process: scope.process,
                     },
                 )
             })
@@ -142,6 +146,9 @@ impl ExactTurnIndex {
             let scope = self.traces.entry(trace.clone()).or_default();
             scope.sessions.extend(session.clone());
             scope.turns.extend(turn.clone());
+            if kind == Some(ScopeKind::Process) {
+                scope.process = true;
+            }
             if let Some(span) =
                 span.filter(|_| self.track_parents || turn.is_some() || kind.is_some())
             {
@@ -229,6 +236,7 @@ impl ExactTurnIndex {
             key = scope.parents.first().cloned();
         }
         Ok(match nearest_boundary {
+            Some(ScopeKind::Process) => Some(SourceScope::Process),
             Some(ScopeKind::Session) => Some(SourceScope::Session(nearest_session)),
             Some(ScopeKind::Turn) => Some(SourceScope::Turn),
             None => None,
@@ -250,8 +258,19 @@ impl ExactTurnIndex {
         let session = session_attribute(attributes)?;
         let turn = turn_attribute(attributes)?;
         match source_scope_attribute(attributes)? {
+            Some(ScopeKind::Process) => {
+                if session.is_some()
+                    || turn.is_some()
+                    || matches!(inherited, Some(SourceScope::Session(_) | SourceScope::Turn))
+                {
+                    bail!("OTLP Process scope conflicts with native Session or Turn context");
+                }
+                Ok(Some(SourceScope::Process))
+            }
             Some(ScopeKind::Session) => {
-                if turn.is_some() || inherited == Some(SourceScope::Turn) {
+                if turn.is_some()
+                    || matches!(inherited, Some(SourceScope::Process | SourceScope::Turn))
+                {
                     bail!("OTLP Session scope conflicts with native Turn context");
                 }
                 if let Some(SourceScope::Session(Some(parent))) = &inherited
@@ -261,9 +280,26 @@ impl ExactTurnIndex {
                 }
                 Ok(Some(SourceScope::Session(session)))
             }
-            Some(ScopeKind::Turn) => Ok(Some(SourceScope::Turn)),
-            None if turn.is_some() => Ok(Some(SourceScope::Turn)),
+            Some(ScopeKind::Turn) => {
+                if matches!(
+                    inherited,
+                    Some(SourceScope::Process | SourceScope::Session(_))
+                ) {
+                    bail!("OTLP Turn scope conflicts with inherited Process or Session context");
+                }
+                Ok(Some(SourceScope::Turn))
+            }
+            None if turn.is_some() => {
+                if inherited == Some(SourceScope::Process) {
+                    bail!("OTLP native Turn identity conflicts with inherited Process context");
+                }
+                Ok(Some(SourceScope::Turn))
+            }
             None => {
+                if inherited == Some(SourceScope::Process) && (session.is_some() || turn.is_some())
+                {
+                    bail!("OTLP native identity conflicts with inherited Process context");
+                }
                 if let Some(SourceScope::Session(Some(parent))) = &inherited
                     && session.as_ref().is_some_and(|s| s != parent)
                 {
@@ -339,6 +375,20 @@ impl ExactTurnIndex {
         Ok(sessions)
     }
 
+    pub(crate) fn capture_has_process_scope(&self, capture: &Value) -> Result<bool> {
+        let mut process = false;
+        visit_otlp(capture, |_, record, attributes| {
+            process |= matches!(
+                self.source_scope(record, &attributes)?,
+                Some(SourceScope::Process)
+            ) || hex_id(record.get("traceId"), 32)
+                .and_then(|trace| self.traces.get(&trace))
+                .is_some_and(|scope| scope.process);
+            Ok(())
+        })?;
+        Ok(process)
+    }
+
     /// Diagnostic categories only: none of these establish a Turn identity.
     pub(crate) fn unresolved_reason(
         &self,
@@ -370,9 +420,13 @@ impl ExactTurnIndex {
     ) -> Result<BTreeSet<String>> {
         let mut sessions = BTreeSet::new();
         sessions.extend(session_attribute(attributes)?);
-        if let Some(SourceScope::Session(session)) = self.source_scope(record, attributes)? {
-            sessions.extend(session);
-            return Ok(sessions);
+        match self.source_scope(record, attributes)? {
+            Some(SourceScope::Process) => return Ok(BTreeSet::new()),
+            Some(SourceScope::Session(session)) => {
+                sessions.extend(session);
+                return Ok(sessions);
+            }
+            Some(SourceScope::Turn) | None => {}
         }
         if let Some(turn) = turn_attribute(attributes)?.and_then(|t| self.native.get(&t)) {
             sessions.extend(turn.iter().map(|(s, _)| s.clone()));
@@ -399,6 +453,11 @@ fn validate_span_scope(scope: &SpanScope) -> Result<()> {
     if scope.kinds.len() > 1 {
         bail!("one OTLP span has conflicting explicit source scopes");
     }
+    if scope.kinds.contains(&ScopeKind::Process)
+        && (!scope.sessions.is_empty() || !scope.turns.is_empty())
+    {
+        bail!("OTLP Process scope conflicts with native Session or Turn context");
+    }
     if scope.kinds.contains(&ScopeKind::Session) && !scope.turns.is_empty() {
         bail!("OTLP Session scope conflicts with native Turn context");
     }
@@ -408,6 +467,7 @@ fn validate_span_scope(scope: &SpanScope) -> Result<()> {
 fn source_scope_attribute(attributes: &BTreeMap<String, String>) -> Result<Option<ScopeKind>> {
     match attributes.get("codex.context_scope").map(String::as_str) {
         None | Some("") => Ok(None),
+        Some("process") => Ok(Some(ScopeKind::Process)),
         Some("session") => Ok(Some(ScopeKind::Session)),
         Some("turn") => Ok(Some(ScopeKind::Turn)),
         Some(_) => bail!("OTLP has an unsupported explicit source scope"),
@@ -630,6 +690,34 @@ mod tests {
             index.source_scope(&tool, &BTreeMap::new()).unwrap(),
             Some(SourceScope::Turn)
         );
+    }
+
+    #[test]
+    fn process_scope_never_borrows_a_native_turn_or_session() {
+        let root = "7777777777777777";
+        let child = "8888888888888888";
+        let mut index = ExactTurnIndex::for_turns();
+        index.observe_capture(&wire("s", "t", PARENT)).unwrap();
+        index
+            .observe_capture(&scoped_spans(json!([
+                {"traceId":TRACE,"spanId":root,"attributes":scope_attributes(None,"process")},
+                {"traceId":TRACE,"spanId":child,"parentSpanId":root,"name":"auth"}
+            ])))
+            .unwrap();
+        let record = json!({"traceId":TRACE,"spanId":child});
+        assert_eq!(
+            index.source_scope(&record, &BTreeMap::new()).unwrap(),
+            Some(SourceScope::Process)
+        );
+        assert!(
+            index
+                .record_sessions(&record, &BTreeMap::new())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(index.resolve(&record, &BTreeMap::new()).unwrap(), None);
+        let invalid = BTreeMap::from([("conversation.id".to_owned(), "s".to_owned())]);
+        assert!(index.source_scope(&record, &invalid).is_err());
     }
 
     #[test]

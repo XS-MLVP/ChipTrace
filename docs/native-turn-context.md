@@ -31,8 +31,10 @@ Hook 部署或正常用户 Hook 信任状态已经通过验收。
 
 `audit-session-context` 复用 Canonical 的完整快照歧义检测和精确 Session 选择，直接只读
 扫描 Capture，不创建投影或临时副本。输出遵循
-[source-context-audit.v1](../schemas/source-context-audit-v1.schema.json)，只含计数、事件/span
+[source-context-audit.v2](../schemas/source-context-audit-v2.schema.json)，只含计数、事件/span
 名称、Capture/Trace/Span ID 和 envelope 内记录序号，不打印对话、工具输出或其他属性值。
+v2 额外要求来源端用 `codex.context_scope=process` 明确标记进程级后台记录；没有该声明的
+记录仍属于未知 Session，不能通过门禁。
 分组最多 128 个，定位样本默认 20 个、最多 1000 个；超限仍保留遗漏记录数。
 这些标识和名称仍属于运维元数据，报告应按项目权限保存。
 
@@ -54,6 +56,10 @@ span 无法精确确定 Session 身份，以前的 Session 未归属计数没有
 未归属的 159 个 span 中，`fs.get_metadata` 70、`fs.read_file` 20、
 `persist_rollout_items` 6；其 Trace 没有已观察到的原生 Turn 身份。初始化/会话循环作用域
 仍须凭来源端代码和原生身份审计，诊断名称本身不是豁免依据。命令不会给出交付通过标志。
+
+进程级记录单独计入 `process_level_records`，不参与 Session/Turn 的四源覆盖，也不计入
+`unknown_session_records`；只有来源端显式声明 `codex.context_scope=process` 时才能使用
+这一分类。旧 v1 报告没有该字段，不能作为当前 v2 门禁证据。
 
 [精简回归 fixture](../fixtures/native-context-README.md) 只保留实际字段和父链，用一致
 别名替换身份。CI 验证缺口、跨 Session 歧义、正文不输出、计数守恒和真实非零退出；
@@ -147,7 +153,60 @@ span 中继续传递；同时核实 Session 级 span 的原始作用域。补丁
 不能替换当前唯一终端安装或改写历史 Raw。只有后续未修改的发行版本通过验收，才能宣称
 Stock Codex 的完整 v2 交付已经可用。
 
+## 2026-10-15 的 patched Canary 门禁结果
+
+在固定 upstream commit `5425d3e625daa58eea3ad1de27c087eb3b2ffbd3` 上顺序应用
+SSE 上下文、Session 作用域、扩展作用域和 process 作用域补丁，再使用真实
+`0.163.0-alpha.11` 客户端在隔离环境采集。该客户端不是未修改 Stock Codex；线上 18084
+也没有加载这组补丁。
+
+本轮 Canary 有 2 个 Native Turn 和 2 个 Session epoch，覆盖第二轮、实际 resume、失败
+工具进程和延迟 `write_stdin`。两个 Turn 均闭合，Session/Turn 没有冲突、未归属或未知
+Session 记录，Wire、OTLP logs、OTLP traces、Hook 四路来源均有正数证据。脱敏后的门禁
+输入保存在 [success report](../fixtures/native-canary-multiturn-0163-success-report.json)
+和 [success audit](../fixtures/native-canary-multiturn-0163-success-audit.json)，只包含
+计数和元数据。
+
+```json
+{
+  "schema_version": "chiptrace.native-canary-gate.v1",
+  "real_upstream": true,
+  "stock_version": "0.163.0-alpha.11",
+  "native_turns": 2,
+  "selected_audit_records": 3621,
+  "delivery_ready": true
+}
+```
+
+审计总计为 OTLP logs 580 条（Turn 573、Session 5、process 2）和 OTLP traces 3041 条
+（Turn 2190、Session 737、process 114），`unscoped_otlp_records=0`，每项分类与总数
+守恒。`process` 记录只有在来源端显式写入 `codex.context_scope=process` 时才可以这样
+分类。该结果证明补丁后的隔离生产者路径可以满足门禁，不证明未修改发行版、线上镜像或
+真实 Alibaba OSS 账户已经验收；正向 fixture 也不替代 Raw、鉴权审计或采购包。
+
+CI 现在在固定源码 clean clone 中复验五个补丁的 `apply --check`、顺序应用和
+`git diff --check`，其中进程级后台任务的补丁单独保存为
+[`upstream-session-scope-process.patch`](upstream-session-scope-process.patch)。
+
 ## 下一轮验收
+
+真实 Canary 的报告和 `audit-session-context` 必须经过仓库内的同一门禁，不能只看
+`integrity.delivery_ready` 或 CLI 退出码。门禁要求真实上游客户端至少两个 Native Turn，
+每个 Turn 的 Wire、OTLP logs、OTLP traces、required Hook 均有记录，Session/Turn 均闭合，
+没有未归属或未知 Session 记录；进程级后台记录必须有显式 `process` scope，并且来源计数守恒：
+
+```bash
+chiptrace inspect-session --input <sealed-raw-or-restored-directory> \
+  --session-id <stock-codex-session-id> > report.json
+chiptrace audit-session-context --input <sealed-raw-or-restored-directory> \
+  --session-id <stock-codex-session-id> --sample-limit 0 > source-context-audit.json
+node scripts/ci/native-canary-gate.js \
+  --report report.json --audit source-context-audit.json --minimum-turns 2
+```
+
+该门禁只输出计数和状态摘要，不读取或打印对话正文、工具参数、鉴权值或文件路径。
+失败结果必须保留 Raw 和审计报告，不能通过删除未归属记录、改写状态或降低轮次门槛来
+获得通过。
 
 1. 保留业务请求的原生 Session、Turn、request/response 和 W3C 上下文，验证 SSE 回调离开
    原始异步任务后仍能精确关联；同 Trace 多 Turn 不允许依赖全局“当前 Turn”。

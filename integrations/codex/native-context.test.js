@@ -44,7 +44,7 @@ test('real native metadata gaps stay visible without printing payloads or writin
   ]);
   const result = await run(binary, ['audit-session-context', '--input', data.file, '--session-id', fixture.session_id, '--sample-limit', '3']);
   const audit = JSON.parse(result.stdout);
-  assert.equal(audit.schema_version, 'chiptrace.source-context-audit.v1');
+  assert.equal(audit.schema_version, 'chiptrace.source-context-audit.v2');
   assert.equal(audit.unscoped_otlp_records, 16);
   assert.equal(audit.sources.otlp_logs.unscoped_turn_records, 1);
   assert.equal(audit.sources.otlp_traces.unscoped_turn_records, 15);
@@ -53,7 +53,8 @@ test('real native metadata gaps stay visible without printing payloads or writin
   assert.equal(audit.omitted_samples, 14);
   for (const counts of Object.values(audit.sources)) {
     assert.equal(counts.total_records, counts.turn_assigned_records + counts.session_level_records
-      + counts.unscoped_turn_records + counts.other_session_records + counts.unknown_session_records);
+      + counts.process_level_records + counts.unscoped_turn_records
+      + counts.other_session_records + counts.unknown_session_records);
   }
   assert.equal(audit.gap_groups.find(g => g.record_name === 'codex.sse_event').reason, 'missing_trace_context');
   assert.equal(audit.gap_groups.find(g => g.record_name === 'fs.get_metadata').records, 2);
@@ -116,10 +117,41 @@ test('source-declared Session scopes preserve exact Turn coverage and unresolved
   assert.equal(audit.samples[0].record_name, 'codex.sse_event');
   for (const counts of Object.values(audit.sources)) {
     assert.equal(counts.total_records, counts.turn_assigned_records + counts.session_level_records
-      + counts.unscoped_turn_records + counts.other_session_records + counts.unknown_session_records);
+      + counts.process_level_records + counts.unscoped_turn_records
+      + counts.other_session_records + counts.unknown_session_records);
   }
   assert.deepEqual(await fs.readFile(data.file), data.bytes);
   assert.deepEqual(await fs.readdir(data.root), ['input.ndjson']);
+});
+
+test('source-declared Process scopes remain outside selected Session accounting', async t => {
+  const traceId = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const root = '5555555555555555';
+  const child = '6666666666666666';
+  const attr = (key, value) => ({ key, value: { stringValue: value } });
+  const spans = [
+    { traceId, spanId: root, name: 'process.bootstrap', attributes: [attr('codex.context_scope', 'process')] },
+    { traceId, spanId: child, parentSpanId: root, name: 'auth' },
+  ];
+  const logs = [{ traceId, spanId: child, attributes: [attr('event.name', 'auth')] }];
+  const data = await input(t, [
+    { captureId: 'cap-process-wire', recordType: 'api_snapshot', traceContext: {
+      session_id: 'selected-session', turn_id: 'native-turn',
+    } },
+    batch('otlp_traces', { resourceSpans: [{ scopeSpans: [{ spans }] }] }, spans.length),
+    batch('otlp_logs', { resourceLogs: [{ scopeLogs: [{ logRecords: logs }] }] }, logs.length),
+  ]);
+  const result = await run(binary, [
+    'audit-session-context', '--input', data.file, '--session-id', 'selected-session', '--sample-limit', '0',
+  ]);
+  const audit = JSON.parse(result.stdout);
+  assert.ok(audit.sources, JSON.stringify(audit));
+  assert.equal(audit.unscoped_otlp_records, 0);
+  assert.equal(audit.sources.otlp_traces.process_level_records, 2);
+  assert.equal(audit.sources.otlp_logs.process_level_records, 1);
+  assert.equal(audit.sources.otlp_traces.unknown_session_records, 0);
+  assert.equal(audit.sources.otlp_logs.unknown_session_records, 0);
+  assert.deepEqual(await fs.readFile(data.file), data.bytes);
 });
 
 test('corrupt Raw, conflicting captures and oversized diagnostic limits retain real nonzero exits', { timeout: 30000 }, async t => {

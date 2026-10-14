@@ -935,7 +935,8 @@ fn read_session_captures_with_scopes(
     let mut turn_index = crate::turn_identity::ExactTurnIndex::default();
     let mut found = false;
     // Inspect the entire corpus for duplicate conflicts, exact links and child
-    // lineage before retaining payloads. Unrelated sessions stay off the heap.
+    // lineage before retaining payloads. Unrelated Sessions stay off the heap;
+    // explicitly process-scoped telemetry is retained for audit conservation.
     visit_captures(inputs, |line, capture| {
         let id = string_field(&capture, "captureId")
             .ok_or_else(|| anyhow::anyhow!("Capture missing captureId"))?;
@@ -979,6 +980,7 @@ fn read_session_captures_with_scopes(
                 .capture_sessions(&capture)?
                 .iter()
                 .any(|s| selection.allows_session_id(s))
+            || turn_index.capture_has_process_scope(&capture)?
         {
             captures.push(capture);
         }
@@ -1053,6 +1055,7 @@ fn select_projection_captures(
                     .capture_sessions(&capture)?
                     .iter()
                     .any(|s| selection.allows_session_id(s))
+                || turn_index.capture_has_process_scope(&capture)?
             {
                 selected.push(capture);
             }
@@ -1089,6 +1092,7 @@ fn select_projection_captures(
                         .capture_sessions(&capture)?
                         .iter()
                         .any(|s| selection.allows_session_id(s))
+                    || turn_index.capture_has_process_scope(&capture)?
                 {
                     selected_captures.push(capture);
                 }

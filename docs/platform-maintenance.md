@@ -12,7 +12,7 @@ HTTP transport：原先 FS 自测可通过，而 OSS/S3 在发送前返回 Confi
 
 2026-10-14 在隔离环境执行，未修改线上 18084 或生产 WAL/OSS：
 
-- Rust 1.91：250 个库测试和 1 个 CLI 测试通过；fmt、Clippy `-D warnings` 通过。
+- Rust 1.91：264 个 workspace 测试和 1 个 CLI 测试通过；fmt、Clippy `-D warnings` 通过。
 - Stock Codex 配置、网关 durable outbox：26 个 Node 测试通过。
 - 平台 HTTP/SDK：真实 CLI 四源采集 fixture，归档、恢复、分页 Turn、逐 Turn 四源覆盖、
   usage 注册、Buyer 导出与下载哈希通过。fixture 中 5 个原生 Turn、10 个采购有效轮次、分数 100。
@@ -66,6 +66,19 @@ CI 的原生字段回归涵盖缺少 Turn 属性、无 Session 属性的 traces�
 采集、失败和流式工具证据已保存，但 Session 不可交付；具体字段和下一轮生产者修复验收
 见[原生 Turn 上下文记录](native-turn-context.md)。代码修复 `b5352ad` 的远端三个 CI 作业
 均已通过，CI 通过不改变真实 Canary 的失败结论。
+
+2026-10-15 又在固定 upstream commit `5425d3e625daa58eea3ad1de27c087eb3b2ffbd3` 上
+验证了带生产者上下文补丁的隔离 Canary：真实 `0.163.0-alpha.11` 完成 2 个 Native Turn、
+2 个 Session epoch、resume、失败工具进程和延迟 `write_stdin`；四路来源均有证据，
+`unscoped_turn_records=0`、`unknown_session_records=0`、`unscoped_otlp_records=0`。
+同一仓库门禁输出 `native_turns=2`、`selected_audit_records=3621`、`delivery_ready=true`。
+这证明隔离补丁链路可通过当前数据治理门禁，但不是未修改 Stock Codex 或线上部署的通过
+证明；正向 fixture 是脱敏元数据，真实 Alibaba OSS 账户验收仍未完成。
+
+本轮同时修正了扩展 producer patch 的 hunk 计数与上下文截断，并在 clean clone 中完成五个
+patch 的顺序 `apply --check`、应用和 `git diff --check`。GitHub CI 会继续固定 upstream
+commit，先应用已有补丁，再应用 Session 扩展和独立的 process 作用域补丁；任何 patch 漂移
+或锁文件依赖变化都应使 job 失败。
 
 宿主网关还须使用 `openCaptureHealthy` 门禁。独立部署 smoke：
 

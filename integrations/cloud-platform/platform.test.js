@@ -86,6 +86,13 @@ test('HTTP service and SDK run the real CLI archive/restore/inspect/export path'
   assert.equal(exportJob.status, 'completed', JSON.stringify(exportJob.error));
   assert.equal(exportJob.result.score, 100);
   assert.equal(exportJob.result.session_view.native_turns, 5);
+  assert.equal(exportJob.result.source_context_audit.schema_version, 'chiptrace.source-context-audit.v2');
+  assert.equal(exportJob.result.source_context_audit.session_id, 'thread-self-test');
+  assert.equal(exportJob.result.source_context_audit.unscoped_otlp_records, 0);
+  for (const counts of Object.values(exportJob.result.source_context_audit.sources)) {
+    assert.equal(counts.unscoped_turn_records, 0);
+    assert.equal(counts.unknown_session_records, 0);
+  }
   assert.equal(exportJob.result.effective_turns, 10);
   assert.ok(exportJob.artifacts.length > 0);
   const artifact = exportJob.artifacts[0];

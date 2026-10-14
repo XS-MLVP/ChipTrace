@@ -1,0 +1,48 @@
+{
+  "schema_version": "chiptrace.source-context-audit.v2",
+  "session_id": "00000000-0000-7000-8000-000000000101",
+  "selected_captures": 58,
+  "duplicate_captures_removed": 0,
+  "sources": {
+    "otlp_logs": {
+      "total_records": 574,
+      "turn_assigned_records": 567,
+      "session_level_records": 5,
+      "process_level_records": 0,
+      "unscoped_turn_records": 0,
+      "other_session_records": 0,
+      "unknown_session_records": 2
+    },
+    "otlp_traces": {
+      "total_records": 2990,
+      "turn_assigned_records": 2467,
+      "session_level_records": 439,
+      "process_level_records": 0,
+      "unscoped_turn_records": 0,
+      "other_session_records": 0,
+      "unknown_session_records": 84
+    }
+  },
+  "unscoped_otlp_records": 0,
+  "group_limit": 128,
+  "gap_groups": [
+    {"source": "otlp_logs", "disposition": "unknown_session", "record_name": "codex.api_request", "reason": "trace_without_native_turn", "records": 2},
+    {"source": "otlp_traces", "disposition": "unknown_session", "record_name": "app_server.serialized_request_queue", "reason": "trace_without_native_turn", "records": 4},
+    {"source": "otlp_traces", "disposition": "unknown_session", "record_name": "append_items", "reason": "trace_without_native_turn", "records": 6},
+    {"source": "otlp_traces", "disposition": "unknown_session", "record_name": "auth", "reason": "trace_without_native_turn", "records": 47},
+    {"source": "otlp_traces", "disposition": "unknown_session", "record_name": "endpoint_session.execute_with", "reason": "trace_without_native_turn", "records": 2},
+    {"source": "otlp_traces", "disposition": "unknown_session", "record_name": "fs.read_file", "reason": "trace_without_native_turn", "records": 6},
+    {"source": "otlp_traces", "disposition": "unknown_session", "record_name": "initialize", "reason": "trace_without_native_turn", "records": 2},
+    {"source": "otlp_traces", "disposition": "unknown_session", "record_name": "list_models", "reason": "trace_without_native_turn", "records": 2},
+    {"source": "otlp_traces", "disposition": "unknown_session", "record_name": "persist_rollout_items", "reason": "trace_without_native_turn", "records": 3},
+    {"source": "otlp_traces", "disposition": "unknown_session", "record_name": "realtime_conversation.running_state", "reason": "trace_without_native_turn", "records": 2},
+    {"source": "otlp_traces", "disposition": "unknown_session", "record_name": "recommended_plugins_mode_for_config", "reason": "trace_without_native_turn", "records": 4},
+    {"source": "otlp_traces", "disposition": "unknown_session", "record_name": "session.flush_rollout", "reason": "trace_without_native_turn", "records": 2},
+    {"source": "otlp_traces", "disposition": "unknown_session", "record_name": "thread/read", "reason": "trace_without_native_turn", "records": 2},
+    {"source": "otlp_traces", "disposition": "unknown_session", "record_name": "thread/unsubscribe", "reason": "trace_without_native_turn", "records": 2}
+  ],
+  "omitted_gap_records": 0,
+  "sample_limit": 0,
+  "samples": [],
+  "omitted_samples": 86
+}

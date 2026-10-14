@@ -16,6 +16,7 @@
     "delivery_ready",
     "effective_turns",
     "session_view",
+    "source_context_audit",
     "distinct_tool_names",
     "complete_tool_definitions",
     "pairing_rate_after_open_tail",
@@ -76,6 +77,9 @@
     },
     "session_view": {
       "$ref": "https://github.com/XS-MLVP/ChipTrace/schemas/session-view-v2.schema.json"
+    },
+    "source_context_audit": {
+      "$ref": "https://chiptrace.dev/schemas/source-context-audit-v2.schema.json"
     },
     "distinct_tool_names": {
       "type": "integer",

@@ -1,0 +1,33 @@
+{
+  "schema_version": "chiptrace.source-context-audit.v2",
+  "session_id": "00000000-0000-7000-8000-000000000201",
+  "selected_captures": 56,
+  "duplicate_captures_removed": 0,
+  "sources": {
+    "otlp_logs": {
+      "total_records": 580,
+      "turn_assigned_records": 573,
+      "session_level_records": 5,
+      "process_level_records": 2,
+      "unscoped_turn_records": 0,
+      "other_session_records": 0,
+      "unknown_session_records": 0
+    },
+    "otlp_traces": {
+      "total_records": 3041,
+      "turn_assigned_records": 2190,
+      "session_level_records": 737,
+      "process_level_records": 114,
+      "unscoped_turn_records": 0,
+      "other_session_records": 0,
+      "unknown_session_records": 0
+    }
+  },
+  "unscoped_otlp_records": 0,
+  "group_limit": 128,
+  "gap_groups": [],
+  "omitted_gap_records": 0,
+  "sample_limit": 0,
+  "samples": [],
+  "omitted_samples": 0
+}

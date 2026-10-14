@@ -111,6 +111,19 @@ node42 完整目录迁入 NFS 后，最终离线镜像 `chiptrace:0.6.0-readines
 当前用户配置与凭据通过 20 项控制端检查；报告及正文节选见
 [热更新证据](../../records/chiptrace-hot-r2-20260905/REPORT.md)。
 
+## v2 当前门禁状态
+
+2026-10-15 的隔离 patched Canary 使用真实 `0.163.0-alpha.11` 上游客户端完成 2 个
+Native Turn 和 2 个 Session epoch，覆盖第二轮、resume、失败工具进程和延迟
+`write_stdin`。四路来源均有证据，`unscoped_turn_records=0`、`unknown_session_records=0`、
+`unscoped_otlp_records=0`；仓库门禁输出 `selected_audit_records=3621`、
+`delivery_ready=true`。该结果只证明 producer 补丁链路在隔离环境满足 v2 门禁。
+
+未修改 Stock Codex 的同等两轮证据、线上新镜像、真实 Alibaba OSS 账户和 18086 平台服务
+仍未完成验收。18084/Collector/Relay 的传输健康和 `pending=0` 不能替代逐 Session 的
+Turn 来源覆盖；历史通过的 v1 长任务也必须从原始 Raw 按当前 v2 门槛重验。GitHub CI 会把
+门禁摘要作为 `native-canary-gate-report` artifact 保存，方便审查者核对这一区分。
+
 ## 历史数据
 
 历史数据可以重放现有真实字段。只有原始 Wire、Stock Codex OTLP/Hook 或其他同源运行时

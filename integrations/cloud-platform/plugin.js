@@ -436,6 +436,11 @@ class ChipTracePlugin {
       if (result.schema_version !== 'chiptrace.cloud-acceptance.v2'
           || result.session_view?.schema_version !== 'chiptrace.session-view.v2'
           || result.session_view?.delivery_ready !== true
+          || result.source_context_audit?.schema_version !== 'chiptrace.source-context-audit.v2'
+          || result.source_context_audit?.session_id !== request.session_id
+          || result.source_context_audit?.unscoped_otlp_records !== 0
+          || Object.values(result.source_context_audit?.sources || {}).some(counts =>
+            counts.unscoped_turn_records !== 0 || counts.unknown_session_records !== 0)
           || result.delivery_ready !== true || result.hard_gate_pass !== true || result.score < 90
           || result.archive_id !== request.archive_id || result.session_id !== request.session_id || result.release_id !== request.release_id) {
         throw new PlatformError('export does not match the requested accepted Session', 422, 'ACCEPTANCE_FAILED');

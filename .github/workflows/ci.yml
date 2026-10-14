@@ -40,6 +40,10 @@ jobs:
           git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-sse-context-test.patch"
           git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-session-scope.patch"
           git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-session-scope.patch"
+          git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-session-scope-extension.patch"
+          git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-session-scope-extension.patch"
+          git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-session-scope-process.patch"
+          git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-session-scope-process.patch"
           git -C .ci-codex-source diff --check
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -110,6 +114,34 @@ jobs:
       - run: node --test integrations/openai-gateway/durable-outbox.test.js
       - run: node --test integrations/codex/config-contract.test.js
       - run: node --test scripts/ci/upstream-context.test.js
+      - run: node --test scripts/ci/native-canary-gate.test.js
+      - run: node --test scripts/ci/native-canary-evidence.test.js
+      - name: Emit the patched multi-turn Canary gate artifact
+        run: |
+          set -euo pipefail
+          node scripts/ci/native-canary-gate.js \
+            --report fixtures/native-canary-multiturn-0163-success-report.json \
+            --audit fixtures/native-canary-multiturn-0163-success-audit.json \
+            --minimum-turns 2 | tee native-canary-gate.json
+          python3 -c '
+          import json
+          result = json.load(open("native-canary-gate.json", encoding="utf-8"))
+          assert result["real_upstream"] is True
+          assert result["stock_version"] == "0.163.0-alpha.11"
+          assert result["native_turns"] == 2
+          assert result["selected_audit_records"] == 3621
+          assert result["scenario_coverage"] == [
+              "delayed_write_stdin", "failed_tool_process", "resume", "second_turn"
+          ]
+          assert result["source_coverage"]["complete"] is True
+          assert result["source_coverage"]["missing_sources"] == []
+          assert result["delivery_ready"] is True
+          '
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-canary-gate-report
+          path: native-canary-gate.json
       - run: cargo run --locked --bin chiptrace -- self-test
       - name: Build the CLI used by the platform integration path
         run: cargo build --locked --bin chiptrace
@@ -173,6 +205,12 @@ jobs:
           assert session_view["conflicted_turns"] == 0
           assert session_view["unscoped_turn_records"] == 0
           assert all(turn["source_coverage"]["complete"] for turn in session_view["turns"])
+          source_audit = result["cloud_acceptance"]["source_context_audit"]
+          assert source_audit["schema_version"] == "chiptrace.source-context-audit.v2"
+          assert source_audit["session_id"] == "thread-self-test"
+          assert source_audit["unscoped_otlp_records"] == 0
+          assert all(counts["unscoped_turn_records"] == 0 and counts["unknown_session_records"] == 0
+                     for counts in source_audit["sources"].values())
           assert result["checks"]["cloud_acceptance"] is True
           assert result["cloud_acceptance"]["schema_version"] == "chiptrace.cloud-acceptance.v2"
           assert result["cloud_acceptance_tamper_detected"] is True

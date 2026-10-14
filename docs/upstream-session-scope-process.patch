@@ -1,0 +1,121 @@
+diff --git a/codex-rs/core-plugins/src/manager.rs b/codex-rs/core-plugins/src/manager.rs
+index d4411b5..f799442 100644
+--- a/codex-rs/core-plugins/src/manager.rs
++++ b/codex-rs/core-plugins/src/manager.rs
+@@ -144,6 +144,7 @@ use tokio::sync::OnceCell;
+ use tokio::sync::OwnedSemaphorePermit;
+ use tokio::sync::Semaphore;
+ use tokio::sync::watch;
++use tracing::Instrument;
+ use tracing::instrument;
+ use tracing::warn;
+ 
+@@ -1549,11 +1550,17 @@ impl PluginsManager {
+ 
+         let manager = Arc::clone(self);
+         let config = config.clone();
+-        tokio::spawn(async move {
+-            manager
+-                .recommended_plugins_mode_for_config(&config, auth.as_ref())
+-                .await;
+-        });
++        tokio::spawn(
++            async move {
++                manager
++                    .recommended_plugins_mode_for_config(&config, auth.as_ref())
++                    .await;
++            }
++            .instrument(tracing::info_span!(
++                "plugins.recommendations.refresh",
++                codex.context_scope = "process",
++            )),
++        );
+     }
+ 
+     fn maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
+@@ -2901,35 +2908,41 @@ impl PluginsManager {
+             let config_for_remote_sync = config.clone();
+             let manager = Arc::clone(self);
+             let on_effective_plugins_changed = on_effective_plugins_changed.clone();
+-            tokio::spawn(async move {
+-                let auth = manager.auth_manager.auth().await;
+-                manager.maybe_start_remote_plugin_caches_refresh(
+-                    &config_for_remote_sync,
+-                    auth.clone(),
+-                    on_effective_plugins_changed.clone(),
+-                );
+-                manager.maybe_start_remote_installed_plugin_bundle_sync(
+-                    &config_for_remote_sync,
+-                    auth.clone(),
+-                    on_effective_plugins_changed,
+-                );
+-                let mut scopes = crate::remote::cached_remote_plugin_catalog_scopes(
+-                    manager.codex_home.as_path(),
+-                    &remote_plugin_service_config(&config_for_remote_sync),
+-                    auth.as_ref(),
+-                );
+-                if config_for_remote_sync.remote_plugin_enabled {
+-                    scopes.insert(RemotePluginScope::Global);
+-                } else {
+-                    scopes.retain(|scope| *scope == RemotePluginScope::Workspace);
++            tokio::spawn(
++                async move {
++                    let auth = manager.auth_manager.auth().await;
++                    manager.maybe_start_remote_plugin_caches_refresh(
++                        &config_for_remote_sync,
++                        auth.clone(),
++                        on_effective_plugins_changed.clone(),
++                    );
++                    manager.maybe_start_remote_installed_plugin_bundle_sync(
++                        &config_for_remote_sync,
++                        auth.clone(),
++                        on_effective_plugins_changed,
++                    );
++                    let mut scopes = crate::remote::cached_remote_plugin_catalog_scopes(
++                        manager.codex_home.as_path(),
++                        &remote_plugin_service_config(&config_for_remote_sync),
++                        auth.as_ref(),
++                    );
++                    if config_for_remote_sync.remote_plugin_enabled {
++                        scopes.insert(RemotePluginScope::Global);
++                    } else {
++                        scopes.retain(|scope| *scope == RemotePluginScope::Workspace);
++                    }
++                    manager.maybe_start_remote_catalog_cache_refresh(
++                        &config_for_remote_sync,
++                        auth,
++                        scopes,
++                        RemoteCatalogCacheRefreshMode::Force,
++                    );
+                 }
+-                manager.maybe_start_remote_catalog_cache_refresh(
+-                    &config_for_remote_sync,
+-                    auth,
+-                    scopes,
+-                    RemoteCatalogCacheRefreshMode::Force,
+-                );
+-            });
++                .instrument(tracing::info_span!(
++                    "plugins.remote_cache_refresh",
++                    codex.context_scope = "process",
++                )),
++            );
+ 
+             let config_for_featured_plugins = config.clone();
+             let manager = Arc::clone(self);
+diff --git a/codex-rs/login/src/auth/manager.rs b/codex-rs/login/src/auth/manager.rs
+index cdc9c8d..cafccf8 100644
+--- a/codex-rs/login/src/auth/manager.rs
++++ b/codex-rs/login/src/auth/manager.rs
+@@ -2387,7 +2387,10 @@ impl AuthManager {
+     /// Current cached auth (clone). May be `None` if not logged in or load failed.
+     /// For managed ChatGPT auth that needs a proactive refresh, first performs
+     /// a guarded reload and then refreshes only if the on-disk auth is unchanged.
+-    #[instrument(level = "trace", skip_all)]
++    // AuthManager is shared by the process and may be queried from detached
++    // refresh/catalog tasks. Keep these credential-cache spans process-scoped;
++    // request/turn spans carry their own provider and model telemetry.
++    #[instrument(level = "trace", skip_all, fields(codex.context_scope = "process"))]
+     pub async fn auth(&self) -> Option<CodexAuth> {
+         if self.has_external_auth() {
+             self.reload().await;

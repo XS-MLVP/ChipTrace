@@ -31,11 +31,17 @@ Relay 目录；OTLP 与 Hook 使用独立采集凭据。Wire Capture 使用网�
 请求获得 Rust Relay 的 durable ACK。格式错误返回 400，认证失败返回 401，ID 冲突返回
 409，只有暂时故障返回可重试 5xx。
 
-2026-09-05 22:56（Asia/Shanghai），router_v2 的 Collector 和 Relay 已升级为
-`chiptrace:0.6.0-readiness-r2-20260905`，持久部署环境中的镜像设置同步更新，18084
-入口保持可用。隔离原生 Canary 和升级后的生产 Canary 均完成四源采集与真实工具正文
-校验。具体镜像 ID、切换记录、node42 配置与凭据检查见
-[本次热更新报告](../../records/chiptrace-hot-r2-20260905/REPORT.md)。
+2026-10-15 的只读检查显示，18084、3011、3012 均返回 HTTP 200；Collector/Relay 已
+投递 1,021,950 条，`pending=0`、`failed=0`、`conservation_ok=true`。当前运行镜像仍是
+`chiptrace:0.6.0-readiness-r2-20260905`，不是本分支最新修复。18084 还有 3 个 open
+transaction、293 个历史失败文件（约 267 MB），watchdog 配置存在但
+`watchdog.running=false`；3012 的旧 Relay 报告 `wire_age_ms=162514459` 且
+`freshness_applicable=false`，所以其 `status=complete` 不能作为最新 freshness 门禁已
+部署的证据。18086 当前没有监听，平台插件尚未作为在线服务运行。
+
+隔离 patched Canary 已通过当前仓库门禁，但线上镜像尚未切换。生产发布仍需先完成远端
+CI、目标 OSS 账号验收和未修改 Stock Codex 的真实 Canary，再灰度升级并复查重启/回滚。
+历史失败文件和 open transaction 是审计证据，不能为了让健康计数变绿而删除。
 
 ## Stock Codex
 
@@ -169,6 +175,8 @@ Canonical Runtime/协议检查通过，不能覆盖原生 Turn 的缺失、未�
 进一步定位时使用只读 `audit-session-context --input <sealed-raw> --session-id <id>`。
 该入口不生成投影，复用全快照身份歧义与子 Session 选择，并对所选 envelope 内全部 OTLP
 记录保留分类总数；`unknown_session_records` 不会被默认为当前 Session。
+来源端显式声明 `codex.context_scope=process` 的后台记录计入 `process_level_records`，
+不会参与 Turn 覆盖；缺少该声明的进程级记录仍按未知 Session 处理。
 `--sample-limit 0` 可关闭定位样本，分组和样本上限不会截断总计数。
 诊断报告保留 ID/名称元数据，按项目控制访问；完整交付结论仍来自云端验收。
 

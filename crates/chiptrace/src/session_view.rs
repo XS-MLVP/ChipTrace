@@ -231,6 +231,7 @@ pub(crate) struct SourceObservation {
     pub(crate) turn_id: Option<String>,
     occurred_at: Option<String>,
     pub(crate) requires_turn: bool,
+    pub(crate) process_scoped: bool,
     pub(crate) related_sessions: BTreeSet<String>,
 }
 
@@ -289,6 +290,7 @@ pub(crate) fn otlp_source_observation(
     );
     let identity = index.resolve(record, attributes)?;
     let source_scope = index.source_scope(record, attributes)?;
+    let process_scoped = matches!(&source_scope, Some(SourceScope::Process));
     let related_sessions = index.record_sessions(record, attributes)?;
     let session_id = identity
         .as_ref()
@@ -313,9 +315,10 @@ pub(crate) fn otlp_source_observation(
                 | "codex.turn_ttft"
                 | "codex.turn_cost"
         )
-    ) || match source_scope {
+    ) || match &source_scope {
         Some(SourceScope::Session(Some(_))) => false,
         Some(SourceScope::Session(None) | SourceScope::Turn) => true,
+        Some(SourceScope::Process) => false,
         None => !exempt,
     };
     Ok(SourceObservation {
@@ -324,6 +327,7 @@ pub(crate) fn otlp_source_observation(
         turn_id,
         occurred_at: first_string(record, &["timeUnixNano", "observedTimeUnixNano"]),
         requires_turn,
+        process_scoped,
         related_sessions,
     })
 }
@@ -350,6 +354,7 @@ fn source_observations(capture: &Value, index: &ExactTurnIndex) -> Result<Vec<So
                 turn_id: first_string(&raw, &["turn_id", "turnId", "root_turn_id", "rootTurnId"]),
                 occurred_at: first_string(&raw, &["occurred_at", "occurredAt", "timestamp"]),
                 requires_turn,
+                process_scoped: false,
                 related_sessions: BTreeSet::new(),
             }])
         }
