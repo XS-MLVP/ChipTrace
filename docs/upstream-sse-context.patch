@@ -1,0 +1,29 @@
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -2937,6 +2937,7 @@
+ struct ApiTelemetry {
+     session_telemetry: SessionTelemetry,
++    sse_span: tracing::Span,
+     auth_context: AuthRequestTelemetryContext,
+     request_route_telemetry: RequestRouteTelemetry,
+     auth_env_telemetry: AuthEnvTelemetry,
+ }
+@@ -2951,6 +2952,7 @@
+         Self {
+             session_telemetry,
++            sse_span: tracing::Span::current(),
+             auth_context,
+             request_route_telemetry,
+             auth_env_telemetry,
+         }
+@@ -3025,6 +3027,8 @@
+         >,
+         duration: Duration,
+     ) {
+-        self.session_telemetry.log_sse_event(result, duration);
++        self.sse_span.in_scope(|| {
++            self.session_telemetry.log_sse_event(result, duration);
++        });
+     }
+ }

@@ -62,6 +62,11 @@ CI 的原生字段回归涵盖缺少 Turn 属性、无 Session 属性的 traces�
 自测的 Turn Hook 数严格为 1；真实 Canary 的 UserPromptSubmit/Stop 则是两个不同事件。
 新版云验收使用 `cloud-acceptance.v2`，v1 Schema 保留原定义，旧通过产物不会自动升级。
 
+同日使用 `0.163.0-alpha.11` 和真实上游在隔离环境完成新 Canary，仍有 455 条未归属记录。
+采集、失败和流式工具证据已保存，但 Session 不可交付；具体字段和下一轮生产者修复验收
+见[原生 Turn 上下文记录](native-turn-context.md)。代码修复 `b5352ad` 的远端三个 CI 作业
+均已通过，CI 通过不改变真实 Canary 的失败结论。
+
 宿主网关还须使用 `openCaptureHealthy` 门禁。独立部署 smoke：
 
 ```bash

@@ -33,6 +33,9 @@ flowchart LR
 Wire、OTLP 和 Hook 使用 Stock Codex 自带的 Session、Turn、call ID 和 W3C Trace Context
 精确关联；缺失或冲突时拒绝交付，不补造 Schema、状态、模型身份或任务边界。
 
+当前真实客户端仍有未归属的 SSE 日志和 span，完整 v2 交付尚未通过真实验收。
+已验证的能力与剩余来源上下文缺口见[原生 Turn 验收记录](docs/native-turn-context.md)。
+
 ## 构建
 
 要求 Rust 1.91+。
