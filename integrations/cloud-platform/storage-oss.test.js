@@ -70,7 +70,8 @@ test('OSS adapter signs immutable writes and restores verified bytes to disk', {
   await fsp.mkdir(input);
   const record = `${JSON.stringify({ recordType: 'api_snapshot', captureId: 'oss-wire', requestBody: { kind: 'json', value: { model: 'synthetic', input: [] } } })}\n`;
   await fsp.writeFile(path.join(input, 'segment-00000000000000000001.sealed.ndjson'), record);
-  await fsp.writeFile(path.join(input, 'segment-00000000000000000002.sealed.ndjson'), '\n');
+  await fsp.writeFile(path.join(input, 'segment-00000000000000000002.sealed.ndjson'), record);
+  await fsp.writeFile(path.join(input, 'segment-00000000000000000003.sealed.ndjson'), '\n');
   const args = ['--backend', 'oss', '--endpoint', 'http://oss-test.invalid', '--bucket', bucket, '--prefix', 'ci/chiptrace'];
   const invoke = async args => JSON.parse((await run(binary, args, { env, timeout: 20000 })).stdout);
   const first = await invoke(['archive-raw', '--input', input, '--archive-id', 'oss-raw', ...args]);
@@ -83,7 +84,7 @@ test('OSS adapter signs immutable writes and restores verified bytes to disk', {
   const restored = await invoke(['restore-raw-archive', '--archive-id', 'oss-raw', '--output', output, '--verify-records', ...args]);
   assert.equal(restored.ok, true);
   const payloadReads = requests.slice(beforeRestore).filter(r => r.method === 'GET' && r.key.includes('/objects/'));
-  assert.equal(payloadReads.length, 2, 'download each data/empty object once');
+  assert.equal(payloadReads.length, 2, 'download each unique data/empty object once despite repeated segments');
   assert.equal((await invoke(['verify-restored-raw', '--input', output])).ok, true);
   assert.equal(await fsp.readFile(path.join(output, 'segments/shard-00000/segment-00000000000000000001.sealed.ndjson'), 'utf8'), record);
   const manifest = JSON.parse(await fsp.readFile(path.join(output, 'RAW_MANIFEST.json'), 'utf8'));

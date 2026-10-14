@@ -98,6 +98,7 @@ jobs:
 
   storage-s3-minio:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     env:
       AWS_ACCESS_KEY_ID: chiptrace-ci
       AWS_SECRET_ACCESS_KEY: chiptrace-ci-secret
@@ -112,11 +113,25 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: Check out pinned MinIO source
+        uses: actions/checkout@v4
+        with:
+          repository: minio/minio
+          ref: 07c3a429bfed433e49018cb0f78a52145d4bedeb
+          path: .ci-minio-source
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: .ci-minio-source/go.mod
+          cache-dependency-path: .ci-minio-source/go.sum
+      - name: Build isolated S3 test service
+        working-directory: .ci-minio-source
+        run: CGO_ENABLED=0 go build -p 4 -o "$RUNNER_TEMP/chiptrace-minio" .
       - name: Start isolated S3 service
         run: |
-          docker run -d --name chiptrace-ci-minio -p 127.0.0.1:9000:9000 \
-            -e MINIO_ROOT_USER=chiptrace-ci -e MINIO_ROOT_PASSWORD=chiptrace-ci-secret \
-            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
+          MINIO_ROOT_USER=chiptrace-ci MINIO_ROOT_PASSWORD=chiptrace-ci-secret \
+            "$RUNNER_TEMP/chiptrace-minio" server "$RUNNER_TEMP/chiptrace-minio-data" \
+            --address 127.0.0.1:9000 > "$RUNNER_TEMP/chiptrace-minio.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/chiptrace-minio.pid"
       - run: for i in $(seq 1 30); do curl -fsS http://127.0.0.1:9000/minio/health/live && exit 0; sleep 2; done; exit 1
       - run: cargo build --locked --bin chiptrace
       - name: Verify multipart S3 archive and disk restoration
@@ -125,10 +140,12 @@ jobs:
         if: always()
         with:
           name: storage-s3-report
-          path: storage-s3.tap
+          path: |
+            storage-s3.tap
+            ${{ runner.temp }}/chiptrace-minio.log
       - name: MinIO diagnostics
         if: failure()
-        run: docker logs chiptrace-ci-minio
+        run: if [ -f "$RUNNER_TEMP/chiptrace-minio.log" ]; then cat "$RUNNER_TEMP/chiptrace-minio.log"; fi
       - name: Stop isolated S3 service
         if: always()
-        run: docker stop chiptrace-ci-minio
+        run: if [ -f "$RUNNER_TEMP/chiptrace-minio.pid" ]; then kill "$(cat "$RUNNER_TEMP/chiptrace-minio.pid")"; fi

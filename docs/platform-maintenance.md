@@ -27,6 +27,8 @@ HTTP transport：原先 FS 自测可通过，而 OSS/S3 在发送前返回 Confi
 GitHub CI 将以上本地路径拆成 Rust/Node、引擎/平台容器、MinIO S3 三个作业。
 测试报告作为 Artifact 保留，所有管道启用 `pipefail`。远端状态必须读取对应提交的
 Actions run，不能用本地通过或旧 main 的绿色结果代替。
+MinIO 公共容器标签的远端拉取已返回 access denied；CI 因此从固定的公开源码提交
+`07c3a429bfed433e49018cb0f78a52145d4bedeb` 构建隔离服务，避免依赖本机镜像缓存。
 
 ## 迭代与发布流程
 

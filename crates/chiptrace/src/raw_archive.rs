@@ -377,55 +377,57 @@ pub async fn restore_raw_archive(
         .prefix(&format!(".{output_name}.chiptrace-restore-"))
         .tempdir_in(output_parent)?;
     let staging = temporary.path();
-    for segment in &manifest.segments {
+    let mut downloaded: BTreeMap<&str, (PathBuf, u64, u64)> = BTreeMap::new();
+    for (shard, id, key, bytes, sha256, records) in manifest
+        .segments
+        .iter()
+        .map(|s| {
+            (
+                s.shard.as_str(),
+                s.segment_id,
+                s.object_key.as_str(),
+                s.bytes,
+                s.sha256.as_str(),
+                s.records,
+            )
+        })
+        .chain(manifest.empty_segments.iter().map(|s| {
+            (
+                s.shard.as_str(),
+                s.segment_id,
+                s.object_key.as_str(),
+                s.bytes,
+                s.sha256.as_str(),
+                0,
+            )
+        }))
+    {
         let relative = Path::new("segments")
-            .join(&segment.shard)
-            .join(format!("segment-{:020}.sealed.ndjson", segment.segment_id));
+            .join(shard)
+            .join(format!("segment-{id:020}.sealed.ndjson"));
         let destination = staging.join(&relative);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        let temporary = destination.with_extension("ndjson.partial");
-        download_object(
-            &operator,
-            &segment.object_key,
-            &temporary,
-            segment.bytes,
-            &segment.sha256,
-        )
-        .await?;
-        if config.verify_records && local_segment_records(&temporary)? != segment.records {
-            bail!(
-                "restored segment record count mismatch: {}",
-                segment.object_key
-            );
-        }
-        fs::rename(&temporary, &destination)?;
-    }
-    for segment in &manifest.empty_segments {
-        let relative = Path::new("segments")
-            .join(&segment.shard)
-            .join(format!("segment-{:020}.sealed.ndjson", segment.segment_id));
-        let destination = staging.join(&relative);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
+        if let Some((previous, previous_bytes, previous_records)) = downloaded.get(key) {
+            if bytes != *previous_bytes || records != *previous_records {
+                bail!("same Raw object has conflicting segment counts: {key}");
+            }
+            // Raw is immutable. Reuse verified disk bytes for repeated
+            // content-addressed objects instead of downloading them again.
+            if fs::hard_link(previous, &destination).is_err() {
+                fs::copy(previous, &destination)?;
+                File::open(&destination)?.sync_all()?;
+            }
+            continue;
         }
         let temporary = destination.with_extension("ndjson.partial");
-        download_object(
-            &operator,
-            &segment.object_key,
-            &temporary,
-            segment.bytes,
-            &segment.sha256,
-        )
-        .await?;
-        if config.verify_records && local_segment_records(&temporary)? != 0 {
-            bail!(
-                "restored empty segment contains records: {}",
-                segment.object_key
-            );
+        download_object(&operator, key, &temporary, bytes, sha256).await?;
+        if config.verify_records && local_segment_records(&temporary)? != records {
+            bail!("restored segment record count mismatch: {key}");
         }
         fs::rename(&temporary, &destination)?;
+        downloaded.insert(key, (destination, bytes, records));
     }
     let checkpoint_bytes = operator.read(&paths.checkpoint).await?.to_vec();
     if serde_json::from_slice::<RawArchiveCheckpoint>(&checkpoint_bytes)? != checkpoint {
