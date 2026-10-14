@@ -34,9 +34,11 @@ callbacks. The attached [patch draft](upstream-sse-context.patch) preserves a
 `tracing::Span` and enters it for `on_sse_poll`. It applies cleanly to the
 pinned `0.163.0-alpha.11` source and to the current inspected upstream source.
 The patch plus [regression test](upstream-sse-context-test.patch) compiled and
-passed on a complete `0.150.0-alpha.9` source worktree. It has not yet been
-compiled against the pinned `0.163.0-alpha.11` tree or validated by a new
-unmodified-client canary. In particular, the adapter's construction sites must
+passed on a complete `0.150.0-alpha.9` source worktree. On 2026-10-15 the same
+patch sequence also compiled against the pinned `0.163.0-alpha.11` tree and the
+callback test passed once after resolving that temporary source tree's lock file.
+It has not yet been validated by a new unmodified-client canary. In particular,
+the adapter's construction sites must
 be checked to ensure the captured Span is request or Turn scoped.
 
 Suggested regression coverage:
