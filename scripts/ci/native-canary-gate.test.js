@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const { verifyNativeCanaryReport } = require('./native-canary-gate');
 
-const coverage = () => ({ wire: 1, otlp_logs: 1, otlp_traces: 1, hooks: 1, missing_sources: [], complete: true });
+const coverage = () => ({ wire: 1, otlp_logs: 2, otlp_traces: 3, hooks: 1, missing_sources: [], complete: true });
 
 function report() {
   return {
@@ -132,6 +132,16 @@ test('source audit counts must conserve every record', () => {
   const broken = audit();
   broken.sources.otlp_logs.turn_assigned_records = 3;
   assert.throws(() => verifyNativeCanaryReport(report(), broken), /counts do not conserve records/);
+});
+
+test('per-Turn OTLP totals must match the source audit', () => {
+  const broken = audit();
+  broken.sources.otlp_logs.turn_assigned_records += 1;
+  broken.sources.otlp_logs.total_records += 1;
+  assert.throws(
+    () => verifyNativeCanaryReport(report(), broken),
+    /turn otlp_logs records do not match source_context_audit/,
+  );
 });
 
 test('explicit process-level records are conserved without becoming Session evidence', () => {

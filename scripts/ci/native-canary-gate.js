@@ -109,7 +109,14 @@ function verifyAudit(audit, expectedSessionId) {
   }
   nonNegativeInteger(audit.selected_captures, 'source_context_audit.selected_captures');
   nonNegativeInteger(audit.duplicate_captures_removed, 'source_context_audit.duplicate_captures_removed');
-  return { selected_records: selectedRecords };
+  return {
+    selected_records: selectedRecords,
+    turn_assigned_records: Object.fromEntries(AUDIT_SOURCES.map(source => [
+      source,
+      nonNegativeInteger(sources[source].turn_assigned_records,
+        `source_context_audit.sources.${source}.turn_assigned_records`),
+    ])),
+  };
 }
 
 function verifyNativeCanaryReport(report, audit, { minimumTurns = DEFAULT_MINIMUM_TURNS } = {}) {
@@ -150,6 +157,7 @@ function verifyNativeCanaryReport(report, audit, { minimumTurns = DEFAULT_MINIMU
     fail('session_view.turns does not match native_turns');
   }
   const turnIdentities = new Set();
+  const turnAssignedRecords = Object.fromEntries(AUDIT_SOURCES.map(source => [source, 0]));
   for (const [index, turn] of session.turns.entries()) {
     object(turn, `session_view.turns[${index}]`);
     if (nonEmptyString(turn.session_id, `session_view.turns[${index}].session_id`) !== sessionId) {
@@ -169,12 +177,24 @@ function verifyNativeCanaryReport(report, audit, { minimumTurns = DEFAULT_MINIMU
       fail(`session_view.turns[${index}].source_coverage.missing_sources must be empty`);
     }
     for (const source of SOURCES) {
-      if (nonNegativeInteger(coverage[source], `session_view.turns[${index}].source_coverage.${source}`) === 0) {
+      const count = nonNegativeInteger(
+        coverage[source], `session_view.turns[${index}].source_coverage.${source}`,
+      );
+      if (count === 0) {
         fail(`session_view.turns[${index}] has no ${source} evidence`);
       }
+      if (AUDIT_SOURCES.includes(source)) turnAssignedRecords[source] += count;
     }
   }
   const auditSummary = verifyAudit(audit, sessionId);
+  for (const source of AUDIT_SOURCES) {
+    if (turnAssignedRecords[source] !== auditSummary.turn_assigned_records[source]) {
+      fail(
+        `session_view turn ${source} records do not match source_context_audit `
+        + `(turns=${turnAssignedRecords[source]}, audit=${auditSummary.turn_assigned_records[source]})`,
+      );
+    }
+  }
   return {
     schema_version: 'chiptrace.native-canary-gate.v1',
     real_upstream: true,
