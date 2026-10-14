@@ -53,7 +53,7 @@ jobs:
         working-directory: .ci-codex-source/codex-rs
         run: |
           cargo metadata --format-version 1 --no-deps > "$RUNNER_TEMP/producer-metadata.json"
-          node "$GITHUB_WORKSPACE/scripts/ci/check-producer-lock.js" \
+          node "$GITHUB_WORKSPACE/scripts/ci/check-producer-lock.js" --prepare \
             "$GITHUB_WORKSPACE/.ci-codex-source" "$RUNNER_TEMP/producer-metadata.json" \
             0.163.0-alpha.11 | tee "$RUNNER_TEMP/producer-lock-check.json"
       - name: Compile and test detached callbacks and successful/failed/parallel stream terminals

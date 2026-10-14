@@ -1,8 +1,12 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { execFileSync, spawnSync } = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const test = require('node:test');
-const { verifyProducerLock } = require('./check-producer-lock');
+const { prepareProducerLock, verifyProducerLock } = require('./check-producer-lock');
 const { verifyProducerRegressions, callbackTests, parallelTests } = require('./check-producer-regressions');
 
 const version = '0.163.0-alpha.11';
@@ -42,7 +46,58 @@ test('dependency versions, checksums, edges and extra lock bytes cannot be norma
     resolved + '\n',
   ]) {
     assert.throws(() => verifyProducerLock(original, changed, metadata, version), /changed beyond/);
+    assert.throws(() => prepareProducerLock(original, changed, metadata, version), /changed beyond/);
   }
+});
+
+function lockCheckout(t, lock = original) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chiptrace-producer-lock-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, 'codex-rs'));
+  const file = path.join(root, 'codex-rs', 'Cargo.lock');
+  fs.writeFileSync(file, lock);
+  const metadataFile = path.join(root, 'metadata.json');
+  fs.writeFileSync(metadataFile, JSON.stringify(metadata));
+  execFileSync('git', ['init', '-q', root]);
+  execFileSync('git', ['-C', root, 'add', 'codex-rs/Cargo.lock']);
+  execFileSync('git', ['-C', root, '-c', 'user.name=ChipTrace CI',
+    '-c', 'user.email=chiptrace-ci@example.invalid', '-c', 'commit.gpgsign=false',
+    'commit', '-qm', 'pinned lock fixture']);
+  const run = (...flags) => spawnSync(process.execPath,
+    [path.join(__dirname, 'check-producer-lock.js'), ...flags, root, metadataFile, version],
+    { encoding: 'utf8', maxBuffer: 1024 * 1024 });
+  return { file, run };
+}
+
+test('CLI prepares a pristine committed lock and is idempotent before locked builds', t => {
+  const { file, run } = lockCheckout(t);
+  const unprepared = run();
+  assert.notEqual(unprepared.status, 0);
+  assert.equal(fs.readFileSync(file, 'utf8'), original);
+  const prepared = run('--prepare');
+  assert.equal(prepared.status, 0, prepared.stderr);
+  assert.equal(fs.readFileSync(file, 'utf8'), resolved);
+  assert.equal(JSON.parse(prepared.stdout).reconciled_workspace_packages, 1);
+  const repeated = run('--prepare');
+  assert.equal(repeated.status, 0, repeated.stderr);
+  assert.equal(repeated.stdout, prepared.stdout);
+  const verified = run();
+  assert.equal(verified.status, 0, verified.stderr);
+  assert.equal(verified.stdout, prepared.stdout);
+});
+
+test('CLI refuses dependency tampering without overwriting it or expanding large lock diagnostics', t => {
+  const privateText = 'private-lock-context'.repeat(30000);
+  const { file, run } = lockCheckout(t, original + `\n# ${privateText}\n`);
+  const changed = fs.readFileSync(file, 'utf8').replace('original-checksum', 'changed-checksum');
+  fs.writeFileSync(file, changed);
+  const result = run('--prepare');
+  assert.notEqual(result.status, 0);
+  assert.equal(fs.readFileSync(file, 'utf8'), changed);
+  assert.match(result.stderr, /changed beyond workspace release versions/);
+  assert.match(result.stderr, /expected_sha256=[a-f0-9]{64}; actual_sha256=[a-f0-9]{64}/);
+  assert.ok(result.stderr.length < 3000, 'lock diagnostics must remain bounded');
+  assert.ok(!result.stderr.includes('private-lock-context'));
 });
 
 test('package names alone do not authorize changing a sourced or non-workspace dependency', () => {
