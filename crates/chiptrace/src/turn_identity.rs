@@ -197,8 +197,8 @@ impl ExactTurnIndex {
     fn span_source_scope(&self, key: SpanKey) -> Result<Option<SourceScope>> {
         let mut key = Some(key);
         let mut visiting = BTreeSet::new();
-        let mut resolved = None;
-        let mut claimed_sessions = BTreeSet::new();
+        let mut nearest_boundary = None;
+        let mut nearest_session = None;
         while let Some(current) = key {
             if !visiting.insert(current.clone()) {
                 bail!("OTLP span ancestry contains a cycle");
@@ -207,33 +207,32 @@ impl ExactTurnIndex {
                 break;
             };
             validate_span_scope(scope)?;
-            if resolved.is_none() {
-                match scope.kinds.first() {
-                    Some(ScopeKind::Session) => {
-                        let session = scope.sessions.first().cloned();
-                        if session
-                            .as_ref()
-                            .is_some_and(|s| claimed_sessions.iter().any(|claimed| claimed != s))
-                        {
-                            bail!("OTLP explicit Session conflicts with inherited source scope");
-                        }
-                        resolved = Some(SourceScope::Session(session));
-                    }
-                    Some(ScopeKind::Turn) => resolved = Some(SourceScope::Turn),
-                    None if !scope.turns.is_empty() => resolved = Some(SourceScope::Turn),
-                    None => {
-                        claimed_sessions.extend(scope.sessions.iter().cloned());
-                        if claimed_sessions.len() > 1 {
-                            bail!("OTLP span ancestry has conflicting native Session identities");
-                        }
-                    }
+            if nearest_boundary.is_none() {
+                nearest_boundary = scope
+                    .kinds
+                    .first()
+                    .copied()
+                    .or_else(|| (!scope.turns.is_empty()).then_some(ScopeKind::Turn));
+                if nearest_boundary == Some(ScopeKind::Session) {
+                    nearest_session = scope.sessions.first().cloned();
                 }
+            } else if nearest_boundary == Some(ScopeKind::Session)
+                && nearest_session.is_none()
+                && scope.kinds.first() == Some(&ScopeKind::Session)
+            {
+                // A child Session boundary may omit the repeated native ID;
+                // inherit it from the nearest parent Session boundary only.
+                nearest_session = scope.sessions.first().cloned();
             }
             // Keep validating the entire parent chain after finding a boundary,
             // including cycles and conflicts above a native Turn or child Session.
             key = scope.parents.first().cloned();
         }
-        Ok(resolved)
+        Ok(match nearest_boundary {
+            Some(ScopeKind::Session) => Some(SourceScope::Session(nearest_session)),
+            Some(ScopeKind::Turn) => Some(SourceScope::Turn),
+            None => None,
+        })
     }
 
     pub(crate) fn source_scope(
@@ -710,6 +709,44 @@ mod tests {
         assert!(ExactTurnIndex::for_turns().observe_capture(&scoped_spans(json!([
             {"traceId":TRACE,"spanId":CHILD,"attributes":scope_attributes(Some("s"),"future-scope")}
         ]))).is_err());
+    }
+
+    #[test]
+    fn child_session_scope_inherits_parent_identity_and_nearest_boundary_wins() {
+        let root = "3333333333333333";
+        let child = "4444444444444444";
+        let grandchild = "5555555555555555";
+        let mut index = ExactTurnIndex::for_turns();
+        index.observe_capture(&wire("s", "t", PARENT)).unwrap();
+        index
+            .observe_capture(&scoped_spans(json!([
+                {"traceId":TRACE,"spanId":root,"attributes":scope_attributes(Some("s"),"session")},
+                {"traceId":TRACE,"spanId":child,"parentSpanId":root,"attributes":scope_attributes(None,"session")},
+                {"traceId":TRACE,"spanId":grandchild,"parentSpanId":child}
+            ])))
+            .unwrap();
+        let record = json!({"traceId":TRACE,"spanId":grandchild});
+        assert_eq!(
+            index.source_scope(&record, &BTreeMap::new()).unwrap(),
+            Some(SourceScope::Session(Some("s".to_owned())))
+        );
+        assert_eq!(
+            index.record_sessions(&record, &BTreeMap::new()).unwrap(),
+            BTreeSet::from(["s".to_owned()])
+        );
+
+        let other = "6666666666666666";
+        index
+            .observe_capture(&scoped_spans(json!([
+                {"traceId":TRACE,"spanId":other,"parentSpanId":child,"attributes":scope_attributes(Some("other"),"session")}
+            ])))
+            .unwrap();
+        assert_eq!(
+            index
+                .source_scope(&json!({"traceId":TRACE,"spanId":other}), &BTreeMap::new())
+                .unwrap(),
+            Some(SourceScope::Session(Some("other".to_owned())))
+        );
     }
 
     #[test]
