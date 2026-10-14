@@ -1,15 +1,16 @@
 diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
+index 46ac895..c5f4b60 100644
 --- a/codex-rs/core/src/client_tests.rs
 +++ b/codex-rs/core/src/client_tests.rs
-@@ -18,6 +18,7 @@ use crate::test_support::responses_metadata as test_responses_metadata;
+@@ -21,6 +21,7 @@ use base64::Engine;
  use codex_api::AgentIdentityTelemetry;
  use codex_api::ApiError;
  use codex_api::ResponseEvent;
 +use codex_api::SseTelemetry;
  use codex_api::TransportError;
+ use codex_history::HistoryInitialization;
  use codex_http_client::HttpClientFactory;
- use codex_http_client::OutboundProxyPolicy;
-@@ -79,6 +80,7 @@ use tokio::sync::Notify;
+@@ -94,6 +95,7 @@ use tokio::sync::Notify;
  use tracing::Event;
  use tracing::Subscriber;
  use tracing::field::Visit;
@@ -17,7 +18,7 @@ diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.
  use tracing_subscriber::Layer;
  use tracing_subscriber::layer::Context as LayerContext;
  use tracing_subscriber::layer::SubscriberExt;
-@@ -298,6 +300,38 @@ fn test_session_telemetry() -> SessionTelemetry {
+@@ -1188,6 +1190,38 @@ fn test_session_telemetry() -> SessionTelemetry {
      )
  }
  
@@ -54,10 +55,10 @@ diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.
 +}
 +
  #[test]
- fn ultra_reasoning_uses_max_for_requests() {
-     assert_eq!(
-@@ -370,6 +404,24 @@ struct TagCollectorLayer {
-     tags: Arc<Mutex<BTreeMap<String, String>>>,
+ fn websocket_continuation_reset_reason_survives_failed_reconnect_and_turn_boundary() {
+     for (reason, later_reason) in [
+@@ -1378,6 +1412,24 @@ impl Visit for TagCollectorVisitor {
+     }
  }
  
 +#[derive(Clone, Default)]
@@ -78,6 +79,6 @@ diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.
 +    }
 +}
 +
- impl<S> Layer<S> for TagCollectorLayer
- where
-     S: Subscriber + for<'a> LookupSpan<'a>,
+ #[derive(Clone)]
+ struct TagCollectorLayer {
+     tags: Arc<Mutex<BTreeMap<String, String>>>,

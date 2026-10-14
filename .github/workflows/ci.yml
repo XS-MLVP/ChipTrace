@@ -12,6 +12,26 @@ defaults:
     shell: bash
 
 jobs:
+  upstream-context:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the pinned Stock Codex source
+        uses: actions/checkout@v4
+        with:
+          repository: openai/codex
+          ref: 5425d3e625daa58eea3ad1de27c087eb3b2ffbd3
+          path: .ci-codex-source
+          fetch-depth: 1
+      - name: Verify the producer context patches still match the pinned source
+        run: |
+          set -euo pipefail
+          test "$(git -C .ci-codex-source rev-parse HEAD)" = "5425d3e625daa58eea3ad1de27c087eb3b2ffbd3"
+          git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-sse-context.patch"
+          git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-sse-context.patch"
+          git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-sse-context-test.patch"
+          git -C .ci-codex-source diff --check
+
   rust:
     runs-on: ubuntu-latest
     steps:

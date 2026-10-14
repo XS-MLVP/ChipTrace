@@ -135,8 +135,10 @@ CI 使用隔离 MinIO 验证 S3 协议、对象长度和 SHA-256；真实 Alibab
 
 - 业务 Responses 增长时，Wire、OTLP logs、OTLP traces 和 Hook 四源是否同时增长。
 - Relay `ingest_coverage.status` 必须保持 `complete`。`partial` 表示启动预热或来源尚未出现；
-  `degraded` 表示 Wire 活跃时 Runtime 来源缺失或落后超过 5 分钟，应按 `missing_sources`、
-  `stale_sources` 和 `source_lag_ms` 检查 Stock Codex 受管配置。
+  `degraded` 表示 Wire 活跃时 Runtime 来源缺失或落后超过 5 分钟，也表示 OTLP/Hook 仍在
+  近 5 分钟持续流入而 Wire 停止或落后超过 5 分钟。后者会把 `wire` 列入 `stale_sources`，
+  应按 `missing_sources`、`stale_sources`、`source_lag_ms`、`runtime_age_ms` 和 `wire_lag_ms`
+  检查 Stock Codex 受管配置；不能用 Runtime 来源的增长把 Wire 断流解释为 complete。
 - Relay `pending`、`inflight`、最老队列时间、磁盘空间和 attempt 守恒。
 - `output_truncated=true`、未知 OTLP 事件、转换错误和身份冲突。
 - Session start/end、模型调用/结果/执行、内部父引用的完整率；以及每个 Turn 的 Wire、

@@ -33,7 +33,7 @@ MinIO 公共容器标签的远端拉取已返回 access denied；CI 因此从固
 ## 迭代与发布流程
 
 1. 在修复分支提交源码、Schema 和 API 契约；完成 `make cloud-test`，以及隔离 S3 回归。
-2. 等待该提交的 GitHub CI 三个作业全部通过，再做 review/合并；镜像记录 Git revision。
+2. 等待该提交的 GitHub CI 全部作业（包含固定 Stock Codex 上下文补丁检查）通过，再做 review/合并；镜像记录 Git revision。
 3. 用目标云平台自己的身份授权和项目隔离，配置一个项目一套 plugin root/storage prefix。
    服务令牌只在后端使用；不要把 OSS 密钥下发给插件调用者。
 4. 在目标 OSS/S3 账号先验收小 Archive：上传、verify、恢复、离线 verify、Session 检查和

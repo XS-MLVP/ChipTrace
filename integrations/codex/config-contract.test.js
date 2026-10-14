@@ -11,9 +11,15 @@ const integrationRoot = __dirname;
 const configPath = path.join(integrationRoot, 'config.toml.example');
 const requirementsPath = path.join(integrationRoot, 'requirements.toml.example');
 const readmePath = path.join(integrationRoot, 'README.md');
+const collectorComposePath = path.join(integrationRoot, '..', '..', 'deploy', 'collector-relay.yml');
+const platformComposePath = path.join(integrationRoot, '..', '..', 'deploy', 'cloud-platform.yml');
+const dockerfilePath = path.join(integrationRoot, '..', '..', 'Dockerfile');
 const config = fs.readFileSync(configPath, 'utf8');
 const requirements = fs.readFileSync(requirementsPath, 'utf8');
 const readme = fs.readFileSync(readmePath, 'utf8');
+const collectorCompose = fs.readFileSync(collectorComposePath, 'utf8');
+const platformCompose = fs.readFileSync(platformComposePath, 'utf8');
+const dockerfile = fs.readFileSync(dockerfilePath, 'utf8');
 
 test('Stock Codex uses the current system configuration contract', () => {
   assert.equal(
@@ -135,6 +141,18 @@ test('configuration has no ChipTrace client or plugin dependency', () => {
       assert.doesNotMatch(content, pattern, `${relativePath} contains ${pattern}`);
     }
   }
+});
+
+test('production deployment templates require an immutable image revision', () => {
+  assert.match(
+    collectorCompose,
+    /image: \$\{CHIPTRACE_IMAGE:\?set CHIPTRACE_IMAGE to an immutable ChipTrace image\}/,
+  );
+  assert.doesNotMatch(collectorCompose, /chiptrace:(?:latest|local)\b/);
+  assert.match(platformCompose, /CHIPTRACE_REVISION: \$\{CHIPTRACE_REVISION:-unknown\}/);
+  assert.match(platformCompose, /CHIPTRACE_PLATFORM_IMAGE/);
+  assert.doesNotMatch(platformCompose, /chiptrace-platform:latest\b/);
+  assert.match(dockerfile, /org\.opencontainers\.image\.revision="\$\{CHIPTRACE_REVISION\}"/);
 });
 
 test('separate native hook invocations survive while HTTP retries deduplicate', async () => {

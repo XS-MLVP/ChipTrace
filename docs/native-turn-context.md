@@ -89,9 +89,13 @@ span 无法精确确定 Session 身份，以前的 Session 未归属计数没有
 `cargo test -p codex-core sse_callback_reenters_the_request_span_after_creation_scope_ends`，
 结果为 1 个测试通过。测试创建请求 Span、退出创建作用域、再进入另一个 Span 后触发
 SSE 回调，并观察 `codex_otel.log_only` 事件的当前 Span。这个结果证明补丁机制在完整
-代码上成立，但不等于 `0.163.0-alpha.11` 已编译或发布该修复；固定版本和当前 upstream
-提交仍需单独编译及真实多 Turn Canary。
-已在上述固定版本源码上通过 `git apply --check`；[上游问题草稿](upstream-turn-context-issue.md)
+代码上成立，但不等于 `0.163.0-alpha.11` 已编译或发布该修复。2026-10-15 已从 tag 固定到
+`5425d3e625daa58eea3ad1de27c087eb3b2ffbd3` 的源码树上顺序执行两个补丁的
+`git apply --check`，均通过；尝试 exact 版本编译时，Cargo 因
+`openai-oss-forks/crossterm` revision 拉取超时而失败，不能把 apply-check 当作编译证明。
+固定版本和当前 upstream 提交仍需在依赖可用的环境中单独编译及真实多 Turn Canary。
+GitHub CI 的 `upstream-context` job 固定同一 commit 并重复该顺序检查。
+[上游问题草稿](upstream-turn-context-issue.md)
 仅作为可审查材料保存在本仓库，尚未向其他项目发消息、创建 Issue 或提交 PR。
 
 下一步应在生产者的请求/Turn 上下文创建时保存不可变关联信息，并在异步 SSE 回调和派生
