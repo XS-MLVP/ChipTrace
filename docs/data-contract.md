@@ -96,6 +96,24 @@ interactions/
 `source_coverage` 另行证明所选 Session 同时存在 Wire、OTLP logs、OTLP traces 和 required
 Hook；它不把 OTLP trace 重写成第二套 Runtime 真相，缺一路时云端采购验收直接失败。
 
+## 原生 Session/Turn 统计
+
+`inspect-session` 和投影/验收 Manifest 中的 `session_view` 使用
+`chiptrace.session-view.v1`。其口径与采购评分分开：
+
+| 字段 | 统计口径 |
+| --- | --- |
+| `native_turns` | 去重的 `(source_session_id, turn_id)`；只允许显式 root Turn ID 回退 |
+| `model_interactions` | 模型请求/响应记录；同一 Turn 的 retry 仍是独立交互 |
+| `tool_execution_records` | 去重后的工具证据记录，pre/post Hook、OTLP 仍分别保留 |
+| `session_epochs` | SessionStart 事件，排除 `source=compact` |
+| `unscoped_turn_records` | 缺少显式 Turn 身份的交互、工具或 Turn 边界记录 |
+| `effective_turns` | Buyer v7 的有效用户配对数加必需工具配对数 |
+
+新一轮 resume 需要自己的 SessionEnd；Stop 只闭合 Turn。冲突终态标记为 `conflict`，
+不能用模型响应的 `completed` 推断 Session 完成。平台 API 将 Turn 明细作为磁盘 JSONL
+保存并分页读取；采购验收会从已验证 Raw 重新计算并比对此统计。
+
 ## Tool Schema
 
 采购工具定义只取自模型实际收到的 Responses Wire。每个被调用工具必须包含明确
@@ -158,3 +176,4 @@ Release 和最终归档。
 - `release-manifest-v1.schema.json`
 - `buyer-package-v1.schema.json`
 - `cloud-acceptance-v1.schema.json`
+- `session-view-v1.schema.json`

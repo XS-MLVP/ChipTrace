@@ -2,14 +2,15 @@
 
 ## 隔离环境
 
-仓库只维护 `deploy/docker-compose.yml` 这一套测试部署。提交前执行：
+`deploy/docker-compose.yml` 提供隔离引擎自测，`deploy/cloud-platform.yml` 提供平台插件部署。
+提交前执行：
 
 ```bash
 make cloud-test
 make m0-test
 ```
 
-其中 `cloud-test` 检查格式、Clippy、Rust/网关测试和完整云端验收自测；`m0-test` 在 Docker
+其中 `cloud-test` 检查格式、Clippy、Rust/网关测试、平台 HTTP/SDK 和完整云端验收自测；`m0-test` 在 Docker
 中复现。热服务只在真实 Stock Codex canary 通过后升级。
 
 ## 云端服务
@@ -29,6 +30,12 @@ docker compose -f deploy/collector-relay.yml up -d
 Relay 目录；OTLP 与 Hook 使用独立采集凭据。Wire Capture 使用网关磁盘 outbox，其余采集
 请求获得 Rust Relay 的 durable ACK。格式错误返回 400，认证失败返回 401，ID 冲突返回
 409，只有暂时故障返回可重试 5xx。
+
+2026-09-05 22:56（Asia/Shanghai），router_v2 的 Collector 和 Relay 已升级为
+`chiptrace:0.6.0-readiness-r2-20260905`，持久部署环境中的镜像设置同步更新，18084
+入口保持可用。隔离原生 Canary 和升级后的生产 Canary 均完成四源采集与真实工具正文
+校验。具体镜像 ID、切换记录、node42 配置与凭据检查见
+[本次热更新报告](../../records/chiptrace-hot-r2-20260905/REPORT.md)。
 
 ## Stock Codex
 
@@ -82,6 +89,48 @@ chiptrace verify-cloud-acceptance \
 配对率、Token、OTLP 父子关系以及每一阶段 Manifest 的 SHA-256。失败命令返回非零状态，
 且不会覆盖已有通过目录。
 
+## 云平台插件
+
+需要把收集与验收能力嵌入已有云平台时，使用
+[integrations/cloud-platform](../integrations/cloud-platform/README.md) 的服务端插件。
+它把每个实例绑定到一个项目命名空间，任务确认、队列、Raw 恢复目录、Session/Turn 分页
+sidecar 和交付包都落在 `CHIPTRACE_PLATFORM_ROOT`；客户端只能提交已授权的 ID，不能传入
+路径、OSS 凭据或降低 Buyer v7 门槛。服务令牌只用于平台后端之间的调用，外层仍应接入
+平台自己的用户鉴权和租户授权。
+
+本地磁盘模式可直接运行：
+
+```bash
+export CHIPTRACE_PLATFORM_TOKEN='<at-least-32-bytes>'
+export CHIPTRACE_PLATFORM_ROOT=/srv/chiptrace/platform
+export CHIPTRACE_CAPTURE_ROOT=/srv/chiptrace/capture
+export CHIPTRACE_OBJECT_ROOT=/srv/chiptrace/objects
+export CHIPTRACE_BACKEND=fs
+sudo install -d -o 10001 -g 10001 -m 0700 \
+  /srv/chiptrace/platform /srv/chiptrace/objects
+docker compose -f deploy/cloud-platform.yml up -d --build
+```
+
+OSS/S3 模式只替换后端环境变量，归档仍会在工作目录恢复后才进入验收：
+
+```bash
+export CHIPTRACE_BACKEND=oss                 # or s3
+export CHIPTRACE_OBJECT_ENDPOINT='<endpoint>'
+export CHIPTRACE_OBJECT_BUCKET='<bucket>'
+export CHIPTRACE_OBJECT_PREFIX='datasets/chiptrace'
+export OSS_ACCESS_KEY_ID='<service-key>'
+export OSS_ACCESS_KEY_SECRET='<service-secret>'
+```
+
+CI 使用隔离 MinIO 验证 S3 协议、对象长度和 SHA-256；真实 Alibaba OSS 账号、区域 endpoint
+和 IAM 权限仍需在目标部署账户做一次小数据验收，不能用本地 FS 结果代替。
+
+显式 `--session-id` 投影会顺序扫描两遍全部输入：先建立身份与子会话关系索引，再只保留
+选中 Session 的载荷。跨 Session 的 captureId 冲突、精确请求关联冲突和来源校验仍会拒绝
+输入。内存需求取决于身份索引和选中 Session 的大小；未指定 Session 的取证投影仍可能
+载入全量。完整验收还会恢复 Raw、生成富化副本并多次验证 SHA，应使用独立离线资源和
+足够磁盘空间，不要在在线请求处理进程内执行。
+
 ## 监控
 
 - 业务 Responses 增长时，Wire、OTLP logs、OTLP traces 和 Hook 四源是否同时增长。
@@ -92,6 +141,14 @@ chiptrace verify-cloud-acceptance \
 - `output_truncated=true`、未知 OTLP 事件、转换错误和身份冲突。
 - Session start/end、模型调用/结果/执行、内部父引用的完整率。
 - Buyer v7 失败原因、合格 Session 数和四种 Token 口径。
+
+网关 `/health` 的 `fullTraceCapture.currentDeliveryHealthy=true`、`outbox.pending=0`、
+`outbox.processing=0`、`outbox.recentFailureCount=0` 且 `rustRelay.conservationOk=true`
+才表示当前 Wire 投递闭环可交接。`historicalFailures` 是启动前保留的审计证据，不应因
+数量非零而清理或把服务标成故障。旧版本在正文脱敏后可能留下过期的 body 长度/哈希；当前
+outbox 会在新写入和发送历史副本前按实际 UTF-8 正文幂等重算元数据，并保留已有的原文哈希。
+重放失败证据时只能复制到 `pending`（不要移动或删除 `failed` 原件），确认 Relay durable
+ACK 后再以 pending/processing 清零作为完成条件。
 
 生命周期 Hook 不是心跳。单个 Turn 超过 5 分钟且没有新的生命周期边界时，可能出现
 `stale_sources=["hooks"]`；这是需要核对的来源新鲜度告警，不单独证明数据丢失。

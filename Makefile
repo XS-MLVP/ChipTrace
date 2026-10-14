@@ -1,4 +1,4 @@
-.PHONY: check test gateway-test codex-config-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
+.PHONY: check test gateway-test codex-config-test platform-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
 
 CHIPTRACE_VERSION ?= 0.6.0
 CHIPTRACE_REVISION ?= $(shell git rev-parse HEAD)
@@ -18,6 +18,10 @@ gateway-test:
 codex-config-test:
 	node --test integrations/codex/config-contract.test.js
 
+platform-test:
+	cargo build --locked --bin chiptrace
+	node --test integrations/cloud-platform/platform.test.js integrations/cloud-platform/storage-oss.test.js
+
 self-test:
 	cargo run --locked --bin chiptrace -- self-test
 
@@ -25,6 +29,7 @@ cloud-test:
 	$(MAKE) check
 	$(MAKE) test
 	$(MAKE) self-test
+	$(MAKE) platform-test
 
 m0-test:
 	CHIPTRACE_VERSION=$(CHIPTRACE_VERSION) CHIPTRACE_REVISION=$(CHIPTRACE_REVISION) \

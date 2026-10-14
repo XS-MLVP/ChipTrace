@@ -5,7 +5,7 @@
 //! which gives object storage a small, explicit commit protocol without
 //! pretending that an object store offers a multi-object transaction.
 
-use crate::jsonl::{sha256_file, utc_now};
+use crate::jsonl::{absolute_path, sha256_file, utc_now};
 use crate::object_store::{
     Backend, LocalObject, ObjectStoreConfig, build_operator, ensure_local_objects, join_key,
     normalize_prefix, read_optional, remote_sha256, validate_component, validate_key,
@@ -22,9 +22,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
-use std::fs::OpenOptions;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -320,6 +318,36 @@ pub async fn restore_raw_archive(
     config: RawArchiveRestoreConfig,
 ) -> Result<RawArchiveRestoreResult> {
     validate_component("archive_id", &config.archive_id)?;
+    let output = absolute_path(&config.output)?;
+    let output_name = output
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !matches!(*value, "." | ".."))
+        .context("restore output must name a directory below its parent")?;
+    let output_parent = output.parent().context("restore output has no parent")?;
+    fs::create_dir_all(output_parent)?;
+    // The lock is scoped to the destination, and the OS releases it even if
+    // the restoring process crashes. Never remove another restore's staging.
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(output_parent.join(format!(".{output_name}.chiptrace-restore.lock")))?;
+    lock.try_lock()
+        .context("restore destination is already locked")?;
+    if output.exists() && !config.replace {
+        bail!(
+            "restore output already exists: {}; pass --replace to replace it",
+            output.display()
+        );
+    }
+    if fs::symlink_metadata(&output).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        bail!("restore output cannot be a symbolic link");
+    }
+    if output.exists() && !output.is_dir() {
+        bail!("restore output must be a directory");
+    }
     let object_config = config.object_store();
     object_config.validate()?;
     let paths = archive_paths(&config.prefix, &config.archive_id)?;
@@ -335,36 +363,20 @@ pub async fn restore_raw_archive(
     if checkpoint.archive_id != config.archive_id {
         bail!("raw archive checkpoint ID does not match requested archive");
     }
-    let (manifest, _, _verified_records) =
-        verify_manifest_objects(&operator, &checkpoint, &paths, config.verify_records).await?;
+    // Check the commit and the complete manifest before touching payloads.
+    // Download each object once and verify the bytes that actually reach disk.
+    let manifest_bytes = operator.read(&paths.manifest).await?.to_vec();
+    let manifest = validate_manifest_bytes(&checkpoint, &paths, &manifest_bytes)?;
     if manifest.completeness == "partial" && !config.allow_partial {
         bail!(
             "raw archive {} is partial; pass --allow-partial only for forensic restore",
             config.archive_id
         );
     }
-    if config.output.exists() && !config.replace {
-        bail!(
-            "restore output already exists: {}; pass --replace to replace it",
-            config.output.display()
-        );
-    }
-    let output_parent = config.output.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(output_parent)?;
-    let output_name = config
-        .output
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("restore");
-    let staging = output_parent.join(format!(
-        ".{output_name}.chiptrace-restore-{}",
-        config.archive_id
-    ));
-    if staging.exists() {
-        fs::remove_dir_all(&staging)
-            .with_context(|| format!("remove stale restore staging {}", staging.display()))?;
-    }
-    fs::create_dir_all(&staging)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(&format!(".{output_name}.chiptrace-restore-"))
+        .tempdir_in(output_parent)?;
+    let staging = temporary.path();
     for segment in &manifest.segments {
         let relative = Path::new("segments")
             .join(&segment.shard)
@@ -374,11 +386,17 @@ pub async fn restore_raw_archive(
             fs::create_dir_all(parent)?;
         }
         let temporary = destination.with_extension("ndjson.partial");
-        download_object(&operator, &segment.object_key, &temporary).await?;
-        let bytes = fs::metadata(&temporary)?.len();
-        if bytes != segment.bytes || sha256_file(&temporary)? != segment.sha256 {
+        download_object(
+            &operator,
+            &segment.object_key,
+            &temporary,
+            segment.bytes,
+            &segment.sha256,
+        )
+        .await?;
+        if config.verify_records && local_segment_records(&temporary)? != segment.records {
             bail!(
-                "restored segment integrity mismatch: {}",
+                "restored segment record count mismatch: {}",
                 segment.object_key
             );
         }
@@ -393,17 +411,26 @@ pub async fn restore_raw_archive(
             fs::create_dir_all(parent)?;
         }
         let temporary = destination.with_extension("ndjson.partial");
-        download_object(&operator, &segment.object_key, &temporary).await?;
-        let bytes = fs::metadata(&temporary)?.len();
-        if bytes != segment.bytes || sha256_file(&temporary)? != segment.sha256 {
+        download_object(
+            &operator,
+            &segment.object_key,
+            &temporary,
+            segment.bytes,
+            &segment.sha256,
+        )
+        .await?;
+        if config.verify_records && local_segment_records(&temporary)? != 0 {
             bail!(
-                "restored empty segment integrity mismatch: {}",
+                "restored empty segment contains records: {}",
                 segment.object_key
             );
         }
         fs::rename(&temporary, &destination)?;
     }
     let checkpoint_bytes = operator.read(&paths.checkpoint).await?.to_vec();
+    if serde_json::from_slice::<RawArchiveCheckpoint>(&checkpoint_bytes)? != checkpoint {
+        bail!("raw archive checkpoint changed during restore");
+    }
     let lineage = RawSourceLineage {
         schema_version: RAW_LINEAGE_SCHEMA_VERSION.to_owned(),
         archive_id: checkpoint.archive_id.clone(),
@@ -419,19 +446,178 @@ pub async fn restore_raw_archive(
     let lineage_path = staging.join("RAW_SOURCE.json");
     fs::write(&lineage_path, serde_json::to_vec_pretty(&lineage)?)?;
     File::open(&lineage_path)?.sync_all()?;
-    if config.output.exists() {
-        if config.output.is_dir() {
-            fs::remove_dir_all(&config.output)?;
-        } else {
-            fs::remove_file(&config.output)?;
+    for (name, bytes) in [
+        ("RAW_MANIFEST.json", manifest_bytes),
+        ("RAW_CHECKPOINT.json", checkpoint_bytes),
+    ] {
+        let path = staging.join(name);
+        fs::write(&path, bytes)?;
+        File::open(path)?.sync_all()?;
+    }
+    for entry in walkdir::WalkDir::new(staging).contents_first(true) {
+        let entry = entry?;
+        if entry.file_type().is_dir() {
+            File::open(entry.path())?.sync_all()?;
         }
     }
-    fs::rename(&staging, &config.output)?;
+    publish_restored_directory(staging, &output, config.replace)?;
+    File::open(output_parent)?.sync_all()?;
     Ok(RawArchiveRestoreResult {
         ok: true,
         archive_id: config.archive_id,
         completeness: manifest.completeness.clone(),
-        output: config.output,
+        output,
+        segment_count: manifest.segment_count,
+        total_records: manifest.total_records,
+        total_bytes: manifest.total_bytes,
+    })
+}
+
+fn publish_restored_directory(staging: &Path, output: &Path, replace: bool) -> Result<()> {
+    let existing = fs::symlink_metadata(output).ok();
+    if let Some(metadata) = &existing
+        && (!replace || !metadata.is_dir() || metadata.file_type().is_symlink())
+    {
+        bail!("restore destination appeared or is unsuitable; previous output retained");
+    }
+    // Exchange two complete directory trees without making output disappear.
+    // If the filesystem cannot exchange them, leave the previous tree intact
+    // and require a fresh destination rather than deleting it first.
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let staging = CString::new(staging.as_os_str().as_bytes())?;
+        let output = CString::new(output.as_os_str().as_bytes())?;
+        let flags = if existing.is_some() {
+            libc::RENAME_EXCHANGE
+        } else {
+            libc::RENAME_NOREPLACE
+        };
+        // SAFETY: both arguments are valid NUL-terminated path strings and
+        // AT_FDCWD resolves their absolute paths; no pointers are retained.
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                staging.as_ptr(),
+                libc::AT_FDCWD,
+                output.as_ptr(),
+                flags,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("atomic restore replacement failed; use a fresh output directory");
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if existing.is_some() {
+            bail!(
+                "atomic restore replacement is only supported on Linux; use a fresh output directory"
+            );
+        }
+        fs::rename(staging, output).context("publish restored Raw directory")
+    }
+}
+
+/// Verify a restored Raw snapshot without credentials or network access.
+pub fn verify_restored_raw(root: &Path) -> Result<RawArchiveRestoreResult> {
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("restored Raw root must be a directory, not a symbolic link");
+    }
+    // Reject links and uncommitted files before opening anything in the tree.
+    let mut actual_files = BTreeSet::new();
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry?;
+        if entry.file_type().is_symlink()
+            || !(entry.file_type().is_file() || entry.file_type().is_dir())
+        {
+            bail!(
+                "restored Raw contains a link or special file: {}",
+                entry.path().display()
+            );
+        }
+        if entry.file_type().is_file() {
+            actual_files.insert(entry.path().strip_prefix(root)?.to_path_buf());
+        }
+    }
+    let lineage: RawSourceLineage =
+        serde_json::from_slice(&fs::read(root.join("RAW_SOURCE.json"))?)?;
+    validate_component("archive_id", &lineage.archive_id)?;
+    let checkpoint_bytes = fs::read(root.join("RAW_CHECKPOINT.json"))?;
+    let checkpoint: RawArchiveCheckpoint = serde_json::from_slice(&checkpoint_bytes)?;
+    let manifest_bytes = fs::read(root.join("RAW_MANIFEST.json"))?;
+    let suffix = format!("raw/{}/manifest.json", lineage.archive_id);
+    let prefix = checkpoint
+        .manifest_key
+        .strip_suffix(&suffix)
+        .context("restored Raw manifest key does not match its archive ID")?;
+    let prefix = if prefix.is_empty() {
+        prefix
+    } else {
+        prefix
+            .strip_suffix('/')
+            .context("invalid restored Raw archive prefix")?
+    };
+    let paths = archive_paths(prefix, &lineage.archive_id)?;
+    let manifest = validate_manifest_bytes(&checkpoint, &paths, &manifest_bytes)?;
+    if lineage.schema_version != RAW_LINEAGE_SCHEMA_VERSION
+        || lineage.archive_id != checkpoint.archive_id
+        || lineage.completeness != checkpoint.completeness
+        || lineage.manifest_key != checkpoint.manifest_key
+        || lineage.manifest_sha256 != checkpoint.manifest_sha256
+        || lineage.checkpoint_key != paths.checkpoint
+        || lineage.checkpoint_sha256 != crate::jsonl::sha256_bytes(&checkpoint_bytes)
+        || lineage.segment_count != checkpoint.segment_count
+        || lineage.total_records != checkpoint.total_records
+        || lineage.total_bytes != checkpoint.total_bytes
+    {
+        bail!("restored Raw lineage does not match its committed checkpoint");
+    }
+    let mut expected_files = BTreeSet::from([
+        PathBuf::from("RAW_SOURCE.json"),
+        PathBuf::from("RAW_MANIFEST.json"),
+        PathBuf::from("RAW_CHECKPOINT.json"),
+    ]);
+    for (source_path, bytes, sha256, records) in manifest
+        .segments
+        .iter()
+        .map(|s| {
+            (
+                s.source_path.as_str(),
+                s.bytes,
+                s.sha256.as_str(),
+                s.records,
+            )
+        })
+        .chain(
+            manifest
+                .empty_segments
+                .iter()
+                .map(|s| (s.source_path.as_str(), s.bytes, s.sha256.as_str(), 0)),
+        )
+    {
+        crate::jsonl::ensure_safe_relative_path(source_path)?;
+        expected_files.insert(PathBuf::from(source_path));
+        let path = root.join(source_path);
+        if path.metadata()?.len() != bytes
+            || sha256_file(&path)? != sha256
+            || local_segment_records(&path)? != records
+        {
+            bail!("restored Raw segment verification failed: {source_path}");
+        }
+    }
+    if actual_files != expected_files {
+        bail!("restored Raw file set differs from its committed manifest");
+    }
+    Ok(RawArchiveRestoreResult {
+        ok: true,
+        archive_id: manifest.archive_id,
+        completeness: manifest.completeness,
+        output: absolute_path(root)?,
         segment_count: manifest.segment_count,
         total_records: manifest.total_records,
         total_bytes: manifest.total_bytes,
@@ -797,29 +983,29 @@ fn validate_checkpoint(
     Ok(())
 }
 
-async fn verify_manifest_objects(
-    operator: &Operator,
+fn validate_manifest_bytes(
     checkpoint: &RawArchiveCheckpoint,
     paths: &ArchivePaths,
-    verify_records: bool,
-) -> Result<(RawArchiveManifest, u64, u64)> {
+    manifest_bytes: &[u8],
+) -> Result<RawArchiveManifest> {
     if checkpoint.schema_version != RAW_CHECKPOINT_SCHEMA_VERSION
         || checkpoint.state != "committed"
+        || checkpoint.committed_at_utc.trim().is_empty()
         || !matches!(checkpoint.completeness.as_str(), "complete" | "partial")
         || checkpoint.manifest_key != paths.manifest
     {
         bail!("invalid raw archive checkpoint at {}", paths.checkpoint);
     }
+    validate_component("archive_id", &checkpoint.archive_id)?;
     validate_key(&checkpoint.manifest_key)?;
-    let manifest_bytes = operator.read(&checkpoint.manifest_key).await?.to_vec();
     validate_sha256(&checkpoint.manifest_sha256)?;
-    if crate::jsonl::sha256_bytes(&manifest_bytes) != checkpoint.manifest_sha256 {
+    if crate::jsonl::sha256_bytes(manifest_bytes) != checkpoint.manifest_sha256 {
         bail!(
             "raw archive manifest SHA-256 mismatch: {}",
             checkpoint.manifest_key
         );
     }
-    let manifest: RawArchiveManifest = serde_json::from_slice(&manifest_bytes)?;
+    let manifest: RawArchiveManifest = serde_json::from_slice(manifest_bytes)?;
     if manifest.schema_version != RAW_ARCHIVE_SCHEMA_VERSION
         || manifest.archive_id != checkpoint.archive_id
         || manifest.format != "UTF-8 NDJSON sealed WAL"
@@ -832,23 +1018,74 @@ async fn verify_manifest_objects(
         bail!("raw archive manifest does not match checkpoint");
     }
     validate_manifest_sequence(&manifest)?;
-    let manifest_records = manifest
+    let mut seen = BTreeSet::new();
+    let mut total_bytes = 0_u64;
+    let mut total_records = 0_u64;
+    for (shard, id, source, key, bytes, sha, records, empty) in manifest
         .segments
         .iter()
-        .map(|segment| segment.records)
-        .sum::<u64>();
-    let manifest_bytes_total = manifest
-        .segments
-        .iter()
-        .map(|segment| segment.bytes)
-        .chain(manifest.empty_segments.iter().map(|segment| segment.bytes))
-        .sum::<u64>();
-    if manifest_records != manifest.total_records || manifest_bytes_total != manifest.total_bytes {
-        bail!("raw archive manifest aggregate totals are inconsistent");
+        .map(|s| {
+            (
+                &s.shard,
+                s.segment_id,
+                &s.source_path,
+                &s.object_key,
+                s.bytes,
+                &s.sha256,
+                s.records,
+                false,
+            )
+        })
+        .chain(manifest.empty_segments.iter().map(|s| {
+            (
+                &s.shard,
+                s.segment_id,
+                &s.source_path,
+                &s.object_key,
+                s.bytes,
+                &s.sha256,
+                s.records,
+                true,
+            )
+        }))
+    {
+        validate_component("segment.shard", shard)?;
+        validate_key(key)?;
+        validate_sha256(sha)?;
+        if source != &format!("segments/{shard}/segment-{id:020}.sealed.ndjson")
+            || key != &join_key(&paths.object_base, &format!("{sha}.ndjson"))
+            || !seen.insert((shard, id))
+            || (!empty && (bytes == 0 || records == 0))
+            || (empty && records != 0)
+        {
+            bail!("raw archive segment descriptor is invalid: {key}");
+        }
+        total_bytes = total_bytes
+            .checked_add(bytes)
+            .context("raw archive byte total overflow")?;
+        total_records = total_records
+            .checked_add(records)
+            .context("raw archive record total overflow")?;
     }
-    if manifest.total_records == 0 || manifest.total_bytes == 0 {
-        bail!("raw archive cannot commit an empty snapshot");
+    if total_records != manifest.total_records
+        || total_bytes != manifest.total_bytes
+        || total_records == 0
+        || total_bytes == 0
+    {
+        bail!("raw archive manifest aggregate totals are inconsistent or empty");
     }
+    Ok(manifest)
+}
+
+async fn verify_manifest_objects(
+    operator: &Operator,
+    checkpoint: &RawArchiveCheckpoint,
+    paths: &ArchivePaths,
+    verify_records: bool,
+) -> Result<(RawArchiveManifest, u64, u64)> {
+    // Shared by remote verification and single-pass disk restoration.
+    let manifest_bytes = operator.read(&paths.manifest).await?.to_vec();
+    let manifest = validate_manifest_bytes(checkpoint, paths, &manifest_bytes)?;
     let mut seen = BTreeSet::new();
     let mut records = 0_u64;
     let mut verified_object_keys = BTreeSet::new();
@@ -1140,7 +1377,13 @@ fn validate_sha256(value: &str) -> Result<()> {
     Ok(())
 }
 
-async fn download_object(operator: &Operator, key: &str, destination: &Path) -> Result<()> {
+async fn download_object(
+    operator: &Operator,
+    key: &str,
+    destination: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> Result<()> {
     use futures_util::io::AsyncReadExt;
     use std::io::BufWriter;
     let mut reader = operator
@@ -1151,16 +1394,61 @@ async fn download_object(operator: &Operator, key: &str, destination: &Path) -> 
     let file = File::create(destination)?;
     let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
     let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    let mut bytes = 0_u64;
+    let mut hasher = sha2::Sha256::new();
     loop {
         let count = reader.read(&mut buffer).await?;
         if count == 0 {
             break;
         }
+        bytes = bytes
+            .checked_add(count as u64)
+            .context("restored object byte count overflow")?;
+        if bytes > expected_bytes {
+            bail!("restored object exceeds its committed length: {key}");
+        }
+        hasher.update(&buffer[..count]);
         writer.write_all(&buffer[..count])?;
+    }
+    if bytes != expected_bytes || hex::encode(hasher.finalize()) != expected_sha256 {
+        bail!("restored object length or SHA-256 mismatch: {key}");
     }
     writer.flush()?;
     writer.get_ref().sync_all()?;
     Ok(())
+}
+
+fn local_segment_records(path: &Path) -> Result<u64> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = Vec::new();
+    let mut records = 0_u64;
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        strip_line_ending(&mut line);
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(&line)
+            .with_context(|| format!("invalid JSON in restored segment {}", path.display()))?;
+        if !value.is_object()
+            || value
+                .get("captureId")
+                .and_then(Value::as_str)
+                .is_none_or(|id| id.trim().is_empty())
+        {
+            bail!(
+                "restored segment contains a record without captureId: {}",
+                path.display()
+            );
+        }
+        records = records
+            .checked_add(1)
+            .context("restored record count overflow")?;
+    }
+    Ok(records)
 }
 
 #[cfg(test)]
@@ -1196,6 +1484,139 @@ mod tests {
             retry_max_times: 3,
             allow_segment_gaps: false,
         }
+    }
+
+    fn restore_config(root: &Path, output: &Path, archive_id: &str) -> RawArchiveRestoreConfig {
+        RawArchiveRestoreConfig {
+            archive_id: archive_id.to_owned(),
+            output: output.to_owned(),
+            backend: Backend::Fs,
+            root: Some(root.to_owned()),
+            endpoint: None,
+            bucket: None,
+            region: None,
+            prefix: "datasets/chiptrace".to_owned(),
+            verify_records: true,
+            replace: false,
+            allow_partial: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_lock_and_corruption_preserve_previous_output() {
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("capture/segments");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(
+            input.join("segment-00000000000000000001.sealed.ndjson"),
+            [fixture_capture("cap-safe"), vec![b'\n']].concat(),
+        )
+        .unwrap();
+        let objects = temporary.path().join("objects");
+        archive_raw(config(&objects, input, "safe")).await.unwrap();
+        let output = temporary.path().join("restored");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(temporary.path().join(".restored.chiptrace-restore.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let error = restore_raw_archive(restore_config(&objects, &output, "safe"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already locked"));
+        assert!(!output.exists());
+        drop(lock);
+        restore_raw_archive(restore_config(&objects, &output, "safe"))
+            .await
+            .unwrap();
+        let original = fs::read(output.join("RAW_SOURCE.json")).unwrap();
+        let manifest: RawArchiveManifest =
+            serde_json::from_slice(&fs::read(output.join("RAW_MANIFEST.json")).unwrap()).unwrap();
+        let previous_segment = fs::read(output.join(&manifest.segments[0].source_path)).unwrap();
+        assert!(
+            restore_raw_archive(restore_config(&objects, &output, "safe"))
+                .await
+                .is_err()
+        );
+        fs::write(objects.join(&manifest.segments[0].object_key), b"corrupted").unwrap();
+        let mut replace = restore_config(&objects, &output, "safe");
+        replace.replace = true;
+        assert!(restore_raw_archive(replace).await.is_err());
+        assert_eq!(fs::read(output.join("RAW_SOURCE.json")).unwrap(), original);
+        assert_eq!(
+            fs::read(output.join(&manifest.segments[0].source_path)).unwrap(),
+            previous_segment
+        );
+        assert!(verify_restored_raw(&output).is_ok());
+    }
+
+    #[tokio::test]
+    async fn offline_restore_verification_rejects_extra_files_tampering_and_wrong_lineage() {
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("capture/segments");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(
+            input.join("segment-00000000000000000001.sealed.ndjson"),
+            [fixture_capture("cap-offline"), vec![b'\n']].concat(),
+        )
+        .unwrap();
+        let objects = temporary.path().join("objects");
+        archive_raw(config(&objects, input, "offline"))
+            .await
+            .unwrap();
+        let output = temporary.path().join("restored");
+        restore_raw_archive(restore_config(&objects, &output, "offline"))
+            .await
+            .unwrap();
+        assert!(verify_restored_raw(&output).is_ok());
+        let extra = output.join("segments/segment-00000000000000000009.open.ndjson");
+        fs::write(&extra, fixture_capture("uncommitted")).unwrap();
+        assert!(verify_restored_raw(&output).is_err());
+        fs::remove_file(extra).unwrap();
+        let lineage_file = output.join("RAW_SOURCE.json");
+        let original = fs::read(&lineage_file).unwrap();
+        let mut lineage: RawSourceLineage = serde_json::from_slice(&original).unwrap();
+        lineage.checkpoint_key = "elsewhere/CHECKPOINT.json".to_owned();
+        fs::write(&lineage_file, serde_json::to_vec(&lineage).unwrap()).unwrap();
+        assert!(verify_restored_raw(&output).is_err());
+        fs::write(&lineage_file, original).unwrap();
+        let manifest: RawArchiveManifest =
+            serde_json::from_slice(&fs::read(output.join("RAW_MANIFEST.json")).unwrap()).unwrap();
+        let segment = output.join(&manifest.segments[0].source_path);
+        #[cfg(unix)]
+        {
+            let retained = temporary.path().join("linked-segment");
+            fs::rename(&segment, &retained).unwrap();
+            std::os::unix::fs::symlink(&retained, &segment).unwrap();
+            assert!(verify_restored_raw(&output).is_err());
+            fs::remove_file(&segment).unwrap();
+            fs::rename(retained, &segment).unwrap();
+        }
+        fs::write(segment, b"tampered").unwrap();
+        assert!(verify_restored_raw(&output).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_directory_replacement_keeps_both_trees_until_exchange() {
+        let temporary = tempfile::tempdir().unwrap();
+        let staging = temporary.path().join("staging");
+        let output = temporary.path().join("output");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&output).unwrap();
+        fs::write(staging.join("evidence"), b"new").unwrap();
+        fs::write(output.join("evidence"), b"previous").unwrap();
+        assert!(publish_restored_directory(&staging, &output, false).is_err());
+        assert_eq!(fs::read(output.join("evidence")).unwrap(), b"previous");
+        publish_restored_directory(&staging, &output, true).unwrap();
+        assert_eq!(fs::read(output.join("evidence")).unwrap(), b"new");
+        assert_eq!(fs::read(staging.join("evidence")).unwrap(), b"previous");
+        assert!(
+            publish_restored_directory(&temporary.path().join("missing"), &output, true).is_err()
+        );
+        assert_eq!(fs::read(output.join("evidence")).unwrap(), b"new");
     }
 
     #[tokio::test]
@@ -1249,6 +1670,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(restored_result.segment_count, 2);
+        assert_eq!(verify_restored_raw(&restored).unwrap().total_records, 2);
         assert!(
             restored
                 .join("segments/shard-00000/segment-00000000000000000001.sealed.ndjson")

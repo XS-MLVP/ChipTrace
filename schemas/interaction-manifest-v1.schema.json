@@ -53,6 +53,7 @@
       },
       "additionalProperties": false
     },
+    "session_view": {"type": "object"},
     "integrity": {
       "type": "object",
       "required": [

@@ -32,6 +32,7 @@ opendal = { version = "0.58.2", default-features = false, features = [
   "services-oss",
   "services-s3",
 ] }
+opendal-http-transport-reqwest = { version = "0.58.2", default-features = false, features = ["rustls-no-provider"] }
 rayon = "1.11"
 redb = "4.2"
 regex = "1.11"

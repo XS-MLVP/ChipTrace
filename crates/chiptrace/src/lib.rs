@@ -19,6 +19,7 @@ pub mod release;
 pub mod schema;
 pub mod score;
 mod session_lineage;
+pub mod session_view;
 pub mod sharded;
 pub mod store;
 pub mod telemetry;

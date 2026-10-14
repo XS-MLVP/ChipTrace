@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -26,6 +30,15 @@ jobs:
       - run: node --test integrations/openai-gateway/durable-outbox.test.js
       - run: node --test integrations/codex/config-contract.test.js
       - run: cargo run --locked --bin chiptrace -- self-test
+      - name: Build the CLI used by the platform integration path
+        run: cargo build --locked --bin chiptrace
+      - name: Verify cloud platform jobs and signed OSS protocol
+        run: node --test integrations/cloud-platform/platform.test.js integrations/cloud-platform/storage-oss.test.js | tee platform.tap
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: platform-report
+          path: platform.tap
       - name: Verify Relay cloud delivery benchmark path
         run: |
           cargo run --locked --bin chiptrace -- benchmark-http \
@@ -41,7 +54,6 @@ jobs:
           '
       - run: cargo build --release --locked --bin chiptrace
       - run: target/release/chiptrace --help
-
   container:
     runs-on: ubuntu-latest
     steps:
@@ -75,3 +87,48 @@ jobs:
           assert result["buyer_publish_retry"]["idempotent"] is True
           assert result["published_buyer_verify"]["ok"] is True
           '
+      - name: Build cloud platform image
+        run: docker build --target platform -t chiptrace-platform:ci .
+      - name: Verify platform service and SDK in a container
+        run: |
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:size=1g,mode=1777 \
+            -v "$PWD/integrations/cloud-platform:/tests:ro" \
+            chiptrace-platform:ci --test /tests/platform.test.js /tests/storage-oss.test.js
+
+  storage-s3-minio:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: chiptrace-ci
+      AWS_SECRET_ACCESS_KEY: chiptrace-ci-secret
+      AWS_EC2_METADATA_DISABLED: "true"
+      CHIPTRACE_S3_ENDPOINT: http://127.0.0.1:9000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91"
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Start isolated S3 service
+        run: |
+          docker run -d --name chiptrace-ci-minio -p 127.0.0.1:9000:9000 \
+            -e MINIO_ROOT_USER=chiptrace-ci -e MINIO_ROOT_PASSWORD=chiptrace-ci-secret \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
+      - run: for i in $(seq 1 30); do curl -fsS http://127.0.0.1:9000/minio/health/live && exit 0; sleep 2; done; exit 1
+      - run: cargo build --locked --bin chiptrace
+      - name: Verify multipart S3 archive and disk restoration
+        run: node --test integrations/cloud-platform/storage-s3.test.js | tee storage-s3.tap
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: storage-s3-report
+          path: storage-s3.tap
+      - name: MinIO diagnostics
+        if: failure()
+        run: docker logs chiptrace-ci-minio
+      - name: Stop isolated S3 service
+        if: always()
+        run: docker stop chiptrace-ci-minio

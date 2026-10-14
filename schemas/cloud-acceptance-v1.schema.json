@@ -24,6 +24,7 @@
     "hard_gate_pass": {"const": true},
     "delivery_ready": {"const": true},
     "effective_turns": {"type": "integer", "minimum": 10},
+    "session_view": {"type": "object"},
     "distinct_tool_names": {"type": "integer", "minimum": 5},
     "complete_tool_definitions": {"type": "integer", "minimum": 5},
     "pairing_rate_after_open_tail": {"const": 1.0},

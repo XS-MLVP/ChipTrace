@@ -1578,6 +1578,14 @@ fn session_lifecycle_state(captures: &[ParsedCapture]) -> LifecycleState {
 fn stock_hook_boundary_event(capture: &ParsedCapture) -> Option<&'static str> {
     capture.lifecycle_event_records.iter().find_map(|event| {
         match event.get("source_event_name").and_then(Value::as_str) {
+            Some("SessionStart")
+                if event
+                    .pointer("/source_event/source")
+                    .and_then(Value::as_str)
+                    .is_some_and(|source| source.eq_ignore_ascii_case("compact")) =>
+            {
+                None
+            }
             Some("SessionStart") => Some("session_start"),
             Some("SessionEnd") => Some("session_end"),
             _ => None,
@@ -7583,6 +7591,30 @@ mod tests {
         let (session, _, _) = assemble_group(vec![capture]).unwrap();
         assert_eq!(session["is_final_snapshot"], false);
         assert_eq!(session["status"], "incomplete");
+    }
+
+    #[test]
+    fn compaction_hook_does_not_start_another_session_epoch() {
+        let boundary = |id: &str, name: &str, source: &str| {
+            json!({
+                "recordType":"lifecycle_event", "captureId":id,
+                "sourceNamespace":"stock-codex-cloud", "traceContext":{"session_id":"s"},
+                "lifecycleEvent":{"type":if name == "SessionEnd" { "session_end" } else { "session_start" },
+                    "source_event_name":name, "source_event":{"source":source}}
+            })
+        };
+        let (session, _, _) = assemble_group(vec![
+            boundary("start", "SessionStart", "startup"),
+            boundary("compact", "SessionStart", "compact"),
+            boundary("end", "SessionEnd", ""),
+        ])
+        .unwrap();
+        assert_eq!(session["meta"]["lifecycle_state"]["start_count"], 1);
+        assert_eq!(
+            session["meta"]["lifecycle_state"]["invalid_boundary_count"],
+            0
+        );
+        assert_eq!(session["is_final_snapshot"], true);
     }
 
     #[test]

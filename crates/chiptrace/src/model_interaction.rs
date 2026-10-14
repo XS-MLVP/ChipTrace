@@ -54,6 +54,8 @@ pub struct InteractionProjectionManifest {
     pub source_coverage: CloudSourceCoverage,
     pub integrity: DeliveryIntegrity,
     pub metrics: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_view: Option<crate::session_view::SessionView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub raw_sources: Vec<RawSourceLineage>,
     pub parts: Vec<FileManifest>,
@@ -240,6 +242,17 @@ fn validate_canonical_records(
     Ok(())
 }
 
+pub(crate) fn summarize_raw_session(
+    inputs: &[PathBuf],
+    session: &str,
+) -> Result<crate::session_view::SessionView> {
+    let inputs = discover_inputs(inputs)?;
+    let (captures, _) = read_session_captures(&inputs, session)?;
+    let (mut captures, _, _) = select_projection_captures(captures, None, Some(session))?;
+    sort_captures(&mut captures);
+    Ok(crate::session_view::summarize_session(&captures, session))
+}
+
 pub fn project_interactions(
     config: InteractionProjectConfig,
 ) -> Result<InteractionProjectionManifest> {
@@ -260,14 +273,25 @@ pub fn project_interactions(
         .ok_or_else(|| anyhow::anyhow!("interaction output has no parent"))?;
     fs::create_dir_all(parent)?;
 
-    let (mut captures, duplicate_captures_removed) = read_captures(&inputs)?;
-    apply_exact_task_links(&mut captures)?;
+    if config.task_session_id.is_some() && config.session_id.is_some() {
+        bail!("--task-session-id and --session-id cannot be used together");
+    }
+    let (captures, duplicate_captures_removed) = if let Some(session) = &config.session_id {
+        read_session_captures(&inputs, session)?
+    } else {
+        let (mut captures, duplicates) = read_captures(&inputs)?;
+        apply_exact_task_links(&mut captures)?;
+        (captures, duplicates)
+    };
     let (mut captures, task_session_id, session_id) = select_projection_captures(
         captures,
         config.task_session_id.as_deref(),
         config.session_id.as_deref(),
     )?;
     sort_captures(&mut captures);
+    let session_view = session_id
+        .as_deref()
+        .map(|session| crate::session_view::summarize_session(&captures, session));
     let capture_records = captures.len() as u64;
     let source_coverage = cloud_source_coverage(&captures);
 
@@ -370,6 +394,7 @@ pub fn project_interactions(
         },
         integrity,
         metrics,
+        session_view,
         raw_sources,
         parts,
     };
@@ -466,8 +491,16 @@ pub(crate) fn canonical_trace_summary(captures: &[Value]) -> Result<Option<Canon
         .filter(|span| runtime_span_is_terminal(span))
         .filter_map(|span| string_field(span, "span_id").map(str::to_owned))
         .collect();
-    let open_nodes = metric_string_set(metrics, "/open_span_ids");
-    let status_conflicts = metric_string_set(metrics, "/conflicting_span_ids");
+    let open_nodes = metric_string_set(metrics, "/blocking_open_span_ids");
+    let container_open_nodes = metric_string_set(metrics, "/open_span_ids")
+        .difference(&open_nodes)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let status_conflicts = metric_string_set(metrics, "/blocking_conflicting_span_ids");
+    let container_status_conflicts = metric_string_set(metrics, "/conflicting_span_ids")
+        .difference(&status_conflicts)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut unresolved = BTreeSet::new();
     for path in [
         "/unscoped_span_ids",
@@ -475,6 +508,8 @@ pub(crate) fn canonical_trace_summary(captures: &[Value]) -> Result<Option<Canon
         "/unresolved_parent_span_ids",
         "/calls_without_results",
         "/calls_without_execution",
+        "/runtime_executions_without_model_calls",
+        "/submitted_results_without_model_calls",
         "/unlinked_interaction_ids",
         "/invalid_link_ids",
     ] {
@@ -492,8 +527,10 @@ pub(crate) fn canonical_trace_summary(captures: &[Value]) -> Result<Option<Canon
         "task_session_ids":task_session_ids,
         "session_ids":session_ids,
         "open_node_ids":open_nodes,
+        "container_open_node_ids":container_open_nodes,
         "unresolved_node_ids":unresolved,
         "status_conflict_node_ids":status_conflicts,
+        "container_status_conflict_node_ids":container_status_conflicts,
         "terminal_root_ids":terminal_roots,
         "canonical_metrics":metrics,
         "root_complete":integrity.root_complete,
@@ -708,6 +745,9 @@ pub(crate) fn verify_interaction_artifacts(root: &Path) -> Result<InteractionPro
     {
         bail!("interaction projection integrity does not match its records");
     }
+    if let Some(view) = &manifest.session_view {
+        view.validate(manifest.session_id.as_deref(), manifest.interactions)?;
+    }
     Ok(manifest)
 }
 
@@ -774,6 +814,28 @@ fn read_captures(inputs: &[PathBuf]) -> Result<(Vec<Value>, u64)> {
     let mut captures = Vec::new();
     let mut seen = HashMap::new();
     let mut duplicates = 0_u64;
+    visit_captures(inputs, |line, value| {
+        let capture_id = string_field(&value, "captureId")
+            .ok_or_else(|| anyhow::anyhow!("Capture missing captureId"))?;
+        let digest = sha256(line);
+        if let Some(existing) = seen.get(capture_id) {
+            if existing != &digest {
+                bail!("captureId {capture_id:?} has conflicting bytes");
+            }
+            duplicates = duplicates.saturating_add(1);
+            return Ok(());
+        }
+        seen.insert(capture_id.to_owned(), digest);
+        captures.push(value);
+        Ok(())
+    })?;
+    Ok((captures, duplicates))
+}
+
+fn visit_captures(
+    inputs: &[PathBuf],
+    mut visit: impl FnMut(&[u8], Value) -> Result<()>,
+) -> Result<()> {
     for path in inputs {
         let mut reader = crate::jsonl::open_jsonl_reader(path)?;
         let mut line = Vec::new();
@@ -797,19 +859,68 @@ fn read_captures(inputs: &[PathBuf]) -> Result<(Vec<Value>, u64)> {
                 .with_context(|| format!("validate {} line {index}", path.display()))?;
             let value: Value = serde_json::from_slice(&line)
                 .with_context(|| format!("parse {} line {index}", path.display()))?;
-            let capture_id = string_field(&value, "captureId")
-                .ok_or_else(|| anyhow::anyhow!("Capture missing captureId"))?;
-            let digest = sha256(&line);
-            if let Some(existing) = seen.get(capture_id) {
-                if existing != &digest {
-                    bail!("captureId {capture_id:?} has conflicting bytes");
-                }
-                duplicates = duplicates.saturating_add(1);
-                continue;
-            }
-            seen.insert(capture_id.to_owned(), digest);
-            captures.push(value);
+            visit(&line, value)?;
         }
+    }
+    Ok(())
+}
+
+fn read_session_captures(inputs: &[PathBuf], session: &str) -> Result<(Vec<Value>, u64)> {
+    let session = session.trim();
+    if session.is_empty() {
+        bail!("--session-id cannot be empty");
+    }
+    let mut seen = HashMap::new();
+    let mut duplicates = 0_u64;
+    let mut lineage = StockSessionLineage::default();
+    let mut task_links = HashMap::new();
+    let mut found = false;
+    // Inspect the entire corpus for duplicate conflicts, exact links and child
+    // lineage before retaining payloads. Unrelated sessions stay off the heap.
+    visit_captures(inputs, |line, capture| {
+        let id = string_field(&capture, "captureId")
+            .ok_or_else(|| anyhow::anyhow!("Capture missing captureId"))?;
+        let digest = sha256(line);
+        if let Some(existing) = seen.get(id) {
+            if existing != &digest {
+                bail!("captureId {id:?} has conflicting bytes");
+            }
+            duplicates += 1;
+            return Ok(());
+        }
+        seen.insert(id.to_owned(), digest);
+        found |= trace_string(&capture, "session_id") == Some(session);
+        lineage.observe(&capture)?;
+        observe_exact_task_links(&capture, &mut task_links)?;
+        Ok(())
+    })?;
+    if !found {
+        bail!("session_id {session:?} was not found in Capture inputs");
+    }
+    let selection = lineage.selection(session)?;
+    let mut captures = Vec::new();
+    let mut visited = HashSet::new();
+    let mut repeated = 0_u64;
+    visit_captures(inputs, |line, mut capture| {
+        let id = string_field(&capture, "captureId")
+            .ok_or_else(|| anyhow::anyhow!("Capture missing captureId"))?;
+        if seen.get(id) != Some(&sha256(line)) {
+            bail!("Capture inputs changed between Session selection scans");
+        }
+        if !visited.insert(id.to_owned()) {
+            repeated += 1;
+            return Ok(());
+        }
+        // Preserve ambiguity rejection even when the conflicting record belongs
+        // to an unrelated session and will not be retained.
+        apply_exact_task_link(&mut capture, &task_links)?;
+        if capture_matches_session(&capture, &selection) {
+            captures.push(capture);
+        }
+        Ok(())
+    })?;
+    if visited.len() != seen.len() || repeated != duplicates {
+        bail!("Capture inputs changed between Session selection scans");
     }
     Ok((captures, duplicates))
 }
@@ -1258,47 +1369,57 @@ fn validate_raw_source(source: &RawSourceLineage) -> Result<()> {
 fn apply_exact_task_links(captures: &mut [Value]) -> Result<()> {
     let mut links: HashMap<String, String> = HashMap::new();
     for capture in captures.iter() {
-        let Some(task_session_id) = capture
-            .pointer("/traceContext/task_session_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        else {
-            continue;
-        };
-        for key in correlation_keys(capture) {
-            if let Some(existing) = links.get(&key)
-                && existing != task_session_id
-            {
-                bail!("one exact request identity maps to multiple task Sessions");
-            }
-            links.insert(key, task_session_id.to_owned());
-        }
+        observe_exact_task_links(capture, &mut links)?;
     }
     for capture in captures {
-        if capture
-            .pointer("/traceContext/task_session_id")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            continue;
-        }
-        let matched: BTreeSet<String> = correlation_keys(capture)
-            .into_iter()
-            .filter_map(|key| links.get(&key).cloned())
-            .collect();
-        if matched.len() > 1 {
-            bail!("Capture exact IDs link to multiple task Sessions");
-        }
-        let Some(task_session_id) = matched.into_iter().next() else {
-            continue;
-        };
-        let object = capture
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("Capture must be an object"))?;
-        object
-            .entry("traceContext".to_owned())
-            .or_insert_with(|| json!({}))["task_session_id"] = json!(task_session_id);
+        apply_exact_task_link(capture, &links)?;
     }
+    Ok(())
+}
+
+fn observe_exact_task_links(capture: &Value, links: &mut HashMap<String, String>) -> Result<()> {
+    let Some(task_session_id) = capture
+        .pointer("/traceContext/task_session_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    for key in correlation_keys(capture) {
+        if let Some(existing) = links.get(&key)
+            && existing != task_session_id
+        {
+            bail!("one exact request identity maps to multiple task Sessions");
+        }
+        links.insert(key, task_session_id.to_owned());
+    }
+    Ok(())
+}
+
+fn apply_exact_task_link(capture: &mut Value, links: &HashMap<String, String>) -> Result<()> {
+    if capture
+        .pointer("/traceContext/task_session_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Ok(());
+    }
+    let matched: BTreeSet<String> = correlation_keys(capture)
+        .into_iter()
+        .filter_map(|key| links.get(&key).cloned())
+        .collect();
+    if matched.len() > 1 {
+        bail!("Capture exact IDs link to multiple task Sessions");
+    }
+    let Some(task_session_id) = matched.into_iter().next() else {
+        return Ok(());
+    };
+    let object = capture
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Capture must be an object"))?;
+    object
+        .entry("traceContext".to_owned())
+        .or_insert_with(|| json!({}))["task_session_id"] = json!(task_session_id);
     Ok(())
 }
 
@@ -2196,6 +2317,17 @@ fn runtime_integrity(
                     == Some(true)
         })
         .collect();
+    let delivery_root_spans: Vec<&Value> = scope_root_spans
+        .iter()
+        .copied()
+        .filter(|span| runtime_span_is_delivery_root(span))
+        .collect();
+    let container_root_span_ids: BTreeSet<&str> = scope_root_spans
+        .iter()
+        .copied()
+        .filter(|span| !runtime_span_is_delivery_root(span))
+        .filter_map(|span| string_field(span, "span_id"))
+        .collect();
     let task_scopes: BTreeSet<String> = runtime_spans
         .iter()
         .filter_map(runtime_task_scope)
@@ -2215,7 +2347,8 @@ fn runtime_integrity(
         && root_spans.len() == 1
         && scope_root_spans.len() == task_scopes.len()
         && root_task_scopes == task_scopes
-        && scope_root_spans.iter().all(|span| {
+        && !delivery_root_spans.is_empty()
+        && delivery_root_spans.iter().all(|span| {
             span.pointer("/extensions/root_complete")
                 .and_then(Value::as_bool)
                 == Some(true)
@@ -2226,6 +2359,10 @@ fn runtime_integrity(
         .filter(|span| !runtime_span_is_terminal(span))
         .filter_map(|span| string_field(span, "span_id"))
         .collect();
+    let blocking_open_span_ids: BTreeSet<&str> = open_span_ids
+        .difference(&container_root_span_ids)
+        .copied()
+        .collect();
     let conflicting_span_ids: BTreeSet<&str> = runtime_spans
         .iter()
         .filter(|span| {
@@ -2234,6 +2371,10 @@ fn runtime_integrity(
                 == Some(true)
         })
         .filter_map(|span| string_field(span, "span_id"))
+        .collect();
+    let blocking_conflicting_span_ids: BTreeSet<&str> = conflicting_span_ids
+        .difference(&container_root_span_ids)
+        .copied()
         .collect();
     let incomplete_result_span_ids: BTreeSet<&str> = runtime_spans
         .iter()
@@ -2350,6 +2491,74 @@ fn runtime_integrity(
         .filter_map(|link| string_field(link, "from"))
         .map(str::to_owned)
         .collect();
+    let runtime_execution_nodes: BTreeSet<String> = runtime_spans
+        .iter()
+        .filter(|span| string_field(span, "span_kind") == Some("tool_execution"))
+        .filter(|span| {
+            span.pointer("/extensions/model_call_required")
+                .and_then(Value::as_bool)
+                != Some(false)
+        })
+        .filter_map(|span| string_field(span, "span_id"))
+        .map(|span_id| format!("runtime-span:{span_id}"))
+        .collect();
+    let linked_runtime_execution_nodes: BTreeSet<String> = links
+        .iter()
+        .filter(|link| string_field(link, "relation") == Some("model_call_to_runtime_execution"))
+        .filter_map(|link| string_field(link, "to"))
+        .map(str::to_owned)
+        .collect();
+    let runtime_executions_without_model_calls: BTreeSet<&String> = runtime_execution_nodes
+        .difference(&linked_runtime_execution_nodes)
+        .collect();
+    let runtime_call_ids_without_model_calls: BTreeSet<&str> = runtime_spans
+        .iter()
+        .filter(|span| {
+            string_field(span, "span_id").is_some_and(|span_id| {
+                runtime_executions_without_model_calls.contains(&format!("runtime-span:{span_id}"))
+            })
+        })
+        .filter_map(|span| string_field(span, "call_id"))
+        .collect();
+    let submitted_result_call_ids_by_node: BTreeMap<String, String> = interactions
+        .iter()
+        .flat_map(|interaction| {
+            let interaction_id = string_field(interaction, "interaction_id").unwrap_or("missing");
+            interaction
+                .get("tool_results_submitted")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter_map(move |(index, result)| {
+                    let call_id = result
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .filter(|call_id| !call_id.trim().is_empty())?;
+                    Some((
+                        format!("submitted-result:{interaction_id}:{index}"),
+                        call_id.to_owned(),
+                    ))
+                })
+        })
+        .collect();
+    let submitted_result_nodes: BTreeSet<String> =
+        submitted_result_call_ids_by_node.keys().cloned().collect();
+    let linked_submitted_result_nodes: BTreeSet<String> = links
+        .iter()
+        .filter(|link| string_field(link, "relation") == Some("model_call_to_submitted_result"))
+        .filter_map(|link| string_field(link, "to"))
+        .map(str::to_owned)
+        .collect();
+    let submitted_results_without_model_calls: BTreeSet<&String> = submitted_result_nodes
+        .difference(&linked_submitted_result_nodes)
+        .collect();
+    let submitted_result_call_ids_without_model_calls: BTreeSet<&str> =
+        submitted_results_without_model_calls
+            .iter()
+            .filter_map(|node| submitted_result_call_ids_by_node.get(*node))
+            .map(String::as_str)
+            .collect();
     let cancelled_delivery_call_candidates: BTreeSet<String> = interactions
         .iter()
         .flat_map(|interaction| {
@@ -2405,14 +2614,16 @@ fn runtime_integrity(
         .collect();
     let runtime_complete = applicable
         && unscoped_span_ids.is_empty()
-        && open_span_ids.is_empty()
-        && conflicting_span_ids.is_empty()
+        && blocking_open_span_ids.is_empty()
+        && blocking_conflicting_span_ids.is_empty()
         && incomplete_result_span_ids.is_empty()
         && quality_failure_span_ids.is_empty()
         && unresolved_parent_call_span_ids.is_empty()
         && unresolved_parent_span_ids.is_empty()
         && calls_without_results.is_empty()
         && calls_without_execution.is_empty()
+        && runtime_executions_without_model_calls.is_empty()
+        && submitted_results_without_model_calls.is_empty()
         && unlinked_interaction_ids.is_empty()
         && invalid_link_ids.is_empty();
     RuntimeIntegrity {
@@ -2423,9 +2634,13 @@ fn runtime_integrity(
             "task_scopes":task_scopes.len(),
             "root_span_count":root_spans.len(),
             "scope_root_span_count":scope_root_spans.len(),
+            "delivery_root_span_count":delivery_root_spans.len(),
+            "container_root_span_ids":container_root_span_ids,
             "unscoped_span_ids":unscoped_span_ids,
             "open_span_ids":open_span_ids,
+            "blocking_open_span_ids":blocking_open_span_ids,
             "conflicting_span_ids":conflicting_span_ids,
+            "blocking_conflicting_span_ids":blocking_conflicting_span_ids,
             "incomplete_result_span_ids":incomplete_result_span_ids,
             "quality_failure_span_ids":quality_failure_span_ids,
             "unresolved_parent_call_span_ids":unresolved_parent_call_span_ids,
@@ -2443,6 +2658,12 @@ fn runtime_integrity(
             "model_tool_calls_with_execution":model_call_nodes.intersection(&calls_with_execution).count(),
             "calls_without_results":calls_without_results,
             "calls_without_execution":calls_without_execution,
+            "runtime_executions":runtime_execution_nodes.len(),
+            "runtime_executions_without_model_calls":runtime_executions_without_model_calls,
+            "runtime_call_ids_without_model_calls":runtime_call_ids_without_model_calls,
+            "submitted_results":submitted_result_nodes.len(),
+            "submitted_results_without_model_calls":submitted_results_without_model_calls,
+            "submitted_result_call_ids_without_model_calls":submitted_result_call_ids_without_model_calls,
             "unlinked_interaction_ids":unlinked_interaction_ids,
             "invalid_link_ids":invalid_link_ids,
         }),
@@ -2454,6 +2675,16 @@ fn runtime_span_is_terminal(span: &Value) -> bool {
         string_field(span, "status"),
         Some("completed" | "failed" | "cancelled" | "timeout" | "incomplete" | "closed")
     )
+}
+
+fn runtime_span_is_delivery_root(span: &Value) -> bool {
+    span.pointer("/extensions/delivery_scope_root")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            span.pointer("/extensions/scope_kind")
+                .and_then(Value::as_str)
+                != Some("session")
+        })
 }
 
 fn projection_nodes(interactions: &[Value], runtime_spans: &[Value]) -> HashSet<String> {
@@ -3782,6 +4013,14 @@ fn stock_hook_session_boundary(value: &Value) -> Option<&'static str> {
         .pointer("/lifecycleEvent/source_event_name")
         .and_then(Value::as_str)
     {
+        Some("SessionStart")
+            if value
+                .pointer("/lifecycleEvent/source_event/source")
+                .and_then(Value::as_str)
+                .is_some_and(|source| source.eq_ignore_ascii_case("compact")) =>
+        {
+            None
+        }
         Some("SessionStart") => Some("session_start"),
         Some("SessionEnd") => Some("session_end"),
         _ => None,
@@ -4071,6 +4310,8 @@ fn build_task_root_spans(
                     .filter(|capture| record_type(capture) == "api_snapshot").count(),
                 "scope_kind":scope_kind,
                 "scope_id":scope_id,
+                "delivery_scope_root":scope_kind != "session",
+                "container_root":scope_kind == "session",
                 "lifecycle_state":if scope_kind == "session" {
                     json!(lifecycle_state)
                 } else {
@@ -4373,6 +4614,7 @@ fn build_dispatcher_runtime_spans(
             "tool_schema":Value::Null,
             "raw_capture_refs":capture_ids,
             "extensions":{
+                "model_call_required":true,
                 "state_observations":if terminal {json!(["started", "completed"])} else {json!(["started"])},
                 "state_conflict":state_conflict,
                 "lifecycle_terminal":terminal,
@@ -4615,6 +4857,7 @@ fn build_tool_runtime_spans(
             "tool_schema":execution.get("schema"),
             "raw_capture_refs":capture_ids,
             "extensions":{
+                "model_call_required":true,
                 "state_observations":statuses,
                 "state_conflict":conflict,
                 "producer":captures.iter().filter_map(|capture| capture.get("producerEvent")).cloned().collect::<Vec<_>>(),
@@ -7205,7 +7448,134 @@ mod tests {
         let spans = build_task_root_spans(&captures, &scope_index).unwrap();
         assert_eq!(spans[0]["status"], "closed");
         assert_eq!(spans[0]["extensions"]["root_complete"], true);
-        assert!(runtime_integrity(&[], &spans, &[]).root_complete);
+        // A process Session boundary remains useful grouping evidence, but it
+        // is not itself a completed user Task/Turn delivery scope.
+        assert!(!runtime_integrity(&[], &spans, &[]).root_complete);
+    }
+
+    #[test]
+    fn closed_turn_is_delivery_ready_while_process_session_remains_open() {
+        let session_start = json!({
+            "recordType":"lifecycle_event",
+            "captureId":"cap-session-start",
+            "sourceNamespace":"stock-codex-cloud",
+            "receivedAt":"2026-09-07T00:00:00Z",
+            "traceContext":{"session_id":"session-long","thread_id":"session-long"},
+            "lifecycleEvent":{
+                "type":"session_start","status":"started","source_event_name":"SessionStart",
+                "source_event":{"source":"startup"}
+            }
+        });
+        let compact_resume = json!({
+            "recordType":"lifecycle_event",
+            "captureId":"cap-session-compact",
+            "sourceNamespace":"stock-codex-cloud",
+            "receivedAt":"2026-09-07T01:00:00Z",
+            "traceContext":{"session_id":"session-long","thread_id":"session-long"},
+            "lifecycleEvent":{
+                "type":"session_start","status":"started","source_event_name":"SessionStart",
+                "source_event":{"source":"compact"}
+            }
+        });
+        let turn = |capture_id: &str, event_type: &str, status: &str, at: &str| {
+            json!({
+                "recordType":"lifecycle_event",
+                "captureId":capture_id,
+                "sourceNamespace":"stock-codex-cloud",
+                "receivedAt":at,
+                "traceContext":{
+                    "session_id":"session-long","thread_id":"session-long",
+                    "root_turn_id":"turn-complete","turn_id":"turn-complete"
+                },
+                "lifecycleEvent":{"type":event_type,"status":status,"occurred_at":at}
+            })
+        };
+        let captures = vec![
+            session_start,
+            turn(
+                "cap-turn-start",
+                "turn_start",
+                "started",
+                "2026-09-07T00:00:01Z",
+            ),
+            compact_resume,
+            turn("cap-turn-end", "turn_end", "closed", "2026-09-07T02:00:00Z"),
+        ];
+        let scope_index = RuntimeScopeIndex::with_interactions(&captures, &[]);
+        let spans = build_task_root_spans(&captures, &scope_index).unwrap();
+        let session = spans
+            .iter()
+            .find(|span| span.pointer("/extensions/scope_kind") == Some(&json!("session")))
+            .unwrap();
+        assert_eq!(session["status"], "running");
+        assert_eq!(session["extensions"]["root_complete"], false);
+        assert_eq!(session["extensions"]["state_conflict"], false);
+        assert_eq!(session["extensions"]["lifecycle_state"]["start_count"], 1);
+        let links = build_interaction_links(&[], &spans, &captures).unwrap();
+        let integrity = runtime_integrity(&[], &spans, &links);
+        assert!(integrity.root_complete);
+        assert!(integrity.runtime_complete);
+        assert_eq!(
+            integrity.metrics["open_span_ids"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(integrity.metrics["blocking_open_span_ids"], json!([]));
+        assert_eq!(integrity.metrics["delivery_root_span_count"], 1);
+        let (_, hierarchy) = crate::telemetry::project_otlp_tree(&[], &spans, &links).unwrap();
+        assert_eq!(hierarchy.root_spans, 1);
+        assert_eq!(hierarchy.resolved_internal_parent_rate, 1.0);
+    }
+
+    #[test]
+    fn runtime_execution_without_wire_model_call_fails_conservation() {
+        let context = json!({
+            "session_id":"session-conservation","thread_id":"session-conservation",
+            "root_turn_id":"turn-conservation","turn_id":"turn-conservation"
+        });
+        let lifecycle = |capture_id: &str, event_type: &str, status: &str| {
+            json!({
+                "recordType":"lifecycle_event","captureId":capture_id,
+                "sourceNamespace":"stock-codex-cloud","traceContext":context,
+                "lifecycleEvent":{"type":event_type,"status":status}
+            })
+        };
+        let captures = vec![
+            json!({
+                "recordType":"lifecycle_event","captureId":"cap-session",
+                "sourceNamespace":"stock-codex-cloud",
+                "traceContext":{"session_id":"session-conservation","thread_id":"session-conservation"},
+                "lifecycleEvent":{
+                    "type":"session_start","status":"started","source_event_name":"SessionStart",
+                    "source_event":{"source":"startup"}
+                }
+            }),
+            lifecycle("cap-turn-start", "turn_start", "started"),
+            json!({
+                "recordType":"tool_execution","captureId":"cap-orphan-runtime",
+                "sourceNamespace":"stock-codex-cloud","traceContext":context,
+                "toolExecution":{
+                    "call_id":"call-missing-wire","name":"exec_command","status":"success",
+                    "arguments":{"cmd":"true"},"result":"ok","result_content_captured":true
+                }
+            }),
+            lifecycle("cap-turn-end", "turn_end", "closed"),
+        ];
+        let spans = build_runtime_spans(&captures, &[]).unwrap();
+        let links = build_interaction_links(&[], &spans, &captures).unwrap();
+        let integrity = runtime_integrity(&[], &spans, &links);
+        assert!(integrity.root_complete);
+        assert!(!integrity.runtime_complete);
+        assert_eq!(
+            integrity.metrics["runtime_call_ids_without_model_calls"],
+            json!(["call-missing-wire"])
+        );
+        assert_eq!(
+            integrity.metrics["runtime_executions_without_model_calls"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -7530,6 +7900,139 @@ mod tests {
         assert_eq!(manifest.input_records, 1);
         assert_eq!(manifest.interactions, 1);
         assert_eq!(verify_interaction_artifacts(&projection).unwrap(), manifest);
+    }
+
+    #[test]
+    fn session_scans_match_full_corpus_selection_with_late_child_lineage_and_duplicates() {
+        let wire = |id: &str, session: &str| {
+            let mut capture = fixture_capture(
+                id,
+                "/v1/responses",
+                true,
+                RESPONSES_STREAM_REQUEST,
+                RESPONSES_STREAM_RESPONSE,
+            );
+            capture["traceContext"] = json!({"session_id":session});
+            capture
+        };
+        let root = wire("scan-root", "scan-root");
+        let child = wire("scan-child", "scan-child");
+        let unrelated = wire("scan-unrelated", "scan-unrelated");
+        let hook = json!({
+            "hook_event_name":"SubagentStart", "session_id":"scan-root",
+            "agent_id":"scan-child", "agent_type":"default", "turn_id":"scan-turn", "event_id":"scan-spawn"
+        });
+        let batch = crate::cloud_ingest::prepare_cloud_ingest(
+            crate::cloud_ingest::CloudEndpoint::CodexHook,
+            &serde_json::to_vec(&hook).unwrap(),
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+        assert!(batch.summary.conversion_errors.is_empty());
+        let mut captures = vec![child, unrelated.clone(), root, unrelated];
+        captures.extend(
+            batch
+                .records
+                .iter()
+                .map(|r| serde_json::from_slice::<Value>(&r.canonical).unwrap()),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("scanned.jsonl");
+        fs::write(
+            &input,
+            captures
+                .iter()
+                .map(|v| format!("{v}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let inputs = vec![input];
+        let (mut full, full_duplicates) = read_captures(&inputs).unwrap();
+        apply_exact_task_links(&mut full).unwrap();
+        let expected = select_projection_captures(full, None, Some("scan-root")).unwrap();
+        let (scoped, scoped_duplicates) = read_session_captures(&inputs, "scan-root").unwrap();
+        let actual = select_projection_captures(scoped, None, Some("scan-root")).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(scoped_duplicates, full_duplicates);
+        assert_eq!(scoped_duplicates, 1);
+        assert_eq!(actual.0.len(), 4);
+    }
+
+    #[test]
+    fn session_scans_do_not_propagate_inferred_task_links_transitively() {
+        let source = fixture_capture(
+            "scan-task-source",
+            "/v1/responses",
+            true,
+            RESPONSES_STREAM_REQUEST,
+            RESPONSES_STREAM_RESPONSE,
+        );
+        let mut source = source;
+        source["traceContext"] =
+            json!({"session_id":"scan-selected", "task_session_id":"task-seed"});
+        source["requestId"] = json!("seed-id");
+        source.as_object_mut().unwrap().remove("responseBody");
+        source.as_object_mut().unwrap().remove("responseId");
+        let mut inferred = source.clone();
+        inferred["captureId"] = json!("cap-scan-inferred");
+        inferred["traceContext"] = json!({"session_id":"scan-selected"});
+        inferred["upstreamRequestId"] = json!("second-id");
+        let mut unlinked = inferred.clone();
+        unlinked["captureId"] = json!("cap-scan-unlinked");
+        unlinked["requestId"] = json!("third-id");
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("task-links.jsonl");
+        fs::write(&input, format!("{source}\n{inferred}\n{unlinked}\n")).unwrap();
+        let (mut full, _) = read_captures(std::slice::from_ref(&input)).unwrap();
+        apply_exact_task_links(&mut full).unwrap();
+        let expected = select_projection_captures(full, None, Some("scan-selected")).unwrap();
+        let (scoped, _) = read_session_captures(&[input], "scan-selected").unwrap();
+        let actual = select_projection_captures(scoped, None, Some("scan-selected")).unwrap();
+        assert_eq!(actual, expected);
+        assert!(
+            actual.0[2]
+                .pointer("/traceContext/task_session_id")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn session_scans_preserve_global_conflict_rejection() {
+        let mut selected = fixture_capture(
+            "scan-selected",
+            "/v1/responses",
+            true,
+            RESPONSES_STREAM_REQUEST,
+            RESPONSES_STREAM_RESPONSE,
+        );
+        selected["traceContext"] = json!({"session_id":"scan-selected"});
+        let mut unrelated = selected.clone();
+        unrelated["captureId"] = json!("cap-scan-conflict");
+        unrelated["traceContext"] = json!({"session_id":"scan-other"});
+        let mut conflicting = unrelated.clone();
+        conflicting["receivedAt"] = json!("2026-08-30T00:00:02Z");
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("conflicts.jsonl");
+        fs::write(&input, format!("{selected}\n{unrelated}\n{conflicting}\n")).unwrap();
+        assert!(
+            read_session_captures(std::slice::from_ref(&input), "scan-selected")
+                .unwrap_err()
+                .to_string()
+                .contains("conflicting bytes")
+        );
+
+        unrelated["traceContext"]["task_session_id"] = json!("task-first");
+        unrelated["requestId"] = json!("shared-request");
+        conflicting["captureId"] = json!("cap-scan-other-task");
+        conflicting["traceContext"]["task_session_id"] = json!("task-second");
+        conflicting["requestId"] = json!("shared-request");
+        fs::write(&input, format!("{selected}\n{unrelated}\n{conflicting}\n")).unwrap();
+        assert!(
+            read_session_captures(&[input], "scan-selected")
+                .unwrap_err()
+                .to_string()
+                .contains("multiple task Sessions")
+        );
     }
 
     #[test]

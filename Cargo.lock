@@ -304,6 +304,7 @@ dependencies = [
  "jsonschema",
  "libc",
  "opendal",
+ "opendal-http-transport-reqwest",
  "rayon",
  "redb",
  "regex",

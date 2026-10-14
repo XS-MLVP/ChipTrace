@@ -75,6 +75,15 @@ OTLP 单根且内部父引用全部可解析。
 - [验收矩阵](docs/acceptance-matrix.md)
 - [交付格式](docs/delivery.md)
 - [OpenAPI](schemas/openapi.yaml)
+- [云平台嵌入插件](integrations/cloud-platform/README.md)
+
+## 磁盘恢复与平台嵌入
+
+原始 sealed WAL 以 Manifest + Checkpoint 提交到 FS、OSS 或 S3。平台插件在服务端固定对象
+存储配置，先将提交的 Raw 恢复到受保护的本地工作目录，再按页提供原生 Session/Turn，
+并只下载经过完整校验的 Buyer 包。插件的 ACK、任务状态、Turn sidecar 和输出校验均落到
+磁盘；服务重启会重新排队未完成任务。平台 API、Node SDK、容器镜像和 Compose 示例见
+[cloud-platform](integrations/cloud-platform/README.md)。
 
 ## 许可证
 

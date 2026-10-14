@@ -1,0 +1,186 @@
+openapi: 3.1.0
+info:
+  title: ChipTrace Cloud Platform Adapter
+  version: 1.0.0
+  description: Internal service API. The host binds one instance to one authorized project and supplies storage credentials.
+servers:
+  - url: http://127.0.0.1:18086
+security:
+  - serviceBearer: []
+paths:
+  /health:
+    get:
+      security: []
+      responses:
+        '200': {description: Ready with queued/running/job counters}
+        '503': {description: Not started, shutting down, or storage/writer lock failure}
+  /v1/jobs:
+    post:
+      description: Acknowledged only after the job record is persisted. Same ID/request is idempotent; changed request returns 409.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/JobRequest'}
+      responses:
+        '202': {$ref: '#/components/responses/Job'}
+        '200': {$ref: '#/components/responses/Job'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '413': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
+    get:
+      parameters:
+        - {$ref: '#/components/parameters/Offset'}
+        - {$ref: '#/components/parameters/Limit'}
+      responses:
+        '200': {description: Total, offset, and bounded job summaries}
+        '401': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/Id'}
+    get:
+      responses:
+        '200': {$ref: '#/components/responses/Job'}
+        '401': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}/turns:
+    parameters:
+      - {$ref: '#/components/parameters/Id'}
+    get:
+      description: Reads the verified Turn JSONL sidecar. Summary excludes full turns; total is the native Turn count.
+      parameters:
+        - {$ref: '#/components/parameters/Offset'}
+        - {$ref: '#/components/parameters/Limit'}
+      responses:
+        '200': {description: 'Object containing summary, total, offset and turns (at most limit entries)'}
+        '401': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
+  /v1/usage/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/Id'}
+    put:
+      description: Stores immutable UTF-8 JSONL usage evidence. Authoritative Sub2API fields are checked during export.
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            schema: {type: string, minLength: 1}
+      responses:
+        '201': {description: Stored; returns id, bytes and duplicate=false}
+        '200': {description: Identical bytes already stored; duplicate=true}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '413': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}/packages/{file}:
+    parameters:
+      - {$ref: '#/components/parameters/Id'}
+      - name: file
+        in: path
+        required: true
+        schema: {$ref: '#/components/schemas/Identifier'}
+    get:
+      description: Streams only a listed, reverified Buyer package from a completed export.
+      responses:
+        '200':
+          description: Verified tar.gz package
+          headers:
+            X-Content-SHA256:
+              schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+            ETag:
+              schema: {type: string}
+          content:
+            application/gzip:
+              schema: {type: string, format: binary}
+        '401': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    serviceBearer: {type: http, scheme: bearer}
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/Identifier'}
+    Offset:
+      name: offset
+      in: query
+      schema: {type: integer, minimum: 0, default: 0}
+    Limit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 100, default: 50}
+  responses:
+    Job:
+      description: Durable job metadata, status, phase and result summary. Completed exports include package hashes. Turn details use the paginated endpoint.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [schema_version, request, status, phase, attempt, created_at]
+            properties:
+              schema_version: {const: chiptrace.platform-job.v1}
+              request: {$ref: '#/components/schemas/JobRequest'}
+              status: {enum: [queued, running, completed, failed]}
+              phase: {type: string}
+              attempt: {type: integer, minimum: 0}
+              created_at: {type: string}
+              result: {type: object}
+              error: {type: object, description: Includes actual engine exit_code and signal when observed}
+    Error:
+      description: Request or service failure
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [ok, error]
+            properties:
+              ok: {const: false}
+              error:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+  schemas:
+    Identifier:
+      type: string
+      pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$'
+    JobRequest:
+      type: object
+      additionalProperties: false
+      required: [id, kind, archive_id]
+      properties:
+        id: {$ref: '#/components/schemas/Identifier'}
+        kind: {enum: [archive, restore, inspect, export]}
+        archive_id: {$ref: '#/components/schemas/Identifier'}
+        session_id: {$ref: '#/components/schemas/Identifier'}
+        release_id: {$ref: '#/components/schemas/Identifier'}
+        usage_log_ids:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items: {$ref: '#/components/schemas/Identifier'}
+      allOf:
+        - if: {properties: {kind: {enum: [inspect, export]}}}
+          then: {required: [session_id]}
+          else: {not: {required: [session_id]}}
+        - if: {properties: {kind: {const: export}}}
+          then: {required: [release_id, usage_log_ids]}
+          else:
+            not:
+              anyOf:
+                - {required: [release_id]}
+                - {required: [usage_log_ids]}

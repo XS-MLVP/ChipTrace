@@ -1,0 +1,45 @@
+# 平台接入维护与验收
+
+本轮维护补齐 FS/OSS/S3 的磁盘恢复、原生 Session/Turn 统计和服务端平台插件。
+一次请求只确认磁盘中已保存的任务，随后由独立 CLI 子进程执行归档、恢复、检查或采购验收。
+业务采集入口仍是网关、Relay 和 Collector；平台插件提供异步管理与交付 API。
+
+已发现并修复的具体故障是 OpenDAL 0.58 在显式 `rustls-no-provider` feature 下未注册
+HTTP transport：原先 FS 自测可通过，而 OSS/S3 在发送前返回 ConfigInvalid。网络存储
+现在显式注册传输与 TLS provider，并有真实适配器回归。
+
+## 本地验证
+
+2026-10-14 在隔离环境执行，未修改线上 18084 或生产 WAL/OSS：
+
+- Rust 1.91：239 个库测试和 1 个 CLI 测试通过；fmt、Clippy `-D warnings` 通过。
+- Stock Codex 配置、网关 durable outbox：25 个 Node 测试通过。
+- 平台 HTTP/SDK：真实 CLI 四源采集 fixture，归档、恢复、分页 Turn、usage 注册、
+  Buyer 导出与下载哈希通过。fixture 中 5 个原生 Turn、10 个采购有效轮次、分数 100。
+- 故障测试覆盖非零引擎退出、重启重排队、ID 冲突、UTF-8、请求上限、单写者锁、
+  锁丢失、任务 ACK 写盘失败、历史容量限制和 Turn 文件篡改。
+- OSS 使用带 V1 签名检查的 HTTP 协议 fixture，校验不可覆盖写入、Checkpoint 最后提交、
+  单遍恢复和损坏对象拒绝。它不证明真实阿里 OSS 账户的 IAM/区域能力。
+- 隔离 MinIO S3 覆盖 6 MiB multipart、幂等、逐记录校验、磁盘恢复、原子替换及损坏拒绝。
+- Rust 1.91 + Node 22 平台容器在只读根文件系统和 `--network none` 下执行 HTTP/SDK
+  与 OSS 协议测试，通过；Compose 配置解析通过。
+
+GitHub CI 将以上本地路径拆成 Rust/Node、引擎/平台容器、MinIO S3 三个作业。
+测试报告作为 Artifact 保留，所有管道启用 `pipefail`。远端状态必须读取对应提交的
+Actions run，不能用本地通过或旧 main 的绿色结果代替。
+
+## 迭代与发布流程
+
+1. 在修复分支提交源码、Schema 和 API 契约；完成 `make cloud-test`，以及隔离 S3 回归。
+2. 等待该提交的 GitHub CI 三个作业全部通过，再做 review/合并；镜像记录 Git revision。
+3. 用目标云平台自己的身份授权和项目隔离，配置一个项目一套 plugin root/storage prefix。
+   服务令牌只在后端使用；不要把 OSS 密钥下发给插件调用者。
+4. 在目标 OSS/S3 账号先验收小 Archive：上传、verify、恢复、离线 verify、Session 检查和
+   Buyer 导出下载，保存真实 endpoint、IAM 结果和镜像 ID。
+5. 先隔离 Stock Codex canary，再升级线上镜像。验收目标 Session 的四源与显式结束边界，
+   同时检查 outbox/Relay 排空；全局 health 不能证明每个 Session 可交付。
+
+后续优先迭代：基于 Session 索引减少两遍全量扫描；按项目设置磁盘配额和确认后的保留周期；
+在主平台完成多租户授权、计费与审计；扩大到真实并发与较大 Archive 的压力测试。
+当前 Turn 分页的内存受页面约束，但每页会扫描并校验整份 sidecar；任务历史有上限，
+导出目录独立保留 Raw，因此上线前仍需安排磁盘容量和保留策略。

@@ -7,6 +7,7 @@ use chiptrace::cloud_acceptance::{
 };
 use chiptrace::collector::{CollectorConfig, serve};
 use chiptrace::enrich::{EnrichConfig, enrich_captures, verify_enrichment};
+use chiptrace::jsonl::absolute_path;
 use chiptrace::model_interaction::{
     InteractionProjectConfig, project_interactions, verify_interaction_projection,
 };
@@ -17,7 +18,7 @@ use chiptrace::publish::{
 };
 use chiptrace::raw_archive::{
     RawArchiveConfig, RawArchiveRestoreConfig, RawArchiveVerifyConfig, archive_raw,
-    restore_raw_archive, verify_raw_archive,
+    restore_raw_archive, verify_raw_archive, verify_restored_raw,
 };
 use chiptrace::relay::{RelayConfig, serve_relay};
 use chiptrace::release::{ReleaseConfig, build_release, verify_release};
@@ -63,6 +64,8 @@ enum Command {
     Assemble(AssembleArgs),
     /// 将 Capture 投影为 vendor-neutral ModelInteraction 与 RuntimeSpan。
     ProjectInteractions(ProjectInteractionsArgs),
+    /// 查看原生 Session/Turn、来源覆盖与完整性；不把工具配对数当作原生轮次。
+    InspectSession(InspectSessionArgs),
     /// 只读验证 ModelInteraction 双轨投影。
     VerifyInteractions(VerifyInteractionsArgs),
     /// 从 delivery-ready canonical Trace 生成单一 OTLP 树。
@@ -97,16 +100,27 @@ enum Command {
     VerifyRawArchive(VerifyRawArchiveArgs),
     /// 从 OSS 原始层恢复已提交的 sealed WAL Segment。
     RestoreRawArchive(RestoreRawArchiveArgs),
+    /// 离线复验恢复到磁盘的 Raw 字节、Manifest、Checkpoint 和记录。
+    VerifyRestoredRaw(VerifyRestoredRawArgs),
+    /// 持有平台工作目录的进程锁直到标准输入关闭，供嵌入式插件使用。
+    PlatformLock(PlatformLockArgs),
     /// 检查 Collector 或 Relay HTTP 健康接口。
     Probe(ProbeArgs),
     /// 运行隔离的采集到交付闭环自测。
-    SelfTest,
+    SelfTest(SelfTestArgs),
     /// 测量本地 WAL/ledger 持久化吞吐。
     BenchmarkStore(BenchmarkStoreArgs),
     /// 测量环回 HTTP、可选 Relay 双 WAL 吞吐。
     BenchmarkHttp(BenchmarkHttpArgs),
     /// 测量 JSONL zstd 压缩吞吐。
     BenchmarkCompression(BenchmarkCompressionArgs),
+}
+
+#[derive(Debug, Args)]
+struct SelfTestArgs {
+    /// Retain the verified synthetic fixture at a new directory for integration tests.
+    #[arg(long)]
+    fixture_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -255,6 +269,26 @@ struct ProjectInteractionsArgs {
 struct VerifyInteractionsArgs {
     #[arg(long, required = true)]
     projection: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct InspectSessionArgs {
+    #[arg(long, required = true)]
+    input: Vec<PathBuf>,
+    #[arg(long)]
+    session_id: String,
+}
+
+#[derive(Debug, Args)]
+struct VerifyRestoredRawArgs {
+    #[arg(long)]
+    input: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct PlatformLockArgs {
+    #[arg(long)]
+    root: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -775,6 +809,23 @@ async fn main() -> Result<()> {
                 replace: args.replace,
             })?)?
         }
+        Command::InspectSession(args) => {
+            let temporary = tempfile::tempdir()?;
+            let projection = project_interactions(InteractionProjectConfig {
+                inputs: args.input,
+                output: temporary.path().join("projection"),
+                task_session_id: None,
+                session_id: Some(args.session_id),
+                zstd_level: 1,
+                replace: false,
+            })?;
+            json!({
+                "session":projection.session_view,
+                "source_coverage":projection.source_coverage,
+                "integrity":projection.integrity,
+                "validation_status":projection.validation_status,
+            })
+        }
         Command::VerifyInteractions(args) => {
             serde_json::to_value(verify_interaction_projection(&args.projection)?)?
         }
@@ -945,7 +996,28 @@ async fn main() -> Result<()> {
             .await?,
         )?,
         Command::Probe(args) => probe(args).await?,
-        Command::SelfTest => self_test().await?,
+        Command::VerifyRestoredRaw(args) => {
+            serde_json::to_value(verify_restored_raw(&args.input)?)?
+        }
+        Command::PlatformLock(args) => {
+            use std::io::Read;
+            fs::create_dir_all(&args.root)?;
+            let lock = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(args.root.join(".platform.lock"))?;
+            lock.try_lock()
+                .context("platform root already has an active writer")?;
+            println!("{}", json!({"ok":true,"locked":true}));
+            std::io::stdout().flush()?;
+            let mut input = std::io::stdin();
+            let mut byte = [0_u8; 1];
+            while input.read(&mut byte)? != 0 {}
+            return Ok(());
+        }
+        Command::SelfTest(args) => self_test(args).await?,
 
         Command::BenchmarkStore(args) => benchmark_store(args).await?,
         Command::BenchmarkHttp(args) => benchmark_http(args).await?,
@@ -1020,8 +1092,29 @@ async fn shutdown_signal() {
     }
 }
 
-async fn self_test() -> Result<Value> {
-    let temporary = tempfile::tempdir()?;
+async fn self_test(args: SelfTestArgs) -> Result<Value> {
+    let fixture_output = args
+        .fixture_output
+        .as_deref()
+        .map(absolute_path)
+        .transpose()?;
+    let temporary = if let Some(output) = &fixture_output {
+        if fs::symlink_metadata(output).is_ok() {
+            bail!(
+                "self-test fixture output already exists: {}",
+                output.display()
+            );
+        }
+        let parent = output
+            .parent()
+            .context("fixture output must have a parent")?;
+        fs::create_dir_all(parent)?;
+        tempfile::Builder::new()
+            .prefix(".chiptrace-fixture-")
+            .tempdir_in(parent)?
+    } else {
+        tempfile::tempdir()?
+    };
     let capture_root = temporary.path().join("capture");
     let collector_bind = reserve_local_address()?;
     let (collector_shutdown_tx, collector_shutdown_rx) = tokio::sync::oneshot::channel();
@@ -1748,7 +1841,10 @@ async fn self_test() -> Result<Value> {
     let self_test_ok = self_test_checks
         .as_object()
         .is_some_and(|checks| checks.values().all(|check| check == &Value::Bool(true)));
-    Ok(json!({
+    if !self_test_ok {
+        bail!("self-test failed its required checks: {self_test_checks}");
+    }
+    let mut result = json!({
         "ok": self_test_ok,
         "checks":self_test_checks,
         "assembly": assembly,
@@ -1791,7 +1887,25 @@ async fn self_test() -> Result<Value> {
             "source_capture_count": delivered["source_capture_count"],
             "semantic_reward_available": semantic_reward_available,
         },
-    }))
+    });
+    if let Some(output) = fixture_output {
+        if fs::symlink_metadata(&output).is_ok() {
+            bail!(
+                "self-test fixture output already exists: {}",
+                output.display()
+            );
+        }
+        fs::rename(temporary.path(), &output)?;
+        File::open(output.parent().context("fixture output has no parent")?)?.sync_all()?;
+        result["fixture"] = json!({
+            "root":output, "capture_root":output.join("capture"),
+            "object_root":output.join("raw-object-store"),
+            "usage_log":output.join("sub2api-usage.jsonl"),
+            "archive_id":"self-test-raw", "prefix":"datasets/chiptrace",
+            "session_id":"thread-self-test"
+        });
+    }
+    Ok(result)
 }
 
 fn reserve_local_address() -> Result<SocketAddr> {
@@ -2685,7 +2799,9 @@ mod cli_tests {
             "collector",
             "enrich",
             "export-otlp",
+            "inspect-session",
             "package-buyer",
+            "platform-lock",
             "probe",
             "project-interactions",
             "publish",
@@ -2703,6 +2819,7 @@ mod cli_tests {
             "verify-otlp",
             "verify-published",
             "verify-raw-archive",
+            "verify-restored-raw",
             "verify-release",
         ];
         expected.sort();

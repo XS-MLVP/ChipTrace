@@ -68,6 +68,8 @@ pub struct CloudAcceptanceManifest {
     pub hard_gate_pass: bool,
     pub delivery_ready: bool,
     pub effective_turns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_view: Option<crate::session_view::SessionView>,
     pub distinct_tool_names: u64,
     pub complete_tool_definitions: u64,
     pub pairing_rate_after_open_tail: f64,
@@ -323,6 +325,7 @@ async fn run_pipeline(
         hard_gate_pass,
         delivery_ready: true,
         effective_turns,
+        session_view: interaction.session_view.clone(),
         distinct_tool_names,
         complete_tool_definitions,
         pairing_rate_after_open_tail,
@@ -495,6 +498,19 @@ pub fn verify_cloud_acceptance(root: &Path) -> Result<CloudAcceptanceManifest> {
         || delivered_pairing != manifest.pairing_rate_after_open_tail
     {
         bail!("cloud acceptance quality summary differs from the delivered Session");
+    }
+    if manifest.session_view != interactions.session_view {
+        bail!("cloud acceptance Session/Turn summary differs from its canonical projection");
+    }
+    if let Some(view) = &manifest.session_view {
+        crate::raw_archive::verify_restored_raw(&root.join("raw"))?;
+        let expected = crate::model_interaction::summarize_raw_session(
+            &[root.join("raw")],
+            &manifest.session_id,
+        )?;
+        if view != &expected {
+            bail!("cloud acceptance Session/Turn summary differs from committed Raw evidence");
+        }
     }
     Ok(manifest)
 }

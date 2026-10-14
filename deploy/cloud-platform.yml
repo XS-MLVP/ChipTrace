@@ -1,0 +1,47 @@
+name: ${CHIPTRACE_PLATFORM_PROJECT:-chiptrace-platform}
+
+services:
+  platform:
+    build:
+      context: ..
+      target: platform
+      args:
+        CHIPTRACE_VERSION: ${CHIPTRACE_VERSION:-0.6.0}
+        CHIPTRACE_REVISION: ${CHIPTRACE_REVISION:-unknown}
+    image: ${CHIPTRACE_PLATFORM_IMAGE:-chiptrace-platform:local}
+    init: true
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 30s
+    tmpfs:
+      - /tmp:size=2g,mode=1777,uid=10001,gid=10001
+    environment:
+      CHIPTRACE_PLATFORM_TOKEN: ${CHIPTRACE_PLATFORM_TOKEN:?set CHIPTRACE_PLATFORM_TOKEN}
+      CHIPTRACE_BACKEND: ${CHIPTRACE_BACKEND:-fs}
+      CHIPTRACE_OBJECT_ENDPOINT: ${CHIPTRACE_OBJECT_ENDPOINT:-}
+      CHIPTRACE_OBJECT_BUCKET: ${CHIPTRACE_OBJECT_BUCKET:-}
+      CHIPTRACE_OBJECT_REGION: ${CHIPTRACE_OBJECT_REGION:-}
+      CHIPTRACE_OBJECT_PREFIX: ${CHIPTRACE_OBJECT_PREFIX:-datasets/chiptrace}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      OSS_ACCESS_KEY_ID: ${OSS_ACCESS_KEY_ID:-}
+      OSS_ACCESS_KEY_SECRET: ${OSS_ACCESS_KEY_SECRET:-}
+      ALIBABA_CLOUD_ACCESS_KEY_ID: ${ALIBABA_CLOUD_ACCESS_KEY_ID:-}
+      ALIBABA_CLOUD_ACCESS_KEY_SECRET: ${ALIBABA_CLOUD_ACCESS_KEY_SECRET:-}
+      ALIBABA_CLOUD_SECURITY_TOKEN: ${ALIBABA_CLOUD_SECURITY_TOKEN:-}
+    ports:
+      - ${CHIPTRACE_PLATFORM_BIND:-127.0.0.1:18086}:18086
+    volumes:
+      - ${CHIPTRACE_PLATFORM_ROOT:?set CHIPTRACE_PLATFORM_ROOT}:/data/platform
+      - ${CHIPTRACE_CAPTURE_ROOT:?set CHIPTRACE_CAPTURE_ROOT}:/data/capture:ro
+      - ${CHIPTRACE_OBJECT_ROOT:-/srv/chiptrace/objects}:/data/objects
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:18086/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s

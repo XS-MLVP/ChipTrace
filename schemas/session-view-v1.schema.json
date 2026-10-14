@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XS-MLVP/ChipTrace/schemas/session-view-v1.schema.json",
+  "title": "ChipTrace native Session and Turn accounting v1",
+  "type": "object",
+  "required": ["schema_version", "session_id", "session_epochs", "closed_session_epochs", "latest_epoch_closed", "invalid_session_boundaries", "native_turns", "closed_turns", "open_turns", "conflicted_turns", "unscoped_turn_records", "model_interactions", "tool_execution_records", "turns"],
+  "properties": {
+    "schema_version": {"const": "chiptrace.session-view.v1"},
+    "session_id": {"type": "string", "minLength": 1},
+    "session_epochs": {"$ref": "#/$defs/count"},
+    "closed_session_epochs": {"$ref": "#/$defs/count"},
+    "latest_epoch_closed": {"type": "boolean"},
+    "invalid_session_boundaries": {"$ref": "#/$defs/count"},
+    "native_turns": {"$ref": "#/$defs/count"},
+    "closed_turns": {"$ref": "#/$defs/count"},
+    "open_turns": {"$ref": "#/$defs/count"},
+    "conflicted_turns": {"$ref": "#/$defs/count"},
+    "unscoped_turn_records": {"$ref": "#/$defs/count"},
+    "model_interactions": {"$ref": "#/$defs/count"},
+    "tool_execution_records": {"$ref": "#/$defs/count", "description": "Deduplicated capture records; pre/post hooks and OTLP are separate evidence records, not additional native turns."},
+    "turns": {"type": "array", "items": {"$ref": "#/$defs/turn"}}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "count": {"type": "integer", "minimum": 0},
+    "optionalString": {"type": ["string", "null"], "minLength": 1},
+    "turn": {
+      "type": "object",
+      "required": ["session_id", "turn_id", "root_turn_id", "started_at", "finished_at", "status", "start_events", "terminal_events", "model_interactions", "tool_execution_records", "state_conflict", "raw_capture_refs"],
+      "properties": {
+        "session_id": {"type": "string", "minLength": 1},
+        "turn_id": {"type": "string", "minLength": 1},
+        "root_turn_id": {"$ref": "#/$defs/optionalString"},
+        "started_at": {"$ref": "#/$defs/optionalString"},
+        "finished_at": {"$ref": "#/$defs/optionalString"},
+        "status": {"enum": ["open", "closed", "cancelled", "conflict"]},
+        "start_events": {"$ref": "#/$defs/count"},
+        "terminal_events": {"$ref": "#/$defs/count"},
+        "model_interactions": {"$ref": "#/$defs/count"},
+        "tool_execution_records": {"$ref": "#/$defs/count"},
+        "state_conflict": {"type": "boolean"},
+        "raw_capture_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      },
+      "additionalProperties": false
+    }
+  }
+}

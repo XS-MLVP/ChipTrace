@@ -70,6 +70,20 @@ impl ObjectStoreConfig {
 
 pub(crate) fn build_operator(config: &ObjectStoreConfig) -> Result<Operator> {
     config.validate()?;
+    // OpenDAL 0.58 only auto-installs the transport for its default feature.
+    // Our explicit rustls-no-provider feature needs registration as well, for
+    // both CLI and library callers; FS-only tests cannot exercise this path.
+    if config.backend != Backend::Fs {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        opendal::HttpTransporter::install_default(
+            opendal_http_transport_reqwest::ReqwestTransport::new(
+                reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(10))
+                    .build()
+                    .context("build object-store HTTP transport")?,
+            ),
+        );
+    }
     let mut options = BTreeMap::new();
     match config.backend {
         Backend::Fs => {

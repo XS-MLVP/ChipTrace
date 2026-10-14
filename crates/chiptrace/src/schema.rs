@@ -383,6 +383,7 @@ mod tests {
             "raw-checkpoint-v1.schema.json",
             "raw-lineage-v1.schema.json",
             "session-v1.schema.json",
+            "session-view-v1.schema.json",
             "runtime-span-v1.schema.json",
         ];
         for name in expected {

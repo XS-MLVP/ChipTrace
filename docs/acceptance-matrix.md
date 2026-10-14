@@ -15,7 +15,7 @@
 | 调用关联 | ModelInteraction、RuntimeSpan、InteractionLink | call/result/execution 精确配对；内部父引用 100% |
 | Tool Schema | Responses Wire direct function tools | 每个被调用工具有 name、description、parameters |
 | 模型路由 | Wire + Sub2API usage | request ID 精确匹配；模型和 Provider 一致 |
-| Buyer v7 | `assessment.v2` | 有效轮次 >=10；工具 >=5；配对率 100%；机器轮 <25% |
+| Buyer v7 | `assessment.v2` | 有效轮次 >=10；真人交互轮 >=2；工具 >=5；配对率 100%；机器轮 <25% |
 | Release | `cloud-acceptance` | `delivery_ready=true`；score >=90；全部 hard gate 通过 |
 | 采购包 | `verify-buyer-package` | 1 Session/JSONL line；UTF-8；tar.gz；SHA/Token 守恒 |
 
@@ -65,6 +65,49 @@ Collector 的连续 sealed Segment 建立 `complete` Raw Checkpoint，再通过�
 
 该结果证明当前源码能从 18084 的真实线上采集生成合格产物。持续生产可用性仍要求 18084、
 Relay、Collector 健康、attempt 守恒，并对每条 Session 独立执行相同的 fail-closed 验收。
+
+同日接入复查发现旧产物缺少当前 Schema 的 `source_coverage`，旧采购包还使用历史
+`buyer-v7-codex-runtime-expanded` 标记，均不能直接作为当前验收证据。已用部署镜像
+`chiptrace:0.6.0-5085f91` 从原始完整归档重新执行全部 `cloud-acceptance` 阶段，退出码 0，
+上表结果在当前 `buyer-v7` 下复现。新产物位于
+`router_v2/records/chiptrace-readiness-20260905/acceptance/historical-01a06d0f/`；
+采购包又经最终离线镜像独立复验并放入同一证据根的 `delivery/`。旧产物保留为历史记录，
+未修改字段或降低门槛。
+
+同日 node42 的 Stock Codex `0.153.4` 完成新的长任务和实际 resume，修复原生 Hook
+相同 `SessionEnd` 被去重的问题后，从连续 sealed Raw 全量归档通过 `cloud-acceptance`
+并以退出码 0 结束：
+
+| 指标 | node42 结果 |
+| --- | --- |
+| Session | `01a07125-8b55-79f2-abf0-6f272e244db1` |
+| Raw lineage | 154,819 条；40,181,343,078 bytes；Checkpoint `complete` |
+| 四源 | Wire 36；OTLP logs 338；OTLP traces 58；Hook 8 |
+| 生命周期 | 实际 start/resume 两次；SessionStart 2、SessionEnd 2；最新 epoch 闭合 |
+| 工具与结构 | 34/34 call/result/execution；5 种工具及完整定义；OTLP 父引用 72/72 |
+| Buyer v7 | 36 个有效轮次；2 个实质用户交互轮；score 100；1/1 eligible |
+| 镜像 | `chiptrace:0.6.0-readiness-20260905`，8 GiB 隔离离线容器 |
+
+该长任务显式使用 `gpt-5.6-sol`；默认 `gpt-6-astra`/`max` 未改动，另有四源完整的短
+smoke，通过采集验收但不满足采购轮次/工具数门槛。两个任务都是操作员运行的 canary，
+不是甲方来源数据或负载测试。Raw 使用本地 FS 对象后端，CI 另用隔离 MinIO 验证 S3
+协议；甲方 OSS 上传与远端校验
+仍需真实目标。该长任务验收时，线上 Collector/Relay 镜像为
+`chiptrace:0.6.0-5085f91`。
+
+node42 完整目录迁入 NFS 后，最终离线镜像 `chiptrace:0.6.0-readiness-r2-20260905`
+再次执行 `verify-cloud-acceptance` 并退出 0；采购包复制后独立复验及所有 SHA-256 通过，
+已放入同一证据根的 `delivery/01a07125-8b55-79f2-abf0-6f272e244db1/`。
+
+2026-09-05 22:56（Asia/Shanghai），线上 Collector/Relay 已更新为上述 r2 镜像。
+隔离候选服务先通过原生 Canary，再以 node42 默认用户配置向生产 18084 发起新会话
+`01a07215-719c-7c72-a402-f3574bdbe939`：Wire 4、OTLP logs 14、OTLP traces 8、Hook 4，
+3/3 调用、执行、结果精确配对，SessionEnd 闭合。工具实际正文 13,400 bytes 中的
+512 行逐一校验通过，故意 exit 7 的错误保留；短会话只证明采集完整性，不满足采购规模。
+两份长采购包又经实际解包检查，保留失败、图片及 resume 证据。两包均有
+`model_attestation_missing` 告警：路由事实已验证，外部密码学模型身份未认证。
+当前用户配置与凭据通过 20 项控制端检查；报告及正文节选见
+[热更新证据](../../records/chiptrace-hot-r2-20260905/REPORT.md)。
 
 ## 历史数据
 

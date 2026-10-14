@@ -1,13 +1,14 @@
 # OSS 原始层与提交协议
 
-本协议是 ChipTrace Raw Zone 的唯一对象存储实现；FS 后端只用于离线复现和自测。
+本协议是 ChipTrace Raw Zone 的统一存储实现，支持 OSS/S3，以及持久磁盘上的 FS 后端。
+FS 模式适合单节点平台接入，运维方负责磁盘备份；OSS/S3 模式以远端提交对象为持久来源。
 
 ChipTrace 将原始 Trace 保存为一条逻辑连续日志，物理上由多个不可变 OSS/S3
-对象组成。采集确认点仍是本地 durable WAL；对象存储只接收已封存的 Segment，
+对象或磁盘 FS 文件组成。采集确认点仍是本地 durable WAL；归档只接收已封存的 Segment，
 不参与在线请求的同步路径。
 
 Collector 的 `redb` ledger 只是幂等、定位和恢复所需的本地运行状态，不是
-交付数据源；Raw Segment、Release 和 Buyer 包均以 OSS 对象及其 Manifest/Checkpoint
+交付数据源；Raw Segment、Release 和 Buyer 包均以配置后端的对象及其 Manifest/Checkpoint
 为准。这样清理或迁移本地 ledger 不会改变已提交的交付内容。
 
 ## 方案选型
@@ -125,12 +126,17 @@ chiptrace assemble \
   --partitions 256
 ```
 
-恢复目录包含 `RAW_SOURCE.json`，记录 Checkpoint/Manifest 对象键、SHA-256、统计值
+恢复目录包含 `RAW_SOURCE.json`、原始 `RAW_MANIFEST.json` 和 `RAW_CHECKPOINT.json`，记录
+Checkpoint/Manifest 对象键、SHA-256、统计值
 和完整性。Assembly 会校验并继承该来源，Release Manifest 继续携带同一份
 `raw_sources`；最终采购包通过 Release Manifest SHA-256 关联到完整来源链。
 
-本地验收可以把 `--backend oss` 换为 `--backend fs --root /srv/object-store`。
+本地磁盘部署可以把 `--backend oss` 换为 `--backend fs --root /srv/object-store`。
 `restore-raw-archive` 默认拒绝覆盖已有目录，确认替换时显式添加 `--replace`。
+恢复过程只下载每个 Segment 一遍，在写盘时校验长度和 SHA-256，记录数校验读取同一份
+落盘文件。目标目录有 OS 进程锁，校验失败不会替换已有目录。Linux 替换使用原子目录交换；
+文件系统不支持时返回非零并保留旧目录，需选择新的输出路径。恢复后可无网络、无凭据运行
+`chiptrace verify-restored-raw --input <directory>`，它拒绝 symlink、额外文件和谱系不一致。
 对于 `completeness=partial` 的取证快照，还必须显式添加 `--allow-partial`；这类
 恢复结果不得进入标准 buyer Release。
 
