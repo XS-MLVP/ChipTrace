@@ -164,6 +164,12 @@ Session 检查以 `session.delivery_ready`（及 inspect 顶层同名字段）�
 用 `unscoped_source_records` 定位无法归属的来源。Runtime `integrity.delivery_ready` 只证明
 Canonical Runtime/协议检查通过，不能覆盖原生 Turn 的缺失、未归属或未闭合状态。
 
+进一步定位时使用只读 `audit-session-context --input <sealed-raw> --session-id <id>`。
+该入口不生成投影，复用全快照身份歧义与子 Session 选择，并对所选 envelope 内全部 OTLP
+记录保留分类总数；`unknown_session_records` 不会被默认为当前 Session。
+`--sample-limit 0` 可关闭定位样本，分组和样本上限不会截断总计数。
+诊断报告保留 ID/名称元数据，按项目控制访问；完整交付结论仍来自云端验收。
+
 ## 回滚
 
 发布和回滚时同时更新部署环境文件中的 `CHIPTRACE_IMAGE`，使后续 Compose 重建使用

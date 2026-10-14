@@ -32,6 +32,13 @@ jobs:
       - run: cargo run --locked --bin chiptrace -- self-test
       - name: Build the CLI used by the platform integration path
         run: cargo build --locked --bin chiptrace
+      - name: Verify real-client context metadata regression and read-only diagnostics
+        run: node --test integrations/codex/native-context.test.js | tee native-context.tap
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-context-report
+          path: native-context.tap
       - name: Verify cloud platform jobs and signed OSS protocol
         run: node --test integrations/cloud-platform/platform.test.js integrations/cloud-platform/storage-oss.test.js | tee platform.tap
       - uses: actions/upload-artifact@v4
@@ -107,6 +114,14 @@ jobs:
             --tmpfs /tmp:size=1g,mode=1777 \
             -v "$PWD/integrations/cloud-platform:/tests:ro" \
             chiptrace-platform:ci --test /tests/platform.test.js /tests/storage-oss.test.js
+      - name: Verify native context diagnostics in the container
+        run: |
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:size=128m,mode=1777 \
+            -e CHIPTRACE_BIN=/usr/local/bin/chiptrace \
+            -v "$PWD/integrations/codex:/tests/codex:ro" \
+            -v "$PWD/fixtures:/fixtures:ro" \
+            chiptrace-platform:ci --test /tests/codex/native-context.test.js
 
   storage-s3-minio:
     runs-on: ubuntu-latest

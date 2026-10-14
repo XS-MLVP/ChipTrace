@@ -27,6 +27,38 @@ Hook 部署或正常用户 Hook 信任状态已经通过验收。
 缺失上下文的原始记录保留作取证，不能通过删除、改写或时间窗口关联使其变成合格数据。
 完整原始证据保存在运维侧，不将对话正文、鉴权值或完整 Raw 提交到 Git。
 
+## 元数据审计与全量计数
+
+`audit-session-context` 复用 Canonical 的完整快照歧义检测和精确 Session 选择，直接只读
+扫描 Capture，不创建投影或临时副本。输出遵循
+[source-context-audit.v1](../schemas/source-context-audit-v1.schema.json)，只含计数、事件/span
+名称、Capture/Trace/Span ID 和 envelope 内记录序号，不打印对话、工具输出或其他属性值。
+分组最多 128 个，定位样本默认 20 个、最多 1000 个；超限仍保留遗漏记录数。
+这些标识和名称仍属于运维元数据，报告应按项目权限保存。
+
+```bash
+chiptrace audit-session-context --input <sealed-raw-or-restored-directory> \
+  --session-id <native-session-id> --sample-limit 5
+```
+
+2026-10-14 对上述 44 条原始 Capture 实际执行并保持 Segment SHA-256 不变：
+
+| 来源 | envelope 内记录总数 | Turn 精确归属 | 已知 Session 级事件 | 未归属 Turn | Session 身份未知 |
+| --- | --- | --- | --- | --- | --- |
+| OTLP logs | 314 | 15 | 3 | 296 | 0 |
+| OTLP spans | 1276 | 1082 | 0 | 159 | 35 |
+
+每一来源的分类计数与总数守恒。455 条未归属 Turn 与当前 Session 检查一致；另有 35 个
+span 无法精确确定 Session 身份，以前的 Session 未归属计数没有涵盖它们。报告显式保留
+这一范围，不能把这些 span 自动归属给当前 Session，也不能宣称其必然不相关。
+未归属的 159 个 span 中，`fs.get_metadata` 70、`fs.read_file` 20、
+`persist_rollout_items` 6；其 Trace 没有已观察到的原生 Turn 身份。初始化/会话循环作用域
+仍须凭来源端代码和原生身份审计，诊断名称本身不是豁免依据。命令不会给出交付通过标志。
+
+[精简回归 fixture](../fixtures/native-context-README.md) 只保留实际字段和父链，用一致
+别名替换身份。CI 验证缺口、跨 Session 歧义、正文不输出、计数守恒和真实非零退出；
+它不替代完整 Raw 或新的真实客户端 Canary。
+
 ## 已定位的生产者路径
 
 296 条未归属日志均为 `codex.sse_event`，有 `conversation.id`，没有有效 Trace/Span ID、
@@ -42,6 +74,11 @@ Hook 部署或正常用户 Hook 信任状态已经通过验收。
 [SSE 日志发射路径](https://github.com/openai/codex/blob/5425d3e625daa58eea3ad1de27c087eb3b2ffbd3/codex-rs/otel/src/events/session_telemetry.rs#L1057)
 也未显式带入原生 Turn 或响应 ID。代码与实际缺失字段相符，具体修复仍需回调级测试和新
 客户端真实 Canary 证明。
+
+固定版本的 HTTP 工厂在 `#[instrument(name = "model_client.stream_responses_api")]`
+函数内构建 SSE 适配器。真实 Raw 中同名 span 的父链经过 `try_run_sampling_request`、
+`session_task.turn` 和 `codex.turn_input`，含原生 Turn 身份。这为保留创建时上下文提供
+具体证据；仍需要验证实际异步回调发射及 OTLP 导出，不能仅以 join 的正例宣布修复。
 
 [来源端补丁草案](upstream-sse-context.patch) 在 `ApiTelemetry` 创建时捕获请求 Span，
 仅在同步 SSE 日志回调期间重新进入它。该草案尚未经过 upstream 编译、回调隔离测试或

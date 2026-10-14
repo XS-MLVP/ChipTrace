@@ -1,0 +1,40 @@
+{
+  "schema_version": "chiptrace.native-context-fixture.v1",
+  "provenance": {"kind":"redacted_metadata_subset","client_version":"0.163.0-alpha.11","upstream_commit":"5425d3e625daa58eea3ad1de27c087eb3b2ffbd3","raw_segment_sha256":"e7c8d59423d494f1006fe341d7dbe010312a6edd075d43215b7aa70d2d20ad48","transform":"Selected actual record identities and ancestry; consistent ID aliases, identity/event attributes only; no bodies, timestamps, paths or credentials. Not original Raw and not a delivery fixture."},
+  "session_id": "00000000-0000-7000-8000-000000000001",
+  "turn_id": "00000000-0000-7000-8000-000000000002",
+  "wire_context": {"session_id":"00000000-0000-7000-8000-000000000001","turn_id":"00000000-0000-7000-8000-000000000002","root_turn_id":"00000000-0000-7000-8000-000000000002","trace_id":"00000000000000000000000000000001","parent_span_id":"0000000000000002"},
+  "logs": [
+    {"traceId":"00000000000000000000000000000003","spanId":"0000000000000004","attributes":[{"key":"event.name","value":{"stringValue":"codex.conversation_starts"}},{"key":"conversation.id","value":{"stringValue":"00000000-0000-7000-8000-000000000001"}}]},
+    {"traceId":"","spanId":"","attributes":[{"key":"event.name","value":{"stringValue":"codex.sse_event"}},{"key":"conversation.id","value":{"stringValue":"00000000-0000-7000-8000-000000000001"}}]},
+    {"traceId":"00000000000000000000000000000001","spanId":"0000000000000005","attributes":[{"key":"event.name","value":{"stringValue":"codex.tool_result"}},{"key":"conversation.id","value":{"stringValue":"00000000-0000-7000-8000-000000000001"}}]}
+  ],
+  "spans": [
+    {"traceId":"00000000000000000000000000000001","spanId":"0000000000000006","parentSpanId":"0000000000000007","name":"model_client.stream_responses_api","attributes":[{"key":"thread.id","value":{"intValue":"34"}}]},
+    {"traceId":"00000000000000000000000000000001","spanId":"0000000000000007","parentSpanId":"0000000000000008","name":"stream_request","attributes":[{"key":"thread.id","value":{"intValue":"34"}}]},
+    {"traceId":"00000000000000000000000000000001","spanId":"0000000000000008","parentSpanId":"0000000000000009","name":"try_run_sampling_request","attributes":[{"key":"thread.id","value":{"intValue":"34"}},{"key":"turn_id","value":{"stringValue":"00000000-0000-7000-8000-000000000002"}}]},
+    {"traceId":"00000000000000000000000000000001","spanId":"0000000000000009","parentSpanId":"000000000000000a","name":"run_sampling_request","attributes":[{"key":"thread.id","value":{"intValue":"34"}},{"key":"turn_id","value":{"stringValue":"00000000-0000-7000-8000-000000000002"}}]},
+    {"traceId":"00000000000000000000000000000001","spanId":"000000000000000a","parentSpanId":"000000000000000b","name":"run_turn","attributes":[{"key":"thread.id","value":{"intValue":"30"}}]},
+    {"traceId":"00000000000000000000000000000001","spanId":"000000000000000b","parentSpanId":"000000000000000c","name":"session_task.run","attributes":[{"key":"thread.id","value":{"intValue":"30"}}]},
+    {"traceId":"00000000000000000000000000000001","spanId":"000000000000000c","parentSpanId":"000000000000000d","name":"session_task.turn","attributes":[{"key":"thread.id","value":{"intValue":"3"}},{"key":"thread.id","value":{"stringValue":"00000000-0000-7000-8000-000000000001"}},{"key":"turn.id","value":{"stringValue":"00000000-0000-7000-8000-000000000002"}}]},
+    {"traceId":"00000000000000000000000000000001","spanId":"000000000000000d","parentSpanId":"000000000000000e","name":"codex.turn_input","attributes":[{"key":"thread.id","value":{"intValue":"28"}},{"key":"conversation.id","value":{"stringValue":"00000000-0000-7000-8000-000000000001"}},{"key":"turn.id","value":{"stringValue":"00000000-0000-7000-8000-000000000002"}}]},
+    {"traceId":"00000000000000000000000000000001","spanId":"000000000000000e","parentSpanId":"000000000000000f","name":"op.dispatch.turn_input","attributes":[{"key":"thread.id","value":{"intValue":"28"}}]},
+    {"traceId":"00000000000000000000000000000001","spanId":"000000000000000f","parentSpanId":"","name":"turn/start","attributes":[{"key":"thread.id","value":{"intValue":"32"}},{"key":"turn.id","value":{"stringValue":"00000000-0000-7000-8000-000000000002"}}]},
+    {"traceId":"00000000000000000000000000000003","spanId":"0000000000000010","parentSpanId":"0000000000000011","name":"shell_snapshot","attributes":[{"key":"thread.id","value":{"intValue":"28"}},{"key":"thread_id","value":{"stringValue":"00000000-0000-7000-8000-000000000001"}}]},
+    {"traceId":"00000000000000000000000000000003","spanId":"0000000000000011","parentSpanId":"0000000000000004","name":"environments.resolve","attributes":[{"key":"thread.id","value":{"intValue":"30"}}]},
+    {"traceId":"00000000000000000000000000000003","spanId":"0000000000000004","parentSpanId":"0000000000000012","name":"session_init","attributes":[{"key":"thread.id","value":{"intValue":"30"}}]},
+    {"traceId":"00000000000000000000000000000003","spanId":"0000000000000012","parentSpanId":"0000000000000013","name":"thread_spawn","attributes":[{"key":"thread.id","value":{"intValue":"3"}}]},
+    {"traceId":"00000000000000000000000000000003","spanId":"0000000000000013","parentSpanId":"","name":"thread/start","attributes":[{"key":"thread.id","value":{"intValue":"32"}}]},
+    {"traceId":"00000000000000000000000000000003","spanId":"0000000000000014","parentSpanId":"0000000000000015","name":"fs.get_metadata","attributes":[{"key":"thread.id","value":{"intValue":"28"}}]},
+    {"traceId":"00000000000000000000000000000003","spanId":"0000000000000015","parentSpanId":"0000000000000013","name":"load_with_cli_overrides","attributes":[{"key":"thread.id","value":{"intValue":"28"}}]},
+    {"traceId":"00000000000000000000000000000016","spanId":"0000000000000017","parentSpanId":"0000000000000018","name":"fs.get_metadata","attributes":[{"key":"thread.id","value":{"intValue":"32"}}]},
+    {"traceId":"00000000000000000000000000000016","spanId":"0000000000000018","parentSpanId":"0000000000000019","name":"skills_for_config","attributes":[{"key":"thread.id","value":{"intValue":"32"}}]},
+    {"traceId":"00000000000000000000000000000016","spanId":"0000000000000019","parentSpanId":"000000000000001a","name":"turn_context.build","attributes":[{"key":"thread.id","value":{"intValue":"32"}}]},
+    {"traceId":"00000000000000000000000000000016","spanId":"000000000000001a","parentSpanId":"000000000000001b","name":"run_session_end_hooks","attributes":[{"key":"thread.id","value":{"intValue":"32"}}]},
+    {"traceId":"00000000000000000000000000000016","spanId":"000000000000001b","parentSpanId":"000000000000001c","name":"op.dispatch.shutdown","attributes":[{"key":"thread.id","value":{"intValue":"32"}}]},
+    {"traceId":"00000000000000000000000000000016","spanId":"000000000000001c","parentSpanId":"","name":"session_loop","attributes":[{"key":"thread.id","value":{"intValue":"3"}},{"key":"thread_id","value":{"stringValue":"00000000-0000-7000-8000-000000000001"}}]},
+    {"traceId":"00000000000000000000000000000016","spanId":"000000000000001d","parentSpanId":"000000000000001a","name":"persist_rollout_items","attributes":[{"key":"thread.id","value":{"intValue":"19"}}]},
+    {"traceId":"00000000000000000000000000000016","spanId":"000000000000001e","parentSpanId":"0000000000000019","name":"turn_context.make","attributes":[{"key":"thread.id","value":{"intValue":"19"}}]},
+    {"traceId":"0000000000000000000000000000001f","spanId":"0000000000000020","parentSpanId":"","name":"auth","attributes":[{"key":"thread.id","value":{"intValue":"34"}}]}
+  ]
+}

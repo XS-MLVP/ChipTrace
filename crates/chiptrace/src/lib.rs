@@ -21,6 +21,7 @@ pub mod score;
 mod session_lineage;
 pub mod session_view;
 pub mod sharded;
+pub mod source_context;
 pub mod store;
 pub mod telemetry;
 pub mod tool_schema;

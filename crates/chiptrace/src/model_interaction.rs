@@ -25,6 +25,41 @@ pub const INTERACTION_LINK_SCHEMA_VERSION: &str = "chiptrace.interaction-link.v1
 pub const INTERACTION_PROJECTION_SCHEMA_VERSION: &str = "chiptrace.interaction-projection.v1";
 const ADAPTER_VERSION: &str = "chiptrace.openai-shape-adapter.v1";
 
+/// Read-only source diagnostics using the same global ambiguity and child-Session
+/// selection as the canonical projection. No projection or sidecar is written.
+pub fn audit_session_context(
+    inputs: &[PathBuf],
+    session_id: &str,
+    sample_limit: usize,
+) -> Result<crate::source_context::SourceContextAudit> {
+    if sample_limit > crate::source_context::MAX_CONTEXT_SAMPLES {
+        bail!(
+            "source context sample limit must be at most {}",
+            crate::source_context::MAX_CONTEXT_SAMPLES
+        );
+    }
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        bail!("--session-id cannot be empty");
+    }
+    let discovered = discover_inputs(inputs)?;
+    if discovered.is_empty() {
+        bail!("no Capture JSONL inputs found");
+    }
+    discover_raw_sources(inputs, &discovered)?;
+    let (captures, duplicates, scopes) =
+        read_session_captures_with_scopes(&discovered, session_id)?;
+    let (mut captures, _, _) = select_projection_captures(captures, None, Some(session_id))?;
+    sort_captures(&mut captures);
+    crate::source_context::audit_selected_source_context(
+        &captures,
+        session_id,
+        &scopes,
+        duplicates,
+        sample_limit,
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct InteractionProjectConfig {
     pub inputs: Vec<PathBuf>,

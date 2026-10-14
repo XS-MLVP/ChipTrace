@@ -1,0 +1,384 @@
+//! Payload-free diagnostics for the exact Session/Turn OTLP join.
+//! Counts do not certify delivery or exempt unresolved records.
+
+use crate::session_view::{allowed_source_sessions, otlp_record_name, otlp_source_observation};
+use crate::turn_identity::{ExactTurnIndex, hex_id, visit_otlp};
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+pub const SOURCE_CONTEXT_AUDIT_SCHEMA_VERSION: &str = "chiptrace.source-context-audit.v1";
+const MAX_GROUPS: usize = 128;
+pub const MAX_CONTEXT_SAMPLES: usize = 1000;
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceContextCounts {
+    pub total_records: u64,
+    pub turn_assigned_records: u64,
+    pub session_level_records: u64,
+    pub unscoped_turn_records: u64,
+    pub other_session_records: u64,
+    pub unknown_session_records: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextGapGroup {
+    pub source: String,
+    pub disposition: String,
+    pub record_name: String,
+    pub reason: String,
+    pub records: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextGapSample {
+    pub capture_id: String,
+    /// Zero-based index across the OTLP records in this original envelope.
+    pub record_index: u64,
+    pub source: String,
+    pub disposition: String,
+    pub record_name: String,
+    pub reason: String,
+    pub trace_id: Option<String>,
+    pub span_id: Option<String>,
+    pub parent_span_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceContextAudit {
+    pub schema_version: String,
+    pub session_id: String,
+    pub selected_captures: u64,
+    pub duplicate_captures_removed: u64,
+    pub sources: BTreeMap<String, SourceContextCounts>,
+    pub unscoped_otlp_records: u64,
+    pub group_limit: usize,
+    pub gap_groups: Vec<ContextGapGroup>,
+    pub omitted_gap_records: u64,
+    pub sample_limit: usize,
+    pub samples: Vec<ContextGapSample>,
+    pub omitted_samples: u64,
+}
+
+pub(crate) fn audit_selected_source_context(
+    captures: &[Value],
+    session_id: &str,
+    global: &ExactTurnIndex,
+    duplicates: u64,
+    sample_limit: usize,
+) -> Result<SourceContextAudit> {
+    if sample_limit > MAX_CONTEXT_SAMPLES {
+        bail!("source context sample limit must be at most {MAX_CONTEXT_SAMPLES}");
+    }
+    let mut index = ExactTurnIndex::for_turns();
+    index.include_global_scopes(global);
+    for capture in captures {
+        index.observe_capture(capture)?;
+    }
+    let allowed = allowed_source_sessions(captures, session_id);
+    let mut sources: BTreeMap<String, SourceContextCounts> = BTreeMap::new();
+    let mut groups: BTreeMap<(String, String, String, String), u64> = BTreeMap::new();
+    let mut samples = Vec::new();
+    let mut omitted_gap_records = 0;
+    let mut gaps = 0;
+    for capture in captures {
+        let capture_id = capture
+            .get("captureId")
+            .and_then(Value::as_str)
+            .unwrap_or("missing");
+        let mut ordinal = 0;
+        visit_otlp(capture, |source, record, attributes| {
+            let record_index = ordinal;
+            ordinal += 1;
+            let observed = otlp_source_observation(source, record, &attributes, &index)?;
+            let counts = sources.entry(source.to_owned()).or_default();
+            counts.total_records += 1;
+            let in_session = observed
+                .session_id
+                .as_deref()
+                .is_some_and(|s| allowed.contains(s));
+            let ambiguous_session = observed.session_id.is_none()
+                && observed
+                    .related_sessions
+                    .iter()
+                    .any(|s| allowed.contains(s));
+            let disposition = if in_session && observed.turn_id.is_some() {
+                counts.turn_assigned_records += 1;
+                return Ok(());
+            } else if in_session && !observed.requires_turn {
+                counts.session_level_records += 1;
+                return Ok(());
+            } else if (in_session || ambiguous_session) && observed.requires_turn {
+                counts.unscoped_turn_records += 1;
+                "unscoped_turn"
+            } else if observed.session_id.is_some() {
+                counts.other_session_records += 1;
+                return Ok(());
+            } else {
+                counts.unknown_session_records += 1;
+                "unknown_session"
+            };
+            gaps += 1;
+            let reason = if ambiguous_session {
+                "ambiguous_session_context"
+            } else {
+                index.unresolved_reason(record, &attributes)?
+            };
+            // Names are diagnostic metadata, not bodies, tool arguments or arbitrary attributes.
+            // Bound their size and omit control characters before printing operator diagnostics.
+            let name = otlp_record_name(source, record, &attributes)
+                .filter(|name| name.len() <= 160 && !name.chars().any(char::is_control))
+                .unwrap_or_else(|| "<unnamed>".to_owned());
+            let key = (
+                source.to_owned(),
+                disposition.to_owned(),
+                name.clone(),
+                reason.to_owned(),
+            );
+            if let Some(count) = groups.get_mut(&key) {
+                *count += 1;
+            } else if groups.len() < MAX_GROUPS {
+                groups.insert(key, 1);
+            } else {
+                omitted_gap_records += 1;
+            }
+            if samples.len() < sample_limit {
+                samples.push(ContextGapSample {
+                    capture_id: capture_id.to_owned(),
+                    record_index,
+                    source: source.to_owned(),
+                    disposition: disposition.to_owned(),
+                    record_name: name,
+                    reason: reason.to_owned(),
+                    trace_id: hex_id(record.get("traceId"), 32),
+                    span_id: hex_id(record.get("spanId"), 16),
+                    parent_span_id: hex_id(record.get("parentSpanId"), 16),
+                });
+            }
+            Ok(())
+        })?;
+    }
+    let unscoped_otlp_records = sources.values().map(|s| s.unscoped_turn_records).sum();
+    let omitted_samples = gaps - samples.len() as u64;
+    Ok(SourceContextAudit {
+        schema_version: SOURCE_CONTEXT_AUDIT_SCHEMA_VERSION.to_owned(),
+        session_id: session_id.to_owned(),
+        selected_captures: captures.len() as u64,
+        duplicate_captures_removed: duplicates,
+        sources,
+        unscoped_otlp_records,
+        group_limit: MAX_GROUPS,
+        gap_groups: groups
+            .into_iter()
+            .map(
+                |((source, disposition, record_name, reason), records)| ContextGapGroup {
+                    source,
+                    disposition,
+                    record_name,
+                    reason,
+                    records,
+                },
+            )
+            .collect(),
+        omitted_gap_records,
+        sample_limit,
+        samples,
+        omitted_samples,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session_view::summarize_session;
+    use serde_json::json;
+
+    fn native_fixture() -> (Value, Vec<Value>) {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../fixtures/native-context-0163.json"))
+                .unwrap();
+        let captures = vec![
+            json!({"recordType":"api_snapshot","captureId":"wire","traceContext":fixture["wire_context"]}),
+            batch(
+                "otlp_logs",
+                json!({"resourceLogs":[{"scopeLogs":[{"logRecords":fixture["logs"]}]}]}),
+            ),
+            batch(
+                "otlp_traces",
+                json!({"resourceSpans":[{"scopeSpans":[{"spans":fixture["spans"]}]}]}),
+            ),
+        ];
+        (fixture, captures)
+    }
+
+    fn batch(source: &str, raw: Value) -> Value {
+        json!({"recordType":"telemetry_batch","captureId":source,"telemetryBatch":{
+            "endpoint":source,"raw_json":serde_json::to_string(&raw).unwrap()
+        }})
+    }
+
+    fn audit(captures: &[Value], session: &str, limit: usize) -> SourceContextAudit {
+        let mut global = ExactTurnIndex::default();
+        for capture in captures {
+            global.observe_capture(capture).unwrap();
+        }
+        let result = audit_selected_source_context(captures, session, &global, 0, limit).unwrap();
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../schemas/source-context-audit-v1.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::draft202012::new(&schema).unwrap();
+        assert!(validator.is_valid(&serde_json::to_value(&result).unwrap()));
+        result
+    }
+
+    #[test]
+    fn current_native_fields_preserve_all_context_gaps_and_count_unknown_sessions() {
+        let (fixture, captures) = native_fixture();
+        let session = fixture["session_id"].as_str().unwrap();
+        let result = audit(&captures, session, 5);
+        assert_eq!(
+            result.sources["otlp_logs"],
+            SourceContextCounts {
+                total_records: 3,
+                turn_assigned_records: 1,
+                session_level_records: 1,
+                unscoped_turn_records: 1,
+                other_session_records: 0,
+                unknown_session_records: 0,
+            }
+        );
+        assert_eq!(
+            result.sources["otlp_traces"],
+            SourceContextCounts {
+                total_records: 26,
+                turn_assigned_records: 10,
+                session_level_records: 0,
+                unscoped_turn_records: 15,
+                other_session_records: 0,
+                unknown_session_records: 1,
+            }
+        );
+        assert_eq!(result.unscoped_otlp_records, 16);
+        assert_eq!(result.samples.len(), 5);
+        assert_eq!(result.omitted_samples, 12);
+        let sse = result
+            .gap_groups
+            .iter()
+            .find(|g| g.record_name == "codex.sse_event")
+            .unwrap();
+        assert_eq!(sse.reason, "missing_trace_context");
+        let init = result
+            .gap_groups
+            .iter()
+            .find(|g| g.record_name == "fs.get_metadata")
+            .unwrap();
+        assert_eq!(init.reason, "trace_without_native_turn");
+        assert_eq!(init.records, 2);
+        let view = summarize_session(&captures, session).unwrap();
+        assert_eq!(
+            view.unscoped_source_records["otlp_logs"],
+            result.sources["otlp_logs"].unscoped_turn_records
+        );
+        assert_eq!(
+            view.unscoped_source_records["otlp_traces"],
+            result.sources["otlp_traces"].unscoped_turn_records
+        );
+        assert!(!view.delivery_ready);
+    }
+
+    #[test]
+    fn sse_requires_original_span_context_even_when_another_turn_shares_the_trace() {
+        let (fixture, captures) = native_fixture();
+        let mut index = ExactTurnIndex::for_turns();
+        for capture in &captures {
+            index.observe_capture(capture).unwrap();
+        }
+        let stream = fixture["spans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "model_client.stream_responses_api")
+            .unwrap();
+        index
+            .observe_capture(&json!({"recordType":"api_snapshot","traceContext":{
+                "session_id":fixture["session_id"],"turn_id":"another-turn",
+                "trace_id":stream["traceId"],"parent_span_id":"ffffffffffffffff"
+            }}))
+            .unwrap();
+        let original = &fixture["logs"][1];
+        let attributes = BTreeMap::from([(
+            "conversation.id".to_owned(),
+            fixture["session_id"].as_str().unwrap().to_owned(),
+        )]);
+        assert_eq!(index.resolve(original, &attributes).unwrap(), None);
+        let mut callback = original.clone();
+        callback["traceId"] = stream["traceId"].clone();
+        assert_eq!(index.resolve(&callback, &attributes).unwrap(), None);
+        // Positive protocol input only, not a modification to historical Raw or proof of a producer fix.
+        callback["spanId"] = stream["spanId"].clone();
+        assert_eq!(
+            index.resolve(&callback, &attributes).unwrap(),
+            Some((
+                fixture["session_id"].as_str().unwrap().to_owned(),
+                fixture["turn_id"].as_str().unwrap().to_owned(),
+            ))
+        );
+    }
+
+    #[test]
+    fn diagnostics_omit_bodies_paths_and_non_identity_attribute_values() {
+        let (fixture, mut captures) = native_fixture();
+        let marker = "private-body-and-credential-marker";
+        let mut logs: Value =
+            serde_json::from_str(captures[1]["telemetryBatch"]["raw_json"].as_str().unwrap())
+                .unwrap();
+        let record = &mut logs["resourceLogs"][0]["scopeLogs"][0]["logRecords"][1];
+        record["body"] = json!({"stringValue":marker});
+        record["attributes"].as_array_mut().unwrap().extend([
+            json!({"key":"tool.output","value":{"stringValue":marker}}),
+            json!({"key":"code.file.path","value":{"stringValue":marker}}),
+            json!({"key":"authorization","value":{"stringValue":marker}}),
+        ]);
+        captures[1]["telemetryBatch"]["raw_json"] = json!(serde_json::to_string(&logs).unwrap());
+        let result = audit(&captures, fixture["session_id"].as_str().unwrap(), 20);
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains(marker));
+        assert!(!serialized.contains("delivery_ready"));
+        assert_eq!(result.unscoped_otlp_records, 16);
+    }
+
+    #[test]
+    fn diagnostic_cardinality_is_bounded_without_dropping_total_gap_counts() {
+        let logs: Vec<_> = (0..1300)
+            .map(|i| {
+                json!({"attributes":[
+                    {"key":"event.name","value":{"stringValue":format!("event-{i}")}},
+                    {"key":"conversation.id","value":{"stringValue":"session"}}
+                ]})
+            })
+            .collect();
+        let captures = vec![batch(
+            "otlp_logs",
+            json!({"resourceLogs":[{"scopeLogs":[{"logRecords":logs}]}]}),
+        )];
+        let result = audit(&captures, "session", 7);
+        assert_eq!(result.sources["otlp_logs"].total_records, 1300);
+        assert_eq!(result.unscoped_otlp_records, 1300);
+        assert_eq!(result.gap_groups.len(), MAX_GROUPS);
+        assert_eq!(result.omitted_gap_records, 1300 - MAX_GROUPS as u64);
+        assert_eq!(result.samples.len(), 7);
+        assert_eq!(result.omitted_samples, 1293);
+        assert!(
+            audit_selected_source_context(
+                &captures,
+                "session",
+                &ExactTurnIndex::default(),
+                0,
+                1001
+            )
+            .is_err()
+        );
+    }
+}

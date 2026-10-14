@@ -9,7 +9,8 @@ use chiptrace::collector::{CollectorConfig, serve};
 use chiptrace::enrich::{EnrichConfig, enrich_captures, verify_enrichment};
 use chiptrace::jsonl::absolute_path;
 use chiptrace::model_interaction::{
-    InteractionProjectConfig, project_interactions, verify_interaction_projection,
+    InteractionProjectConfig, audit_session_context, project_interactions,
+    verify_interaction_projection,
 };
 use chiptrace::otlp_delivery::{OtlpDeliveryConfig, send_otlp};
 use chiptrace::publish::{
@@ -66,6 +67,8 @@ enum Command {
     ProjectInteractions(ProjectInteractionsArgs),
     /// 查看原生 Session/Turn、来源覆盖与完整性；不把工具配对数当作原生轮次。
     InspectSession(InspectSessionArgs),
+    /// 只读审计 OTLP 原生 Turn 上下文缺口，输出有界元数据样本，不输出对话正文。
+    AuditSessionContext(AuditSessionContextArgs),
     /// 只读验证 ModelInteraction 双轨投影。
     VerifyInteractions(VerifyInteractionsArgs),
     /// 从 delivery-ready canonical Trace 生成单一 OTLP 树。
@@ -277,6 +280,16 @@ struct InspectSessionArgs {
     input: Vec<PathBuf>,
     #[arg(long)]
     session_id: String,
+}
+
+#[derive(Debug, Args)]
+struct AuditSessionContextArgs {
+    #[arg(long, required = true)]
+    input: Vec<PathBuf>,
+    #[arg(long)]
+    session_id: String,
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(0..=1000))]
+    sample_limit: u16,
 }
 
 #[derive(Debug, Args)]
@@ -827,6 +840,11 @@ async fn main() -> Result<()> {
                 "validation_status":projection.validation_status,
             })
         }
+        Command::AuditSessionContext(args) => serde_json::to_value(audit_session_context(
+            &args.input,
+            &args.session_id,
+            usize::from(args.sample_limit),
+        )?)?,
         Command::VerifyInteractions(args) => {
             serde_json::to_value(verify_interaction_projection(&args.projection)?)?
         }
@@ -2844,6 +2862,7 @@ mod cli_tests {
             "archive-raw",
             "assemble",
             "audit",
+            "audit-session-context",
             "benchmark-compression",
             "benchmark-http",
             "benchmark-store",

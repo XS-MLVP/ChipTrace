@@ -236,6 +236,30 @@ impl ExactTurnIndex {
         Ok(sessions)
     }
 
+    /// Diagnostic categories only: none of these establish a Turn identity.
+    pub(crate) fn unresolved_reason(
+        &self,
+        record: &Value,
+        attributes: &BTreeMap<String, String>,
+    ) -> Result<&'static str> {
+        if turn_attribute(attributes)?.is_some_and(|turn| !self.native.contains_key(&turn)) {
+            return Ok("unknown_turn_owner");
+        }
+        let Some(trace) = hex_id(record.get("traceId"), 32) else {
+            return Ok("missing_trace_context");
+        };
+        let Some(scope) = self.traces.get(&trace) else {
+            return Ok("unobserved_trace_context");
+        };
+        if scope.turns.is_empty() {
+            return Ok("trace_without_native_turn");
+        }
+        if self.candidates(&scope.sessions, &scope.turns).len() > 1 {
+            return Ok("ambiguous_turn_context");
+        }
+        Ok("unresolved_turn_context")
+    }
+
     pub(crate) fn record_sessions(
         &self,
         record: &Value,
@@ -271,7 +295,7 @@ fn text(value: Option<&Value>) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn hex_id(value: Option<&Value>, size: usize) -> Option<String> {
+pub(crate) fn hex_id(value: Option<&Value>, size: usize) -> Option<String> {
     text(value)
         .filter(|v| {
             v.len() == size

@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chiptrace.dev/schemas/source-context-audit-v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "session_id", "selected_captures", "duplicate_captures_removed", "sources", "unscoped_otlp_records", "group_limit", "gap_groups", "omitted_gap_records", "sample_limit", "samples", "omitted_samples"],
+  "properties": {
+    "schema_version": {"const": "chiptrace.source-context-audit.v1"},
+    "session_id": {"type": "string", "minLength": 1},
+    "selected_captures": {"$ref": "#/$defs/count"},
+    "duplicate_captures_removed": {"$ref": "#/$defs/count"},
+    "sources": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"otlp_logs": {"$ref": "#/$defs/counts"}, "otlp_traces": {"$ref": "#/$defs/counts"}}
+    },
+    "unscoped_otlp_records": {"$ref": "#/$defs/count"},
+    "group_limit": {"const": 128},
+    "gap_groups": {"type": "array", "maxItems": 128, "items": {"$ref": "#/$defs/group"}},
+    "omitted_gap_records": {"$ref": "#/$defs/count"},
+    "sample_limit": {"type": "integer", "minimum": 0, "maximum": 1000},
+    "samples": {"type": "array", "maxItems": 1000, "items": {"$ref": "#/$defs/sample"}},
+    "omitted_samples": {"$ref": "#/$defs/count"}
+  },
+  "$defs": {
+    "count": {"type": "integer", "minimum": 0},
+    "source": {"enum": ["otlp_logs", "otlp_traces"]},
+    "disposition": {"enum": ["unscoped_turn", "unknown_session"]},
+    "reason": {"enum": ["unknown_turn_owner", "missing_trace_context", "unobserved_trace_context", "trace_without_native_turn", "ambiguous_turn_context", "unresolved_turn_context", "ambiguous_session_context"]},
+    "name": {"type": "string", "maxLength": 160},
+    "trace": {"type": ["string", "null"], "pattern": "^[0-9a-f]{32}$"},
+    "span": {"type": ["string", "null"], "pattern": "^[0-9a-f]{16}$"},
+    "counts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["total_records", "turn_assigned_records", "session_level_records", "unscoped_turn_records", "other_session_records", "unknown_session_records"],
+      "properties": {
+        "total_records": {"$ref": "#/$defs/count"},
+        "turn_assigned_records": {"$ref": "#/$defs/count"},
+        "session_level_records": {"$ref": "#/$defs/count"},
+        "unscoped_turn_records": {"$ref": "#/$defs/count"},
+        "other_session_records": {"$ref": "#/$defs/count"},
+        "unknown_session_records": {"$ref": "#/$defs/count"}
+      }
+    },
+    "group": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "disposition", "record_name", "reason", "records"],
+      "properties": {
+        "source": {"$ref": "#/$defs/source"}, "disposition": {"$ref": "#/$defs/disposition"},
+        "record_name": {"$ref": "#/$defs/name"}, "reason": {"$ref": "#/$defs/reason"},
+        "records": {"type": "integer", "minimum": 1}
+      }
+    },
+    "sample": {
+      "type": "object", "additionalProperties": false,
+      "required": ["capture_id", "record_index", "source", "disposition", "record_name", "reason", "trace_id", "span_id", "parent_span_id"],
+      "properties": {
+        "capture_id": {"type": "string"}, "record_index": {"$ref": "#/$defs/count"},
+        "source": {"$ref": "#/$defs/source"}, "disposition": {"$ref": "#/$defs/disposition"},
+        "record_name": {"$ref": "#/$defs/name"}, "reason": {"$ref": "#/$defs/reason"},
+        "trace_id": {"$ref": "#/$defs/trace"}, "span_id": {"$ref": "#/$defs/span"},
+        "parent_span_id": {"$ref": "#/$defs/span"}
+      }
+    }
+  }
+}

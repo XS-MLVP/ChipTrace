@@ -35,6 +35,8 @@ Wire、OTLP 和 Hook 使用 Stock Codex 自带的 Session、Turn、call ID 和 W
 
 当前真实客户端仍有未归属的 SSE 日志和 span，完整 v2 交付尚未通过真实验收。
 已验证的能力与剩余来源上下文缺口见[原生 Turn 验收记录](docs/native-turn-context.md)。
+`audit-session-context` 提供只读的上下文缺口统计和有界定位样本；CI 使用精简的真实
+客户端元数据回归，完整对话和原始取证档保留在运维侧。
 
 ## 构建
 

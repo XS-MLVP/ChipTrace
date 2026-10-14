@@ -223,13 +223,13 @@ fn source_session(capture: &Value) -> Option<&str> {
 }
 
 #[derive(Debug, Clone)]
-struct SourceObservation {
-    source: &'static str,
-    session_id: Option<String>,
-    turn_id: Option<String>,
+pub(crate) struct SourceObservation {
+    pub(crate) source: &'static str,
+    pub(crate) session_id: Option<String>,
+    pub(crate) turn_id: Option<String>,
     occurred_at: Option<String>,
-    requires_turn: bool,
-    related_sessions: BTreeSet<String>,
+    pub(crate) requires_turn: bool,
+    pub(crate) related_sessions: BTreeSet<String>,
 }
 
 fn nonempty_string(value: Option<&Value>) -> Option<String> {
@@ -241,6 +241,68 @@ fn nonempty_string(value: Option<&Value>) -> Option<String> {
 
 fn first_string(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| nonempty_string(value.get(*key)))
+}
+
+pub(crate) fn allowed_source_sessions(captures: &[Value], session_id: &str) -> BTreeSet<String> {
+    captures
+        .iter()
+        .filter(|capture| string(capture, "/recordType") != Some("telemetry_batch"))
+        .filter_map(source_session)
+        .chain(std::iter::once(session_id))
+        .map(str::to_owned)
+        .collect()
+}
+
+pub(crate) fn otlp_record_name(
+    source: &str,
+    record: &Value,
+    attributes: &BTreeMap<String, String>,
+) -> Option<String> {
+    if source == "otlp_logs" {
+        attributes.get("event.name").cloned()
+    } else {
+        nonempty_string(record.get("name"))
+    }
+}
+
+pub(crate) fn otlp_source_observation(
+    source: &'static str,
+    record: &Value,
+    attributes: &BTreeMap<String, String>,
+    index: &ExactTurnIndex,
+) -> Result<SourceObservation> {
+    let event_name = otlp_record_name(source, record, attributes);
+    let exempt = matches!(
+        event_name.as_deref(),
+        Some(
+            "codex.conversation_starts"
+                | "codex.startup_phase"
+                | "codex.websocket_connect"
+                | "codex.websocket_request"
+                | "codex.auth_recovery"
+                | "codex.agent_communication"
+                | "codex.session"
+                | "session"
+        )
+    );
+    let identity = index.resolve(record, attributes)?;
+    let related_sessions = index.record_sessions(record, attributes)?;
+    let session_id = identity
+        .as_ref()
+        .map(|(s, _)| s.clone())
+        .or(session_attribute(attributes)?)
+        .or_else(|| {
+            (related_sessions.len() == 1).then(|| related_sessions.first().unwrap().clone())
+        });
+    let turn_id = identity.map(|(_, t)| t).or(turn_attribute(attributes)?);
+    Ok(SourceObservation {
+        source,
+        session_id,
+        turn_id,
+        occurred_at: first_string(record, &["timeUnixNano", "observedTimeUnixNano"]),
+        requires_turn: !exempt,
+        related_sessions,
+    })
 }
 
 fn source_observations(capture: &Value, index: &ExactTurnIndex) -> Result<Vec<SourceObservation>> {
@@ -271,43 +333,7 @@ fn source_observations(capture: &Value, index: &ExactTurnIndex) -> Result<Vec<So
         Some("otlp_logs" | "otlp_traces") => {
             let mut output = Vec::new();
             visit_otlp(capture, |source, record, attributes| {
-                let event_name = if source == "otlp_logs" {
-                    attributes.get("event.name").cloned()
-                } else {
-                    nonempty_string(record.get("name"))
-                };
-                let exempt = matches!(
-                    event_name.as_deref(),
-                    Some(
-                        "codex.conversation_starts"
-                            | "codex.startup_phase"
-                            | "codex.websocket_connect"
-                            | "codex.websocket_request"
-                            | "codex.auth_recovery"
-                            | "codex.agent_communication"
-                            | "codex.session"
-                            | "session"
-                    )
-                );
-                let identity = index.resolve(record, &attributes)?;
-                let related_sessions = index.record_sessions(record, &attributes)?;
-                let session_id = identity
-                    .as_ref()
-                    .map(|(s, _)| s.clone())
-                    .or(session_attribute(&attributes)?)
-                    .or_else(|| {
-                        (related_sessions.len() == 1)
-                            .then(|| related_sessions.first().unwrap().clone())
-                    });
-                let turn_id = identity.map(|(_, t)| t).or(turn_attribute(&attributes)?);
-                output.push(SourceObservation {
-                    source,
-                    session_id,
-                    turn_id,
-                    occurred_at: first_string(record, &["timeUnixNano", "observedTimeUnixNano"]),
-                    requires_turn: !exempt,
-                    related_sessions,
-                });
+                output.push(otlp_source_observation(source, record, &attributes, index)?);
                 Ok(())
             })?;
             Ok(output)
@@ -335,12 +361,7 @@ pub(crate) fn summarize_session_with_scopes(
     for capture in captures {
         index.observe_capture(capture)?;
     }
-    let allowed_sessions: BTreeSet<_> = captures
-        .iter()
-        .filter(|capture| string(capture, "/recordType") != Some("telemetry_batch"))
-        .filter_map(source_session)
-        .chain(std::iter::once(session_id))
-        .collect();
+    let allowed_sessions = allowed_source_sessions(captures, session_id);
     let mut lifecycle = LifecycleState::new("stock_codex_hook");
     let mut turns: BTreeMap<(String, String), TurnView> = BTreeMap::new();
     let mut terminal_statuses: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
