@@ -1,0 +1,83 @@
+diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
+--- a/codex-rs/core/src/client_tests.rs
++++ b/codex-rs/core/src/client_tests.rs
+@@ -18,6 +18,7 @@ use crate::test_support::responses_metadata as test_responses_metadata;
+ use codex_api::AgentIdentityTelemetry;
+ use codex_api::ApiError;
+ use codex_api::ResponseEvent;
++use codex_api::SseTelemetry;
+ use codex_api::TransportError;
+ use codex_http_client::HttpClientFactory;
+ use codex_http_client::OutboundProxyPolicy;
+@@ -79,6 +80,7 @@ use tokio::sync::Notify;
+ use tracing::Event;
+ use tracing::Subscriber;
+ use tracing::field::Visit;
++use tracing::Id;
+ use tracing_subscriber::Layer;
+ use tracing_subscriber::layer::Context as LayerContext;
+ use tracing_subscriber::layer::SubscriberExt;
+@@ -298,6 +300,38 @@ fn test_session_telemetry() -> SessionTelemetry {
+     )
+ }
+ 
++#[test]
++fn sse_callback_reenters_the_request_span_after_creation_scope_ends() {
++    let collector = OtlpSpanCollector::default();
++    let _subscriber = tracing_subscriber::registry()
++        .with(collector.clone())
++        .set_default();
++    let request_span = tracing::info_span!("native_turn_request", turn_id = "turn-1");
++    let telemetry = request_span.in_scope(|| {
++        super::ApiTelemetry::new(
++            test_session_telemetry(),
++            super::AuthRequestTelemetryContext::default(),
++            super::RequestRouteTelemetry::for_endpoint("/responses"),
++            super::AuthEnvTelemetry::default(),
++        )
++    });
++    let unrelated_span = tracing::info_span!("unrelated_turn", turn_id = "turn-2");
++    let _guard = unrelated_span.enter();
++    let response: std::result::Result<
++        Option<std::result::Result<eventsource_stream::Event, eventsource_stream::EventStreamError<TransportError>>>,
++        tokio::time::error::Elapsed,
++    > = Ok(Some(Ok(eventsource_stream::Event {
++        event: "response.created".to_string(),
++        data: "{}".to_string(),
++        id: String::new(),
++        retry: None,
++    })));
++    telemetry.on_sse_poll(&response, Duration::from_millis(1));
++    let observed = collector.span_ids.lock().unwrap();
++    assert_eq!(observed.as_slice(), &[request_span.id().expect("request span id")]);
++    assert_ne!(observed.as_slice(), &[unrelated_span.id().expect("unrelated span id")]);
++}
++
+ #[test]
+ fn ultra_reasoning_uses_max_for_requests() {
+     assert_eq!(
+@@ -370,6 +404,24 @@ struct TagCollectorLayer {
+     tags: Arc<Mutex<BTreeMap<String, String>>>,
+ }
+ 
++#[derive(Clone, Default)]
++struct OtlpSpanCollector {
++    span_ids: Arc<Mutex<Vec<Id>>>,
++}
++
++impl<S> Layer<S> for OtlpSpanCollector
++where
++    S: Subscriber + for<'a> LookupSpan<'a>,
++{
++    fn on_event(&self, event: &Event<'_>, ctx: LayerContext<'_, S>) {
++        if event.metadata().target() == "codex_otel.log_only"
++            && let Some(span_id) = ctx.current_span().id()
++        {
++            self.span_ids.lock().unwrap().push(span_id.clone());
++        }
++    }
++}
++
+ impl<S> Layer<S> for TagCollectorLayer
+ where
+     S: Subscriber + for<'a> LookupSpan<'a>,

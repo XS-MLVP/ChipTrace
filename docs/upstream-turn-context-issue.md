@@ -31,10 +31,13 @@ does not explicitly include native Turn or response identity either.
 The proposed investigation is to retain immutable request/Turn context when
 the telemetry adapter is constructed and restore it inside synchronous SSE
 callbacks. The attached [patch draft](upstream-sse-context.patch) preserves a
-`tracing::Span` and enters it for `on_sse_poll`. It passes `git apply --check`
-against the pinned source, but has not been compiled or tested upstream and
-is not claimed as a verified fix. In particular, the adapter's construction
-sites must be checked to ensure the captured Span is request or Turn scoped.
+`tracing::Span` and enters it for `on_sse_poll`. It applies cleanly to the
+pinned `0.163.0-alpha.11` source and to the current inspected upstream source.
+The patch plus [regression test](upstream-sse-context-test.patch) compiled and
+passed on a complete `0.150.0-alpha.9` source worktree. It has not yet been
+compiled against the pinned `0.163.0-alpha.11` tree or validated by a new
+unmodified-client canary. In particular, the adapter's construction sites must
+be checked to ensure the captured Span is request or Turn scoped.
 
 Suggested regression coverage:
 

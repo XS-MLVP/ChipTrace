@@ -81,8 +81,16 @@ span 无法精确确定 Session 身份，以前的 Session 未归属计数没有
 具体证据；仍需要验证实际异步回调发射及 OTLP 导出，不能仅以 join 的正例宣布修复。
 
 [来源端补丁草案](upstream-sse-context.patch) 在 `ApiTelemetry` 创建时捕获请求 Span，
-仅在同步 SSE 日志回调期间重新进入它。该草案尚未经过 upstream 编译、回调隔离测试或
-真实客户端验证，不能作为已修复证明；它也没有解决其余未归属 span 的作用域问题。
+仅在同步 SSE 日志回调期间重新进入它。该草案尚未在固定的 `0.163.0-alpha.11` 源码上
+编译、完成回调隔离测试或经过真实客户端验证，不能作为已修复证明；它也没有解决其余
+未归属 span 的作用域问题。
+在完整的 Codex `0.150.0-alpha.9` 源码工作树上，已应用该补丁和
+[回调回归测试](upstream-sse-context-test.patch)，使用离线缓存执行
+`cargo test -p codex-core sse_callback_reenters_the_request_span_after_creation_scope_ends`，
+结果为 1 个测试通过。测试创建请求 Span、退出创建作用域、再进入另一个 Span 后触发
+SSE 回调，并观察 `codex_otel.log_only` 事件的当前 Span。这个结果证明补丁机制在完整
+代码上成立，但不等于 `0.163.0-alpha.11` 已编译或发布该修复；固定版本和当前 upstream
+提交仍需单独编译及真实多 Turn Canary。
 已在上述固定版本源码上通过 `git apply --check`；[上游问题草稿](upstream-turn-context-issue.md)
 仅作为可审查材料保存在本仓库，尚未向其他项目发消息、创建 Issue 或提交 PR。
 
