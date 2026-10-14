@@ -8,9 +8,9 @@
 | 验收项 | 实现 | 通过条件 |
 | --- | --- | --- |
 | Raw 完整性 | WAL、sealed Segment、OSS Manifest/Checkpoint | complete；逐对象和逐行 SHA-256 通过 |
-| 云端来源 | Wire、OTLP logs、OTLP traces、required Hook | 四路均精确归属当前 Session；缺一路即拒绝 |
+| 云端来源 | Wire、OTLP logs、OTLP traces、required Hook | Session 与每个 Native Turn 均精确归属四路来源；缺一路即拒绝 |
 | Wire 完整性 | 18084 原字节 Capture | 请求/响应长度与 SHA 一致；Responses 有协议终态 |
-| Session 身份 | Stock Codex headers、OTLP、required Hook | 显式 `session_id`；start/end 闭合；无冲突 |
+| Session/Turn 身份 | Stock Codex headers、OTLP、required Hook | 显式 `session_id`/`turn_id`；Session start/end 闭合；每个 Turn 无 open/conflict/unscoped |
 | Runtime | `codex.tool_result` + lifecycle | 输出未截断；调度状态明确；Shell 进程结果独立；无 open/conflict span |
 | 调用关联 | ModelInteraction、RuntimeSpan、InteractionLink | call/result/execution 精确配对；内部父引用 100% |
 | Tool Schema | Responses Wire direct function tools | 每个被调用工具有 name、description、parameters |
@@ -28,7 +28,7 @@
 | --- | --- |
 | Relay/Collector | attempt 守恒，pending/inflight 为 0 |
 | Raw | Archive、Verify、Restore 全通过 |
-| Canonical | Schema 全通过，四源齐全，`delivery_ready=true` |
+| Canonical | Schema 全通过，四源齐全，每个 Turn 四源齐全，`delivery_ready=true` |
 | OTLP | 1 个 root，内部父引用解析率 100% |
 | Buyer v7 | 10 个有效轮次、5 个不同工具、5 份完整 Schema、配对率 100% |
 | Release | score 100、hard gate 全通过、1/1 eligible |
@@ -63,7 +63,9 @@ Collector 的连续 sealed Segment 建立 `complete` Raw Checkpoint，再通过�
 | Token | API 929,396；缓存输入 819,200；规范化语料 53,297；监督输出 11,820 |
 | 交付 | UTF-8 JSONL `tar.gz`、七阶段 Manifest 和 SHA-256 复验通过 |
 
-该结果证明当前源码能从 18084 的真实线上采集生成合格产物。持续生产可用性仍要求 18084、
+该结果证明当时的镜像和 v1 验收契约能从 18084 的真实线上采集生成合格产物。当前 v2
+新增逐 Turn 来源和未归属记录门禁；这些历史通过结果必须从原始 Raw 重验，不能作为 v2
+已经通过的证明。持续生产可用性仍要求 18084、
 Relay、Collector 健康、attempt 守恒，并对每条 Session 独立执行相同的 fail-closed 验收。
 
 同日接入复查发现旧产物缺少当前 Schema 的 `source_coverage`，旧采购包还使用历史

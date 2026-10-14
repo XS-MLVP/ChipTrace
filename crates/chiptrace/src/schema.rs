@@ -372,6 +372,7 @@ mod tests {
             "capture-v1.schema.json",
             "capture-v2.schema.json",
             "cloud-acceptance-v1.schema.json",
+            "cloud-acceptance-v2.schema.json",
             "gateway-enrichment-v1.schema.json",
             "interaction-link-v1.schema.json",
             "interaction-manifest-v1.schema.json",
@@ -384,6 +385,7 @@ mod tests {
             "raw-lineage-v1.schema.json",
             "session-v1.schema.json",
             "session-view-v1.schema.json",
+            "session-view-v2.schema.json",
             "runtime-span-v1.schema.json",
         ];
         for name in expected {

@@ -139,7 +139,8 @@ CI 使用隔离 MinIO 验证 S3 协议、对象长度和 SHA-256；真实 Alibab
   `stale_sources` 和 `source_lag_ms` 检查 Stock Codex 受管配置。
 - Relay `pending`、`inflight`、最老队列时间、磁盘空间和 attempt 守恒。
 - `output_truncated=true`、未知 OTLP 事件、转换错误和身份冲突。
-- Session start/end、模型调用/结果/执行、内部父引用的完整率。
+- Session start/end、模型调用/结果/执行、内部父引用的完整率；以及每个 Turn 的 Wire、
+  OTLP logs、OTLP traces、required Hook 覆盖和 `incomplete_turns`。
 - Buyer v7 失败原因、合格 Session 数和四种 Token 口径。
 
 网关 `/health` 的 `fullTraceCapture.currentDeliveryHealthy=true`、`outbox.pending=0`、
@@ -147,12 +148,21 @@ CI 使用隔离 MinIO 验证 S3 协议、对象长度和 SHA-256；真实 Alibab
 才表示当前 Wire 投递闭环可交接。`historicalFailures` 是启动前保留的审计证据，不应因
 数量非零而清理或把服务标成故障。旧版本在正文脱敏后可能留下过期的 body 长度/哈希；当前
 outbox 会在新写入和发送历史副本前按实际 UTF-8 正文幂等重算元数据，并保留已有的原文哈希。
+`outbox.openTransactions`、`outbox.oldestOpenAgeMs` 和 `outbox.staleOpenTransactions` 也必须
+纳入告警；长期 open 的流式 Capture 不是已交付证据，必须保留为未完成证据或完成最终化后
+再交付。
+宿主网关健康门禁必须要求 `outbox.openCaptureHealthy === true`；该值在超龄或缺少可验证
+open 时间的事务存在时为 false。router_v2 宿主使用 `FULL_TRACE_CAPTURE_HEALTH_MAX_OPEN_MS`
+配置期限，默认 30 分钟。新增模块和宿主检查只在进程重新加载后生效，修改挂载文件不等于部署。
 重放失败证据时只能复制到 `pending`（不要移动或删除 `failed` 原件），确认 Relay durable
 ACK 后再以 pending/processing 清零作为完成条件。
 
 生命周期 Hook 不是心跳。单个 Turn 超过 5 分钟且没有新的生命周期边界时，可能出现
 `stale_sources=["hooks"]`；这是需要核对的来源新鲜度告警，不单独证明数据丢失。
 应检查目标 Session 的起始 Hook、持续 OTLP，以及结束后的 `SessionEnd` 和投影完整性。
+Session 检查以 `session.delivery_ready`（及 inspect 顶层同名字段）作为完整 Turn 门禁，
+用 `unscoped_source_records` 定位无法归属的来源。Runtime `integrity.delivery_ready` 只证明
+Canonical Runtime/协议检查通过，不能覆盖原生 Turn 的缺失、未归属或未闭合状态。
 
 ## 回滚
 

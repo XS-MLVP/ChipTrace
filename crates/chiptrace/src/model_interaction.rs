@@ -247,10 +247,10 @@ pub(crate) fn summarize_raw_session(
     session: &str,
 ) -> Result<crate::session_view::SessionView> {
     let inputs = discover_inputs(inputs)?;
-    let (captures, _) = read_session_captures(&inputs, session)?;
+    let (captures, _, index) = read_session_captures_with_scopes(&inputs, session)?;
     let (mut captures, _, _) = select_projection_captures(captures, None, Some(session))?;
     sort_captures(&mut captures);
-    Ok(crate::session_view::summarize_session(&captures, session))
+    crate::session_view::summarize_session_with_scopes(&captures, session, Some(&index))
 }
 
 pub fn project_interactions(
@@ -276,12 +276,19 @@ pub fn project_interactions(
     if config.task_session_id.is_some() && config.session_id.is_some() {
         bail!("--task-session-id and --session-id cannot be used together");
     }
-    let (captures, duplicate_captures_removed) = if let Some(session) = &config.session_id {
-        read_session_captures(&inputs, session)?
+    let (captures, duplicate_captures_removed, global_scopes) = if let Some(session) =
+        &config.session_id
+    {
+        let (captures, duplicates, scopes) = read_session_captures_with_scopes(&inputs, session)?;
+        (captures, duplicates, Some(scopes))
     } else {
         let (mut captures, duplicates) = read_captures(&inputs)?;
         apply_exact_task_links(&mut captures)?;
-        (captures, duplicates)
+        let mut scopes = crate::turn_identity::ExactTurnIndex::default();
+        for capture in &captures {
+            scopes.observe_capture(capture)?;
+        }
+        (captures, duplicates, Some(scopes))
     };
     let (mut captures, task_session_id, session_id) = select_projection_captures(
         captures,
@@ -291,7 +298,14 @@ pub fn project_interactions(
     sort_captures(&mut captures);
     let session_view = session_id
         .as_deref()
-        .map(|session| crate::session_view::summarize_session(&captures, session));
+        .map(|session| {
+            crate::session_view::summarize_session_with_scopes(
+                &captures,
+                session,
+                global_scopes.as_ref(),
+            )
+        })
+        .transpose()?;
     let capture_records = captures.len() as u64;
     let source_coverage = cloud_source_coverage(&captures);
 
@@ -865,7 +879,16 @@ fn visit_captures(
     Ok(())
 }
 
+#[cfg(test)]
 fn read_session_captures(inputs: &[PathBuf], session: &str) -> Result<(Vec<Value>, u64)> {
+    let (captures, duplicates, _) = read_session_captures_with_scopes(inputs, session)?;
+    Ok((captures, duplicates))
+}
+
+fn read_session_captures_with_scopes(
+    inputs: &[PathBuf],
+    session: &str,
+) -> Result<(Vec<Value>, u64, crate::turn_identity::ExactTurnIndex)> {
     let session = session.trim();
     if session.is_empty() {
         bail!("--session-id cannot be empty");
@@ -874,6 +897,7 @@ fn read_session_captures(inputs: &[PathBuf], session: &str) -> Result<(Vec<Value
     let mut duplicates = 0_u64;
     let mut lineage = StockSessionLineage::default();
     let mut task_links = HashMap::new();
+    let mut turn_index = crate::turn_identity::ExactTurnIndex::default();
     let mut found = false;
     // Inspect the entire corpus for duplicate conflicts, exact links and child
     // lineage before retaining payloads. Unrelated sessions stay off the heap.
@@ -892,6 +916,7 @@ fn read_session_captures(inputs: &[PathBuf], session: &str) -> Result<(Vec<Value
         found |= trace_string(&capture, "session_id") == Some(session);
         lineage.observe(&capture)?;
         observe_exact_task_links(&capture, &mut task_links)?;
+        turn_index.observe_capture(&capture)?;
         Ok(())
     })?;
     if !found {
@@ -914,7 +939,12 @@ fn read_session_captures(inputs: &[PathBuf], session: &str) -> Result<(Vec<Value
         // Preserve ambiguity rejection even when the conflicting record belongs
         // to an unrelated session and will not be retained.
         apply_exact_task_link(&mut capture, &task_links)?;
-        if capture_matches_session(&capture, &selection) {
+        if capture_matches_session(&capture, &selection)
+            || turn_index
+                .capture_sessions(&capture)?
+                .iter()
+                .any(|s| selection.allows_session_id(s))
+        {
             captures.push(capture);
         }
         Ok(())
@@ -922,7 +952,7 @@ fn read_session_captures(inputs: &[PathBuf], session: &str) -> Result<(Vec<Value
     if visited.len() != seen.len() || repeated != duplicates {
         bail!("Capture inputs changed between Session selection scans");
     }
-    Ok((captures, duplicates))
+    Ok((captures, duplicates, turn_index))
 }
 
 fn select_projection_captures(
@@ -954,8 +984,10 @@ fn select_projection_captures(
         })
         .collect();
     let mut session_lineage = StockSessionLineage::default();
+    let mut turn_index = crate::turn_identity::ExactTurnIndex::default();
     for capture in &captures {
         session_lineage.observe(capture)?;
+        turn_index.observe_capture(capture)?;
     }
 
     if let Some(requested) = requested_task {
@@ -979,7 +1011,18 @@ fn select_projection_captures(
             bail!("session_id {requested:?} was not found in Capture inputs");
         }
         let selection = session_lineage.selection(requested)?;
-        captures.retain(|capture| capture_matches_session(capture, &selection));
+        let mut selected = Vec::new();
+        for capture in captures {
+            if capture_matches_session(&capture, &selection)
+                || turn_index
+                    .capture_sessions(&capture)?
+                    .iter()
+                    .any(|s| selection.allows_session_id(s))
+            {
+                selected.push(capture);
+            }
+        }
+        captures = selected;
         for capture in &mut captures {
             selection.canonicalize(capture)?;
         }
@@ -1004,7 +1047,18 @@ fn select_projection_captures(
         1 => {
             let selected = top_level_sessions.into_iter().next().unwrap_or_default();
             let selection = session_lineage.selection(&selected)?;
-            captures.retain(|capture| capture_matches_session(capture, &selection));
+            let mut selected_captures = Vec::new();
+            for capture in captures {
+                if capture_matches_session(&capture, &selection)
+                    || turn_index
+                        .capture_sessions(&capture)?
+                        .iter()
+                        .any(|s| selection.allows_session_id(s))
+                {
+                    selected_captures.push(capture);
+                }
+            }
+            captures = selected_captures;
             for capture in &mut captures {
                 selection.canonicalize(capture)?;
             }
@@ -7900,6 +7954,78 @@ mod tests {
         assert_eq!(manifest.input_records, 1);
         assert_eq!(manifest.interactions, 1);
         assert_eq!(verify_interaction_artifacts(&projection).unwrap(), manifest);
+    }
+
+    #[test]
+    fn native_otlp_session_scan_retains_traces_without_session_attributes() {
+        let mut wire = fixture_capture(
+            "native-scan-wire",
+            "/v1/responses",
+            true,
+            RESPONSES_STREAM_REQUEST,
+            RESPONSES_STREAM_RESPONSE,
+        );
+        wire["traceContext"] = json!({"session_id":"native-scan", "turn_id":"native-turn",
+            "trace_id":TRACE_ID,"parent_span_id":ROOT_SPAN_ID});
+        let raw = json!({"resourceSpans":[{"scopeSpans":[{"spans":[{
+            "name":"session_task.turn","traceId":TRACE_ID,"spanId":"2222222222222222",
+            "startTimeUnixNano":"1","endTimeUnixNano":"2",
+            "attributes":[{"key":"turn.id","value":{"stringValue":"native-turn"}}]
+        }]}]}]});
+        let batch = crate::cloud_ingest::prepare_cloud_ingest(
+            crate::cloud_ingest::CloudEndpoint::OtlpTraces,
+            &serde_json::to_vec(&raw).unwrap(),
+            1024 * 1024,
+        )
+        .unwrap();
+        assert!(batch.summary.conversion_errors.is_empty());
+        let raw: Value = serde_json::from_slice(&batch.records[0].canonical).unwrap();
+        assert!(!telemetry_batch_identities(&raw).1.contains("native-scan"));
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("native-otlp.jsonl");
+        fs::write(&input, format!("{raw}\n{wire}\n")).unwrap();
+        let (selected, _) = read_session_captures(&[input], "native-scan").unwrap();
+        assert_eq!(selected.len(), 2);
+        let (selected, _, _) =
+            select_projection_captures(selected, None, Some("native-scan")).unwrap();
+        assert_eq!(cloud_source_coverage(&selected).otlp_traces, 1);
+        let view = crate::session_view::summarize_session(&selected, "native-scan").unwrap();
+        assert_eq!(view.turns[0].source_coverage.otlp_traces, 1);
+        assert!(!view.delivery_ready);
+    }
+
+    #[test]
+    fn native_otlp_projection_preserves_global_turn_identity_ambiguity() {
+        let mut selected = fixture_capture(
+            "native-selected",
+            "/v1/responses",
+            true,
+            RESPONSES_STREAM_REQUEST,
+            RESPONSES_STREAM_RESPONSE,
+        );
+        selected["traceContext"] = json!({"session_id":"selected", "turn_id":"shared-turn"});
+        let mut other = selected.clone();
+        other["captureId"] = json!("cap-native-other");
+        other["traceContext"]["session_id"] = json!("other");
+        let raw = json!({"resourceSpans":[{"scopeSpans":[{"spans":[{
+            "name":"session_task.turn","traceId":"cccccccccccccccccccccccccccccccc","spanId":"2222222222222222",
+            "startTimeUnixNano":"1","endTimeUnixNano":"2",
+            "attributes":[{"key":"turn.id","value":{"stringValue":"shared-turn"}}]
+        }]}]}]});
+        let batch = crate::cloud_ingest::prepare_cloud_ingest(
+            crate::cloud_ingest::CloudEndpoint::OtlpTraces,
+            &serde_json::to_vec(&raw).unwrap(),
+            1024 * 1024,
+        )
+        .unwrap();
+        let raw: Value = serde_json::from_slice(&batch.records[0].canonical).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("ambiguous-turn.jsonl");
+        fs::write(&input, format!("{selected}\n{other}\n{raw}\n")).unwrap();
+        let view = summarize_raw_session(&[input], "selected").unwrap();
+        assert_eq!(view.turns[0].source_coverage.otlp_traces, 0);
+        assert_eq!(view.unscoped_source_records["otlp_traces"], 1);
+        assert!(!view.delivery_ready);
     }
 
     #[test]

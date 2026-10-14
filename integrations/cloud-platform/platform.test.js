@@ -68,6 +68,12 @@ test('HTTP service and SDK run the real CLI archive/restore/inspect/export path'
   const page = await client.getTurns('inspect-job', { offset: 0, limit: 1 });
   assert.equal(page.total, page.summary.native_turns);
   assert.equal(page.total, 5);
+  assert.equal(page.summary.schema_version, 'chiptrace.session-view.v2');
+  assert.equal(page.summary.turn_source_coverage_complete, true);
+  assert.equal(page.summary.incomplete_turns, 0);
+  assert.equal(page.summary.delivery_ready, true);
+  assert.deepEqual(page.summary.unscoped_source_records, {});
+  assert.ok(page.summary.turns === undefined);
   assert.equal(page.turns.length, Math.min(1, page.total));
   assert.equal(Object.prototype.hasOwnProperty.call(page.summary, 'turns'), false);
 

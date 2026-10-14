@@ -433,7 +433,10 @@ class ChipTracePlugin {
           '--session-id', request.session_id, '--release-id', request.release_id, '--output', output,
           '--minimum-score', '90', '--workers', '1', '--partitions', '16', ...usage]);
       }
-      if (result.delivery_ready !== true || result.hard_gate_pass !== true || result.score < 90
+      if (result.schema_version !== 'chiptrace.cloud-acceptance.v2'
+          || result.session_view?.schema_version !== 'chiptrace.session-view.v2'
+          || result.session_view?.delivery_ready !== true
+          || result.delivery_ready !== true || result.hard_gate_pass !== true || result.score < 90
           || result.archive_id !== request.archive_id || result.session_id !== request.session_id || result.release_id !== request.release_id) {
         throw new PlatformError('export does not match the requested accepted Session', 422, 'ACCEPTANCE_FAILED');
       }
@@ -460,7 +463,7 @@ class ChipTracePlugin {
     if (request.kind === 'restore') return result;
     await this.#phase(job, 'inspecting');
     const inspected = await this.#engine(['inspect-session', '--input', output, '--session-id', request.session_id]);
-    if (inspected.session?.session_id !== request.session_id || inspected.session.schema_version !== 'chiptrace.session-view.v1') {
+    if (inspected.session?.session_id !== request.session_id || inspected.session.schema_version !== 'chiptrace.session-view.v2') {
       throw new PlatformError('inspection does not match requested Session', 502, 'ENGINE_PROTOCOL');
     }
     return inspected;

@@ -87,13 +87,25 @@ that do not support that operation keep the previous output and require a new
 destination. Every restored directory retains `RAW_SOURCE.json`,
 `RAW_MANIFEST.json` and `RAW_CHECKPOINT.json`.
 
-`chiptrace.session-view.v1` reports native turns by explicit source Session and
-Turn IDs, model interactions, evidence record counts and open/closed/conflicted
-boundaries. Retry requests and tool captures cannot inflate native turns,
-`SessionStart(source=compact)` cannot start another epoch, and resumed Sessions
-need a new `SessionEnd`. Missing IDs remain unscoped. Buyer v7's
+`chiptrace.session-view.v2` reports native turns by explicit source Session and
+Turn IDs, model interactions, evidence record counts, open/closed/conflicted
+boundaries, and per-Turn Wire/OTLP logs/OTLP traces/Hook coverage. A Session is
+delivery-ready only when every Turn has all four sources, no Turn is open or
+conflicted, and no business evidence is unscoped. Retry requests and tool
+captures cannot inflate native turns, `SessionStart(source=compact)` cannot
+start another epoch, and resumed Sessions need a new `SessionEnd`. Missing IDs
+remain unscoped. Buyer v7's
 `effective_turns` is a separate procurement metric (user pairs plus paired
 required calls) and keeps its existing gate.
+
+`delivery_ready` on the Session view and inspection result combines source
+coverage, closed Session/Turn boundaries and zero unscoped records.
+`unscoped_source_records` identifies which sources still lack an exact Turn
+join. Native logs can join through the Wire's W3C context and observed span
+ancestry; blank IDs and ambiguous shared traces never join by time or order.
+Exports require `chiptrace.cloud-acceptance.v2`. Historical v1 manifests retain
+their original contract and must be reprocessed from original Raw to qualify
+for the current release.
 
 For a container image, build from the repository root:
 

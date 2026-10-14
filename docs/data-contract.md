@@ -99,7 +99,8 @@ Hook；它不把 OTLP trace 重写成第二套 Runtime 真相，缺一路时云�
 ## 原生 Session/Turn 统计
 
 `inspect-session` 和投影/验收 Manifest 中的 `session_view` 使用
-`chiptrace.session-view.v1`。其口径与采购评分分开：
+`chiptrace.session-view.v2`。其口径与采购评分分开；每个 Native Turn 都必须单独记录
+四路来源覆盖，不能用 Session 级别的全局计数替代：
 
 | 字段 | 统计口径 |
 | --- | --- |
@@ -108,11 +109,32 @@ Hook；它不把 OTLP trace 重写成第二套 Runtime 真相，缺一路时云�
 | `tool_execution_records` | 去重后的工具证据记录，pre/post Hook、OTLP 仍分别保留 |
 | `session_epochs` | SessionStart 事件，排除 `source=compact` |
 | `unscoped_turn_records` | 缺少显式 Turn 身份的交互、工具或 Turn 边界记录 |
+| `unscoped_source_records` | 上述未归属记录按 Wire、工具、生命周期、OTLP logs/traces 和 Hook 的计数；总和必须守恒 |
+| `turn.source_coverage` | 当前 Turn 的 Wire、OTLP logs、OTLP traces、required Hook 证据计数及缺失来源 |
+| `incomplete_turns` | 至少缺一路 Turn 来源、未闭合、冲突或缺少明确身份的 Turn 数 |
+| `delivery_ready` | 最新 Session epoch 已闭合；无 open/conflict/incomplete Turn、无未归属记录且四源完整 |
 | `effective_turns` | Buyer v7 的有效用户配对数加必需工具配对数 |
 
 新一轮 resume 需要自己的 SessionEnd；Stop 只闭合 Turn。冲突终态标记为 `conflict`，
 不能用模型响应的 `completed` 推断 Session 完成。平台 API 将 Turn 明细作为磁盘 JSONL
-保存并分页读取；采购验收会从已验证 Raw 重新计算并比对此统计。
+保存并分页读取；采购验收会从已验证 Raw 重新计算并比对此统计。`turn_source_coverage_complete=true`
+且 `incomplete_turns=0` 才能进入云端交付门禁。SessionStart/SessionEnd 本身没有 Turn ID
+时只作为 Session 边界，不会被错误分配到某个 Turn；缺少 Turn ID 的业务证据继续计入
+`unscoped_turn_records`。
+
+原生 OTLP 不要求重复附带所有身份属性。Turn 可通过原始 Wire 中的 W3C Trace Context、
+精确 Span/parentSpan 和原生 Turn ID 关联；同一 Trace 包含多个 Turn 时，必须有足够的
+Span 或显式身份消歧。全量快照中发现的身份歧义在 Session 选择后仍保留，不能因为其他
+Session 被移出载荷而宣称唯一。`thread.id` 是 OS 线程号，不是 Session 身份。
+空值、全零 Trace/Span ID、冲突别名和环形父关系不能成为关联证据；不按时间或记录顺序匹配。
+
+Turn 覆盖中的 Wire 是 Capture 数，OTLP logs/traces 是原始记录数，Hook 是原始批次中的
+事件数。派生生命周期和工具事件不重复计为 Hook。Session 级 `source_coverage` 的 OTLP
+数仍是批次数，两种统计不能直接相加或比较。
+
+当前交付契约为 `chiptrace.cloud-acceptance.v2`，必须包含完整的 `session-view.v2`。
+v1 Schema 保持历史定义；旧产物只能按其冻结的旧验证器进行历史复验。升级必须从同一份
+原始 Raw 重新运行全部验收，不能仅改版本字段、补写 Session 统计或沿用旧的通过标志。
 
 ## Tool Schema
 
@@ -175,5 +197,7 @@ Release 和最终归档。
 - `assessment-v2.schema.json`
 - `release-manifest-v1.schema.json`
 - `buyer-package-v1.schema.json`
-- `cloud-acceptance-v1.schema.json`
-- `session-view-v1.schema.json`
+- `cloud-acceptance-v1.schema.json`（历史格式）
+- `cloud-acceptance-v2.schema.json`
+- `session-view-v1.schema.json`（历史格式）
+- `session-view-v2.schema.json`

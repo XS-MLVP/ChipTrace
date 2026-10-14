@@ -1,11 +1,77 @@
 //! Native Session/Turn accounting, separate from Buyer-v7 effective rounds.
 
 use crate::lifecycle::LifecycleState;
+use crate::turn_identity::{ExactTurnIndex, session_attribute, turn_attribute, visit_otlp};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SESSION_VIEW_SCHEMA_VERSION: &str = "chiptrace.session-view.v1";
+pub const SESSION_VIEW_SCHEMA_VERSION: &str = "chiptrace.session-view.v2";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnSourceCoverage {
+    pub wire: u64,
+    pub otlp_logs: u64,
+    pub otlp_traces: u64,
+    pub hooks: u64,
+    pub missing_sources: Vec<String>,
+    pub complete: bool,
+}
+
+impl TurnSourceCoverage {
+    fn new() -> Self {
+        let mut coverage = Self {
+            wire: 0,
+            otlp_logs: 0,
+            otlp_traces: 0,
+            hooks: 0,
+            missing_sources: Vec::new(),
+            complete: false,
+        };
+        coverage.finalize();
+        coverage
+    }
+
+    fn observe(&mut self, source: &str) {
+        match source {
+            "wire" => self.wire = self.wire.saturating_add(1),
+            "otlp_logs" => self.otlp_logs = self.otlp_logs.saturating_add(1),
+            "otlp_traces" => self.otlp_traces = self.otlp_traces.saturating_add(1),
+            "hooks" => self.hooks = self.hooks.saturating_add(1),
+            _ => return,
+        }
+        self.finalize();
+    }
+
+    fn finalize(&mut self) {
+        self.missing_sources = [
+            ("wire", self.wire),
+            ("otlp_logs", self.otlp_logs),
+            ("otlp_traces", self.otlp_traces),
+            ("hooks", self.hooks),
+        ]
+        .into_iter()
+        .filter(|(_, count)| *count == 0)
+        .map(|(source, _)| source.to_owned())
+        .collect();
+        self.complete = self.missing_sources.is_empty();
+    }
+
+    fn is_consistent(&self) -> bool {
+        let expected: Vec<String> = [
+            ("wire", self.wire),
+            ("otlp_logs", self.otlp_logs),
+            ("otlp_traces", self.otlp_traces),
+            ("hooks", self.hooks),
+        ]
+        .into_iter()
+        .filter(|(_, count)| *count == 0)
+        .map(|(source, _)| source.to_owned())
+        .collect();
+        self.missing_sources == expected && self.complete == expected.is_empty()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TurnView {
@@ -21,6 +87,15 @@ pub struct TurnView {
     pub tool_execution_records: u64,
     pub state_conflict: bool,
     pub raw_capture_refs: BTreeSet<String>,
+    pub source_coverage: TurnSourceCoverage,
+}
+
+impl TurnView {
+    fn incomplete(&self) -> bool {
+        !self.source_coverage.complete
+            || !matches!(self.status.as_str(), "closed" | "cancelled")
+            || self.state_conflict
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,20 +110,35 @@ pub struct SessionView {
     pub closed_turns: u64,
     pub open_turns: u64,
     pub conflicted_turns: u64,
+    pub incomplete_turns: u64,
+    pub turn_source_coverage_complete: bool,
     pub unscoped_turn_records: u64,
+    pub unscoped_source_records: BTreeMap<String, u64>,
+    pub delivery_ready: bool,
     pub model_interactions: u64,
     pub tool_execution_records: u64,
     pub turns: Vec<TurnView>,
 }
 
 impl SessionView {
+    fn ready(&self) -> bool {
+        self.native_turns > 0
+            && self.latest_epoch_closed
+            && self.invalid_session_boundaries == 0
+            && self.open_turns == 0
+            && self.conflicted_turns == 0
+            && self.incomplete_turns == 0
+            && self.unscoped_turn_records == 0
+            && self.turn_source_coverage_complete
+    }
+
     pub(crate) fn validate(
         &self,
         session_id: Option<&str>,
         interactions: u64,
     ) -> anyhow::Result<()> {
         let schema: Value =
-            serde_json::from_str(include_str!("../../../schemas/session-view-v1.schema.json"))?;
+            serde_json::from_str(include_str!("../../../schemas/session-view-v2.schema.json"))?;
         let validator = jsonschema::draft202012::new(&schema)
             .map_err(|error| anyhow::anyhow!("compile Session/Turn schema: {error}"))?;
         if !validator.is_valid(&serde_json::to_value(self)?) {
@@ -69,6 +159,12 @@ impl SessionView {
                 .and_then(|v| v.checked_add(self.conflicted_turns))
                 != Some(self.native_turns)
             || self.model_interactions != interactions
+            || self.delivery_ready != self.ready()
+            || self
+                .unscoped_source_records
+                .values()
+                .try_fold(0_u64, |n, v| n.checked_add(*v))
+                != Some(self.unscoped_turn_records)
             || scoped_interactions.is_none_or(|total| total > self.model_interactions)
             || scoped_tools.is_none_or(|total| total > self.tool_execution_records)
             || self.open_turns != self.turns.iter().filter(|t| t.status == "open").count() as u64
@@ -80,6 +176,13 @@ impl SessionView {
                     .count() as u64
             || self.conflicted_turns
                 != self.turns.iter().filter(|t| t.state_conflict).count() as u64
+            || self.incomplete_turns != self.turns.iter().filter(|t| t.incomplete()).count() as u64
+            || self.turn_source_coverage_complete
+                != (self.native_turns > 0 && self.incomplete_turns == 0)
+            || self
+                .turns
+                .iter()
+                .any(|t| !t.source_coverage.is_consistent())
             || self.turns.iter().any(|t| {
                 (t.status == "conflict") != t.state_conflict
                     || (matches!(t.status.as_str(), "closed" | "cancelled")
@@ -119,22 +222,139 @@ fn source_session(capture: &Value) -> Option<&str> {
         .or_else(|| string(capture, "/traceContext/session_id"))
 }
 
+#[derive(Debug, Clone)]
+struct SourceObservation {
+    source: &'static str,
+    session_id: Option<String>,
+    turn_id: Option<String>,
+    occurred_at: Option<String>,
+    requires_turn: bool,
+    related_sessions: BTreeSet<String>,
+}
+
+fn nonempty_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+}
+
+fn first_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| nonempty_string(value.get(*key)))
+}
+
+fn source_observations(capture: &Value, index: &ExactTurnIndex) -> Result<Vec<SourceObservation>> {
+    if string(capture, "/recordType") != Some("telemetry_batch") {
+        return Ok(Vec::new());
+    }
+    let endpoint = string(capture, "/telemetryBatch/endpoint");
+    let Some(raw) = string(capture, "/telemetryBatch/raw_json")
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+    else {
+        return Ok(Vec::new());
+    };
+    match endpoint {
+        Some("codex_hook") => {
+            let event_name = first_string(&raw, &["hook_event_name"]);
+            let requires_turn = event_name
+                .as_deref()
+                .is_some_and(|event| !matches!(event, "SessionStart" | "SessionEnd"));
+            Ok(vec![SourceObservation {
+                source: "hooks",
+                session_id: first_string(&raw, &["session_id", "sessionId"]),
+                turn_id: first_string(&raw, &["turn_id", "turnId", "root_turn_id", "rootTurnId"]),
+                occurred_at: first_string(&raw, &["occurred_at", "occurredAt", "timestamp"]),
+                requires_turn,
+                related_sessions: BTreeSet::new(),
+            }])
+        }
+        Some("otlp_logs" | "otlp_traces") => {
+            let mut output = Vec::new();
+            visit_otlp(capture, |source, record, attributes| {
+                let event_name = if source == "otlp_logs" {
+                    attributes.get("event.name").cloned()
+                } else {
+                    nonempty_string(record.get("name"))
+                };
+                let exempt = matches!(
+                    event_name.as_deref(),
+                    Some(
+                        "codex.conversation_starts"
+                            | "codex.startup_phase"
+                            | "codex.websocket_connect"
+                            | "codex.websocket_request"
+                            | "codex.auth_recovery"
+                            | "codex.agent_communication"
+                            | "codex.session"
+                            | "session"
+                    )
+                );
+                let identity = index.resolve(record, &attributes)?;
+                let related_sessions = index.record_sessions(record, &attributes)?;
+                let session_id = identity
+                    .as_ref()
+                    .map(|(s, _)| s.clone())
+                    .or(session_attribute(&attributes)?)
+                    .or_else(|| {
+                        (related_sessions.len() == 1)
+                            .then(|| related_sessions.first().unwrap().clone())
+                    });
+                let turn_id = identity.map(|(_, t)| t).or(turn_attribute(&attributes)?);
+                output.push(SourceObservation {
+                    source,
+                    session_id,
+                    turn_id,
+                    occurred_at: first_string(record, &["timeUnixNano", "observedTimeUnixNano"]),
+                    requires_turn: !exempt,
+                    related_sessions,
+                });
+                Ok(())
+            })?;
+            Ok(output)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 /// Call with deduplicated, chronologically ordered captures selected by the
 /// canonical exact-ID join. Repeated model requests never create extra turns.
-pub(crate) fn summarize_session(captures: &[Value], session_id: &str) -> SessionView {
+#[cfg(test)]
+pub(crate) fn summarize_session(captures: &[Value], session_id: &str) -> Result<SessionView> {
+    summarize_session_with_scopes(captures, session_id, None)
+}
+
+pub(crate) fn summarize_session_with_scopes(
+    captures: &[Value],
+    session_id: &str,
+    global: Option<&ExactTurnIndex>,
+) -> Result<SessionView> {
+    let mut index = ExactTurnIndex::for_turns();
+    if let Some(global) = global {
+        index.include_global_scopes(global);
+    }
+    for capture in captures {
+        index.observe_capture(capture)?;
+    }
+    let allowed_sessions: BTreeSet<_> = captures
+        .iter()
+        .filter(|capture| string(capture, "/recordType") != Some("telemetry_batch"))
+        .filter_map(source_session)
+        .chain(std::iter::once(session_id))
+        .collect();
     let mut lifecycle = LifecycleState::new("stock_codex_hook");
     let mut turns: BTreeMap<(String, String), TurnView> = BTreeMap::new();
     let mut terminal_statuses: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     let mut unscoped_turn_records = 0;
+    let mut unscoped_source_records = BTreeMap::new();
     let mut model_interactions = 0;
     let mut tool_execution_records = 0;
     for capture in captures {
         let capture_id = string(capture, "/captureId").unwrap_or("missing");
-        let source_session = source_session(capture).unwrap_or(session_id);
+        let source_session = source_session(capture);
         let hook = string(capture, "/lifecycleEvent/source_event_name");
         let compact = string(capture, "/lifecycleEvent/source_event/source")
             .is_some_and(|value| value.eq_ignore_ascii_case("compact"));
-        if source_session == session_id {
+        if source_session == Some(session_id) {
             match hook {
                 Some("SessionStart") if !compact => {
                     lifecycle.observe_event("session_start", capture_id, true);
@@ -162,17 +382,27 @@ pub(crate) fn summarize_session(captures: &[Value], session_id: &str) -> Session
         let native_turn_id = string(capture, "/traceContext/turn_id")
             .or_else(|| string(capture, "/lifecycleEvent/source_event/turn_id"));
         let root_turn_id = string(capture, "/traceContext/root_turn_id");
-        let Some(turn_id) = native_turn_id.or(root_turn_id) else {
+        let mut attributes = BTreeMap::new();
+        if let Some(session) = source_session {
+            attributes.insert("session.id".to_owned(), session.to_owned());
+        }
+        if let Some(turn) = native_turn_id.or(root_turn_id) {
+            attributes.insert("turn.id".to_owned(), turn.to_owned());
+        }
+        let context = serde_json::json!({"traceId":capture.pointer("/traceContext/trace_id"), "spanId":capture.pointer("/traceContext/parent_span_id")});
+        let Some(key) = index.resolve(&context, &attributes)? else {
             unscoped_turn_records += 1;
+            *unscoped_source_records
+                .entry(if is_wire { "wire" } else { kind }.to_owned())
+                .or_insert(0) += 1;
             continue;
         };
-        let key = (source_session.to_owned(), turn_id.to_owned());
         let time = string(capture, "/lifecycleEvent/occurred_at")
             .or_else(|| string(capture, "/startedAt"))
             .or_else(|| string(capture, "/receivedAt"));
         let turn = turns.entry(key.clone()).or_insert_with(|| TurnView {
-            session_id: source_session.to_owned(),
-            turn_id: turn_id.to_owned(),
+            session_id: key.0.clone(),
+            turn_id: key.1.clone(),
             root_turn_id: root_turn_id.map(str::to_owned),
             started_at: time.map(str::to_owned),
             finished_at: None,
@@ -183,6 +413,7 @@ pub(crate) fn summarize_session(captures: &[Value], session_id: &str) -> Session
             tool_execution_records: 0,
             state_conflict: false,
             raw_capture_refs: BTreeSet::new(),
+            source_coverage: TurnSourceCoverage::new(),
         });
         if let Some(root) = root_turn_id {
             if turn
@@ -198,6 +429,11 @@ pub(crate) fn summarize_session(captures: &[Value], session_id: &str) -> Session
         turn.raw_capture_refs.insert(capture_id.to_owned());
         turn.model_interactions += u64::from(is_wire);
         turn.tool_execution_records += u64::from(is_tool);
+        if is_wire {
+            turn.source_coverage.observe("wire");
+        }
+        // Hook coverage counts the durable original batch only. The derived
+        // lifecycle/tool record remains boundary evidence, not another Hook.
         if is_start {
             // A second start for the same native identity after a terminal is
             // a conflicting boundary, not an invented second turn.
@@ -218,6 +454,60 @@ pub(crate) fn summarize_session(captures: &[Value], session_id: &str) -> Session
             turn.status = status.to_owned();
         }
     }
+
+    for capture in captures {
+        let capture_id = string(capture, "/captureId").unwrap_or("missing");
+        for observation in source_observations(capture, &index)? {
+            if observation.session_id.is_none()
+                && observation.requires_turn
+                && observation
+                    .related_sessions
+                    .iter()
+                    .any(|s| allowed_sessions.contains(s.as_str()))
+            {
+                unscoped_turn_records += 1;
+                *unscoped_source_records
+                    .entry(observation.source.to_owned())
+                    .or_insert(0) += 1;
+                continue;
+            }
+            if !observation
+                .session_id
+                .as_deref()
+                .is_some_and(|s| allowed_sessions.contains(s))
+            {
+                continue;
+            }
+            let Some(turn_id) = observation.turn_id else {
+                if observation.requires_turn {
+                    unscoped_turn_records += 1;
+                    *unscoped_source_records
+                        .entry(observation.source.to_owned())
+                        .or_insert(0) += 1;
+                }
+                continue;
+            };
+            let source_session = observation.session_id.unwrap();
+            let key = (source_session.clone(), turn_id.clone());
+            let turn = turns.entry(key).or_insert_with(|| TurnView {
+                session_id: source_session,
+                turn_id,
+                root_turn_id: None,
+                started_at: observation.occurred_at.clone(),
+                finished_at: None,
+                status: "open".to_owned(),
+                start_events: 0,
+                terminal_events: 0,
+                model_interactions: 0,
+                tool_execution_records: 0,
+                state_conflict: false,
+                raw_capture_refs: BTreeSet::new(),
+                source_coverage: TurnSourceCoverage::new(),
+            });
+            turn.raw_capture_refs.insert(capture_id.to_owned());
+            turn.source_coverage.observe(observation.source);
+        }
+    }
     for (key, turn) in &mut turns {
         turn.state_conflict |= terminal_statuses
             .get(key)
@@ -229,7 +519,8 @@ pub(crate) fn summarize_session(captures: &[Value], session_id: &str) -> Session
     let turns: Vec<_> = turns.into_values().collect();
     let open_turns = turns.iter().filter(|t| t.status == "open").count() as u64;
     let conflicted_turns = turns.iter().filter(|t| t.state_conflict).count() as u64;
-    SessionView {
+    let incomplete_turns = turns.iter().filter(|turn| turn.incomplete()).count() as u64;
+    let mut view = SessionView {
         schema_version: SESSION_VIEW_SCHEMA_VERSION.to_owned(),
         session_id: session_id.to_owned(),
         session_epochs: lifecycle.start_count,
@@ -240,11 +531,17 @@ pub(crate) fn summarize_session(captures: &[Value], session_id: &str) -> Session
         closed_turns: turns.len() as u64 - open_turns - conflicted_turns,
         open_turns,
         conflicted_turns,
+        incomplete_turns,
+        turn_source_coverage_complete: !turns.is_empty() && incomplete_turns == 0,
         unscoped_turn_records,
+        unscoped_source_records,
+        delivery_ready: false,
         model_interactions,
         tool_execution_records,
         turns,
-    }
+    };
+    view.delivery_ready = view.ready();
+    Ok(view)
 }
 
 #[cfg(test)]
@@ -255,6 +552,131 @@ mod tests {
     fn boundary(id: &str, hook: &str, source: &str) -> Value {
         json!({"captureId":id,"recordType":"lifecycle_event", "traceContext":{"session_id":"s"},
             "lifecycleEvent":{"source_event_name":hook,"source_event":{"session_id":"s","source":source}}})
+    }
+
+    fn telemetry(id: &str, endpoint: &str, raw: Value) -> Value {
+        json!({"captureId":id,"recordType":"telemetry_batch","telemetryBatch":{
+            "endpoint":endpoint,"raw_json":serde_json::to_string(&raw).unwrap()
+        }})
+    }
+
+    #[test]
+    fn native_otlp_unscoped_logs_keep_a_four_source_session_unready() {
+        // Field layout observed in the 2026-09-05 Stock Codex canary: native
+        // tool logs have W3C context, while SSE diagnostic logs may have none.
+        let trace = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut captures = vec![
+            boundary("start", "SessionStart", "startup"),
+            boundary("end", "SessionEnd", ""),
+        ];
+        captures.push(
+            json!({"captureId":"wire","recordType":"api_snapshot","traceContext":{
+                "session_id":"s","turn_id":"t","trace_id":trace,"parent_span_id":"1111111111111111"
+            }}),
+        );
+        captures.push(telemetry(
+            "logs",
+            "otlp_logs",
+            json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[
+                {"traceId":trace,"spanId":"1111111111111111","attributes":[
+                    {"key":"event.name","value":{"stringValue":"codex.tool_result"}},
+                    {"key":"conversation.id","value":{"stringValue":"s"}}
+                ]},
+                {"traceId":"","spanId":"","attributes":[
+                    {"key":"event.name","value":{"stringValue":"codex.sse_event"}},
+                    {"key":"conversation.id","value":{"stringValue":"s"}}
+                ]}
+            ]}]}]}),
+        ));
+        captures.push(telemetry(
+            "traces",
+            "otlp_traces",
+            json!({"resourceSpans":[{"scopeSpans":[{"spans":[{
+                "name":"session_task.turn","traceId":trace,"spanId":"2222222222222222",
+                "attributes":[{"key":"turn.id","value":{"stringValue":"t"}}]
+            }]}]}]}),
+        ));
+        captures.push(telemetry(
+            "hook",
+            "codex_hook",
+            json!({"hook_event_name":"Stop","session_id":"s","turn_id":"t"}),
+        ));
+        captures.push(json!({"captureId":"stop","recordType":"lifecycle_event","traceContext":{"session_id":"s","turn_id":"t"},"lifecycleEvent":{"type":"turn_stop","source_event_name":"Stop"}}));
+        let view = summarize_session(&captures, "s").unwrap();
+        assert!(view.turn_source_coverage_complete);
+        assert_eq!(view.turns[0].source_coverage.hooks, 1);
+        assert_eq!(
+            view.unscoped_source_records,
+            BTreeMap::from([("otlp_logs".to_owned(), 1)])
+        );
+        assert!(!view.delivery_ready);
+        view.validate(Some("s"), 1).unwrap();
+    }
+
+    #[test]
+    fn unnamed_otlp_records_are_not_exempt_from_turn_accounting() {
+        let session_attribute = json!({"key":"conversation.id","value":{"stringValue":"s"}});
+        let captures = vec![
+            telemetry(
+                "unnamed-log",
+                "otlp_logs",
+                json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[{
+                    "attributes":[session_attribute.clone()]
+                }]}]}]}),
+            ),
+            telemetry(
+                "unnamed-span",
+                "otlp_traces",
+                json!({"resourceSpans":[{"scopeSpans":[{"spans":[{
+                    "attributes":[session_attribute]
+                }]}]}]}),
+            ),
+        ];
+        let view = summarize_session(&captures, "s").unwrap();
+        assert_eq!(view.unscoped_turn_records, 2);
+        assert_eq!(
+            view.unscoped_source_records,
+            BTreeMap::from([("otlp_logs".to_owned(), 1), ("otlp_traces".to_owned(), 1)])
+        );
+        assert!(!view.delivery_ready);
+        view.validate(Some("s"), 0).unwrap();
+    }
+
+    #[test]
+    fn native_otlp_child_session_sources_do_not_borrow_parent_coverage() {
+        let mut captures = vec![
+            boundary("start", "SessionStart", "startup"),
+            boundary("end", "SessionEnd", ""),
+        ];
+        for session in ["s", "child"] {
+            captures.push(
+                json!({"captureId":format!("wire-{session}"),"recordType":"api_snapshot",
+                "traceContext":{"session_id":"s","source_session_id":session,"turn_id":"t"}}),
+            );
+            captures.push(json!({"captureId":format!("stop-{session}"),"recordType":"lifecycle_event",
+                "traceContext":{"session_id":"s","source_session_id":session,"turn_id":"t"},"lifecycleEvent":{"type":"turn_stop"}}));
+            captures.push(telemetry(
+                &format!("hook-{session}"),
+                "codex_hook",
+                json!({"hook_event_name":"Stop","session_id":session,"turn_id":"t"}),
+            ));
+            let attributes = json!([
+                {"key":"conversation.id","value":{"stringValue":session}},
+                {"key":"turn.id","value":{"stringValue":"t"}}
+            ]);
+            captures.push(telemetry(&format!("log-{session}"),"otlp_logs",json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":attributes}]}]}]})));
+            if session == "s" {
+                captures.push(telemetry("trace-root","otlp_traces",json!({"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"codex.turn","attributes":attributes}]}]}]})));
+            }
+        }
+        let view = summarize_session(&captures, "s").unwrap();
+        assert_eq!(view.native_turns, 2);
+        assert_eq!(view.incomplete_turns, 1);
+        let child = view.turns.iter().find(|t| t.session_id == "child").unwrap();
+        assert_eq!(child.source_coverage.missing_sources, ["otlp_traces"]);
+        assert_eq!(child.source_coverage.hooks, 1);
+        assert!(!view.delivery_ready);
+        view.validate(Some("s"), 2).unwrap();
     }
 
     #[test]
@@ -270,7 +692,7 @@ mod tests {
         captures.push(json!({"captureId":"stop","recordType":"lifecycle_event",
             "traceContext":{"session_id":"s","turn_id":"t"},"lifecycleEvent":{"type":"turn_stop"}}));
         captures.push(boundary("end", "SessionEnd", ""));
-        let view = summarize_session(&captures, "s");
+        let view = summarize_session(&captures, "s").unwrap();
         assert_eq!(
             (view.session_epochs, view.native_turns, view.closed_turns),
             (1, 1, 1)
@@ -294,12 +716,16 @@ mod tests {
             boundary("s2", "SessionStart", "resume"),
             json!({"captureId":"wire","recordType":"api_snapshot","traceContext":{"session_id":"s"}}),
         ];
-        let open = summarize_session(&captures, "s");
+        let open = summarize_session(&captures, "s").unwrap();
         assert_eq!((open.session_epochs, open.closed_session_epochs), (2, 1));
         assert!(!open.latest_epoch_closed);
         assert_eq!((open.native_turns, open.unscoped_turn_records), (0, 1));
         captures.push(boundary("e2", "SessionEnd", ""));
-        assert!(summarize_session(&captures, "s").latest_epoch_closed);
+        assert!(
+            summarize_session(&captures, "s")
+                .unwrap()
+                .latest_epoch_closed
+        );
     }
 
     #[test]
@@ -310,11 +736,72 @@ mod tests {
             json!({"captureId":"stop","recordType":"lifecycle_event","traceContext":{"session_id":"s","turn_id":"t"},"lifecycleEvent":{"type":"turn_stop"}}),
             json!({"captureId":"cancel","recordType":"lifecycle_event","traceContext":{"session_id":"s","turn_id":"t"},"lifecycleEvent":{"type":"turn_interrupt"}}),
         ];
-        let view = summarize_session(&captures, "s");
+        let view = summarize_session(&captures, "s").unwrap();
         assert_eq!(
             (view.native_turns, view.open_turns, view.conflicted_turns),
             (2, 1, 1)
         );
         assert_eq!(view.closed_turns, 0);
+    }
+
+    #[test]
+    fn every_native_turn_requires_all_four_source_observations() {
+        let telemetry = |id: &str, endpoint: &str, raw: Value| {
+            json!({
+                "captureId":id,
+                "recordType":"telemetry_batch",
+                "telemetryBatch":{"endpoint":endpoint,"raw_json":serde_json::to_string(&raw).unwrap()}
+            })
+        };
+        let wire = json!({
+            "captureId":"wire",
+            "recordType":"api_snapshot",
+            "traceContext":{"session_id":"s","turn_id":"t"}
+        });
+        let logs = telemetry(
+            "logs",
+            "otlp_logs",
+            json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[
+                {"key":"event.name","value":{"stringValue":"codex.tool_result"}},
+                {"key":"conversation.id","value":{"stringValue":"s"}},
+                {"key":"turn.id","value":{"stringValue":"t"}}
+            ]}]}]}]}),
+        );
+        let traces = telemetry(
+            "traces",
+            "otlp_traces",
+            json!({"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"codex.turn","attributes":[
+                {"key":"conversation.id","value":{"stringValue":"s"}},
+                {"key":"turn.id","value":{"stringValue":"t"}}
+            ]}]}]}]}),
+        );
+        let hook = telemetry(
+            "hook",
+            "codex_hook",
+            json!({"hook_event_name":"Stop","session_id":"s","turn_id":"t"}),
+        );
+        let end = json!({
+            "captureId":"end",
+            "recordType":"lifecycle_event",
+            "traceContext":{"session_id":"s","turn_id":"t"},
+            "lifecycleEvent":{"type":"turn_end","source_event_name":"Stop"}
+        });
+        let complete =
+            summarize_session(&[wire.clone(), logs, traces, hook, end.clone()], "s").unwrap();
+        assert!(complete.turn_source_coverage_complete);
+        assert_eq!(complete.incomplete_turns, 0);
+        assert_eq!(complete.turns[0].source_coverage.hooks, 1);
+        assert_eq!(
+            complete.turns[0].source_coverage.missing_sources,
+            Vec::<String>::new()
+        );
+
+        let incomplete = summarize_session(&[wire, end], "s").unwrap();
+        assert!(!incomplete.turn_source_coverage_complete);
+        assert_eq!(incomplete.incomplete_turns, 1);
+        assert_eq!(
+            incomplete.turns[0].source_coverage.missing_sources,
+            ["otlp_logs", "otlp_traces", "hooks"]
+        );
     }
 }

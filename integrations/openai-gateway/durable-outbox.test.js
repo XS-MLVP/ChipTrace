@@ -389,6 +389,43 @@ test('two-phase capture durably starts before streaming and finalizes exact Wire
   }
 });
 
+test('open streamed captures expose age and stale transaction count', async () => {
+  const root = temporaryRoot();
+  const outbox = new DurableCaptureOutbox({ root, relayUrl: '', maxOpenAgeMs: 1000 });
+  try {
+    await outbox.start();
+    const transaction = await outbox.beginCapture({
+      captureId: 'cap-stale-open',
+      sourceNamespace: 'gateway-test',
+      method: 'POST',
+      proxiedPath: '/v1/responses',
+    });
+    const metadataPath = path.join(root, 'open', 'cap-stale-open.open.json');
+    const metadata = JSON.parse(await fsp.readFile(metadataPath, 'utf8'));
+    metadata.captureTransaction.openedAt = new Date(Date.now() - 5000).toISOString();
+    await fsp.writeFile(metadataPath, `${JSON.stringify(metadata)}\n`);
+    await outbox.refreshQueueStats();
+    const snapshot = outbox.snapshot();
+    assert.equal(snapshot.openTransactions, 1);
+    assert.equal(snapshot.staleOpenTransactions, 1);
+    assert.equal(snapshot.openCaptureHealthy, false);
+    assert.ok(snapshot.oldestOpenAgeMs >= 5000);
+    await transaction.finalize({
+      finishedAt: new Date().toISOString(),
+      responseStatus: 200,
+      responseBodyText: '{}',
+      upstreamResponseCompleted: true,
+      clientResponseFinished: true,
+    });
+    assert.equal(outbox.snapshot().staleOpenTransactions, 0);
+    assert.equal(outbox.snapshot().oldestOpenAt, null);
+    assert.equal(outbox.snapshot().openCaptureHealthy, true);
+  } finally {
+    await outbox.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('restart converts an open streamed capture into explicit incomplete evidence', async () => {
   const root = temporaryRoot();
   const first = new DurableCaptureOutbox({ root, relayUrl: '', maxAttempts: 20 });

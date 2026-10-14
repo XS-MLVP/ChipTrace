@@ -1,6 +1,6 @@
 # 平台接入维护与验收
 
-本轮维护补齐 FS/OSS/S3 的磁盘恢复、原生 Session/Turn 统计和服务端平台插件。
+本轮维护补齐 FS/OSS/S3 的磁盘恢复、逐 Turn 四源覆盖校验、原生 Session/Turn 统计和服务端平台插件。
 一次请求只确认磁盘中已保存的任务，随后由独立 CLI 子进程执行归档、恢复、检查或采购验收。
 业务采集入口仍是网关、Relay 和 Collector；平台插件提供异步管理与交付 API。
 
@@ -12,10 +12,10 @@ HTTP transport：原先 FS 自测可通过，而 OSS/S3 在发送前返回 Confi
 
 2026-10-14 在隔离环境执行，未修改线上 18084 或生产 WAL/OSS：
 
-- Rust 1.91：239 个库测试和 1 个 CLI 测试通过；fmt、Clippy `-D warnings` 通过。
-- Stock Codex 配置、网关 durable outbox：25 个 Node 测试通过。
-- 平台 HTTP/SDK：真实 CLI 四源采集 fixture，归档、恢复、分页 Turn、usage 注册、
-  Buyer 导出与下载哈希通过。fixture 中 5 个原生 Turn、10 个采购有效轮次、分数 100。
+- Rust 1.91：250 个库测试和 1 个 CLI 测试通过；fmt、Clippy `-D warnings` 通过。
+- Stock Codex 配置、网关 durable outbox：26 个 Node 测试通过。
+- 平台 HTTP/SDK：真实 CLI 四源采集 fixture，归档、恢复、分页 Turn、逐 Turn 四源覆盖、
+  usage 注册、Buyer 导出与下载哈希通过。fixture 中 5 个原生 Turn、10 个采购有效轮次、分数 100。
 - 故障测试覆盖非零引擎退出、重启重排队、ID 冲突、UTF-8、请求上限、单写者锁、
   锁丢失、任务 ACK 写盘失败、历史容量限制和 Turn 文件篡改。
 - OSS 使用带 V1 签名检查的 HTTP 协议 fixture，校验不可覆盖写入、Checkpoint 最后提交、
@@ -38,10 +38,36 @@ MinIO 公共容器标签的远端拉取已返回 access denied；CI 因此从固
    服务令牌只在后端使用；不要把 OSS 密钥下发给插件调用者。
 4. 在目标 OSS/S3 账号先验收小 Archive：上传、verify、恢复、离线 verify、Session 检查和
    Buyer 导出下载，保存真实 endpoint、IAM 结果和镜像 ID。
-5. 先隔离 Stock Codex canary，再升级线上镜像。验收目标 Session 的四源与显式结束边界，
-   同时检查 outbox/Relay 排空；全局 health 不能证明每个 Session 可交付。
+5. 先隔离 Stock Codex canary，再升级线上镜像。验收目标 Session 的每个 Turn 都有四源和
+   显式结束边界，同时检查 outbox/Relay 排空；全局 health 不能证明每个 Session 可交付。
 
-后续优先迭代：基于 Session 索引减少两遍全量扫描；按项目设置磁盘配额和确认后的保留周期；
+后续优先迭代：基于 Session/Turn 索引减少两遍全量扫描；按项目设置磁盘配额和确认后的保留周期；
 在主平台完成多租户授权、计费与审计；扩大到真实并发与较大 Archive 的压力测试。
 当前 Turn 分页的内存受页面约束，但每页会扫描并校验整份 sidecar；任务历史有上限，
 导出目录独立保留 Raw，因此上线前仍需安排磁盘容量和保留策略。
+
+## 真实字段回归与当前缺口
+
+2026-10-14 从保留的 2026-09-05 Stock Codex 原始 sealed Canary 只读重放：
+1 个原生 Turn 闭合；Wire 4、精确归属的 OTLP logs 12、OTLP spans 823、不同 Hook 2。
+原生日志没有直接的 Turn 属性，Trace/Span 精确关联恢复了这部分证据；没有人为补写原始 ID。
+仍有 294 条日志、66 个 span 无法精确归属，`unscoped_turn_records=360`，因此 Session 和
+inspect 顶层 `delivery_ready=false`。四源存在和 Runtime 投影通过不能替代完整 Turn 交付。
+这些无 ID 记录继续保留在 Raw；后续需要补齐来源端上下文或取得同源精确关联证据。
+
+CI 的原生字段回归涵盖缺少 Turn 属性、无 Session 属性的 traces、共享 Trace、子 Session、
+全局身份歧义、全零 ID、冲突别名、父关系环和未归属记录，均不采用时间窗口推断。
+同一精确 Span 的不同 Session/Turn 身份必须拒绝，单条日志的显式属性不能覆盖该冲突；
+没有事件名的原始日志和 span 仍参与未归属计数，不能因名字缺失而隐式豁免。
+自测的 Turn Hook 数严格为 1；真实 Canary 的 UserPromptSubmit/Stop 则是两个不同事件。
+新版云验收使用 `cloud-acceptance.v2`，v1 Schema 保留原定义，旧通过产物不会自动升级。
+
+宿主网关还须使用 `openCaptureHealthy` 门禁。独立部署 smoke：
+
+```bash
+CHIPTRACE_GATEWAY_SCRIPT=/absolute/path/to/server.js make gateway-host-test
+```
+
+该测试启动临时网关、Provider 和 Relay，保留超过配置期限的流式请求，验证真实 `/health`
+变为 `degraded`，不接触生产队列。宿主源码不随 ChipTrace 发布，公共 CI 覆盖 outbox 模块，
+目标网关部署前必须运行上述宿主测试；不能用模块通过代替宿主已部署。

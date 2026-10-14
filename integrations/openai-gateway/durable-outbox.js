@@ -694,6 +694,7 @@ class DurableCaptureOutbox {
     );
     this.maxAttempts = positiveInteger(options.maxAttempts, 25, 20, 128);
     this.timeoutMs = positiveInteger(options.timeoutMs, 30000, 1, 300000);
+    this.maxOpenAgeMs = positiveInteger(options.maxOpenAgeMs, 30 * 60 * 1000, 1000, 7 * 24 * 60 * 60 * 1000);
     this.retryBaseMs = positiveInteger(options.retryBaseMs, 250, 10, 60000);
     this.retryMaxMs = positiveInteger(options.retryMaxMs, 5000, this.retryBaseMs, 300000);
     this.retryJitterPercent = positiveInteger(options.retryJitterPercent, 20, 0, 50);
@@ -719,6 +720,9 @@ class DurableCaptureOutbox {
       openTransactions: 0,
       openFiles: 0,
       openBytes: 0,
+      oldestOpenAt: null,
+      oldestOpenAgeMs: 0,
+      staleOpenTransactions: 0,
       failedFiles: 0,
       auxiliaryFiles: 0,
       // Files already present when the process starts are retained audit
@@ -754,6 +758,7 @@ class DurableCaptureOutbox {
     this.filesystemCheckedAtMs = 0;
     this.attemptsByFile = new Map();
     this.queuedAtByName = new Map();
+    this.openAtByName = new Map();
     this.openCaptures = new Map();
   }
 
@@ -938,6 +943,7 @@ class DurableCaptureOutbox {
     await atomicWrite(files.metadata, bytes);
     const transaction = new DurableCaptureTransaction(this, baseRecord, files, options, bytes.length);
     this.openCaptures.set(captureId, transaction);
+    this.openAtByName.set(path.basename(files.metadata), Date.parse(openedAt));
     this.metrics.openTransactions += 1;
     this.metrics.openFiles += 1;
     this.metrics.openBytes += bytes.length;
@@ -949,6 +955,7 @@ class DurableCaptureOutbox {
     if (this.openCaptures.get(transaction.captureId) === transaction) {
       this.openCaptures.delete(transaction.captureId);
     }
+    this.openAtByName.delete(path.basename(transaction.files.metadata));
     this.metrics.openTransactions = Math.max(0, this.metrics.openTransactions - 1);
     this.metrics.openFiles = Math.max(0, this.metrics.openFiles - files);
     this.metrics.openBytes = Math.max(0, this.metrics.openBytes - bytes);
@@ -997,6 +1004,7 @@ class DurableCaptureOutbox {
     let openFiles = 0;
     let openBytes = 0;
     let openTransactions = 0;
+    const openAtByName = new Map();
     const queuedAtByName = new Map();
     for (const [directory, kind] of [
       [this.pendingDir, 'pending'],
@@ -1032,7 +1040,18 @@ class DurableCaptureOutbox {
         bytes += stat.size;
         openBytes += stat.size;
         openFiles += 1;
-        if (file.endsWith('.open.json')) openTransactions += 1;
+        if (file.endsWith('.open.json')) {
+          openTransactions += 1;
+          try {
+            const metadata = JSON.parse(await fsp.readFile(file, 'utf8'));
+            const openedAt = Date.parse(
+              metadata.captureTransaction?.openedAt || metadata.startedAt || '',
+            );
+            if (Number.isFinite(openedAt)) openAtByName.set(path.basename(file), openedAt);
+          } catch (error) {
+            this.recordError(error);
+          }
+        }
       } catch (error) {
         if (error.code !== 'ENOENT') this.recordError(error);
       }
@@ -1048,8 +1067,27 @@ class DurableCaptureOutbox {
     this.metrics.failedFiles = failedFiles;
     this.metrics.auxiliaryFiles = auxiliaryFiles;
     this.queuedAtByName = queuedAtByName;
+    this.openAtByName = openAtByName;
+    this.refreshOpenAgeMetrics();
     await this.refreshFilesystemStats(true);
     return this.metrics;
+  }
+
+  refreshOpenAgeMetrics() {
+    let oldestOpenAtMs = null;
+    let staleOpenTransactions = 0;
+    const now = Date.now();
+    for (const openedAtMs of this.openAtByName.values()) {
+      if (oldestOpenAtMs === null || openedAtMs < oldestOpenAtMs) oldestOpenAtMs = openedAtMs;
+      if (now - openedAtMs > this.maxOpenAgeMs) staleOpenTransactions += 1;
+    }
+    this.metrics.oldestOpenAt = oldestOpenAtMs === null
+      ? null
+      : new Date(oldestOpenAtMs).toISOString();
+    this.metrics.oldestOpenAgeMs = oldestOpenAtMs === null
+      ? 0
+      : Math.max(0, now - oldestOpenAtMs);
+    this.metrics.staleOpenTransactions = staleOpenTransactions;
   }
 
   async refreshFilesystemStats(force = false) {
@@ -1424,6 +1462,7 @@ class DurableCaptureOutbox {
   }
 
   snapshot() {
+    this.refreshOpenAgeMetrics();
     let oldestQueuedAtMs = null;
     for (const queuedAtMs of this.queuedAtByName.values()) {
       if (oldestQueuedAtMs === null || queuedAtMs < oldestQueuedAtMs) {
@@ -1440,6 +1479,9 @@ class DurableCaptureOutbox {
       concurrency: this.concurrency,
       maxInflightBytes: this.maxInflightBytes,
       maxAttempts: this.maxAttempts,
+      maxOpenAgeMs: this.maxOpenAgeMs,
+      openCaptureHealthy: this.metrics.staleOpenTransactions === 0
+        && this.openAtByName.size === this.metrics.openTransactions,
       timeoutMs: this.timeoutMs,
       sanitize: this.sanitize,
       ...this.metrics,

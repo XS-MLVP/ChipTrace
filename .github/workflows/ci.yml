@@ -74,7 +74,19 @@ jobs:
           assert result["checks"]["cloud_source_isolation"] is True
           assert result["checks"]["cloud_runtime_evidence"] is True
           assert result["checks"]["cloud_source_coverage"] is True
+          assert result["checks"]["turn_source_coverage"] is True
+          session_view = result["interaction"]["session_view"]
+          assert session_view["schema_version"] == "chiptrace.session-view.v2"
+          assert session_view["turn_source_coverage_complete"] is True
+          assert session_view["delivery_ready"] is True
+          assert session_view["unscoped_source_records"] == {}
+          assert session_view["incomplete_turns"] == 0
+          assert session_view["open_turns"] == 0
+          assert session_view["conflicted_turns"] == 0
+          assert session_view["unscoped_turn_records"] == 0
+          assert all(turn["source_coverage"]["complete"] for turn in session_view["turns"])
           assert result["checks"]["cloud_acceptance"] is True
+          assert result["cloud_acceptance"]["schema_version"] == "chiptrace.cloud-acceptance.v2"
           assert result["cloud_acceptance_tamper_detected"] is True
           assert result["checks"]["cloud_tool_execution_evidence"] is True
           assert result["acceptance"]["source_capture_count"] == 20

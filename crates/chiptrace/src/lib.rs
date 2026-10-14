@@ -24,6 +24,7 @@ pub mod sharded;
 pub mod store;
 pub mod telemetry;
 pub mod tool_schema;
+mod turn_identity;
 pub mod wire_tools;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

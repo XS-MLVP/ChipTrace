@@ -820,6 +820,7 @@ async fn main() -> Result<()> {
                 replace: false,
             })?;
             json!({
+                "delivery_ready":projection.session_view.as_ref().is_some_and(|view| view.delivery_ready),
                 "session":projection.session_view,
                 "source_coverage":projection.source_coverage,
                 "integrity":projection.integrity,
@@ -1783,6 +1784,25 @@ async fn self_test(args: SelfTestArgs) -> Result<Value> {
             && interaction.source_coverage.otlp_logs == 1
             && interaction.source_coverage.otlp_traces == 1
             && interaction.source_coverage.hooks == 7,
+        "turn_source_coverage":interaction.session_view.as_ref().is_some_and(|view| {
+            view.schema_version == "chiptrace.session-view.v2"
+                && view.native_turns == 5
+                && view.closed_turns == 5
+                && view.open_turns == 0
+                && view.conflicted_turns == 0
+                && view.incomplete_turns == 0
+                && view.unscoped_turn_records == 0
+                && view.turn_source_coverage_complete
+                && view.delivery_ready
+                && view.turns.iter().all(|turn| {
+                    turn.status == "closed"
+                        && turn.source_coverage.complete
+                        && turn.source_coverage.wire > 0
+                        && turn.source_coverage.otlp_logs > 0
+                        && turn.source_coverage.otlp_traces > 0
+                        && turn.source_coverage.hooks == 1
+                })
+        }),
         "cloud_source_isolation":relay_source_isolation
             && relay_health.pointer("/ingest_coverage/wire/durable_captures")
                 .and_then(Value::as_u64) == Some(api_snapshot_count as u64),
@@ -1989,11 +2009,12 @@ fn self_test_otlp_logs() -> Value {
         records.push(json!({
             "timeUnixNano":format!("17877888{:02}000000000", ordinal * 3 + 3),
             "traceId":"0123456789abcdef0123456789abcdef",
-            "spanId":format!("{:016x}", ordinal + 1),
+            "spanId":format!("{:016x}", 0x1000 + ordinal),
             "attributes":[
                 self_test_otlp_attribute("event.name", json!({"stringValue":"codex.tool_result"})),
                 self_test_otlp_attribute("event.timestamp", json!({"stringValue":format!("2026-08-27T00:00:{:02}Z", index * 3 + 3)})),
                 self_test_otlp_attribute("conversation.id", json!({"stringValue":"thread-self-test"})),
+                self_test_otlp_attribute("turn.id", json!({"stringValue":format!("turn-{ordinal}")})),
                 self_test_otlp_attribute("model", json!({"stringValue":"gpt-5.6-sol"})),
                 self_test_otlp_attribute("tool_name", json!({"stringValue":name})),
                 self_test_otlp_attribute("tool_namespace", json!({"stringValue":"functions"})),
@@ -2017,6 +2038,40 @@ fn self_test_otlp_logs() -> Value {
 }
 
 fn self_test_otlp_traces() -> Value {
+    let mut spans = vec![json!({
+        "traceId":"0123456789abcdef0123456789abcdef",
+        "spanId":"1111111111111111",
+        "parentSpanId":"",
+        "name":"codex.session",
+        "startTimeUnixNano":"1787788800000000000",
+        "endTimeUnixNano":"1787788815000000000",
+        "attributes":[
+            self_test_otlp_attribute(
+                "conversation.id",
+                json!({"stringValue":"thread-self-test"})
+            )
+        ]
+    })];
+    for ordinal in 1..=5 {
+        spans.push(json!({
+            "traceId":"0123456789abcdef0123456789abcdef",
+            "spanId":format!("{:016x}", 0x1000 + ordinal),
+            "parentSpanId":"1111111111111111",
+            "name":"codex.turn",
+            "startTimeUnixNano":format!("17877888{:02}000000000", ordinal * 3 + 1),
+            "endTimeUnixNano":format!("17877888{:02}000000000", ordinal * 3 + 2),
+            "attributes":[
+                self_test_otlp_attribute(
+                    "conversation.id",
+                    json!({"stringValue":"thread-self-test"})
+                ),
+                self_test_otlp_attribute(
+                    "turn.id",
+                    json!({"stringValue":format!("turn-{ordinal}")})
+                )
+            ]
+        }));
+    }
     json!({
         "resourceSpans":[{
             "resource":{"attributes":[
@@ -2024,20 +2079,7 @@ fn self_test_otlp_traces() -> Value {
             ]},
             "scopeSpans":[{
                 "scope":{"name":"codex_otel"},
-                "spans":[{
-                    "traceId":"0123456789abcdef0123456789abcdef",
-                    "spanId":"1111111111111111",
-                    "parentSpanId":"",
-                    "name":"codex.session",
-                    "startTimeUnixNano":"1787788800000000000",
-                    "endTimeUnixNano":"1787788815000000000",
-                    "attributes":[
-                        self_test_otlp_attribute(
-                            "conversation.id",
-                            json!({"stringValue":"thread-self-test"})
-                        )
-                    ]
-                }]
+                "spans":spans
             }]
         }]
     })
@@ -2059,6 +2101,16 @@ fn self_test_tool_schema(name: &str) -> Value {
 }
 
 fn self_test_trace(turn_id: Option<&str>) -> Value {
+    let span_id = turn_id
+        .map(|turn| {
+            let ordinal: u64 = turn
+                .strip_prefix("turn-")
+                .expect("self-test Turn prefix")
+                .parse()
+                .expect("self-test Turn ordinal");
+            format!("{:016x}", 0x1000 + ordinal)
+        })
+        .unwrap_or_else(|| "1111111111111111".to_owned());
     let mut trace = json!({
         "session_id":"thread-self-test",
         "thread_id":"thread-self-test",
@@ -2066,9 +2118,9 @@ fn self_test_trace(turn_id: Option<&str>) -> Value {
         "agent_id":"agent-root",
         "branch_id":"main",
         "trace_id":"0123456789abcdef0123456789abcdef",
-        "parent_span_id":"1111111111111111",
+        "parent_span_id":span_id,
         "trace_flags":"01",
-        "traceparent":"00-0123456789abcdef0123456789abcdef-1111111111111111-01"
+        "traceparent":format!("00-0123456789abcdef0123456789abcdef-{span_id}-01")
     });
     if let Some(turn_id) = turn_id {
         trace["root_turn_id"] = json!(turn_id);

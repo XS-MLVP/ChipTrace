@@ -1,4 +1,4 @@
-.PHONY: check test gateway-test codex-config-test platform-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
+.PHONY: check test gateway-test gateway-host-test codex-config-test platform-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
 
 CHIPTRACE_VERSION ?= 0.6.0
 CHIPTRACE_REVISION ?= $(shell git rev-parse HEAD)
@@ -14,6 +14,9 @@ test:
 
 gateway-test:
 	node --test integrations/openai-gateway/durable-outbox.test.js
+
+gateway-host-test:
+	node --test integrations/openai-gateway/host-health.test.js
 
 codex-config-test:
 	node --test integrations/codex/config-contract.test.js

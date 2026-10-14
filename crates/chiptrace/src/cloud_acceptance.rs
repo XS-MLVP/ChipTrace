@@ -25,7 +25,7 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-pub const CLOUD_ACCEPTANCE_SCHEMA_VERSION: &str = "chiptrace.cloud-acceptance.v1";
+pub const CLOUD_ACCEPTANCE_SCHEMA_VERSION: &str = "chiptrace.cloud-acceptance.v2";
 
 #[derive(Debug, Clone)]
 pub struct CloudAcceptanceConfig {
@@ -206,6 +206,26 @@ async fn run_pipeline(
             interaction.source_coverage.missing_sources
         );
     }
+    let session_view = interaction
+        .session_view
+        .as_ref()
+        .context("selected Stock Codex Session has no native Session/Turn view")?;
+    if session_view.schema_version != crate::session_view::SESSION_VIEW_SCHEMA_VERSION
+        || !session_view.delivery_ready
+        || session_view.native_turns == 0
+        || !session_view.latest_epoch_closed
+        || session_view.open_turns != 0
+        || session_view.conflicted_turns != 0
+        || session_view.unscoped_turn_records != 0
+        || !session_view.turn_source_coverage_complete
+        || session_view.incomplete_turns != 0
+        || session_view
+            .turns
+            .iter()
+            .any(|turn| !turn.source_coverage.complete)
+    {
+        bail!("selected Stock Codex Session does not have complete per-Turn source coverage");
+    }
 
     let otlp_root = output.join("otlp");
     let otlp = export_otlp(OtlpExportConfig {
@@ -351,10 +371,26 @@ async fn run_pipeline(
 pub fn verify_cloud_acceptance(root: &Path) -> Result<CloudAcceptanceManifest> {
     let manifest_path = root.join("manifest.json");
     let value: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    if value.get("schema_version").and_then(Value::as_str) != Some(CLOUD_ACCEPTANCE_SCHEMA_VERSION)
+    {
+        bail!(
+            "current delivery requires chiptrace.cloud-acceptance.v2; retain the historical artifact and re-run acceptance from its original Raw archive"
+        );
+    }
     let schema: Value = serde_json::from_str(include_str!(
-        "../../../schemas/cloud-acceptance-v1.schema.json"
+        "../../../schemas/cloud-acceptance-v2.schema.json"
     ))?;
-    let validator = jsonschema::draft202012::new(&schema)
+    let registry = jsonschema::Registry::new()
+        .add(
+            "https://github.com/XS-MLVP/ChipTrace/schemas/session-view-v2.schema.json",
+            serde_json::from_str::<Value>(include_str!(
+                "../../../schemas/session-view-v2.schema.json"
+            ))?,
+        )?
+        .prepare()?;
+    let validator = jsonschema::options()
+        .with_registry(&registry)
+        .build(&schema)
         .map_err(|error| anyhow::anyhow!("compile cloud acceptance schema: {error}"))?;
     if let Err(error) = validator.validate(&value) {
         bail!(
@@ -383,6 +419,26 @@ pub fn verify_cloud_acceptance(root: &Path) -> Result<CloudAcceptanceManifest> {
         || manifest.internal_parent_references != manifest.resolved_internal_parents
     {
         bail!("cloud acceptance manifest does not satisfy strict delivery gates");
+    }
+    let session_view = manifest
+        .session_view
+        .as_ref()
+        .context("cloud acceptance manifest has no Session/Turn view")?;
+    if session_view.schema_version != crate::session_view::SESSION_VIEW_SCHEMA_VERSION
+        || !session_view.delivery_ready
+        || session_view.native_turns == 0
+        || !session_view.latest_epoch_closed
+        || session_view.open_turns != 0
+        || session_view.conflicted_turns != 0
+        || session_view.unscoped_turn_records != 0
+        || !session_view.turn_source_coverage_complete
+        || session_view.incomplete_turns != 0
+        || session_view
+            .turns
+            .iter()
+            .any(|turn| !turn.source_coverage.complete)
+    {
+        bail!("cloud acceptance Session/Turn view is not complete for every Turn");
     }
     let expected_artifacts = [
         ("raw", "raw/RAW_SOURCE.json"),
