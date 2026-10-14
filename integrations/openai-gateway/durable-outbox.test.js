@@ -6,14 +6,21 @@ const fsp = fs.promises;
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const test = require('node:test');
 
 const {
   DurableCaptureOutbox,
   ResponsesSseBoundaryTracker,
   codexTraceContextFromHeaders,
+  reconcileCaptureBodyMetadata,
+  sanitizeCaptureRecord,
   validateProviderCredential,
 } = require('./durable-outbox');
+
+function cryptoHash(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
 
 test('Responses SSE boundary requires a complete terminal event', () => {
   const tracker = new ResponsesSseBoundaryTracker();
@@ -141,6 +148,87 @@ function capture(id = 'cap-test-1') {
   };
 }
 
+test('body sanitization reconciles bytes and hashes while retaining the original hash', () => {
+  const original = capture('cap-sanitize-contract');
+  const sanitized = sanitizeCaptureRecord(original, true);
+  assert.notEqual(sanitized.requestBodyText, original.requestBodyText);
+  assert.equal(
+    sanitized.requestBytesCaptured,
+    Buffer.byteLength(sanitized.requestBodyText, 'utf8'),
+  );
+  assert.equal(sanitized.requestBodySha256, cryptoHash(sanitized.requestBodyText));
+  assert.equal(
+    sanitized.requestBodyTextOriginalSha256,
+    cryptoHash(original.requestBodyText),
+  );
+  assert.equal(
+    reconcileCaptureBodyMetadata({
+      ...sanitized,
+      requestBytesCaptured: 1,
+      requestBodySha256: '0'.repeat(64),
+    }).record.requestBodySha256,
+    cryptoHash(sanitized.requestBodyText),
+  );
+});
+
+test('historical records with stale body metadata are repaired only in the replay copy', async () => {
+  const root = temporaryRoot();
+  const failedDir = path.join(root, 'failed');
+  await fsp.mkdir(failedDir, { recursive: true });
+  const historical = capture('cap-historical-replay');
+  historical.requestBytesCaptured += 17;
+  historical.requestBodySha256 = '1'.repeat(64);
+  historical.responseBytesCaptured += 19;
+  historical.responseBodySha256 = '2'.repeat(64);
+  const historicalBytes = Buffer.from(`${JSON.stringify(historical)}\n`, 'utf8');
+  const historicalFile = path.join(failedDir, 'cap-historical-replay.json');
+  await fsp.writeFile(historicalFile, historicalBytes, { mode: 0o600 });
+  await fsp.writeFile(
+    `${historicalFile}.error.json`,
+    `${JSON.stringify({ captureId: historical.captureId, reason: 'http_400' })}\n`,
+    { mode: 0o600 },
+  );
+
+  let received = 0;
+  const relay = await fakeRelay((req, res) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.once('end', () => {
+      received += 1;
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      assert.equal(body.requestBytesCaptured, Buffer.byteLength(body.requestBodyText, 'utf8'));
+      assert.equal(body.requestBodySha256, cryptoHash(body.requestBodyText));
+      assert.equal(body.responseBytesCaptured, Buffer.byteLength(body.responseBodyText, 'utf8'));
+      assert.equal(body.responseBodySha256, cryptoHash(body.responseBodyText));
+      res.statusCode = 202;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ ok: true, durable: true, duplicate: false }));
+    });
+  });
+  const outbox = new DurableCaptureOutbox({
+    root,
+    relayUrl: relay.url,
+    retryBaseMs: 1,
+    retryMaxMs: 1,
+    retryJitterPercent: 0,
+    maxAttempts: 20,
+  });
+  try {
+    await outbox.start();
+    await fsp.copyFile(historicalFile, path.join(root, 'pending', 'cap-historical-replay.json'));
+    await outbox.refreshQueueStats();
+    assert.equal(await outbox.flush(2000), true);
+    assert.equal(received, 1);
+    assert.deepEqual(await fsp.readFile(historicalFile), historicalBytes);
+    assert.equal(fs.existsSync(path.join(root, 'pending', 'cap-historical-replay.json')), false);
+    assert.equal(outbox.snapshot().recentFailureCount, 0);
+  } finally {
+    await outbox.close();
+    await relay.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 async function fakeRelay(handler) {
   const server = http.createServer((req, res) => {
     res.setHeader('connection', 'close');
@@ -174,7 +262,7 @@ test('outbox preserves Wire bodies, strips credentials, retries, and removes aft
   const root = temporaryRoot();
   const outbox = new DurableCaptureOutbox({
     root,
-    relayUrl: relay.url,
+    relayUrl: '',
     bearerToken: ingestToken,
     retryBaseMs: 1,
     retryMaxMs: 2,
@@ -182,12 +270,13 @@ test('outbox preserves Wire bodies, strips credentials, retries, and removes aft
     maxAttempts: 20,
   });
   try {
-    const ack = await outbox.enqueue(capture());
+    const ack = await outbox.enqueue(capture(), { schedule: false });
     assert.equal(ack.durable, true);
     const stored = JSON.parse(await fsp.readFile(path.join(root, 'pending', 'cap-test-1.json'), 'utf8'));
     assert.equal(stored.requestHeaders.authorization, undefined);
     assert.equal(stored.requestBodyText, capture().requestBodyText);
     assert.equal(stored.captureSanitization.bodyRedacted, false);
+    outbox.relayUrl = relay.url;
     assert.equal(await outbox.flush(3000), true);
     assert.equal(attempts, 3);
     assert.equal(outbox.snapshot().pending, 0);
@@ -241,6 +330,100 @@ test('processing files are recovered and replayed after a restart', async () => 
   } finally {
     await second.close();
     await relay.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('two-phase capture durably starts before streaming and finalizes exact Wire bytes', async () => {
+  const root = temporaryRoot();
+  const outbox = new DurableCaptureOutbox({ root, relayUrl: '', maxAttempts: 20 });
+  try {
+    const transaction = await outbox.beginCapture({
+      captureId: 'cap-two-phase',
+      sourceNamespace: 'gateway-test',
+      method: 'POST',
+      proxiedPath: '/v1/responses',
+      startedAt: '2026-09-08T00:00:00Z',
+    }, {
+      maxRequestBytes: 1024,
+      maxResponseBytes: 1024,
+    });
+    const openNames = fs.readdirSync(path.join(root, 'open'));
+    assert.deepEqual(openNames, ['cap-two-phase.open.json']);
+    const open = JSON.parse(fs.readFileSync(path.join(root, 'open', openNames[0]), 'utf8'));
+    assert.equal(open.captureId, 'cap-two-phase');
+    assert.equal(open.captureStage, 'ingress');
+    assert.equal(open.captureTransaction.state, 'open');
+
+    await Promise.all([
+      transaction.appendRequest(Buffer.from('{"input":')),
+      transaction.appendRequest(Buffer.from('"hello"}')),
+      transaction.appendResponse(Buffer.from('data: {"type":"response.completed"}\n')),
+      transaction.appendResponse(Buffer.from('data: [DONE]\n\n')),
+    ]);
+    const ack = await transaction.finalize({
+      finishedAt: '2026-09-08T00:00:01Z',
+      responseStatus: 200,
+      stream: true,
+      upstreamResponseCompleted: true,
+      clientResponseFinished: true,
+    });
+    assert.equal(ack.durable, true);
+    assert.equal(ack.duplicate, false);
+    assert.deepEqual(fs.readdirSync(path.join(root, 'open')), []);
+    const stored = JSON.parse(
+      fs.readFileSync(path.join(root, 'pending', 'cap-two-phase.json'), 'utf8'),
+    );
+    assert.equal(stored.requestBodyText, '{"input":"hello"}');
+    assert.equal(stored.requestBytesCaptured, Buffer.byteLength(stored.requestBodyText));
+    assert.equal(stored.responseBodyText, 'data: {"type":"response.completed"}\ndata: [DONE]\n\n');
+    assert.equal(stored.responseBytesCaptured, Buffer.byteLength(stored.responseBodyText));
+    assert.equal(stored.requestBodySha256, cryptoHash(stored.requestBodyText));
+    assert.equal(stored.responseBodySha256, cryptoHash(stored.responseBodyText));
+    assert.equal(stored.captureTransaction.state, 'finalized');
+    assert.equal(outbox.snapshot().openTransactions, 0);
+    assert.equal(outbox.snapshot().pending, 1);
+  } finally {
+    await outbox.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('restart converts an open streamed capture into explicit incomplete evidence', async () => {
+  const root = temporaryRoot();
+  const first = new DurableCaptureOutbox({ root, relayUrl: '', maxAttempts: 20 });
+  const transaction = await first.beginCapture({
+    captureId: 'cap-open-crash',
+    sourceNamespace: 'gateway-test',
+    method: 'POST',
+    proxiedPath: '/v1/responses',
+    startedAt: '2026-09-08T00:00:00Z',
+  });
+  await transaction.appendRequest(Buffer.from('{"input":"kept"}'));
+  await transaction.appendResponse(Buffer.from('data: {"type":"response.created"}\n\n'));
+  await first.close();
+
+  const second = new DurableCaptureOutbox({ root, relayUrl: '', maxAttempts: 20 });
+  try {
+    await second.start();
+    assert.deepEqual(fs.readdirSync(path.join(root, 'open')), []);
+    const stored = JSON.parse(
+      fs.readFileSync(path.join(root, 'pending', 'cap-open-crash.json'), 'utf8'),
+    );
+    assert.equal(stored.requestBodyText, '{"input":"kept"}');
+    assert.equal(stored.responseBodyText, 'data: {"type":"response.created"}\n\n');
+    assert.equal(stored.requestTruncated, true);
+    assert.equal(stored.responseTruncated, true);
+    assert.equal(stored.upstreamResponseCompleted, false);
+    assert.equal(stored.clientResponseFinished, false);
+    assert.equal(stored.captureErrorCode, 'CHIPTRACE_GATEWAY_CRASH');
+    assert.equal(stored.captureTransaction.state, 'recovered_incomplete');
+    assert.equal(stored.requestBodySha256, cryptoHash(stored.requestBodyText));
+    assert.equal(stored.responseBodySha256, cryptoHash(stored.responseBodyText));
+    assert.equal(second.snapshot().openTransactions, 0);
+    assert.equal(second.snapshot().pending, 1);
+  } finally {
+    await second.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

@@ -485,7 +485,21 @@ fn derive_codex_hook(envelope: &Value, raw_sha256: &str, max_bytes: usize) -> Re
     // A lifecycle hook attests that a boundary was observed, not that the
     // user's task succeeded. Tool success comes from codex.tool_result and
     // model completion comes from the captured Responses protocol.
-    let status = event_kind.default_status.unwrap_or("unknown");
+    let compact_resume = event_name == "SessionStart"
+        && envelope
+            .get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|source| source.eq_ignore_ascii_case("compact"));
+    let lifecycle_type = if compact_resume {
+        "compaction_resume"
+    } else {
+        event_kind.lifecycle_type
+    };
+    let status = if compact_resume {
+        "completed"
+    } else {
+        event_kind.default_status.unwrap_or("unknown")
+    };
     let occurred_at = optional_alias_string(envelope, &["occurred_at", "occurredAt", "timestamp"]);
     let capture = json!({
         "recordType":"lifecycle_event",
@@ -495,10 +509,10 @@ fn derive_codex_hook(envelope: &Value, raw_sha256: &str, max_bytes: usize) -> Re
         "requestedModelAlias":optional_alias_string(envelope, &["model", "model_name", "modelName"]),
         "isFinalSnapshot":event_kind.terminal,
         "traceContext":trace,
-        "observedLifecycleEvents":[event_kind.lifecycle_type],
+        "observedLifecycleEvents":[lifecycle_type],
         "lifecycleEvent":{
             "event_id":format!("hook-{event_id}"),
-            "type":event_kind.lifecycle_type,
+            "type":lifecycle_type,
             "status":status,
             "reason":value_alias(envelope, &["reason"]),
             "occurred_at":occurred_at,
@@ -1283,6 +1297,24 @@ mod tests {
             assert_eq!(values[1]["lifecycleEvent"]["type"], expected_type);
             assert_eq!(values[1]["lifecycleEvent"]["status"], expected_status);
         }
+    }
+
+    #[test]
+    fn compact_session_start_is_a_resume_event_not_a_new_session_boundary() {
+        let raw = serde_json::to_vec(&json!({
+            "hook_event_name":"SessionStart",
+            "session_id":"session-long",
+            "model":"gpt-6-astra",
+            "permission_mode":"default",
+            "source":"compact"
+        }))
+        .unwrap();
+        let batch = prepare_cloud_ingest(CloudEndpoint::CodexHook, &raw, 1024 * 1024).unwrap();
+        let values = values(&batch);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[1]["lifecycleEvent"]["type"], "compaction_resume");
+        assert_eq!(values[1]["lifecycleEvent"]["status"], "completed");
+        assert_eq!(values[1]["isFinalSnapshot"], false);
     }
 
     #[test]

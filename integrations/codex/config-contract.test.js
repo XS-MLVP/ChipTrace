@@ -4,6 +4,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
+const http = require('node:http');
+const { spawn } = require('node:child_process');
 
 const integrationRoot = __dirname;
 const configPath = path.join(integrationRoot, 'config.toml.example');
@@ -132,5 +134,85 @@ test('configuration has no ChipTrace client or plugin dependency', () => {
     for (const pattern of forbiddenPatterns) {
       assert.doesNotMatch(content, pattern, `${relativePath} contains ${pattern}`);
     }
+  }
+});
+
+test('separate native hook invocations survive while HTTP retries deduplicate', async () => {
+  const bodies = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      bodies.push(Buffer.concat(chunks).toString('utf8'));
+      res.writeHead(bodies.length === 1 ? 503 : 200);
+      res.end('{}');
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const block = requirements.split('[[hooks.SessionEnd]]')[1].split('[[hooks.Interrupt]]')[0];
+    const native = JSON.parse(block.match(/^command = (.*)$/m)[1]);
+    const command = native.replace('http://172.28.11.121:18084', `http://127.0.0.1:${server.address().port}`);
+    const event = { hook_event_name: 'SessionEnd', session_id: 'resume-contract-session', reason: 'other' };
+    async function invoke(input) {
+      const child = spawn('/bin/sh', ['-c', command], {
+        env: { ...process.env, CHIPTRACE_INGEST_TOKEN: 'synthetic-hook-test-credential' },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      const stderr = [];
+      child.stderr.on('data', block => stderr.push(block));
+      child.stdout.resume();
+      const finished = new Promise((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', (code, signal) => code === 0 ? resolve() : reject(new Error(`Hook failed (${code}, ${signal}): ${Buffer.concat(stderr)}`)));
+      });
+      child.stdin.end(JSON.stringify(input));
+      await finished;
+    }
+    await invoke(event);
+    await invoke(event);
+    assert.equal(bodies.length, 3);
+    assert.equal(bodies[0], bodies[1], 'curl must retry the same serialized invocation');
+    const first = JSON.parse(bodies[0]);
+    const second = JSON.parse(bodies[2]);
+    assert.notEqual(first.event_id, second.event_id, 'equal native payloads are separate occurrences');
+    for (const body of [first, second]) {
+      assert.match(body.event_id, /^[0-9a-f-]{36}$/);
+      assert.ok(Number.isFinite(Date.parse(body.occurred_at)));
+      const { event_id, occurred_at, ...nativeFields } = body;
+      assert.deepEqual(nativeFields, event);
+    }
+    const identified = { ...event, event_id: 'stock-event-id', occurred_at: '2026-09-05T10:00:00Z' };
+    await invoke(identified);
+    assert.deepEqual(JSON.parse(bodies[3]), identified, 'existing native identity must be preserved');
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('SessionStart stops before forwarding when credentials or hook JSON are invalid', async () => {
+  const block = requirements.split('[[hooks.SessionEnd]]', 1)[0];
+  const command = JSON.parse(block.match(/^command = (.*)$/m)[1]);
+  for (const scenario of [
+    { input: '{}', token: '' },
+    { input: '{invalid', token: 'synthetic-hook-test-credential' },
+  ]) {
+    const child = spawn('/bin/sh', ['-c', command], {
+      env: { ...process.env, CHIPTRACE_API_KEY: 'synthetic-provider-credential',
+        CHIPTRACE_INGEST_TOKEN: scenario.token,
+        OTEL_EXPORTER_OTLP_HEADERS: `Authorization=Bearer%20${scenario.token}` },
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    let stdout = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    const finished = new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', code => code === 0 ? resolve() : reject(new Error(`Unexpected hook exit ${code}`)));
+    });
+    child.stdin.end(scenario.input);
+    await finished;
+    const response = JSON.parse(stdout);
+    assert.equal(response.continue, false);
+    assert.match(response.stopReason, /cloud ingest unavailable or configuration incomplete/);
   }
 });

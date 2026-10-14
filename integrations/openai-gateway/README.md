@@ -41,6 +41,12 @@ await outbox.enqueue(capture);
   OTLP/Hook 证据提供。无法关联的记录保留为 Wire-only，不能进入合格 Release。
 - 业务响应不等待远端 Relay。磁盘写入失败、队列上限或 inode/空间水位必须出现在健康指标。
 
+历史失败 Capture 的正文如果曾经被脱敏，旧记录可能把脱敏前的 `requestBytesCaptured`/
+`responseBytesCaptured` 或 SHA-256 留在元数据中。发送前 outbox 会按当前 UTF-8 正文修复这
+两个字段，并保留 `*BodyTextOriginalSha256`；修复只作用于内存中的发送副本，不改写
+`failed/` 审计原件。人工恢复时将原件复制（`cp -p`）到 `pending/`，等待 durable ACK，
+并同时确认 `pending=0`、`processing=0` 和 `recentFailureCount=0`。
+
 运行测试：
 
 ```bash

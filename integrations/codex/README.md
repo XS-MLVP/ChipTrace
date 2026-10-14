@@ -50,3 +50,9 @@ Session 的四源和 start/end 闭合，不能以 CLI 正常退出代替采集�
 Stock Codex 0.153.4 的 `exec --json` 被 SessionStart Hook 前置拦截时，仍可能返回
 退出码 0 和零 Token 的 `turn.completed`。前置拦截测试应验证零模型请求；正常采集测试
 则应验证真实模型交互、工具结果以及 Collector 的会话完整性。
+
+原生 Hook 命令依赖 `/usr/bin/python3` 和 `/usr/bin/curl`。命令在每次 Hook 调用时保留原生
+JSON 字段，并为缺少身份的事件补充独立 `event_id` 与 `occurred_at`，然后把同一份 JSON
+交给 curl 重试。Stock Codex 恢复会话后可能再次发送内容完全相同的 `SessionEnd`；单纯按
+请求体哈希去重会丢掉第二次闭合。独立调用必须有不同 ID，同一次 HTTP 重试必须保持 ID
+不变。更新用户级命令后，需要在最终路径重新审核并记录 Hook trust hash。

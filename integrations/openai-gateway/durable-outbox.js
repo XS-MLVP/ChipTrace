@@ -274,6 +274,41 @@ function captureFileName(captureId) {
   return `${captureId.slice(0, 80)}-${sha256(Buffer.from(captureId, 'utf8'))}.json`;
 }
 
+function openCapturePaths(directory, captureId) {
+  const name = captureFileName(captureId).replace(/\.json$/, '');
+  return {
+    metadata: path.join(directory, `${name}.open.json`),
+    request: path.join(directory, `${name}.request.bin`),
+    response: path.join(directory, `${name}.response.bin`),
+  };
+}
+
+async function readOptionalFile(file) {
+  try {
+    return await fsp.readFile(file);
+  } catch (error) {
+    if (error.code === 'ENOENT') return Buffer.alloc(0);
+    throw error;
+  }
+}
+
+async function syncOptionalFile(file) {
+  let handle;
+  try {
+    handle = await fsp.open(file, 'r');
+    await handle.sync();
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function removeCaptureFiles(files) {
+  await Promise.all(Object.values(files).map((file) => fsp.rm(file, { force: true })));
+  await fsyncDirectory(path.dirname(files.metadata));
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -339,6 +374,38 @@ function sanitizeBodyText(text, redactedFields) {
   }
 }
 
+/**
+ * Keep the capture contract tied to the bytes that are actually sent.  Body
+ * redaction (and older outbox versions) can leave the declared byte count or
+ * digest referring to a pre-redaction string.  Rust Relay intentionally
+ * rejects that ambiguity, so normalize the metadata at the last safe point
+ * before enqueue/delivery.  The original pre-redaction digest, when known,
+ * is never replaced.
+ */
+function reconcileCaptureBodyMetadata(record) {
+  const copy = { ...record };
+  let changed = false;
+  for (const [textField, bytesField, shaField] of [
+    ['requestBodyText', 'requestBytesCaptured', 'requestBodySha256'],
+    ['responseBodyText', 'responseBytesCaptured', 'responseBodySha256'],
+  ]) {
+    if (typeof copy[textField] !== 'string') continue;
+    const text = copy[textField];
+    const bytes = Buffer.from(text, 'utf8');
+    const byteCount = bytes.length;
+    const digest = sha256(bytes);
+    if (copy[bytesField] !== byteCount) {
+      copy[bytesField] = byteCount;
+      changed = true;
+    }
+    if (copy[shaField] !== digest) {
+      copy[shaField] = digest;
+      changed = true;
+    }
+  }
+  return { record: copy, changed };
+}
+
 function sanitizeHeaders(headers, redactedFields, prefix) {
   const output = {};
   for (const [key, value] of Object.entries(headers && typeof headers === 'object' ? headers : {})) {
@@ -371,7 +438,9 @@ function sanitizeCaptureRecord(record, sanitizeBodies = true) {
       const originalHash = sha256(Buffer.from(original, 'utf8'));
       const sanitized = sanitizeBodyText(original, redactedFields);
       copy[field] = sanitized.value;
-      if (sanitized.changed) copy[`${field}OriginalSha256`] = originalHash;
+      if (sanitized.changed && !copy[`${field}OriginalSha256`]) {
+        copy[`${field}OriginalSha256`] = originalHash;
+      }
     }
   }
   if (redactedFields.size) {
@@ -382,7 +451,7 @@ function sanitizeCaptureRecord(record, sanitizeBodies = true) {
       fields: copy.redactedBodyFields,
     };
   }
-  return copy;
+  return reconcileCaptureBodyMetadata(copy).record;
 }
 
 async function fsyncDirectory(directory) {
@@ -487,12 +556,129 @@ async function listRegularFilesLimited(directory, suffix, limit) {
   return files.sort();
 }
 
+class DurableCaptureTransaction {
+  constructor(outbox, baseRecord, files, options, metadataBytes) {
+    this.outbox = outbox;
+    this.baseRecord = baseRecord;
+    this.captureId = baseRecord.captureId;
+    this.files = files;
+    this.maxRequestBytes = positiveInteger(
+      options.maxRequestBytes,
+      256 * 1024 * 1024,
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    this.maxResponseBytes = positiveInteger(
+      options.maxResponseBytes,
+      384 * 1024 * 1024,
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    this.requestBytes = 0;
+    this.responseBytes = 0;
+    this.requestTruncated = false;
+    this.responseTruncated = false;
+    this.persistedBytes = metadataBytes;
+    this.persistedFiles = 1;
+    this.createdSpools = new Set();
+    this.writeChain = Promise.resolve();
+    this.writeError = null;
+    this.closed = false;
+  }
+
+  appendRequest(chunk) {
+    return this.#append('request', chunk, this.maxRequestBytes);
+  }
+
+  appendResponse(chunk) {
+    return this.#append('response', chunk, this.maxResponseBytes);
+  }
+
+  #append(side, chunk, limit) {
+    if (this.closed) return Promise.reject(new Error('capture transaction is closed'));
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const countField = `${side}Bytes`;
+    const truncatedField = `${side}Truncated`;
+    const remaining = Math.max(0, limit - this[countField]);
+    const retained = bytes.subarray(0, remaining);
+    this[countField] += retained.length;
+    if (retained.length < bytes.length) this[truncatedField] = true;
+    if (retained.length === 0) return this.writeChain;
+    const file = this.files[side];
+    this.writeChain = this.writeChain.then(async () => {
+      if (this.writeError) return;
+      if (this.outbox.metrics.queueBytes + retained.length > this.outbox.maxBytes) {
+        const error = new Error('capture outbox byte cap is full');
+        error.code = 'OUTBOX_FULL';
+        throw error;
+      }
+      const firstWrite = !this.createdSpools.has(side);
+      await fsp.appendFile(file, retained, { mode: 0o600, flag: 'a' });
+      if (firstWrite) {
+        this.createdSpools.add(side);
+        this.persistedFiles += 1;
+        this.outbox.metrics.openFiles += 1;
+      }
+      this.persistedBytes += retained.length;
+      this.outbox.metrics.openBytes += retained.length;
+      this.outbox.metrics.queueBytes += retained.length;
+    }).catch((error) => {
+      this.writeError ||= error;
+    });
+    return this.writeChain;
+  }
+
+  async finalize(fields = {}) {
+    if (this.closed) throw new Error('capture transaction is closed');
+    this.closed = true;
+    await this.writeChain;
+    if (this.writeError) throw this.writeError;
+    await Promise.all([
+      syncOptionalFile(this.files.request),
+      syncOptionalFile(this.files.response),
+    ]);
+    const [requestBytes, responseBytes] = await Promise.all([
+      readOptionalFile(this.files.request),
+      readOptionalFile(this.files.response),
+    ]);
+    const record = {
+      ...this.baseRecord,
+      ...fields,
+      captureId: this.captureId,
+      captureStage: 'combined',
+      requestBodyText: requestBytes.toString('utf8'),
+      requestBytesCaptured: requestBytes.length,
+      requestBodySha256: sha256(requestBytes),
+      requestTruncated: this.requestTruncated || fields.requestTruncated === true,
+      responseBodyText: responseBytes.toString('utf8'),
+      responseBytesCaptured: responseBytes.length,
+      responseBodySha256: sha256(responseBytes),
+      responseTruncated: this.responseTruncated || fields.responseTruncated === true,
+      captureTransaction: {
+        state: 'finalized',
+        openedAt: this.baseRecord.captureTransaction.openedAt,
+        finalizedAt: new Date().toISOString(),
+      },
+    };
+    const ack = await this.outbox.enqueue(record, {
+      creditBytes: this.persistedBytes,
+      creditFiles: this.persistedFiles,
+      schedule: false,
+    });
+    await removeCaptureFiles(this.files);
+    this.outbox.releaseOpenCapture(this, this.persistedBytes, this.persistedFiles);
+    this.outbox.scheduleDrain(0);
+    return ack;
+  }
+}
+
 class DurableCaptureOutbox {
   constructor(options = {}) {
     this.root = path.resolve(String(options.root || '/var/lib/chiptrace/relay-shell-outbox'));
     this.pendingDir = path.join(this.root, 'pending');
     this.processingDir = path.join(this.root, 'processing');
     this.failedDir = path.join(this.root, 'failed');
+    this.openDir = path.join(this.root, 'open');
     this.relayUrl = String(options.relayUrl || '').replace(/\/$/, '');
     this.bearerToken = String(options.bearerToken || '').trim();
     this.maxBytes = positiveInteger(options.maxBytes, 10 * 1024 * 1024 * 1024, 1024 * 1024);
@@ -530,6 +716,9 @@ class DurableCaptureOutbox {
       rejected: 0,
       pending: 0,
       processing: 0,
+      openTransactions: 0,
+      openFiles: 0,
+      openBytes: 0,
       failedFiles: 0,
       auxiliaryFiles: 0,
       // Files already present when the process starts are retained audit
@@ -565,6 +754,7 @@ class DurableCaptureOutbox {
     this.filesystemCheckedAtMs = 0;
     this.attemptsByFile = new Map();
     this.queuedAtByName = new Map();
+    this.openCaptures = new Map();
   }
 
   async start() {
@@ -584,6 +774,7 @@ class DurableCaptureOutbox {
       fsp.mkdir(this.pendingDir, { recursive: true, mode: 0o700 }),
       fsp.mkdir(this.processingDir, { recursive: true, mode: 0o700 }),
       fsp.mkdir(this.failedDir, { recursive: true, mode: 0o700 }),
+      fsp.mkdir(this.openDir, { recursive: true, mode: 0o700 }),
     ]);
     await this.recoverPendingTemporaries();
     // A crash between claim and remote ACK leaves the file in processing.
@@ -598,11 +789,20 @@ class DurableCaptureOutbox {
       }
     }
     await this.refreshQueueStats();
+    // Mark the outbox started before recovery so recovered transactions can
+    // reuse the same immutable enqueue path without recursively starting it.
+    this.started = true;
+    try {
+      await this.recoverOpenCaptures();
+    } catch (error) {
+      this.started = false;
+      throw error;
+    }
+    await this.refreshQueueStats();
     this.metrics.historicalFailedFiles = this.metrics.failedFiles;
     this.metrics.historicalAuxiliaryFiles = this.metrics.auxiliaryFiles;
     this.metrics.historicalFailedBytes = this.metrics.failedBytes;
     this.metrics.startedAt = new Date().toISOString();
-    this.started = true;
     this.scheduleDrain(0);
     return this.snapshot();
   }
@@ -628,6 +828,131 @@ class DurableCaptureOutbox {
         }
       }
     }
+  }
+
+  async recoverOpenCaptures() {
+    const metadataFiles = await listRegularFiles(this.openDir, '.open.json');
+    for (const metadataFile of metadataFiles) {
+      const stem = path.basename(metadataFile, '.open.json');
+      const files = {
+        metadata: metadataFile,
+        request: path.join(this.openDir, `${stem}.request.bin`),
+        response: path.join(this.openDir, `${stem}.response.bin`),
+      };
+      const metadataBytes = await fsp.readFile(metadataFile);
+      const baseRecord = JSON.parse(metadataBytes.toString('utf8'));
+      const captureId = String(baseRecord.captureId || '');
+      if (!validCaptureId(captureId)) throw new Error('open Capture has invalid captureId');
+      const existing = await this.findExisting(captureId);
+      if (existing) {
+        await removeCaptureFiles(files);
+        continue;
+      }
+      const [requestBytes, responseBytes] = await Promise.all([
+        readOptionalFile(files.request),
+        readOptionalFile(files.response),
+      ]);
+      const recoveredAt = new Date().toISOString();
+      const record = {
+        ...baseRecord,
+        captureStage: 'combined',
+        finishedAt: recoveredAt,
+        requestBodyText: requestBytes.toString('utf8'),
+        requestBytesCaptured: requestBytes.length,
+        requestBodySha256: sha256(requestBytes),
+        requestTruncated: true,
+        responseBodyText: responseBytes.toString('utf8'),
+        responseBytesCaptured: responseBytes.length,
+        responseBodySha256: sha256(responseBytes),
+        responseTruncated: true,
+        upstreamResponseCompleted: false,
+        clientResponseFinished: false,
+        captureError: 'gateway process ended before Capture finalization',
+        captureErrorCode: 'CHIPTRACE_GATEWAY_CRASH',
+        captureTransaction: {
+          state: 'recovered_incomplete',
+          openedAt: baseRecord.captureTransaction?.openedAt || null,
+          recoveredAt,
+        },
+      };
+      const openBytes = metadataBytes.length + requestBytes.length + responseBytes.length;
+      const openFiles = 1 + Number(requestBytes.length > 0) + Number(responseBytes.length > 0);
+      await this.enqueue(record, {
+        creditBytes: openBytes,
+        creditFiles: openFiles,
+        schedule: false,
+      });
+      await removeCaptureFiles(files);
+    }
+  }
+
+  async beginCapture(record, options = {}) {
+    if (!this.started) await this.start();
+    if (this.closed) throw new Error('capture outbox is closed');
+    const captureId = String(record?.captureId || '');
+    if (!validCaptureId(captureId)) {
+      this.metrics.rejected += 1;
+      throw new Error('captureId is invalid for outbox');
+    }
+    if (this.openCaptures.has(captureId) || await this.findExisting(captureId)) {
+      this.metrics.conflicts += 1;
+      const error = new Error(`captureId ${captureId} already exists`);
+      error.code = 'CAPTURE_ID_CONFLICT';
+      throw error;
+    }
+    const files = openCapturePaths(this.openDir, captureId);
+    const openedAt = new Date().toISOString();
+    const baseRecord = sanitizeCaptureRecord({
+      ...record,
+      captureId,
+      recordType: 'api_snapshot',
+      captureStage: 'ingress',
+      captureTransaction: { state: 'open', openedAt },
+    }, false);
+    delete baseRecord.requestBodyText;
+    delete baseRecord.responseBodyText;
+    const bytes = Buffer.from(`${JSON.stringify(baseRecord)}\n`, 'utf8');
+    await this.refreshFilesystemStats(false);
+    if (this.metrics.queueBytes + this.reservedBytes + bytes.length > this.maxBytes) {
+      const error = new Error('capture outbox byte cap is full');
+      error.code = 'OUTBOX_FULL';
+      throw error;
+    }
+    if (this.metrics.filesystemFreeBytes !== null
+      && this.metrics.filesystemFreeBytes - this.reservedBytes - bytes.length < this.minFreeBytes) {
+      const error = new Error('capture outbox filesystem free-space cutoff reached');
+      error.code = 'OUTBOX_DISK_PRESSURE';
+      throw error;
+    }
+    if (this.metrics.pending
+      + this.metrics.processing
+      + this.metrics.failedFiles
+      + this.metrics.auxiliaryFiles
+      + this.metrics.openFiles
+      + this.metrics.stalledFiles
+      + this.reservedFiles >= this.maxFiles) {
+      const error = new Error('capture outbox file cap is full');
+      error.code = 'OUTBOX_FULL';
+      throw error;
+    }
+    await atomicWrite(files.metadata, bytes);
+    const transaction = new DurableCaptureTransaction(this, baseRecord, files, options, bytes.length);
+    this.openCaptures.set(captureId, transaction);
+    this.metrics.openTransactions += 1;
+    this.metrics.openFiles += 1;
+    this.metrics.openBytes += bytes.length;
+    this.metrics.queueBytes += bytes.length;
+    return transaction;
+  }
+
+  releaseOpenCapture(transaction, bytes, files) {
+    if (this.openCaptures.get(transaction.captureId) === transaction) {
+      this.openCaptures.delete(transaction.captureId);
+    }
+    this.metrics.openTransactions = Math.max(0, this.metrics.openTransactions - 1);
+    this.metrics.openFiles = Math.max(0, this.metrics.openFiles - files);
+    this.metrics.openBytes = Math.max(0, this.metrics.openBytes - bytes);
+    this.metrics.queueBytes = Math.max(0, this.metrics.queueBytes - bytes);
   }
 
   async close() {
@@ -669,6 +994,9 @@ class DurableCaptureOutbox {
     let processing = 0;
     let failedFiles = 0;
     let auxiliaryFiles = 0;
+    let openFiles = 0;
+    let openBytes = 0;
+    let openTransactions = 0;
     const queuedAtByName = new Map();
     for (const [directory, kind] of [
       [this.pendingDir, 'pending'],
@@ -698,11 +1026,25 @@ class DurableCaptureOutbox {
         }
       }
     }
+    for (const file of await listRegularFiles(this.openDir, null, true)) {
+      try {
+        const stat = await fsp.stat(file);
+        bytes += stat.size;
+        openBytes += stat.size;
+        openFiles += 1;
+        if (file.endsWith('.open.json')) openTransactions += 1;
+      } catch (error) {
+        if (error.code !== 'ENOENT') this.recordError(error);
+      }
+    }
     this.metrics.queueBytes = bytes;
     this.metrics.activeQueueBytes = activeQueueBytes;
     this.metrics.failedBytes = failedBytes;
     this.metrics.pending = pending;
     this.metrics.processing = processing;
+    this.metrics.openTransactions = openTransactions;
+    this.metrics.openFiles = openFiles;
+    this.metrics.openBytes = openBytes;
     this.metrics.failedFiles = failedFiles;
     this.metrics.auxiliaryFiles = auxiliaryFiles;
     this.queuedAtByName = queuedAtByName;
@@ -724,7 +1066,7 @@ class DurableCaptureOutbox {
     }
   }
 
-  async enqueue(record) {
+  async enqueue(record, options = {}) {
     if (!this.started) await this.start();
     if (this.closed) throw new Error('capture outbox is closed');
     const captureId = String(record?.captureId || '');
@@ -737,6 +1079,8 @@ class DurableCaptureOutbox {
     const prepared = sanitizeCaptureRecord(record, this.sanitize);
     const bytes = Buffer.from(`${JSON.stringify(prepared)}\n`, 'utf8');
     const digest = sha256(bytes);
+    const creditBytes = Math.max(0, Number(options.creditBytes) || 0);
+    const creditFiles = Math.max(0, Number(options.creditFiles) || 0);
     const existing = await this.findExisting(captureId);
     if (existing) {
       if (existing.hash !== digest) {
@@ -749,21 +1093,23 @@ class DurableCaptureOutbox {
       return { durable: true, duplicate: true, captureId, bytes: existing.bytes.length };
     }
     await this.refreshFilesystemStats(false);
+    const additionalBytes = Math.max(0, bytes.length - creditBytes);
     if (this.metrics.filesystemFreeBytes !== null
-      && this.metrics.filesystemFreeBytes - this.reservedBytes - bytes.length < this.minFreeBytes) {
+      && this.metrics.filesystemFreeBytes - this.reservedBytes - additionalBytes < this.minFreeBytes) {
       this.metrics.rejected += 1;
       const error = new Error('capture outbox filesystem free-space cutoff reached');
       error.code = 'OUTBOX_DISK_PRESSURE';
       throw error;
     }
     if (this.metrics.filesystemFreeFiles !== null
-      && this.metrics.filesystemFreeFiles - this.reservedFiles - 1 < this.minFreeFiles) {
+      && this.metrics.filesystemFreeFiles - this.reservedFiles - Math.max(0, 1 - creditFiles) < this.minFreeFiles) {
       this.metrics.rejected += 1;
       const error = new Error('capture outbox filesystem inode cutoff reached');
       error.code = 'OUTBOX_INODE_PRESSURE';
       throw error;
     }
-    if (this.metrics.queueBytes + this.reservedBytes + bytes.length > this.maxBytes) {
+    if (Math.max(0, this.metrics.queueBytes - creditBytes)
+      + this.reservedBytes + bytes.length > this.maxBytes) {
       this.metrics.rejected += 1;
       const error = new Error('capture outbox byte cap is full');
       error.code = 'OUTBOX_FULL';
@@ -773,8 +1119,9 @@ class DurableCaptureOutbox {
       + this.metrics.processing
       + this.metrics.failedFiles
       + this.metrics.auxiliaryFiles
+      + this.metrics.openFiles
       + this.metrics.stalledFiles
-      + this.reservedFiles >= this.maxFiles) {
+      + this.reservedFiles - creditFiles >= this.maxFiles) {
       this.metrics.rejected += 1;
       const error = new Error('capture outbox file cap is full');
       error.code = 'OUTBOX_FULL';
@@ -822,7 +1169,7 @@ class DurableCaptureOutbox {
       this.metrics.filesystemFreeFiles = Math.max(0, this.metrics.filesystemFreeFiles - 1);
     }
     this.metrics.lastAcceptedAt = new Date().toISOString();
-    this.scheduleDrain(0);
+    if (options.schedule !== false) this.scheduleDrain(0);
     return { durable: true, duplicate: false, captureId, bytes: bytes.length };
   }
 
@@ -908,16 +1255,24 @@ class DurableCaptureOutbox {
 
   async deliverFile(file) {
     let bytes;
+    let storedBytesLength = 0;
     let captureId = path.basename(file, '.json');
     try {
       bytes = await fsp.readFile(file);
+      storedBytesLength = bytes.length;
       const record = JSON.parse(bytes.toString('utf8'));
       captureId = String(record.captureId || captureId);
       if (!validCaptureId(captureId)) throw new Error('outbox file has invalid captureId');
+      const reconciled = reconcileCaptureBodyMetadata(record);
+      if (reconciled.changed) {
+        // Repair in memory so the original failed file remains untouched as
+        // audit evidence. A successful ACK removes only the replay copy.
+        bytes = Buffer.from(`${JSON.stringify(reconciled.record)}\n`, 'utf8');
+      }
     } catch (error) {
       this.metrics.failed += 1;
       this.recordError(error);
-      await this.moveFailed(file, 'invalid_record', bytes?.length);
+      await this.moveFailed(file, 'invalid_record', storedBytesLength || bytes?.length);
       return;
     }
 
@@ -950,11 +1305,11 @@ class DurableCaptureOutbox {
           await fsp.rm(file, { force: false });
           await fsyncDirectory(this.processingDir);
           this.metrics.durable += 1;
-          this.metrics.queueBytes = Math.max(0, this.metrics.queueBytes - bytes.length);
-          this.metrics.activeQueueBytes = Math.max(0, this.metrics.activeQueueBytes - bytes.length);
+          this.metrics.queueBytes = Math.max(0, this.metrics.queueBytes - storedBytesLength);
+          this.metrics.activeQueueBytes = Math.max(0, this.metrics.activeQueueBytes - storedBytesLength);
           this.queuedAtByName.delete(path.basename(file));
           if (this.metrics.filesystemFreeBytes !== null) {
-            this.metrics.filesystemFreeBytes += bytes.length;
+            this.metrics.filesystemFreeBytes += storedBytesLength;
           }
           if (this.metrics.filesystemFreeFiles !== null) {
             this.metrics.filesystemFreeFiles += 1;
@@ -973,11 +1328,11 @@ class DurableCaptureOutbox {
           if (response.status === 409 || payload.reason === 'capture_id_conflict') {
             this.metrics.conflicts += 1;
             this.onFailure?.({ captureId, reason: 'capture_id_conflict', error });
-            await this.moveFailed(file, 'capture_id_conflict', bytes.length);
+            await this.moveFailed(file, 'capture_id_conflict', storedBytesLength);
           } else {
             this.metrics.failed += 1;
             this.onFailure?.({ captureId, reason: `http_${response.status}`, error });
-            await this.moveFailed(file, `http_${response.status}`, bytes.length);
+            await this.moveFailed(file, `http_${response.status}`, storedBytesLength);
           }
           this.recordError(error);
           this.attemptsByFile.delete(file);
@@ -1108,6 +1463,7 @@ module.exports = {
   DurableCaptureOutbox,
   ResponsesSseBoundaryTracker,
   codexTraceContextFromHeaders,
+  reconcileCaptureBodyMetadata,
   sanitizeCaptureRecord,
   retryDelayMs,
   validateProviderCredential,
