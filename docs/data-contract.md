@@ -54,6 +54,16 @@ response chain           by response_id / previous_response_id
 
 不按时间邻近、模型名、正文相似度或 thread ID 猜测跨 Session 关系。
 
+来源端可在 OTLP 记录或 Span 边界声明 `codex.context_scope=session|turn`。
+Session 边界必须提供实际原生 Session 身份；初始化、关闭及其派生操作仅通过精确
+Trace/Span 父链继承这一作用域，不能借用同一 Trace 的唯一 Turn。业务 Turn 分支的
+显式作用域或原生 Turn 身份优先，缺少 Turn 身份的新边界不能借用祖先 Turn。
+缺少 Session 身份的边界保留为未解析记录，未知作用域、矛盾声明、父关系冲突和环均拒绝。
+
+Session 级记录不参与逐 Turn 四源计数。SSE、工具结果/决策、用户输入及 Turn 指标
+始终需要 Turn 身份；声明 Session 作用域不能豁免这些业务记录。未提供这一协议的
+历史 Raw 保持现有严格分类；添加来源补丁不改变历史字节或历史交付结论。
+
 ## 状态
 
 以下事实分别保存：

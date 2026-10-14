@@ -38,6 +38,8 @@ jobs:
           git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-sse-context.patch"
           git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-sse-context-test.patch"
           git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-sse-context-test.patch"
+          git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-session-scope.patch"
+          git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-session-scope.patch"
           git -C .ci-codex-source diff --check
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -68,6 +70,12 @@ jobs:
             | tee "$RUNNER_TEMP/producer-regression-check.json"
           cargo test -p codex-core --lib --locked client::tests \
             2>&1 | tee "$RUNNER_TEMP/producer-client.log"
+          RUST_MIN_STACK=16777216 cargo test -p codex-app-server --lib --locked message_processor_tracing_tests \
+            2>&1 | tee "$RUNNER_TEMP/producer-session.log"
+          node "$GITHUB_WORKSPACE/scripts/ci/check-producer-regressions.js" \
+            "$RUNNER_TEMP/producer-callbacks.log" "$RUNNER_TEMP/producer-parallel.log" \
+            "$RUNNER_TEMP/producer-session.log" \
+            | tee "$RUNNER_TEMP/producer-regression-check-with-session.json"
       - name: Build the patched CLI from the exact producer source
         working-directory: .ci-codex-source/codex-rs
         run: cargo build -p codex-cli --bin codex --locked
@@ -81,6 +89,8 @@ jobs:
             ${{ runner.temp }}/producer-parallel.log
             ${{ runner.temp }}/producer-regression-check.json
             ${{ runner.temp }}/producer-client.log
+            ${{ runner.temp }}/producer-session.log
+            ${{ runner.temp }}/producer-regression-check-with-session.json
 
   rust:
     runs-on: ubuntu-latest

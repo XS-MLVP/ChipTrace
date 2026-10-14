@@ -7,7 +7,13 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { prepareProducerLock, verifyProducerLock } = require('./check-producer-lock');
-const { verifyProducerRegressions, callbackTests, parallelTests } = require('./check-producer-regressions');
+const {
+  verifyProducerRegressions,
+  verifyProducerSessionRegressions,
+  callbackTests,
+  parallelTests,
+  sessionTests,
+} = require('./check-producer-regressions');
 
 const version = '0.163.0-alpha.11';
 const metadata = {
@@ -123,4 +129,20 @@ test('producer report requires the four actual named tests, not just a successfu
     assert.throws(() => verifyProducerRegressions(callbacks, cargoReport(parallelTests)));
   }
   assert.throws(() => verifyProducerRegressions(cargoReport(callbackTests), cargoReport([])));
+});
+
+test('producer session report requires both scope propagation tests exactly once', () => {
+  assert.equal(
+    verifyProducerSessionRegressions(cargoReport(sessionTests)).passed_tests,
+    sessionTests.length,
+  );
+  for (const sessionLog of [
+    cargoReport([]),
+    cargoReport(sessionTests.slice(1)),
+    cargoReport([...sessionTests, sessionTests[0]]),
+    cargoReport(sessionTests).replace('... ok', '... FAILED'),
+    cargoReport(sessionTests).replace('2 passed; 0 failed', '1 passed; 1 failed'),
+  ]) {
+    assert.throws(() => verifyProducerSessionRegressions(sessionLog));
+  }
 });

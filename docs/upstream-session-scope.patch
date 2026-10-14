@@ -1,0 +1,284 @@
+diff --git a/codex-rs/app-server/src/app_server_tracing.rs b/codex-rs/app-server/src/app_server_tracing.rs
+index 764634d..ddc0441 100644
+--- a/codex-rs/app-server/src/app_server_tracing.rs
++++ b/codex-rs/app-server/src/app_server_tracing.rs
+@@ -108,8 +108,10 @@ fn app_server_request_span_template(
+         app_server.connection_id = %connection_id,
+         app_server.api_version = "v2",
+         app_server.client_name = field::Empty,
+         app_server.client_version = field::Empty,
++        codex.context_scope = field::Empty,
++        conversation.id = field::Empty,
+         turn.id = field::Empty,
+     )
+ }
+
+diff --git a/codex-rs/app-server/src/message_processor_tracing_tests.rs b/codex-rs/app-server/src/message_processor_tracing_tests.rs
+index 518df30..c2a4b85 100644
+--- a/codex-rs/app-server/src/message_processor_tracing_tests.rs
++++ b/codex-rs/app-server/src/message_processor_tracing_tests.rs
+@@ -578,9 +578,9 @@ fn thread_start_jsonrpc_span_exports_server_span_and_parents_children() -> Resul
+                 context: remote_trace,
+                 ..
+             } = RemoteTrace::new("00000000000000000000000000000011", "0000000000000022");
+
+-            let _: ThreadStartResponse = harness
++            let untraced_response: ThreadStartResponse = harness
+                 .start_thread(/*request_id*/ 20_002, /*trace*/ None)
+                 .await;
+             let untraced_spans = wait_for_exported_spans(harness.tracing, |spans| {
+                 spans.iter().any(|span| {
+@@ -614,11 +614,19 @@ fn thread_start_jsonrpc_span_exports_server_span_and_parents_children() -> Resul
+                 &untraced_spans,
+                 untraced_server_span,
+                 /*min_depth*/ 1,
+             );
++            assert_eq!(
++                span_attr(untraced_server_span, "conversation.id"),
++                Some(untraced_response.thread.id.as_str())
++            );
++            assert_eq!(
++                span_attr(untraced_server_span, "codex.context_scope"),
++                Some("session")
++            );
+
+             let baseline_len = untraced_spans.len();
+-            let _: ThreadStartResponse = harness
++            let traced_response: ThreadStartResponse = harness
+                 .start_thread(/*request_id*/ 20_003, Some(remote_trace))
+                 .await;
+             let spans = wait_for_new_exported_spans(harness.tracing, baseline_len, |spans| {
+                 spans.iter().any(|span| {
+@@ -634,8 +642,29 @@ fn thread_start_jsonrpc_span_exports_server_span_and_parents_children() -> Resul
+
+             let server_request_span =
+                 find_rpc_span_with_trace(&spans, SpanKind::Server, "thread/start", remote_trace_id);
+             assert_eq!(server_request_span.name.as_ref(), "thread/start");
++            assert_eq!(
++                span_attr(server_request_span, "conversation.id"),
++                Some(traced_response.thread.id.as_str())
++            );
++            assert_eq!(
++                span_attr(server_request_span, "codex.context_scope"),
++                Some("session")
++            );
++            for name in ["thread_spawn", "session_init"] {
++                let source_span = find_span_with_trace(&spans, remote_trace_id, name, |span| {
++                    span.name.as_ref() == name
++                });
++                assert_eq!(
++                    span_attr(source_span, "conversation.id"),
++                    Some(traced_response.thread.id.as_str())
++                );
++                assert_eq!(
++                    span_attr(source_span, "codex.context_scope"),
++                    Some("session")
++                );
++            }
+             assert_eq!(server_request_span.parent_span_id, remote_parent_span_id);
+             assert!(server_request_span.parent_span_is_remote);
+             assert_eq!(server_request_span.span_context.trace_id(), remote_trace_id);
+             assert_ne!(server_request_span.span_context.span_id(), SpanId::INVALID);
+@@ -648,9 +677,26 @@ fn thread_start_jsonrpc_span_exports_server_span_and_parents_children() -> Resul
+                 &spans,
+                 server_request_span,
+                 /*min_depth*/ 2,
+             );
++            let tracing = harness.tracing;
++            let thread_id = traced_response.thread.id;
+             harness.shutdown().await;
++            let closed = wait_for_exported_spans(tracing, |spans| {
++                spans.iter().any(|span| {
++                    span.name.as_ref() == "session_loop"
++                        && span_attr(span, "conversation.id") == Some(thread_id.as_str())
++                })
++            })
++            .await;
++            let loop_span = closed
++                .iter()
++                .find(|span| {
++                    span.name.as_ref() == "session_loop"
++                        && span_attr(span, "conversation.id") == Some(thread_id.as_str())
++                })
++                .unwrap();
++            assert_eq!(span_attr(loop_span, "codex.context_scope"), Some("session"));
+
+             Ok(())
+         },
+     )
+@@ -735,8 +781,12 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
+     assert_eq!(
+         span_attr(server_request_span, "turn.id"),
+         Some(turn_start_response.turn.id.as_str())
+     );
++    assert_eq!(
++        span_attr(server_request_span, "codex.context_scope"),
++        Some("turn")
++    );
+     assert_span_descends_from(&spans, core_turn_span, server_request_span);
+     harness.shutdown().await;
+
+     Ok(())
+diff --git a/codex-rs/app-server/src/outgoing_message.rs b/codex-rs/app-server/src/outgoing_message.rs
+index 9ed210e..9f7af20 100644
+--- a/codex-rs/app-server/src/outgoing_message.rs
++++ b/codex-rs/app-server/src/outgoing_message.rs
+@@ -109,8 +109,22 @@ impl RequestContext {
+     }
+
+     fn record_turn_id(&self, turn_id: &str) {
+         self.span.record("turn.id", turn_id);
++        self.span.record("codex.context_scope", "turn");
++    }
++
++    fn record_response_context(&self, response: &ClientResponsePayload) {
++        let thread_id = match response {
++            ClientResponsePayload::ThreadStart(response) => Some(response.thread.id.as_str()),
++            ClientResponsePayload::ThreadResume(response) => Some(response.thread.id.as_str()),
++            ClientResponsePayload::ThreadFork(response) => Some(response.thread.id.as_str()),
++            _ => None,
++        };
++        if let Some(thread_id) = thread_id {
++            self.span.record("conversation.id", thread_id);
++            self.span.record("codex.context_scope", "session");
++        }
+     }
+ }
+
+ #[derive(Debug)]
+@@ -730,8 +744,11 @@ impl OutgoingMessageSender {
+             }
+         }
+         let response = Box::new(response);
+         let request_context = self.take_request_context(&request_id).await;
++        if let Some(context) = &request_context {
++            context.record_response_context(&response);
++        }
+         let outgoing_message = OutgoingMessage::Response(OutgoingResponse {
+             id: request_id.request_id,
+             result: response,
+         });
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 9b00655..45b32c0 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -573,22 +573,31 @@ impl Session {
+                     }
+                 }
+                 None => None,
+             };
+-            let thread_spawn_span = info_span!("thread_spawn", otel.name = "thread_spawn");
++            let thread_spawn_span = info_span!(
++                "thread_spawn",
++                otel.name = "thread_spawn",
++                codex.context_scope = "session",
++                conversation.id = tracing::field::Empty,
++            );
+             if let Some(trace) = parent_trace.as_ref() {
+                 let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
+             }
+             let spawn = Self::spawn_internal(SessionSpawnArgs {
+                 parent_trace,
+                 ..args
+             })
+-            .instrument(thread_spawn_span);
+-            tokio::select! {
++            .instrument(thread_spawn_span.clone());
++            let result = tokio::select! {
+                 biased;
+                 _ = tree_shutdown.cancelled() => Err(CodexErr::TurnAborted),
+                 result = spawn => result,
++            };
++            if let Ok((session, _)) = &result {
++                thread_spawn_span.record("conversation.id", session.thread_id.to_string());
+             }
++            result
+         })
+     }
+
+     async fn spawn_internal(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
+@@ -1021,9 +1030,14 @@ impl Session {
+             .and_then(|startup| startup.session_teardown(thread_id));
+         let session_for_loop = Arc::clone(&session);
+         let session_loop_handle = tokio::spawn(Box::pin(storage_originator.scope(async move {
+             submission_loop(session_for_loop, configured_config, rx_sub)
+-                .instrument(info_span!("session_loop", thread_id = %thread_id))
++                .instrument(info_span!(
++                    "session_loop",
++                    thread_id = %thread_id,
++                    conversation.id = %thread_id,
++                    codex.context_scope = "session",
++                ))
+                 .await;
+             if let Some(tree_teardown) = tree_teardown {
+                 tree_teardown.complete();
+             }
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+index 725f213..e679427 100644
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -770,9 +770,12 @@ impl Session {
+             ..responses_metadata
+         }
+     }
+
+-    #[instrument(name = "session_init", level = "info", skip_all)]
++    #[instrument(
++        name = "session_init", level = "info", skip_all,
++        fields(codex.context_scope = "session", conversation.id = tracing::field::Empty)
++    )]
+     #[allow(clippy::too_many_arguments)]
+     pub(crate) async fn new(
+         startup: Option<Arc<super::startup::SessionStartup>>,
+         mut session_configuration: SessionConfiguration,
+@@ -901,8 +904,9 @@ impl Session {
+                     "reserved thread ID cannot be used when resuming a thread"
+                 ));
+             }
+         };
++        tracing::Span::current().record("conversation.id", thread_id.to_string());
+         let isolation = thread_extension_init
+             .get::<codex_extension_api::SessionIsolation>()
+             .map(|policy| *policy)
+             .unwrap_or_default();
+diff --git a/codex-rs/core/src/session/turn_input.rs b/codex-rs/core/src/session/turn_input.rs
+index 74a7592..f0f1b21 100644
+--- a/codex-rs/core/src/session/turn_input.rs
++++ b/codex-rs/core/src/session/turn_input.rs
+@@ -224,9 +224,9 @@ impl PreparedTurnInputSettings {
+ #[tracing::instrument(
+     name = "codex.turn_input",
+     level = "trace",
+     skip_all,
+-    fields(conversation.id = %session.thread_id, turn.id)
++    fields(conversation.id = %session.thread_id, codex.context_scope = "turn", turn.id)
+ )]
+ pub(super) async fn handle(
+     session: &Arc<Session>,
+     request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
+@@ -292,9 +292,9 @@ pub(super) async fn handle(
+ #[tracing::instrument(
+     name = "codex.turn_input",
+     level = "trace",
+     skip_all,
+-    fields(conversation.id = %session.thread_id, turn.id)
++    fields(conversation.id = %session.thread_id, codex.context_scope = "turn", turn.id)
+ )]
+ pub(super) async fn handle_recovery(
+     session: &Arc<Session>,
+     thread_settings: impl Into<WithTurnExtensionData<ThreadSettingsOverrides>>,
+diff --git a/codex-rs/core/src/tasks/mod.rs b/codex-rs/core/src/tasks/mod.rs
+index 6a3e95e..284ad78 100644
+--- a/codex-rs/core/src/tasks/mod.rs
++++ b/codex-rs/core/src/tasks/mod.rs
+@@ -368,8 +368,10 @@ impl Session {
+         let task_span = info_span!(
+             "turn",
+             otel.name = span_name,
+             thread.id = %self.thread_id,
++            conversation.id = %self.thread_id,
++            codex.context_scope = "turn",
+             turn.id = %turn_context.sub_id,
+             model = %turn_context.model_info().slug,
+             codex.turn.reasoning_effort = %reasoning_effort,
+             codex.turn.token_usage.input_tokens = field::Empty,

@@ -1,7 +1,9 @@
 //! Native Session/Turn accounting, separate from Buyer-v7 effective rounds.
 
 use crate::lifecycle::LifecycleState;
-use crate::turn_identity::{ExactTurnIndex, session_attribute, turn_attribute, visit_otlp};
+use crate::turn_identity::{
+    ExactTurnIndex, SourceScope, session_attribute, turn_attribute, visit_otlp,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -286,21 +288,42 @@ pub(crate) fn otlp_source_observation(
         )
     );
     let identity = index.resolve(record, attributes)?;
+    let source_scope = index.source_scope(record, attributes)?;
     let related_sessions = index.record_sessions(record, attributes)?;
     let session_id = identity
         .as_ref()
         .map(|(s, _)| s.clone())
         .or(session_attribute(attributes)?)
+        .or_else(|| match &source_scope {
+            Some(SourceScope::Session(session)) => session.clone(),
+            _ => None,
+        })
         .or_else(|| {
             (related_sessions.len() == 1).then(|| related_sessions.first().unwrap().clone())
         });
     let turn_id = identity.map(|(_, t)| t).or(turn_attribute(attributes)?);
+    let requires_turn = matches!(
+        event_name.as_deref(),
+        Some(
+            "codex.sse_event"
+                | "codex.tool_result"
+                | "codex.tool_decision"
+                | "codex.sandbox_outcome"
+                | "codex.user_prompt"
+                | "codex.turn_ttft"
+                | "codex.turn_cost"
+        )
+    ) || match source_scope {
+        Some(SourceScope::Session(Some(_))) => false,
+        Some(SourceScope::Session(None) | SourceScope::Turn) => true,
+        None => !exempt,
+    };
     Ok(SourceObservation {
         source,
         session_id,
         turn_id,
         occurred_at: first_string(record, &["timeUnixNano", "observedTimeUnixNano"]),
-        requires_turn: !exempt,
+        requires_turn,
         related_sessions,
     })
 }

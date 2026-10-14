@@ -81,6 +81,47 @@ test('selecting one Session preserves whole-corpus native identity ambiguity', {
   assert.deepEqual(await fs.readFile(data.file), data.bytes);
 });
 
+test('source-declared Session scopes preserve exact Turn coverage and unresolved business evidence', async t => {
+  const traceId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const session = 'scoped-session';
+  const root = '1111111111111111';
+  const init = '2222222222222222';
+  const turn = '3333333333333333';
+  const attr = (key, value) => ({ key, value: { stringValue: value } });
+  const spans = [
+    { traceId, spanId: root, attributes: [attr('codex.context_scope', 'session'), attr('conversation.id', session)] },
+    { traceId, spanId: init, parentSpanId: root, name: 'fs.get_metadata' },
+    { traceId, spanId: turn, parentSpanId: root },
+    { traceId, spanId: '4444444444444444', parentSpanId: turn, name: 'fs.get_metadata' },
+  ];
+  const logs = [
+    { traceId, spanId: init, attributes: [attr('event.name', 'codex.api_request')] },
+    { traceId, spanId: init, attributes: [attr('event.name', 'codex.sse_event')] },
+    { traceId, spanId: turn, attributes: [attr('event.name', 'codex.sse_event')] },
+  ];
+  const data = await input(t, [
+    { captureId: 'cap-scoped-wire', recordType: 'api_snapshot', traceContext: {
+      session_id: session, turn_id: 'native-turn', trace_id: traceId, parent_span_id: turn,
+    } },
+    batch('otlp_traces', { resourceSpans: [{ scopeSpans: [{ spans }] }] }, spans.length),
+    batch('otlp_logs', { resourceLogs: [{ scopeLogs: [{ logRecords: logs }] }] }, logs.length),
+  ]);
+  const result = await run(binary, ['audit-session-context', '--input', data.file, '--session-id', session]);
+  const audit = JSON.parse(result.stdout);
+  assert.equal(audit.sources.otlp_traces.session_level_records, 2);
+  assert.equal(audit.sources.otlp_traces.turn_assigned_records, 2);
+  assert.equal(audit.sources.otlp_logs.session_level_records, 1);
+  assert.equal(audit.sources.otlp_logs.turn_assigned_records, 1);
+  assert.equal(audit.unscoped_otlp_records, 1);
+  assert.equal(audit.samples[0].record_name, 'codex.sse_event');
+  for (const counts of Object.values(audit.sources)) {
+    assert.equal(counts.total_records, counts.turn_assigned_records + counts.session_level_records
+      + counts.unscoped_turn_records + counts.other_session_records + counts.unknown_session_records);
+  }
+  assert.deepEqual(await fs.readFile(data.file), data.bytes);
+  assert.deepEqual(await fs.readdir(data.root), ['input.ndjson']);
+});
+
 test('corrupt Raw, conflicting captures and oversized diagnostic limits retain real nonzero exits', { timeout: 30000 }, async t => {
   const raw = { resourceLogs: [] };
   const bad = batch('otlp_logs', raw, 0);

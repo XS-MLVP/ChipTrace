@@ -7,6 +7,20 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) type NativeTurn = (String, String);
 type SpanKey = (String, String);
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ScopeKind {
+    Session,
+    Turn,
+}
+
+/// A source-declared boundary, resolved only through an exact Span parent chain.
+/// A Session boundary without its native identity remains unresolved.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SourceScope {
+    Session(Option<String>),
+    Turn,
+}
+
 #[derive(Default)]
 struct TraceScope {
     sessions: BTreeSet<String>,
@@ -18,6 +32,7 @@ struct SpanScope {
     sessions: BTreeSet<String>,
     turns: BTreeSet<String>,
     parents: BTreeSet<SpanKey>,
+    kinds: BTreeSet<ScopeKind>,
 }
 
 #[derive(Default)]
@@ -59,6 +74,7 @@ impl ExactTurnIndex {
                         sessions: scope.sessions.clone(),
                         turns: scope.turns.clone(),
                         parents: scope.parents.clone(),
+                        kinds: scope.kinds.clone(),
                     },
                 )
             })
@@ -79,7 +95,7 @@ impl ExactTurnIndex {
             .or_else(|| text(capture.pointer("/traceContext/root_turn_id")));
         let trace = hex_id(capture.pointer("/traceContext/trace_id"), 32);
         let span = hex_id(capture.pointer("/traceContext/parent_span_id"), 16);
-        self.observe(session, turn, trace, span, None);
+        self.observe(session, turn, trace, span, None, None);
         if capture
             .pointer("/telemetryBatch/endpoint")
             .and_then(Value::as_str)
@@ -92,6 +108,7 @@ impl ExactTurnIndex {
                 None,
                 None,
                 None,
+                None,
             );
         }
         visit_otlp(capture, |_, record, attributes| {
@@ -100,7 +117,8 @@ impl ExactTurnIndex {
             let trace = hex_id(record.get("traceId"), 32);
             let span = hex_id(record.get("spanId"), 16);
             let parent = hex_id(record.get("parentSpanId"), 16);
-            self.observe(session, turn, trace, span, parent);
+            let kind = source_scope_attribute(&attributes)?;
+            self.observe(session, turn, trace, span, parent, kind);
             Ok(())
         })
     }
@@ -112,6 +130,7 @@ impl ExactTurnIndex {
         trace: Option<String>,
         span: Option<String>,
         parent: Option<String>,
+        kind: Option<ScopeKind>,
     ) {
         if let (Some(s), Some(t)) = (&session, &turn) {
             self.native
@@ -123,11 +142,14 @@ impl ExactTurnIndex {
             let scope = self.traces.entry(trace.clone()).or_default();
             scope.sessions.extend(session.clone());
             scope.turns.extend(turn.clone());
-            if let Some(span) = span.filter(|_| self.track_parents || turn.is_some()) {
+            if let Some(span) =
+                span.filter(|_| self.track_parents || turn.is_some() || kind.is_some())
+            {
                 let scope = self.spans.entry((trace.clone(), span)).or_default();
                 scope.sessions.extend(session);
                 scope.turns.extend(turn);
                 scope.parents.extend(parent.map(|parent| (trace, parent)));
+                scope.kinds.extend(kind);
             }
         }
     }
@@ -157,14 +179,9 @@ impl ExactTurnIndex {
         if !visiting.insert(key.clone()) {
             bail!("OTLP span ancestry contains a cycle");
         }
-        if scope.parents.len() > 1 {
-            bail!("one OTLP span has conflicting explicit parents");
-        }
-        if scope.sessions.len() > 1 || scope.turns.len() > 1 {
-            bail!("one OTLP span has conflicting explicit native identities");
-        }
+        validate_span_scope(scope)?;
         let mut candidates = self.candidates(&scope.sessions, &scope.turns);
-        if candidates.is_empty() && scope.turns.is_empty() {
+        if candidates.is_empty() && scope.turns.is_empty() && scope.kinds.is_empty() {
             for parent in &scope.parents {
                 candidates.extend(
                     self.span_candidates(parent, visiting)?
@@ -177,6 +194,87 @@ impl ExactTurnIndex {
         Ok(candidates)
     }
 
+    fn span_source_scope(&self, key: SpanKey) -> Result<Option<SourceScope>> {
+        let mut key = Some(key);
+        let mut visiting = BTreeSet::new();
+        let mut resolved = None;
+        let mut claimed_sessions = BTreeSet::new();
+        while let Some(current) = key {
+            if !visiting.insert(current.clone()) {
+                bail!("OTLP span ancestry contains a cycle");
+            }
+            let Some(scope) = self.spans.get(&current) else {
+                break;
+            };
+            validate_span_scope(scope)?;
+            if resolved.is_none() {
+                match scope.kinds.first() {
+                    Some(ScopeKind::Session) => {
+                        let session = scope.sessions.first().cloned();
+                        if session
+                            .as_ref()
+                            .is_some_and(|s| claimed_sessions.iter().any(|claimed| claimed != s))
+                        {
+                            bail!("OTLP explicit Session conflicts with inherited source scope");
+                        }
+                        resolved = Some(SourceScope::Session(session));
+                    }
+                    Some(ScopeKind::Turn) => resolved = Some(SourceScope::Turn),
+                    None if !scope.turns.is_empty() => resolved = Some(SourceScope::Turn),
+                    None => {
+                        claimed_sessions.extend(scope.sessions.iter().cloned());
+                        if claimed_sessions.len() > 1 {
+                            bail!("OTLP span ancestry has conflicting native Session identities");
+                        }
+                    }
+                }
+            }
+            // Keep validating the entire parent chain after finding a boundary,
+            // including cycles and conflicts above a native Turn or child Session.
+            key = scope.parents.first().cloned();
+        }
+        Ok(resolved)
+    }
+
+    pub(crate) fn source_scope(
+        &self,
+        record: &Value,
+        attributes: &BTreeMap<String, String>,
+    ) -> Result<Option<SourceScope>> {
+        let inherited = match (
+            hex_id(record.get("traceId"), 32),
+            hex_id(record.get("spanId"), 16),
+        ) {
+            (Some(trace), Some(span)) => self.span_source_scope((trace, span))?,
+            _ => None,
+        };
+        let session = session_attribute(attributes)?;
+        let turn = turn_attribute(attributes)?;
+        match source_scope_attribute(attributes)? {
+            Some(ScopeKind::Session) => {
+                if turn.is_some() || inherited == Some(SourceScope::Turn) {
+                    bail!("OTLP Session scope conflicts with native Turn context");
+                }
+                if let Some(SourceScope::Session(Some(parent))) = &inherited
+                    && session.as_ref().is_some_and(|s| s != parent)
+                {
+                    bail!("OTLP explicit Session conflicts with inherited source scope");
+                }
+                Ok(Some(SourceScope::Session(session)))
+            }
+            Some(ScopeKind::Turn) => Ok(Some(SourceScope::Turn)),
+            None if turn.is_some() => Ok(Some(SourceScope::Turn)),
+            None => {
+                if let Some(SourceScope::Session(Some(parent))) = &inherited
+                    && session.as_ref().is_some_and(|s| s != parent)
+                {
+                    bail!("OTLP explicit Session conflicts with inherited source scope");
+                }
+                Ok(inherited)
+            }
+        }
+    }
+
     pub(crate) fn resolve(
         &self,
         record: &Value,
@@ -184,6 +282,7 @@ impl ExactTurnIndex {
     ) -> Result<Option<NativeTurn>> {
         let session = session_attribute(attributes)?;
         let turn = turn_attribute(attributes)?;
+        let source_scope = self.source_scope(record, attributes)?;
         let trace = hex_id(record.get("traceId"), 32);
         let span = hex_id(record.get("spanId"), 16);
         let explicit = session
@@ -206,6 +305,11 @@ impl ExactTurnIndex {
         }
         if let Some(explicit) = explicit {
             return Ok(Some(explicit));
+        }
+        // Explicit boundaries cannot borrow the sole Turn on a shared Trace.
+        // An unbound Turn also cannot inherit a previous Turn across its boundary.
+        if source_scope.is_some() && span_matches.is_empty() && turn.is_none() {
+            return Ok(None);
         }
         let candidates = if !span_matches.is_empty() {
             span_matches
@@ -267,6 +371,10 @@ impl ExactTurnIndex {
     ) -> Result<BTreeSet<String>> {
         let mut sessions = BTreeSet::new();
         sessions.extend(session_attribute(attributes)?);
+        if let Some(SourceScope::Session(session)) = self.source_scope(record, attributes)? {
+            sessions.extend(session);
+            return Ok(sessions);
+        }
         if let Some(turn) = turn_attribute(attributes)?.and_then(|t| self.native.get(&t)) {
             sessions.extend(turn.iter().map(|(s, _)| s.clone()));
         }
@@ -279,6 +387,31 @@ impl ExactTurnIndex {
             );
         }
         Ok(sessions)
+    }
+}
+
+fn validate_span_scope(scope: &SpanScope) -> Result<()> {
+    if scope.parents.len() > 1 {
+        bail!("one OTLP span has conflicting explicit parents");
+    }
+    if scope.sessions.len() > 1 || scope.turns.len() > 1 {
+        bail!("one OTLP span has conflicting explicit native identities");
+    }
+    if scope.kinds.len() > 1 {
+        bail!("one OTLP span has conflicting explicit source scopes");
+    }
+    if scope.kinds.contains(&ScopeKind::Session) && !scope.turns.is_empty() {
+        bail!("OTLP Session scope conflicts with native Turn context");
+    }
+    Ok(())
+}
+
+fn source_scope_attribute(attributes: &BTreeMap<String, String>) -> Result<Option<ScopeKind>> {
+    match attributes.get("codex.context_scope").map(String::as_str) {
+        None | Some("") => Ok(None),
+        Some("session") => Ok(Some(ScopeKind::Session)),
+        Some("turn") => Ok(Some(ScopeKind::Turn)),
+        Some(_) => bail!("OTLP has an unsupported explicit source scope"),
     }
 }
 
@@ -452,6 +585,150 @@ mod tests {
         }})
     }
 
+    fn scoped_spans(spans: Value) -> Value {
+        batch(
+            "otlp_traces",
+            json!({"resourceSpans":[{"scopeSpans":[{"spans":spans}]}]}),
+        )
+    }
+
+    fn scope_attributes(session: Option<&str>, kind: &str) -> Value {
+        let mut attributes =
+            vec![json!({"key":"codex.context_scope","value":{"stringValue":kind}})];
+        if let Some(session) = session {
+            attributes.push(json!({"key":"conversation.id","value":{"stringValue":session}}));
+        }
+        json!(attributes)
+    }
+
+    #[test]
+    fn explicit_session_chain_never_borrows_the_only_turn_on_its_trace() {
+        let root = "3333333333333333";
+        let mut index = ExactTurnIndex::for_turns();
+        index.observe_capture(&wire("s", "t", PARENT)).unwrap();
+        index.observe_capture(&scoped_spans(json!([
+            {"traceId":TRACE,"spanId":root,"attributes":scope_attributes(Some("s"),"session")},
+            {"name":"fs.get_metadata","traceId":TRACE,"spanId":CHILD,"parentSpanId":root},
+            {"traceId":TRACE,"spanId":PARENT,"parentSpanId":root},
+            {"name":"fs.get_metadata","traceId":TRACE,"spanId":"4444444444444444","parentSpanId":PARENT}
+        ]))).unwrap();
+        let init = json!({"traceId":TRACE,"spanId":CHILD});
+        assert_eq!(index.resolve(&init, &BTreeMap::new()).unwrap(), None);
+        assert_eq!(
+            index.source_scope(&init, &BTreeMap::new()).unwrap(),
+            Some(SourceScope::Session(Some("s".to_owned())))
+        );
+        assert_eq!(
+            index.record_sessions(&init, &BTreeMap::new()).unwrap(),
+            BTreeSet::from(["s".to_owned()])
+        );
+        let tool = json!({"traceId":TRACE,"spanId":"4444444444444444"});
+        assert_eq!(
+            index.resolve(&tool, &BTreeMap::new()).unwrap(),
+            Some(("s".to_owned(), "t".to_owned()))
+        );
+        assert_eq!(
+            index.source_scope(&tool, &BTreeMap::new()).unwrap(),
+            Some(SourceScope::Turn)
+        );
+    }
+
+    #[test]
+    fn turn_boundary_without_native_identity_cannot_borrow_an_ancestor_turn() {
+        let mut index = ExactTurnIndex::for_turns();
+        index
+            .observe_capture(&wire("s", "previous", PARENT))
+            .unwrap();
+        index.observe_capture(&scoped_spans(json!([
+            {"traceId":TRACE,"spanId":CHILD,"parentSpanId":PARENT,"attributes":scope_attributes(Some("s"),"turn")}
+        ]))).unwrap();
+        assert_eq!(
+            index
+                .resolve(&json!({"traceId":TRACE,"spanId":CHILD}), &BTreeMap::new())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn session_boundaries_keep_distinct_owners_on_a_shared_trace() {
+        let mut index = ExactTurnIndex::for_turns();
+        index
+            .observe_capture(&wire("parent", "parent-turn", PARENT))
+            .unwrap();
+        index
+            .observe_capture(&wire("child", "child-turn", CHILD))
+            .unwrap();
+        index.observe_capture(&scoped_spans(json!([
+            {"traceId":TRACE,"spanId":"3333333333333333","parentSpanId":PARENT,"attributes":scope_attributes(Some("child"),"session")},
+            {"traceId":TRACE,"spanId":"4444444444444444","parentSpanId":"3333333333333333"}
+        ]))).unwrap();
+        let child_init = json!({"traceId":TRACE,"spanId":"4444444444444444"});
+        assert_eq!(index.resolve(&child_init, &BTreeMap::new()).unwrap(), None);
+        assert_eq!(
+            index
+                .record_sessions(&child_init, &BTreeMap::new())
+                .unwrap(),
+            BTreeSet::from(["child".to_owned()])
+        );
+        let wrong_owner = BTreeMap::from([("conversation.id".to_owned(), "parent".to_owned())]);
+        assert!(index.resolve(&child_init, &wrong_owner).is_err());
+    }
+
+    #[test]
+    fn unresolved_session_boundary_remains_unknown_and_scope_conflicts_fail_closed() {
+        let mut index = ExactTurnIndex::for_turns();
+        index.observe_capture(&wire("s", "t", PARENT)).unwrap();
+        index
+            .observe_capture(&scoped_spans(json!([
+                {"traceId":TRACE,"spanId":CHILD,"attributes":scope_attributes(None,"session")}
+            ])))
+            .unwrap();
+        let record = json!({"traceId":TRACE,"spanId":CHILD});
+        assert_eq!(index.resolve(&record, &BTreeMap::new()).unwrap(), None);
+        assert!(
+            index
+                .record_sessions(&record, &BTreeMap::new())
+                .unwrap()
+                .is_empty()
+        );
+        let direct = BTreeMap::from([
+            ("codex.context_scope".to_owned(), "session".to_owned()),
+            ("conversation.id".to_owned(), "s".to_owned()),
+        ]);
+        assert!(
+            index
+                .resolve(&json!({"traceId":TRACE,"spanId":PARENT}), &direct)
+                .is_err()
+        );
+        index
+            .observe_capture(&scoped_spans(json!([
+                {"traceId":TRACE,"spanId":CHILD,"attributes":scope_attributes(Some("s"),"turn")}
+            ])))
+            .unwrap();
+        assert!(index.resolve(&record, &BTreeMap::new()).is_err());
+        assert!(ExactTurnIndex::for_turns().observe_capture(&scoped_spans(json!([
+            {"traceId":TRACE,"spanId":CHILD,"attributes":scope_attributes(Some("s"),"future-scope")}
+        ]))).is_err());
+    }
+
+    #[test]
+    fn explicit_scope_or_native_identity_does_not_hide_parent_cycles() {
+        let mut index = ExactTurnIndex::for_turns();
+        index.observe_capture(&wire("s", "t", PARENT)).unwrap();
+        index
+            .observe_capture(&scoped_spans(json!([
+                {"traceId":TRACE,"spanId":PARENT,"parentSpanId":CHILD},
+                {"traceId":TRACE,"spanId":CHILD,"parentSpanId":PARENT}
+            ])))
+            .unwrap();
+        assert!(
+            index
+                .resolve(&json!({"traceId":TRACE,"spanId":PARENT}), &BTreeMap::new())
+                .is_err()
+        );
+    }
+
     #[test]
     fn native_otlp_logs_without_turn_attributes_join_exact_wire_context() {
         let mut index = ExactTurnIndex::for_turns();
@@ -460,6 +737,15 @@ mod tests {
         let attrs = BTreeMap::from([("conversation.id".to_owned(), "s".to_owned())]);
         assert_eq!(
             index.resolve(&log, &attrs).unwrap(),
+            Some(("s".to_owned(), "t".to_owned()))
+        );
+        assert_eq!(
+            index
+                .resolve(
+                    &json!({}),
+                    &BTreeMap::from([("turn.id".to_owned(), "t".to_owned())])
+                )
+                .unwrap(),
             Some(("s".to_owned(), "t".to_owned()))
         );
         let traces = batch(

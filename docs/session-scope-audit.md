@@ -32,3 +32,9 @@ Session 未知的记录包含独立鉴权、模型目录、文件访问、持久
    resume 和子 Session 都需独立验证。
 5. 真实多 Turn Canary 必须证明分类总数守恒、零未归属业务记录、所有 Turn 四源齐全且
    Session/Turn 边界闭合；仍无法确定 Session 的记录继续在审计中显式报告。
+
+当前来源端补丁草案 `upstream-session-scope.patch` 为固定 upstream commit 增加
+`codex.context_scope=session|turn`、实际 `conversation.id` 和精确父链测试；CI 会在
+SSE 上下文补丁之后应用它，并使用 16 MiB 测试栈运行 thread-start、session-init、
+session-loop 和 turn-start 作用域回归。该补丁仍需进入上游发行版本并通过未修改客户端
+的多 Turn、并行、resume、取消和子 Session Canary；它不改变历史 Raw 的分类结论。

@@ -234,6 +234,66 @@ mod tests {
     }
 
     #[test]
+    fn explicit_session_scope_counts_conserve_records_without_exempting_business_events() {
+        let trace = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let root = "1111111111111111";
+        let init = "2222222222222222";
+        let turn = "3333333333333333";
+        let captures = vec![
+            json!({"recordType":"api_snapshot","captureId":"wire","traceContext":{
+                "session_id":"s","turn_id":"t","trace_id":trace,"parent_span_id":turn
+            }}),
+            batch(
+                "otlp_traces",
+                json!({"resourceSpans":[{"scopeSpans":[{"spans":[
+                    {"traceId":trace,"spanId":root,"attributes":[
+                        {"key":"codex.context_scope","value":{"stringValue":"session"}},
+                        {"key":"conversation.id","value":{"stringValue":"s"}}
+                    ]},
+                    {"name":"fs.get_metadata","traceId":trace,"spanId":init,"parentSpanId":root},
+                    {"traceId":trace,"spanId":turn,"parentSpanId":root},
+                    {"name":"fs.get_metadata","traceId":trace,"spanId":"4444444444444444","parentSpanId":turn}
+                ]}]}]}),
+            ),
+            batch(
+                "otlp_logs",
+                json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[
+                    {"traceId":trace,"spanId":init,"attributes":[{"key":"event.name","value":{"stringValue":"codex.api_request"}}]},
+                    {"traceId":trace,"spanId":init,"attributes":[{"key":"event.name","value":{"stringValue":"codex.sse_event"}}]},
+                    {"traceId":trace,"spanId":turn,"attributes":[{"key":"event.name","value":{"stringValue":"codex.sse_event"}}]},
+                    {"attributes":[{"key":"event.name","value":{"stringValue":"unknown"}}]}
+                ]}]}]}),
+            ),
+        ];
+        let result = audit(&captures, "s", 10);
+        assert_eq!(
+            result.sources["otlp_traces"],
+            SourceContextCounts {
+                total_records: 4,
+                turn_assigned_records: 2,
+                session_level_records: 2,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            result.sources["otlp_logs"],
+            SourceContextCounts {
+                total_records: 4,
+                turn_assigned_records: 1,
+                session_level_records: 1,
+                unscoped_turn_records: 1,
+                unknown_session_records: 1,
+                ..Default::default()
+            }
+        );
+        let view = summarize_session(&captures, "s").unwrap();
+        assert_eq!(view.turns[0].source_coverage.otlp_traces, 2);
+        assert_eq!(view.turns[0].source_coverage.otlp_logs, 1);
+        assert_eq!(view.unscoped_turn_records, 1);
+        assert!(!view.delivery_ready);
+    }
+
+    #[test]
     fn current_native_fields_preserve_all_context_gaps_and_count_unknown_sessions() {
         let (fixture, captures) = native_fixture();
         let session = fixture["session_id"].as_str().unwrap();
