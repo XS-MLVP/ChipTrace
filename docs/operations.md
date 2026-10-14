@@ -162,6 +162,18 @@ outbox 会在新写入和发送历史副本前按实际 UTF-8 正文幂等重算
 宿主网关健康门禁必须要求 `outbox.openCaptureHealthy === true`；该值在超龄或缺少可验证
 open 时间的事务存在时为 false。router_v2 宿主使用 `FULL_TRACE_CAPTURE_HEALTH_MAX_OPEN_MS`
 配置期限，默认 30 分钟。新增模块和宿主检查只在进程重新加载后生效，修改挂载文件不等于部署。
+升级后应在同一窗口执行仓库提供的 runtime health gate：
+
+```bash
+node scripts/ci/runtime-health-gate.js \
+  --gateway-url http://127.0.0.1:18084/health \
+  --relay-url http://127.0.0.1:3012/health
+```
+
+该门禁同时要求网关 `openCaptureHealthy`、Relay `freshness_applicable`、四路来源新鲜、
+队列排空和 attempt 守恒。旧网关缺少 `openCaptureHealthy`，或旧 Relay 在 Runtime 有流量而
+Wire 停止时返回 `freshness_applicable=false`，都会失败；历史失败文件仍保留为审计证据，
+不会被当作当前失败清理。
 重放失败证据时只能复制到 `pending`（不要移动或删除 `failed` 原件），确认 Relay durable
 ACK 后再以 pending/processing 清零作为完成条件。
 

@@ -116,6 +116,7 @@ jobs:
       - run: node --test scripts/ci/upstream-context.test.js
       - run: node --test scripts/ci/native-canary-gate.test.js
       - run: node --test scripts/ci/native-canary-evidence.test.js
+      - run: node --test scripts/ci/runtime-health-gate.test.js
       - name: Emit the patched multi-turn Canary gate artifact
         run: |
           set -euo pipefail

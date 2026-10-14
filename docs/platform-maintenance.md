@@ -41,6 +41,10 @@ MinIO 公共容器标签的远端拉取已返回 access denied；CI 因此从固
 5. 先隔离 Stock Codex canary，再升级线上镜像。验收目标 Session 的每个 Turn 都有四源和
    显式结束边界，同时检查 outbox/Relay 排空；全局 health 不能证明每个 Session 可交付。
 
+升级完成后还要运行 `node scripts/ci/runtime-health-gate.js` 检查网关和 Relay 的实时门禁。
+它会拒绝旧版本缺少 `openCaptureHealthy` 的响应，以及 `freshness_applicable=false` 的
+Relay 快照，避免把“Runtime 仍在增长、Wire 已断流”误判为完整采集。
+
 后续优先迭代：基于 Session/Turn 索引减少两遍全量扫描；按项目设置磁盘配额和确认后的保留周期；
 在主平台完成多租户授权、计费与审计；扩大到真实并发与较大 Archive 的压力测试。
 当前 Turn 分页的内存受页面约束，但每页会扫描并校验整份 sidecar；任务历史有上限，

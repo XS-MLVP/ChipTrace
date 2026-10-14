@@ -1,4 +1,4 @@
-.PHONY: check test gateway-test gateway-host-test codex-config-test native-context-test native-canary-gate-test native-canary-evidence-test platform-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
+.PHONY: check test gateway-test gateway-host-test codex-config-test native-context-test native-canary-gate-test native-canary-evidence-test runtime-health-gate-test platform-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
 
 CHIPTRACE_VERSION ?= 0.6.0
 CHIPTRACE_REVISION ?= $(shell git rev-parse HEAD)
@@ -32,6 +32,9 @@ native-canary-gate-test:
 native-canary-evidence-test:
 	node --test scripts/ci/native-canary-evidence.test.js
 
+runtime-health-gate-test:
+	node --test scripts/ci/runtime-health-gate.test.js
+
 platform-test:
 	cargo build --locked --bin chiptrace
 	node --test integrations/cloud-platform/platform.test.js integrations/cloud-platform/storage-oss.test.js
@@ -46,6 +49,7 @@ cloud-test:
 	$(MAKE) native-context-test
 	$(MAKE) native-canary-gate-test
 	$(MAKE) native-canary-evidence-test
+	$(MAKE) runtime-health-gate-test
 	$(MAKE) platform-test
 
 m0-test:
