@@ -118,7 +118,7 @@ async function health(url, handle, predicate = () => true) {
   assert.fail(`isolated service did not reach its expected state: ${handle.stderr}`);
 }
 
-function rpc(handle) {
+function rpc(handle, externalFailure) {
   let nextId = 0;
   let failure;
   let bytes = 0;
@@ -166,6 +166,8 @@ function rpc(handle) {
       const deadline = Date.now() + 30000;
       while (Date.now() < deadline) {
         if (failure) throw failure;
+        const cause = externalFailure();
+        if (cause) throw cause;
         const completed = notifications.find(message => message.method === 'turn/completed'
           && message.params.threadId === threadId && message.params.turn.id === turnId);
         if (completed) {
@@ -212,7 +214,8 @@ function deterministicModel() {
         item = exec('protocol-read', 'head -n 12 README.md');
         phase = 'fail';
       } else if (phase === 'fail') {
-        assert.match(output(body, 'protocol-read'), /CHIPTRACE_READ_OK/);
+        const actual = output(body, 'protocol-read');
+        assert.match(actual, /CHIPTRACE_READ_OK/, `first real shell read failed: ${actual}`);
         item = exec('protocol-fail', 'printf CHIPTRACE_EXPECTED_EXIT_7 >&2; exit 7');
         phase = 'launch';
       } else if (phase === 'launch') {
@@ -259,8 +262,7 @@ function deterministicModel() {
   };
 }
 
-test('newly executed producer preserves two Turns, resume, failed exits and real async polling in four sources',
-  { timeout: 180000 }, async t => {
+async function collectProtocol(t) {
     assert.ok(process.env.CHIPTRACE_PROTOCOL_PRODUCER, 'set CHIPTRACE_PROTOCOL_PRODUCER to the pinned patched debug App Server');
     assert.ok(process.env.CHIPTRACE_PROTOCOL_SOURCE, 'set CHIPTRACE_PROTOCOL_SOURCE to its pinned patched checkout');
     const producer = await fs.realpath(process.env.CHIPTRACE_PROTOCOL_PRODUCER);
@@ -393,7 +395,7 @@ test('newly executed producer preserves two Turns, resume, failed exits and real
       CODEX_APP_SERVER_MANAGED_CONFIG_PATH: path.join(managed, 'managed_config.toml') };
     const connect = async () => {
       const handle = launch(producer, ['--strict-config', '--disable-plugin-startup-tasks-for-tests'], producerEnv);
-      const client = rpc(handle);
+      const client = rpc(handle, () => failure);
       const initialized = await client.request('initialize', {
         clientInfo: { name: 'chiptrace-protocol-ci', version: '1.0.0' }, capabilities: { experimentalApi: true } });
       assert.ok(initialized.userAgent.includes(version));
@@ -525,4 +527,20 @@ test('newly executed producer preserves two Turns, resume, failed exits and real
       tool_execution_records: report.tool_execution_records, restart_verified: true,
       real_upstream: false, production_acceptance_claimed: false }));
     passed = true;
+}
+
+test('newly executed producer preserves two Turns, resume, failed exits and real async polling in four sources',
+  { timeout: 180000 }, async t => {
+    try {
+      await collectProtocol(t);
+    } catch (error) {
+      if (process.env.GITHUB_ACTIONS === 'true') {
+        // Only the isolated synthetic experiment runs here. Keep actionable
+        // errors in check annotations when anonymous job-log access is denied.
+        const message = String(error.message).replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').slice(0, 4000)
+          .replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
+        console.log(`::error title=Native protocol collection::${message}`);
+      }
+      throw error;
+    }
   });

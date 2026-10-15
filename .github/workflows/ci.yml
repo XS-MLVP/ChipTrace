@@ -72,6 +72,17 @@ jobs:
           git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-config-read-scope.patch"
           git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-config-read-scope.patch"
           git -C .ci-codex-source diff --check
+      - name: Enable the pinned producer's unprivileged Linux sandbox on the isolated runner
+        run: |
+          set -euo pipefail
+          # Match the pinned producer's .github/actions/setup-ci/action.yml.
+          if test -f /proc/sys/kernel/unprivileged_userns_clone; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if test -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user true
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95.0"
@@ -96,12 +107,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         id: producer-cache
         with:
-          workspaces: .ci-codex-source/codex-rs -> target
+          workspaces: |
+            .ci-codex-source/codex-rs -> target
+            . -> target
           prefix-key: upstream-context-workspace-v1
           # The key is also in rust-cache's fallback prefix. Different source
           # bytes can never receive artifacts with normalized old timestamps.
           key: source-${{ steps.producer-source.outputs.digest }}
           cache-workspace-crates: "true"
+          cache-on-failure: "true"
       - name: "Verify source and normalize timestamps (exact cache hit: ${{ steps.producer-cache.outputs.cache-hit }})"
         env:
           PRODUCER_SOURCE_DIGEST: ${{ steps.producer-source.outputs.digest }}
@@ -146,7 +160,14 @@ jobs:
           CHIPTRACE_PROTOCOL_REPORT: ${{ runner.temp }}/native-protocol-ci.json
         run: |
           set -euo pipefail
-          make protocol-collection-test 2>&1 | tee "$RUNNER_TEMP/native-protocol-ci.tap"
+          if make protocol-collection-test 2>&1 | tee "$RUNNER_TEMP/native-protocol-ci.tap"; then
+            exit 0
+          else
+            protocol_status=$?
+            node -e 'const fs = require("node:fs"); const lines = fs.readFileSync(process.argv[1], "utf8").split("\n"); const commands = lines.filter(line => line.startsWith("# ::error title=Native protocol collection::")); for (const line of commands) console.log(line.slice(2)); if (commands.length === 0) console.log("::error title=Native protocol collection::The protocol test process failed; inspect native-protocol-ci.tap.")' \
+              "$RUNNER_TEMP/native-protocol-ci.tap"
+            exit "$protocol_status"
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

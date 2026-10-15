@@ -37,6 +37,10 @@ CHIPTRACE_PROTOCOL_REPORT=/private/path/native-protocol-ci.json \
 
 运行只创建新的临时采集目录。通过后清理本次临时数据；失败时保留证据目录并返回非零。
 `CHIPTRACE_PROTOCOL_KEEP=1` 可保留通过的本地实验数据，须按运维数据权限管理。
+GitHub 的临时 runner 按同一 pinned producer 的 CI 配置启用非特权 user namespace，并先
+用 `unshare --user --map-root-user true` 验证。实际工具仍使用 `read-only` sandbox。
+失败同时生成有长度限制的 check annotation，避免匿名日志访问受限时只能看到退出码；
+模型服务的断言错误会立即结束当前等待，不等待生产者耗尽网络重试。
 
 本轮新执行的实验在完整五补丁基线上发现 `config/read` 及其文件读取子 span 没有作用域，
 导致 62 个 span 的 Session 身份未知，交付检查实际退出为不通过。此请求读取进程配置，
