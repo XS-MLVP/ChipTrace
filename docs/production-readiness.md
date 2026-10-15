@@ -1,23 +1,26 @@
 # 生产就绪评估
 
-评估日期：2026-10-16。最新线上只读快照为 06:02（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-16。最新线上只读快照为 07:10（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-06:02 的本机回环只读快照中，18084、3011、3012 均返回 200，Collector/Relay 仍为 `fe9fcf9`；
-Collector Capture 与 Relay 累计投递均为 1,112,762，pending/inflight/failed 均为 0，计数守恒。
+07:10 的本机回环只读快照中，18084、3011（Collector）、3012（Relay）均返回 200，
+Collector/Relay 仍为 `fe9fcf9`；Relay 累计投递为 1,117,321，pending/inflight/failed
+均为 0，计数守恒。
 这只是瞬时队列状态，不构成持续 SLO 或完整 Session 的证明。Wire 仍只有 1 条且已约
-19.3 小时未更新，覆盖为 `degraded`；18086 连接拒绝。runtime gate 真实退出 1，明确
+20.4 小时未更新，覆盖为 `degraded`；18086 连接拒绝。使用两个 `/health` URL 的
+runtime gate 真实退出 1，明确
 报告 `stale_sources=wire`。
-模型探针最后可用时间仍为 10 月 8 日，网关 trace exporter 未启用。
-同一快照中，744 个 sealed Segment 共 89,018,977,042 bytes
+上一轮观察到模型探针最后可用时间为 10 月 8 日、网关 trace exporter 未启用；本次未复验这两项。
+同轮文件元数据统计中，745 个 sealed Segment 共 89,521,805,706 bytes
 保存在共享 NFS；此观测不证明已提交目标 OSS。当前状态应区分为传输进程存活、完整
 业务链路未验收和在线交付入口不可用。
 
-当前已提交基线 `b5526c0` 的 [CI run 38810483478](https://github.com/XS-MLVP/ChipTrace/actions/runs/38810483478)
-已独立确认 5/5 作业成功，16 个 artifact 元数据有效；未下载正文重新计算哈希。
-它包含工作区编译/执行的独立超时和诊断，不证明线上已升级。新增正式版上下文诊断
-有独立作业，不能沿用基线的成功状态宣称该新增作业已通过。
+正式版基线 `4b5a502` 的 [CI run 38819711090](https://github.com/XS-MLVP/ChipTrace/actions/runs/38819711090)
+已独立确认 6/6 作业成功，17 个 artifact 元数据有效；未下载正文重新计算哈希。
+固定正式版的生产者回归、五场景 debug App Server 采集、官方原版拒绝诊断、受管路由、
+容器及存储作业均实际执行。该结果不证明线上已升级，也不能替代后续完整 CLI 入口
+改动对应提交的远端 CI；下文完整 CLI 证据来自独立本地新采集。
 
 ## 官方正式版 0.163.0 的新采集
 
@@ -43,6 +46,24 @@ Turn 为 422、未知 Session 为 153；初始化 span 数量会变化，不能�
 报告上限 16 KiB，仅保存计数、版本/源码/二进制和 Raw 哈希，不保存对话、工具正文或
 完整 Turn 数组；GitHub artifact 只选择精简报告和测试日志，失败 Raw 保留在临时 runner。
 具体运行命令和身份约束见[原生 Turn 验收记录](native-turn-context.md)。
+
+## 同一正式版的完整修复 CLI
+
+在同一 `0.163.0` 源码应用完整六补丁后，正常 CLI 的 `app-server` 入口完成五项新采集
+联测，实际 5/5 通过、无跳过，保留插件启动任务。`patched_stock_cli` 与官方原版使用
+相同的私有 user/PID/mount namespace、只读根及私有 `/etc`、`/tmp`；报告核对完整源码、
+六补丁和实际 CLI ELF 的 SHA-256。五份报告的 OTLP 分类均守恒，未归属 Turn 和未知
+Session 记录均为 0；不能用旧 debug App Server 的结果替代这次启动边界验证。
+
+同模型正向样本保留 2 Native Turn、2 个 epoch、12 次 HTTP 尝试及 10 条工具结果，
+通过 FS 归档/恢复、全部投影和 Turn 鉴权下载、Buyer 下载包内容核对、重启与幂等复验，
+score=100、采购有效轮次=12、生成 1 个包。模型切换、取消/断流及缺少压缩 Hook 或业务
+Stop 的负例仍被拒绝；手动/自动压缩的一工具样本仍明确未执行 Buyer 准入。
+
+这些是带补丁生产者、合成模型和 FS 后端的隔离证据，五份报告均声明
+`production_acceptance_claimed=false`、`real_upstream=false`、`real_oss_account=false`。
+它们不改变官方未修改二进制的来源缺口，也不证明线上已升级或目标 OSS、租户授权和
+容量达到生产条件。线上容器本次仍未设置 CPU、内存、PID 限额，根文件系统可写。
 
 ## 平台状态验收
 

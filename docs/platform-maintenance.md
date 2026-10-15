@@ -41,7 +41,8 @@ Actions run，不能用本地通过或旧 main 的绿色结果代替。
 MinIO 公共容器标签的远端拉取已返回 access denied；CI 因此从固定的公开源码提交
 `07c3a429bfed433e49018cb0f78a52145d4bedeb` 构建隔离服务，避免依赖本机镜像缓存。
 
-固定生产者上下文作业中的 `make protocol-collection-test` 另执行五项新采集联测：
+固定生产者上下文作业中的 `make protocol-collection-test` 通过 `patched_stock_cli`
+正常 CLI 入口执行五项新采集联测，保留插件启动任务并使用私有配置/命名空间：
 模型切换完整保存但拒绝混合模型采购、同模型双轮成功导出并独立检查下载包、取消/
 断流保留部分证据并拒绝采购、独立手动压缩后继续和新进程 resume，以及真实轮前/轮中/
 轮后自动压缩与业务终态的完整性。

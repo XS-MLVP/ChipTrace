@@ -1,5 +1,5 @@
 # Install as /etc/codex/requirements.toml.
-# Validated with Stock Codex 0.163.0-alpha.11.
+# Routing validated with the official Stock Codex 0.163.0 ELF.
 # SessionStart fails closed when cloud ingest is unavailable.
 # Every Hook requires HTTP 200 and a conserved, error-free Relay durable receipt.
 # Exact requirements prevent user/profile/session overrides from bypassing Wire capture.

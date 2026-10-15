@@ -1,7 +1,7 @@
 'use strict';
 
 // Execute a pinned producer against a local deterministic Responses endpoint.
-// Default: patched debug App Server; explicit stock mode: pinned official ELF.
+// Default: patched debug App Server; CLI mode: repaired CLI; stock: official ELF.
 // Neither synthetic experiment is real-model production acceptance.
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');

@@ -282,9 +282,9 @@ async function collectInterruption(t) {
   for (const record of rawDigests) assert.equal(await fileDigest(path.join(capture, 'segments', record.file)), record.sha256);
   const platformEvidence = await fixture.verifyPlatform();
   const report = { schema_version: 'chiptrace.native-interruption-ci.v1', ok: true,
-    checked_at: new Date().toISOString(), real_upstream: false, unmodified_stock: false,
+    checked_at: new Date().toISOString(), real_upstream: false, unmodified_stock: fixture.unmodifiedStock,
     production_acceptance_claimed: false, model_mode: 'local_deterministic_responses',
-    producer_mode: 'patched_stock_debug_app_server', client_version: version,
+    producer_mode: fixture.producerMode, client_version: version,
     producer_source: fixture.source, patch_set: fixture.patchSet,
     producer_binary_sha256: await fileDigest(fixture.producer),
     native_turns: 3, model_interactions: 4, interrupted_status: interruptedResult.status,

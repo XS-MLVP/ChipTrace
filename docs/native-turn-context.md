@@ -57,13 +57,15 @@ Session/Turn 不上传。正向的 patched 五场景仍独立执行，原有所�
 当前修复生产者与官方原版诊断统一固定
 [`stock-release.json`](../integrations/codex/stock-release.json) 的正式版 `0.163.0`，
 upstream commit 为 `83086188ae0614bd882818ff1aa23f3194962012`。
-`upstream-context` 在该源码应用完整六补丁并构建；`stock-release-context` 使用同一
+`upstream-context` 在该源码应用完整六补丁并构建 CLI；`stock-release-context` 使用同一
 源码对应的官方未修改 ELF。修复版的来源报告仍明确保留补丁列表和源码摘要，不能通过
 未修改客户端门禁。受管路由配置回归也使用同一正式版；下文 alpha Canary 是历史证据。
 源码、外部依赖和 API 行为均须重新验证，不能从旧 alpha 的通过结果推导正式版通过。
 
-`upstream-context` 除生产者单元测试和 CLI 构建外，还构建固定源码的 debug App Server，
-运行 [protocol-collection.test.js](../integrations/codex/protocol-collection.test.js)。它使用临时
+`upstream-context` 除生产者单元测试和 CLI 构建外，还以 `patched_stock_cli` 模式运行
+[protocol-collection.test.js](../integrations/codex/protocol-collection.test.js)。完整 CLI 通过
+正常 `app-server` 入口启动，保留插件启动任务；私有 user/PID/mount namespace 提供只读根、
+私有 `/etc` 和 `/tmp`，与官方原版诊断使用同一隔离路径。它使用临时
 受管配置、本地确定性 Responses 服务、真实工具、当前 Relay/Collector 和原生 OTLP/Hook；
 不读取宿主客户端配置或模型凭据。先更新计划、读取隔离线程的实际空 Goal，用
 `view_image` 打开仓库 PNG，再执行 README 读取、故意 exit 7 和 sleep/write_stdin。
@@ -152,11 +154,12 @@ Buyer 导出必须真实退出 1，明确拒绝 `protocol_complete=false`。仅�
 回归执行前，在源码副本上逆序撤销完整六补丁集，并逐文件核对固定 upstream 原文；
 GitHub 还核对构建前的源码摘要。仅同版本号、补丁文件名或编译成功不能证明实验基线一致。
 
-本地复验需先构建 ChipTrace，以及固定源码、六个补丁和协调锁文件对应的 debug App Server：
+本地复验需先构建 ChipTrace，以及固定源码、六个补丁和协调锁文件对应的 CLI：
 
 ```bash
+CHIPTRACE_PROTOCOL_MODE=patched_stock_cli \
 CHIPTRACE_PROTOCOL_SOURCE=/absolute/path/to/pinned-codex-checkout \
-CHIPTRACE_PROTOCOL_PRODUCER=/absolute/path/to/codex-app-server \
+CHIPTRACE_PROTOCOL_PRODUCER=/absolute/path/to/codex \
 CHIPTRACE_PROTOCOL_REPORT=/private/path/native-protocol-ci.json \
 CHIPTRACE_BUYER_PROTOCOL_REPORT=/private/path/native-buyer-protocol-ci.json \
 CHIPTRACE_INTERRUPTION_REPORT=/private/path/native-interruption-ci.json \
@@ -164,6 +167,11 @@ CHIPTRACE_COMPACTION_REPORT=/private/path/native-compaction-ci.json \
 CHIPTRACE_AUTO_COMPACTION_REPORT=/private/path/native-auto-compaction-ci.json \
   make protocol-collection-test
 ```
+
+本地仍可显式选择 `patched_stock_debug_app_server` 并传入 `codex-app-server` 进行调试；
+该路径关闭插件启动任务，不能用它的通过代替完整 CLI 的启动边界验证。
+取消、手动和自动压缩报告的 `producer_mode`、`unmodified_stock` 均取实际 fixture 模式，
+不再写死为 debug App Server。所有合成模型报告仍明确声明非真实上游和非生产验收。
 
 运行只创建新的临时采集目录。通过后清理本次临时数据；失败时保留证据目录并返回非零。
 `CHIPTRACE_PROTOCOL_KEEP=1` 可保留通过的本地实验数据，须按运维数据权限管理。

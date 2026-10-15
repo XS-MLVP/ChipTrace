@@ -275,9 +275,9 @@ async function collectAutomaticCompaction(t) {
   for (const digest of rawDigests) assert.equal(await fileDigest(path.join(capture, 'segments', digest.file)), digest.sha256);
   const platformEvidence = await fixture.verifyPlatform('compaction');
   const report = { schema_version: 'chiptrace.native-auto-compaction-ci.v1', ok: true,
-    checked_at: new Date().toISOString(), real_upstream: false, unmodified_stock: false,
+    checked_at: new Date().toISOString(), real_upstream: false, unmodified_stock: fixture.unmodifiedStock,
     production_acceptance_claimed: false, model_mode: 'local_deterministic_responses',
-    producer_mode: 'patched_stock_debug_app_server', client_version: version,
+    producer_mode: fixture.producerMode, client_version: version,
     producer_source: fixture.source, patch_set: fixture.patchSet, producer_binary_sha256: await fileDigest(fixture.producer),
     native_turns: 4, session_epochs: 2, model_interactions: 8, tool_execution_records: 1,
     automatic_compaction_phases: ['pre_turn', 'mid_turn', 'post_turn'],

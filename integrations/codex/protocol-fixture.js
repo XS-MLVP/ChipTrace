@@ -19,8 +19,9 @@ const stockRelease = require('./stock-release.json');
 
 const run = promisify(execFile);
 const producerMode = process.env.CHIPTRACE_PROTOCOL_MODE || 'patched_stock_debug_app_server';
-assert.ok(['patched_stock_debug_app_server', 'unmodified_stock'].includes(producerMode), 'unsupported protocol producer mode');
+assert.ok(['patched_stock_debug_app_server', 'patched_stock_cli', 'unmodified_stock'].includes(producerMode), 'unsupported protocol producer mode');
 const unmodifiedStock = producerMode === 'unmodified_stock';
+const cliProducer = producerMode !== 'patched_stock_debug_app_server';
 // Compare the official release and its context repair on the same upstream
 // source. Patch provenance still distinguishes the repaired producer.
 const version = stockRelease.version;
@@ -267,7 +268,7 @@ async function protocolFixture(t, prefix) {
       await fs.mkdir(home, { mode: 0o700 });
       await fs.mkdir(managed, { mode: 0o700 });
       const sandboxTmp = path.join(root, 'sandbox-tmp');
-      if (unmodifiedStock) await fs.mkdir(sandboxTmp, { mode: 0o700 });
+      if (cliProducer) await fs.mkdir(sandboxTmp, { mode: 0o700 });
       const substitute = value => value.replaceAll('http://172.28.11.121:18084', endpoint)
         .replaceAll('CHIPTRACE_API_KEY', 'CHIPTRACE_PROTOCOL_API_KEY');
       const config = substitute(await fs.readFile(path.join(__dirname, 'config.toml.example'), 'utf8'))
@@ -287,7 +288,7 @@ async function protocolFixture(t, prefix) {
         // Build a private /etc even when the host has no /etc/codex. Only known
         // public OS files and this fixture's config are visible in that mount.
         const publicEtc = ['passwd', 'group', 'hosts', 'resolv.conf', 'nsswitch.conf', 'os-release', 'ssl/certs'];
-        const args = unmodifiedStock ? [
+        const args = cliProducer ? [
           '--unshare-user', '--unshare-pid', '--die-with-parent',
           '--ro-bind', '/', '/', '--proc', '/proc', '--dev', '/dev',
           // The released sandbox prepares /tmp/codex-daemon-<uid> even for
@@ -300,7 +301,7 @@ async function protocolFixture(t, prefix) {
           '--ro-bind', path.join(managed, 'requirements.toml'), '/etc/codex/requirements.toml',
           '--remount-ro', '/etc', '--chdir', root, '--', producer, '--strict-config', 'app-server',
         ] : ['--strict-config', '--disable-plugin-startup-tasks-for-tests'];
-        const handle = launch(unmodifiedStock ? 'bwrap' : producer, args, producerEnv);
+        const handle = launch(cliProducer ? 'bwrap' : producer, args, producerEnv);
         const client = rpc(handle, () => failure);
         const initialized = await client.request('initialize', {
           clientInfo: { name: 'chiptrace-protocol-ci', version: '1.0.0' }, capabilities: { experimentalApi: true } });

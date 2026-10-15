@@ -65,7 +65,7 @@ Responses Wire；模型身份以 Wire 与 Sub2API 精确路由为准。
 `stock-release-context` CI 保存该已知拒绝的精简诊断，不声明生产版本支持；命令、固定
 身份和验收边界见[原生 Turn 记录](../../docs/native-turn-context.md)。
 修复生产者的五项协议联测已迁移到同一正式版源码及完整六补丁；其来源仍为
-`patched_stock_debug_app_server`，不表示官方二进制已经包含修复。
+`patched_stock_cli`，从正常 CLI 入口启动并保留插件启动任务；不表示官方二进制已包含修复。
 
 配置回归不需要 Provider 凭据，不启动 Turn，不调用模型，也不读取宿主用户配置：
 

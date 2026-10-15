@@ -267,9 +267,10 @@ jobs:
           bash scripts/ci/run-producer-check.sh collector-build \
             "$RUNNER_TEMP/producer-collector-build.log" \
             cargo +1.91.0 build --locked --bin chiptrace
-      - name: Collect native Turns and verify Buyer downloads, interruption and compaction recovery
+      - name: Collect native Turns through the CLI and verify Buyer, interruption and compaction recovery
         env:
-          CHIPTRACE_PROTOCOL_PRODUCER: ${{ github.workspace }}/.ci-codex-source/codex-rs/target/debug/codex-app-server
+          CHIPTRACE_PROTOCOL_MODE: patched_stock_cli
+          CHIPTRACE_PROTOCOL_PRODUCER: ${{ github.workspace }}/.ci-codex-source/codex-rs/target/debug/codex
           CHIPTRACE_PROTOCOL_SOURCE: ${{ github.workspace }}/.ci-codex-source
           CHIPTRACE_PROTOCOL_EXPECTED_SOURCE_DIGEST: ${{ steps.producer-source.outputs.digest }}
           CHIPTRACE_PROTOCOL_REPORT: ${{ runner.temp }}/native-protocol-ci.json
