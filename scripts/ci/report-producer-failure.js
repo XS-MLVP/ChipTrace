@@ -35,6 +35,8 @@ if (!/^[a-z][a-z0-9-]{0,63}$/.test(phase || '')
     + '; command_exit=' + commandStatus + '; log_exit=' + logStatus + '\n' + tail;
   if (process.env.GITHUB_ACTIONS === 'true') {
     const escaped = message.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
-    console.log('::error title=Producer ' + phase + '::' + escaped);
+    const title = phase === 'workspace-build' ? 'Workspace build'
+      : phase === 'workspace-tests' ? 'Workspace tests' : 'Producer ' + phase;
+    console.log('::error title=' + title + '::' + escaped);
   } else console.error(message);
 }

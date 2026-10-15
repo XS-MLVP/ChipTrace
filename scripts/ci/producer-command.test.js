@@ -21,9 +21,10 @@ function command(t, source, options = {}) {
     fs.writeFileSync(path.join(bin, 'tee'), '#!/bin/sh\n/bin/cat >/dev/null\nexit 91\n', { mode: 0o700 });
     env.PATH = bin + path.delimiter + env.PATH;
   }
-  const args = options.missing ? [path.join(root, 'missing-producer-command')]
+  let args = options.missing ? [path.join(root, 'missing-producer-command')]
     : [process.execPath, '-e', source];
-  const result = spawnSync('bash', [path.join(__dirname, 'run-producer-check.sh'), 'callbacks', log, ...args],
+  if (options.timeout) args = ['timeout', '--signal=TERM', '--kill-after=1s', '2s', ...args];
+  const result = spawnSync('bash', [path.join(__dirname, 'run-producer-check.sh'), options.phase || 'callbacks', log, ...args],
     { encoding: 'utf8', env, timeout: 10000, maxBuffer: 1024 * 1024 });
   assert.equal(result.error, undefined);
   return { result, log, bytes: fs.readFileSync(log, 'utf8') };
@@ -64,6 +65,23 @@ test('producer termination retains the actual signal exit and its phase', t => {
   const { result } = command(t, 'process.kill(process.pid,"SIGTERM")');
   assert.equal(result.status, 143, result.stderr);
   assert.match(result.stdout, /::error title=Producer callbacks::phase=callbacks; actual exit=143/);
+});
+
+test('a stalled workspace test is actually terminated and keeps its unfinished test and real timeout exit', t => {
+  const { result, bytes } = command(t,
+    'process.stdout.write("running 1 test\\ntest fixture::blocked ...\\nfixture_pid="+process.pid+"\\n");setInterval(()=>{},1000)',
+    { phase: 'workspace-tests', timeout: true, resources: true });
+  assert.equal(result.status, 124, result.stderr);
+  assert.match(bytes, /^running 1 test\ntest fixture::blocked \.\.\.\nfixture_pid=\d+\n$/);
+  assert.match(result.stdout, /::error title=Workspace tests::phase=workspace-tests; actual exit=124; command_exit=124; log_exit=0/);
+  const childPid = Number(/fixture_pid=(\d+)/.exec(bytes)[1]);
+  assert.throws(() => process.kill(childPid, 0), { code: 'ESRCH' });
+  const prefix = '::notice title=Producer resources::';
+  const samples = result.stdout.split('\n').filter(line => line.startsWith(prefix))
+    .map(line => JSON.parse(line.slice(prefix.length)));
+  assert.ok(samples.length >= 1, result.stdout);
+  assert.equal(samples[0].phase, 'workspace-tests');
+  assert.throws(() => process.kill(samples[0].monitor_pid, 0), { code: 'ESRCH' });
 });
 
 test('producer command refuses to overwrite earlier evidence before executing the child', t => {
