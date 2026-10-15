@@ -260,15 +260,19 @@ jobs:
           name: native-canary-gate-report
           path: native-canary-gate.json
       - run: cargo run --locked --bin chiptrace -- self-test
-      - name: Verify native context gaps, unowned batches and read-only diagnostics
-        run: node --test integrations/codex/native-context.test.js | tee native-context.tap
+      - name: Verify native context gaps, conflicting attributes and read-only diagnostics
+        run: |
+          set -euo pipefail
+          node --test integrations/codex/native-context.test.js 2>&1 | tee native-context.tap
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: native-context-report
           path: native-context.tap
-      - name: Verify cloud platform delivery gates and signed OSS protocol
-        run: node --test integrations/cloud-platform/platform.test.js integrations/cloud-platform/storage-oss.test.js | tee platform.tap
+      - name: Verify cloud platform delivery gates, conflicting identities and signed OSS protocol
+        run: |
+          set -euo pipefail
+          node --test integrations/cloud-platform/platform.test.js integrations/cloud-platform/storage-oss.test.js 2>&1 | tee platform.tap
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

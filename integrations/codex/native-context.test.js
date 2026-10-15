@@ -82,6 +82,47 @@ test('selecting one Session preserves whole-corpus native identity ambiguity', {
   assert.deepEqual(await fs.readFile(data.file), data.bytes);
 });
 
+test('conflicting duplicate context attributes fail without choosing a native owner', { timeout: 30000 }, async t => {
+  const attr = (key, value) => ({ key, value: { stringValue: value } });
+  const marker = 'private-duplicate-context-value';
+  const cases = [
+    { key: 'conversation.id', values: [marker, 'selected'], extra: [attr('turn.id', 'native-turn')] },
+    { key: 'turn.id', values: [marker, 'native-turn'], extra: [attr('conversation.id', 'selected')] },
+    { key: 'codex.context_scope', values: ['turn', 'process'], extra: [] },
+    { key: 'event.name', values: ['codex.sse_event', 'auth'], extra: [
+      attr('codex.context_scope', 'session'), attr('conversation.id', 'selected'),
+    ] },
+  ];
+  for (const endpoint of ['otlp_logs', 'otlp_traces']) {
+    for (const [index, scenario] of cases.entries()) {
+      await t.test(`${endpoint}: ${scenario.key}`, async t => {
+        const attributes = [...scenario.extra, ...scenario.values.map(value => attr(scenario.key, value))];
+        const record = { name: 'auth', attributes, body: { stringValue: marker } };
+        const raw = endpoint === 'otlp_logs'
+          ? { resourceLogs: [{ scopeLogs: [{ logRecords: [record] }] }] }
+          : { resourceSpans: [{ scopeSpans: [{ spans: [record] }] }] };
+        const data = await input(t, [
+          { captureId: `cap-duplicate-wire-${index}`, recordType: 'api_snapshot', traceContext: {
+            session_id: 'selected', turn_id: 'native-turn',
+          } },
+          batch(endpoint, raw, 1),
+        ]);
+        await assert.rejects(run(binary, ['audit-session-context', '--input', data.file,
+          '--session-id', 'selected']), error => {
+          assert.equal(error.code, 1);
+          assert.equal(error.stdout, '');
+          assert.match(error.stderr, /conflicting duplicate context attribute/);
+          assert.ok(!error.stderr.includes(marker));
+          assert.ok(error.stderr.length < 4096);
+          return true;
+        });
+        assert.deepEqual(await fs.readFile(data.file), data.bytes);
+        assert.deepEqual(await fs.readdir(data.root), ['input.ndjson']);
+      });
+    }
+  }
+});
+
 test('source-declared Session scopes preserve exact Turn coverage and unresolved business evidence', async t => {
   const traceId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const session = 'scoped-session';

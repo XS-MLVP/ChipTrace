@@ -563,22 +563,53 @@ pub(crate) fn turn_attribute(attributes: &BTreeMap<String, String>) -> Result<Op
     )?))
 }
 
-fn attributes(value: Option<&Value>) -> BTreeMap<String, String> {
-    value
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|a| {
-            let key = a.get("key")?.as_str()?;
-            let value = a.get("value")?;
-            let parsed = value.get("stringValue").or_else(|| value.get("intValue"))?;
-            let parsed = parsed
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| parsed.as_i64().map(|n| n.to_string()))?;
-            Some((key.to_owned(), parsed))
-        })
-        .collect()
+fn attributes(value: Option<&Value>) -> Result<BTreeMap<String, String>> {
+    let mut output = BTreeMap::new();
+    let mut context_values = BTreeMap::new();
+    for attribute in value.and_then(Value::as_array).into_iter().flatten() {
+        let (Some(key), Some(value)) = (
+            attribute.get("key").and_then(Value::as_str),
+            attribute.get("value"),
+        ) else {
+            continue;
+        };
+        // Check the original AnyValue before scalar parsing or map insertion:
+        // otherwise a duplicate can erase a native identity, source boundary,
+        // or business event name before conflict detection sees it. Resource,
+        // scope and record attributes remain separate attribute lists.
+        if matches!(
+            key,
+            "conversation.id"
+                | "session.id"
+                | "session_id"
+                | "conversation_id"
+                | "codex.session_id"
+                | "thread_id"
+                | "turn.id"
+                | "turn_id"
+                | "codex.turn_id"
+                | "root_turn.id"
+                | "root_turn_id"
+                | "codex.context_scope"
+                | "event.name"
+        ) && context_values
+            .insert(key, value)
+            .is_some_and(|previous| previous != value)
+        {
+            bail!("OTLP has conflicting duplicate context attribute {key:?}");
+        }
+        let Some(parsed) = value.get("stringValue").or_else(|| value.get("intValue")) else {
+            continue;
+        };
+        if let Some(parsed) = parsed
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| parsed.as_i64().map(|n| n.to_string()))
+        {
+            output.insert(key.to_owned(), parsed);
+        }
+    }
+    Ok(output)
 }
 
 fn raw_batch(capture: &Value) -> Result<Value> {
@@ -609,7 +640,7 @@ pub(crate) fn visit_otlp(
         .into_iter()
         .flatten()
     {
-        let resource_attributes = attributes(resource.pointer("/resource/attributes"));
+        let resource_attributes = attributes(resource.pointer("/resource/attributes"))?;
         for scope in resource
             .get(scopes)
             .and_then(Value::as_array)
@@ -617,7 +648,7 @@ pub(crate) fn visit_otlp(
             .flatten()
         {
             let mut scoped = resource_attributes.clone();
-            scoped.extend(attributes(scope.pointer("/scope/attributes")));
+            scoped.extend(attributes(scope.pointer("/scope/attributes"))?);
             for record in scope
                 .get(records)
                 .and_then(Value::as_array)
@@ -625,7 +656,7 @@ pub(crate) fn visit_otlp(
                 .flatten()
             {
                 let mut merged = scoped.clone();
-                merged.extend(attributes(record.get("attributes")));
+                merged.extend(attributes(record.get("attributes"))?);
                 visit(source, record, merged)?;
             }
         }
@@ -652,6 +683,139 @@ mod tests {
         json!({"recordType":"telemetry_batch","telemetryBatch":{
             "endpoint":endpoint,"raw_json":serde_json::to_string(&raw).unwrap()
         }})
+    }
+
+    fn attributes_at_layer(endpoint: &str, layer: &str, attributes: Value) -> Value {
+        let (resources, scopes, records) = match endpoint {
+            "otlp_logs" => ("resourceLogs", "scopeLogs", "logRecords"),
+            "otlp_traces" => ("resourceSpans", "scopeSpans", "spans"),
+            _ => unreachable!(),
+        };
+        let mut record = json!({"name":"auth"});
+        let mut scope = json!({});
+        let mut resource = json!({});
+        match layer {
+            "resource" => resource["resource"] = json!({"attributes":attributes}),
+            "scope" => scope["scope"] = json!({"attributes":attributes}),
+            "record" => record["attributes"] = attributes,
+            _ => unreachable!(),
+        }
+        scope[records] = json!([record]);
+        resource[scopes] = json!([scope]);
+        let mut raw = json!({});
+        raw[resources] = json!([resource]);
+        batch(endpoint, raw)
+    }
+
+    #[test]
+    fn duplicate_context_conflicts_fail_before_attribute_maps_choose_an_owner() {
+        let context_keys = [
+            "conversation.id",
+            "session.id",
+            "session_id",
+            "conversation_id",
+            "codex.session_id",
+            "thread_id",
+            "turn.id",
+            "turn_id",
+            "codex.turn_id",
+            "root_turn.id",
+            "root_turn_id",
+            "codex.context_scope",
+            "event.name",
+        ];
+        for endpoint in ["otlp_logs", "otlp_traces"] {
+            for layer in ["resource", "scope", "record"] {
+                for key in context_keys {
+                    for values in [
+                        [
+                            json!({"stringValue":"private-first"}),
+                            json!({"stringValue":"private-second"}),
+                        ],
+                        [
+                            json!({"stringValue":"private-second"}),
+                            json!({"stringValue":"private-first"}),
+                        ],
+                        [
+                            json!({"boolValue":true}),
+                            json!({"stringValue":"private-second"}),
+                        ],
+                        [
+                            json!({"stringValue":"private-second"}),
+                            json!({"boolValue":true}),
+                        ],
+                    ] {
+                        let capture = attributes_at_layer(
+                            endpoint,
+                            layer,
+                            json!([
+                                {"key":key,"value":values[0]},
+                                {"key":key,"value":values[1]}
+                            ]),
+                        );
+                        let error = visit_otlp(&capture, |_, _, _| {
+                            panic!("conflicting attributes must not reach the visitor")
+                        })
+                        .unwrap_err()
+                        .to_string();
+                        assert!(error.contains("conflicting duplicate context attribute"));
+                        assert!(error.contains(key));
+                        assert!(!error.contains("private-"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn equal_context_duplicates_count_one_record_and_keep_attribute_layer_precedence() {
+        for endpoint in ["otlp_logs", "otlp_traces"] {
+            for layer in ["resource", "scope", "record"] {
+                let capture = attributes_at_layer(
+                    endpoint,
+                    layer,
+                    json!([
+                        {"key":"conversation.id","value":{"stringValue":"s"}},
+                        {"key":"conversation.id","value":{"stringValue":"s"}},
+                        {"key":"turn.id","value":{"stringValue":"t"}},
+                        {"key":"turn.id","value":{"stringValue":"t"}}
+                    ]),
+                );
+                let mut observed = 0;
+                visit_otlp(&capture, |_, _, attributes| {
+                    observed += 1;
+                    assert_eq!(session_attribute(&attributes)?.as_deref(), Some("s"));
+                    assert_eq!(turn_attribute(&attributes)?.as_deref(), Some("t"));
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(observed, 1);
+            }
+        }
+        let capture = batch(
+            "otlp_logs",
+            json!({"resourceLogs":[{
+                "resource":{"attributes":[{"key":"component","value":{"stringValue":"resource"}}]},
+                "scopeLogs":[{
+                    "scope":{"attributes":[{"key":"component","value":{"stringValue":"scope"}}]},
+                    "logRecords":[{"attributes":[
+                        {"key":"component","value":{"stringValue":"record"}},
+                        {"key":"conversation.id","value":{"stringValue":"s"}},
+                        {"key":"turn.id","value":{"stringValue":"t"}}
+                    ]}]
+                }]
+            }]}),
+        );
+        visit_otlp(&capture, |_, _, attributes| {
+            assert_eq!(
+                attributes.get("component").map(String::as_str),
+                Some("record")
+            );
+            assert_eq!(session_attribute(&attributes)?.as_deref(), Some("s"));
+            assert_eq!(turn_attribute(&attributes)?.as_deref(), Some("t"));
+            Ok(())
+        })
+        .unwrap();
     }
 
     fn scoped_spans(spans: Value) -> Value {

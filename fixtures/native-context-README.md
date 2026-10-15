@@ -35,3 +35,12 @@ unrelated Session, and counts duplicate Captures once. The HTTP/SDK regression
 in `integrations/cloud-platform/platform.test.js` verifies that an otherwise
 complete synthetic Session with unowned logs/traces cannot claim overall
 delivery through inspection, paged Turns, or export.
+
+Synthetic duplicate-attribute regressions reject conflicting native identity,
+scope and event-name values before the OTLP attribute map can choose the last
+value. Rust covers resource, scope and record lists for logs and traces, both
+orders and conflicting AnyValue types; identical duplicates count one record.
+The real CLI preserves nonzero exits and unchanged input, while the platform
+HTTP/SDK refuses inspection, export, Turn pages and package downloads for the
+conflicting archive. These inputs are protocol negatives, not observed producer
+conflicts or production acceptance evidence.

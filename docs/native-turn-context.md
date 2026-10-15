@@ -75,6 +75,13 @@ Session、显式 Process 和身份未知的 batch，可能大于投影的 `input
 诊断为 `OTLP Turn-level business event conflicts with Process scope`。合法进程后台记录
 仍按原始声明分类；冲突输入和 Raw 保留，不改写 scope 或删除业务记录。
 
+同一属性列表的重复键也必须在合并前检查。原先属性映射会静默采用最后一个值，导致
+冲突的 Session/Turn、scope 或事件名绕过后续别名校验。现在 resource、scope 和 record
+各层都会拒绝这些冲突；相同重复值仍只对应一条原始记录。真实 CLI 的合成负例覆盖 logs
+和 traces 的四类冲突，要求退出 1、stdout 为空、诊断不含正文且 Raw 字节不变。
+平台 HTTP/SDK 还验证冲突 Raw 可归档取证，但检查和导出任务失败、分页和下载不可用。
+这些协议负例不表示实际生产者已经发射了同类冲突，也不替代未修改客户端的真实验收。
+
 [精简回归 fixture](../fixtures/native-context-README.md) 只保留实际字段和父链，用一致
 别名替换身份。CI 验证缺口、跨 Session 歧义、正文不输出、计数守恒和真实非零退出；
 它不替代完整 Raw 或新的真实客户端 Canary。

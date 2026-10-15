@@ -175,6 +175,12 @@ Span 或显式身份消歧。全量快照中发现的身份歧义在 Session 选
 Session 被移出载荷而宣称唯一。`thread.id` 是 OS 线程号，不是 Session 身份。
 空值、全零 Trace/Span ID、冲突别名和环形父关系不能成为关联证据；不按时间或记录顺序匹配。
 
+同一 OTLP resource、scope 或 record 的属性列表内，原生 Session/Turn 身份、
+`codex.context_scope` 和 `event.name` 的重复键若值冲突，检查、投影和交付均拒绝；
+不能按最后一个值选择归属或把业务事件改分为后台记录。冲突在原始 AnyValue 转为属性映射
+之前检测，诊断只输出已知属性名，不输出冲突值或正文。完全相同的重复值不增加记录数，
+原始 Raw 保持不变。
+
 Turn 覆盖中的 Wire 是 Capture 数，OTLP logs/traces 是原始记录数，Hook 是原始批次中的
 事件数。派生生命周期和工具事件不重复计为 Hook。Session 级 `source_coverage` 的 OTLP
 数仍是批次数，两种统计不能直接相加或比较。

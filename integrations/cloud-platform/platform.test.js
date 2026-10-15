@@ -131,6 +131,60 @@ test('inspection and paged Turns preserve unknown source records without claimin
   assert.deepEqual(await fs.readFile(segment), bytes);
 });
 
+test('platform inspection and export reject conflicting duplicate native identities', { timeout: 60000 }, async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-duplicates-'));
+  let app;
+  t.after(async () => { if (app) await app.close(); await fs.rm(root, { recursive: true, force: true }); });
+  const data = await fixture(root);
+  const marker = 'private-duplicate-native-identity';
+  const raw = { resourceLogs: [{ scopeLogs: [{ logRecords: [{
+    body: { stringValue: marker },
+    attributes: [
+      { key: 'event.name', value: { stringValue: 'codex.sse_event' } },
+      { key: 'conversation.id', value: { stringValue: marker } },
+      { key: 'conversation.id', value: { stringValue: 'thread-self-test' } },
+      { key: 'turn.id', value: { stringValue: 'turn-self-test' } },
+    ],
+  }] }] }] };
+  const rawJson = JSON.stringify(raw);
+  const capture = { captureId: 'cap-conflicting-native-identity', recordType: 'telemetry_batch', telemetryBatch: {
+    schema_version: 'chiptrace.telemetry-batch.v1', endpoint: 'otlp_logs', raw_json: rawJson,
+    raw_bytes: Buffer.byteLength(rawJson), raw_sha256: crypto.createHash('sha256').update(rawJson).digest('hex'),
+    source_records: 1, derived_captures: 0, unknown_events: 0, conversion_errors: [],
+  } };
+  const segmentsRoot = path.join(data.captureRoot, 'segments');
+  const segments = (await fs.readdir(segmentsRoot)).filter(name => name.endsWith('.sealed.ndjson')).sort();
+  assert.ok(segments.length > 0);
+  const segment = path.join(segmentsRoot, segments.at(-1));
+  await fs.appendFile(segment, JSON.stringify(capture) + '\n');
+  const bytes = await fs.readFile(segment);
+  const plugin = new ChipTracePlugin({ root: path.join(root, 'platform'), captureRoot: data.captureRoot,
+    objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace' });
+  const token = 'platform-test-token-with-at-least-32-bytes';
+  app = await createPlatformServer({ plugin, token });
+  await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
+  const client = new ChipTraceClient({ baseUrl: `http://127.0.0.1:${app.server.address().port}`, token });
+  await client.submit({ id: 'archive-conflict', kind: 'archive', archive_id: 'raw-conflict' });
+  assert.equal((await client.wait('archive-conflict')).status, 'completed');
+  await client.submit({ id: 'inspect-conflict', kind: 'inspect', archive_id: 'raw-conflict', session_id: 'thread-self-test' });
+  const inspected = await client.wait('inspect-conflict');
+  assert.equal(inspected.status, 'failed');
+  assert.equal(inspected.error.exit_code, 1);
+  assert.match(inspected.error.message, /conflicting duplicate context attribute/);
+  assert.ok(!JSON.stringify(inspected).includes(marker));
+  await assert.rejects(client.getTurns('inspect-conflict'), error => error.status === 409);
+  await client.putUsageLog('conflict-usage', await fs.readFile(data.usage));
+  await client.submit({ id: 'export-conflict', kind: 'export', archive_id: 'raw-conflict',
+    session_id: 'thread-self-test', release_id: 'release-conflict', usage_log_ids: ['conflict-usage'] });
+  const exported = await client.wait('export-conflict');
+  assert.equal(exported.status, 'failed');
+  assert.equal(exported.error.exit_code, 1);
+  assert.match(exported.error.message, /conflicting duplicate context attribute/);
+  assert.ok(!JSON.stringify(exported).includes(marker));
+  await assert.rejects(client.download('export-conflict', 'buyer-package.tar.gz'), error => error.status === 409);
+  assert.deepEqual(await fs.readFile(segment), bytes);
+});
+
 test('HTTP service and SDK run the real CLI archive/restore/inspect/export path', { timeout: 60000 }, async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-'));
   let app;
