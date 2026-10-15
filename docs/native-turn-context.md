@@ -8,15 +8,26 @@
 
 `upstream-context` 除生产者单元测试和 CLI 构建外，还构建固定源码的 debug App Server，
 运行 [protocol-collection.test.js](../integrations/codex/protocol-collection.test.js)。它使用临时
-受管配置、本地确定性 Responses 服务、真实 shell 工具、当前 Relay/Collector 和原生
-OTLP/Hook；不读取宿主客户端配置或模型凭据。先执行 README 读取、故意 exit 7 和
-sleep/write_stdin，再关闭客户端、启动新进程实际 resume，在第二个 Turn 保留 exit 9。
-异步轮询只能使用第一次工具输出中的真实 process session ID。
+受管配置、本地确定性 Responses 服务、真实工具、当前 Relay/Collector 和原生 OTLP/Hook；
+不读取宿主客户端配置或模型凭据。先更新计划、读取隔离线程的实际空 Goal，用
+`view_image` 打开仓库 PNG，再执行 README 读取、故意 exit 7 和 sleep/write_stdin。
+关闭客户端并启动新进程实际 resume 后，必须仍能读取第一轮的图片和工具结果；第二轮
+保留 exit 9 并完成计划。异步轮询只能使用第一次工具输出中的真实 process session ID。
+计划工具只在临时测试配置显式启用；每次调用还检查真实请求的 `tools` 或
+`input[].additional_tools` 声明，不能靠模型服务返回一个未注册的工具调用制造成功。
 
 检查直接来自本次 Collector Raw：原生 Session/Turn 身份、四源覆盖、来源计数守恒、闭合
 边界、失败/异步场景见证及 Wire 请求/响应正文哈希。Relay/Collector 重启后还须得到完全
 相同的 Session 检查结果和原始 Segment 哈希。工作流保留 `native-protocol-ci.tap` 和
 `chiptrace.native-protocol-ci.v1` 元数据报告，不上传 Raw 或对话正文。
+
+图片验证比较实际 inline PNG 的完整字节数和 SHA-256，包括新进程 resume 后的请求以及
+Canonical 交互投影；不能只检查图片占位文字。五类工具的每次实际调用都须有唯一原生
+`codex.tool_result`、精确 Raw 引用、完整 Tool Schema 和 Canonical RuntimeSpan；其 Turn
+归属与发出调用时实际 Wire 的原生 ID 比较。原生日志可通过精确 Trace 父链继承 Turn，
+不要求每条日志重复相同字段。报告只保存工具类型、完整性结论、图片长度与哈希。
+全部模型输入须与实际保存的 Wire JSON 相等，全部输出项目（包含两轮最终文本）须与
+本次 Responses 返回的项目相等；交互和工具的条数均以实际执行为准。
 
 这项回归使用已打补丁生产者和合成模型响应，报告固定声明 `real_upstream=false`、
 `production_acceptance_claimed=false`，并验证真实上游 Canary 门禁拒绝它。它能发现协议、

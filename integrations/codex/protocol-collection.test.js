@@ -12,6 +12,7 @@ const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const readline = require('node:readline');
+const zlib = require('node:zlib');
 const { execFile, spawn } = require('node:child_process');
 const { promisify } = require('node:util');
 const test = require('node:test');
@@ -189,28 +190,59 @@ function sse(id, item) {
     .map(value => `event: ${value.type}\ndata: ${JSON.stringify(value)}\n\n`).join('');
 }
 
-function deterministicModel() {
-  let phase = 'read';
+function deterministicModel(image) {
+  let phase = 'plan-start';
   let polls = 0;
   let processId;
   const observations = [];
   const tool = (callId, name, args) => ({ type: 'function_call', call_id: callId,
     name, arguments: JSON.stringify(args) });
-  const output = (body, callId) => {
+  const result = (body, callId) => {
     const value = body.input.find(item => item.type === 'function_call_output' && item.call_id === callId)?.output;
+    assert.notEqual(value, undefined, `missing actual tool result for ${callId}`);
+    return value;
+  };
+  const output = (body, callId) => {
+    const value = result(body, callId);
     assert.equal(typeof value, 'string', `missing actual tool output for ${callId}`);
     return value;
   };
+  const verifyImage = content => {
+    assert.ok(Array.isArray(content), 'view_image must return structured content');
+    const images = content.filter(item => item.type === 'input_image');
+    assert.equal(images.length, 1, 'the actual tool must return one image');
+    const encoded = /^data:image\/png;base64,([A-Za-z0-9+/=]+)$/.exec(images[0].image_url);
+    assert.ok(encoded, 'view_image must return the actual inline PNG');
+    const bytes = Buffer.from(encoded[1], 'base64');
+    assert.equal(bytes.length, image.bytes);
+    assert.equal(sha256(bytes), image.sha256, 'view_image must retain the fixture image bytes');
+  };
   return {
     observations,
+    verifyImage,
     get finished() { return phase === 'done'; },
-    respond(body) {
+    respond(body, turnId) {
       assert.equal(body.model, 'gpt-5.6-sol');
       assert.equal(body.stream, true);
       let item;
       const exec = (callId, cmd, yieldTime = 250) => tool(callId, 'exec_command',
         { cmd, shell: '/bin/sh', login: false, yield_time_ms: yieldTime, max_output_tokens: 2000 });
-      if (phase === 'read') {
+      if (phase === 'plan-start') {
+        item = tool('protocol-plan-start', 'update_plan', {
+          plan: [{ step: 'Verify native multimodal collection and resume', status: 'in_progress' }],
+        });
+        phase = 'goal';
+      } else if (phase === 'goal') {
+        assert.equal(output(body, 'protocol-plan-start'), 'Plan updated');
+        item = tool('protocol-goal', 'get_goal', {});
+        phase = 'image';
+      } else if (phase === 'image') {
+        assert.equal(JSON.parse(output(body, 'protocol-goal')).goal, null,
+          'the isolated thread must read its actual empty goal');
+        item = tool('protocol-image', 'view_image', { path: image.path, detail: 'original' });
+        phase = 'read';
+      } else if (phase === 'read') {
+        verifyImage(result(body, 'protocol-image'));
         item = exec('protocol-read', 'head -n 12 README.md');
         phase = 'fail';
       } else if (phase === 'fail') {
@@ -245,17 +277,34 @@ function deterministicModel() {
         assert.ok(JSON.stringify(body.input).includes('SECOND_TURN_REQUEST'));
         assert.match(output(body, 'protocol-fail'), /Process exited with code 7/,
           'resume must retain the failed first-turn tool output');
+        assert.equal(output(body, 'protocol-plan-start'), 'Plan updated');
+        assert.equal(JSON.parse(output(body, 'protocol-goal')).goal, null);
+        verifyImage(result(body, 'protocol-image'));
         item = exec('protocol-resumed', 'printf RESUMED_TURN_OK; printf CHIPTRACE_EXPECTED_EXIT_9 >&2; exit 9');
-        phase = 'final';
-      } else if (phase === 'final') {
+        phase = 'plan-complete';
+      } else if (phase === 'plan-complete') {
         const actual = output(body, 'protocol-resumed');
         assert.match(actual, /Process exited with code 9/);
         assert.match(actual, /RESUMED_TURN_OK/);
+        item = tool('protocol-plan-complete', 'update_plan', {
+          plan: [{ step: 'Verify native multimodal collection and resume', status: 'completed' }],
+        });
+        phase = 'final';
+      } else if (phase === 'final') {
+        assert.equal(output(body, 'protocol-plan-complete'), 'Plan updated');
         item = { type: 'message', role: 'assistant', id: 'protocol-second-final',
           content: [{ type: 'output_text', text: 'SECOND_TURN_COMPLETE' }] };
         phase = 'done';
       } else assert.fail('unexpected model request after terminal response');
+      if (item.type === 'function_call') {
+        const names = specs => specs.flatMap(spec => spec.type === 'namespace'
+          ? names(spec.tools) : [spec.name ?? spec.function?.name]);
+        const declarations = [...(body.tools || []), ...body.input
+          .filter(input => input.type === 'additional_tools').flatMap(input => input.tools)];
+        assert.ok(names(declarations).includes(item.name), `the real producer must advertise ${item.name}`);
+      }
       observations.push({ call_id: item.call_id || null, name: item.name || 'assistant',
+        turn_id: turnId, output_item: item,
         input_sha256: sha256(JSON.stringify(body.input)), input_items: body.input.length });
       return sse(`protocol-response-${observations.length}`, item);
     },
@@ -310,7 +359,11 @@ async function collectProtocol(t) {
     outbox = new DurableCaptureOutbox({ root: path.join(root, 'outbox'), relayUrl,
       bearerToken: token, minFreeBytes: 0, minFreeFiles: 0, sanitize: false });
     await outbox.start();
-    const model = deterministicModel();
+    const imagePath = 'docs/assets/xs-mlvp-avatar.png';
+    const imageSource = path.resolve(__dirname, '../../', imagePath);
+    const image = { path: imagePath, bytes: (await fs.stat(imageSource)).size,
+      sha256: await fileDigest(imageSource) };
+    const model = deterministicModel(image);
     const wire = [];
     const catalog = JSON.parse(await fs.readFile(path.join(__dirname, 'managed-models.json'), 'utf8'));
     server = http.createServer((req, res) => {
@@ -342,7 +395,7 @@ async function collectProtocol(t) {
         assert.deepEqual(context.conflicts, []);
         assert.ok(context.trace.session_id && context.trace.turn_id, 'actual Wire native identities required');
         const request = Buffer.concat(chunks);
-        const response = Buffer.from(model.respond(JSON.parse(request)));
+        const response = Buffer.from(model.respond(JSON.parse(request), context.trace.turn_id));
         const transaction = await outbox.beginCapture({ captureId: `cap-protocol-${crypto.randomUUID()}`,
           version: 'chiptrace.capture.v2', recordType: 'api_snapshot', sourceNamespace: 'synthetic-protocol-ci',
           method: req.method, proxiedPath: req.url, startedAt: new Date().toISOString(),
@@ -382,13 +435,15 @@ async function collectProtocol(t) {
     await fs.mkdir(home, { mode: 0o700 });
     await fs.mkdir(managed, { mode: 0o700 });
     await fs.writeFile(path.join(root, 'README.md'), 'CHIPTRACE_READ_OK 中文 🧪\n' + 'bounded fixture line\n'.repeat(15));
+    await fs.mkdir(path.dirname(path.join(root, image.path)), { recursive: true });
+    await fs.copyFile(imageSource, path.join(root, image.path));
     const substitute = value => value.replaceAll('http://172.28.11.121:18084', endpoint)
       .replaceAll('CHIPTRACE_API_KEY', 'CHIPTRACE_PROTOCOL_API_KEY');
     const config = substitute(await fs.readFile(path.join(__dirname, 'config.toml.example'), 'utf8'))
       .replaceAll(`${endpoint}/otel/`, `${relayUrl}/otel/`);
     const requirements = substitute(await fs.readFile(path.join(__dirname, 'requirements.toml.example'), 'utf8'))
       .replaceAll(`${endpoint}/hooks/codex`, `${relayUrl}/hooks/codex`);
-    await fs.writeFile(path.join(home, 'config.toml'), config, { mode: 0o600 });
+    await fs.writeFile(path.join(home, 'config.toml'), config + '\n[tools.update_plan]\nenabled = true\n', { mode: 0o600 });
     await fs.writeFile(path.join(managed, 'requirements.toml'), requirements, { mode: 0o600 });
     const producerEnv = { CODEX_HOME: home, CHIPTRACE_PROTOCOL_API_KEY: 'synthetic-protocol-provider',
       CHIPTRACE_INGEST_TOKEN: token, OTEL_EXPORTER_OTLP_HEADERS: `Authorization=Bearer%20${token}`,
@@ -450,8 +505,10 @@ async function collectProtocol(t) {
         headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(5000) });
       assert.equal(response.status, 200);
     }
+    const projectionRoot = path.join(root, 'projection');
     const inspect = async () => JSON.parse((await run(chiptrace,
-      ['inspect-session', '--input', capture, '--session-id', session], { maxBuffer: 32 * 1024 * 1024 })).stdout);
+      ['inspect-session', '--input', capture, '--session-id', session, '--projection-output', projectionRoot],
+      { maxBuffer: 32 * 1024 * 1024 })).stdout);
     const inspection = await inspect();
     await fs.writeFile(path.join(root, 'inspection.json'), JSON.stringify(inspection, null, 2));
     const audit = JSON.parse((await run(chiptrace,
@@ -479,12 +536,14 @@ async function collectProtocol(t) {
     const sealed = await fs.readdir(path.join(capture, 'segments'));
     const rawDigests = [];
     const savedWire = [];
+    const nativeTools = [];
     for (const name of sealed.filter(name => name.endsWith('.sealed.ndjson'))) {
       const file = path.join(capture, 'segments', name);
       rawDigests.push({ file: name, sha256: await fileDigest(file), bytes: (await fs.stat(file)).size });
       for await (const line of readline.createInterface({ input: createReadStream(file) })) {
         const record = JSON.parse(line);
         if (record.recordType === 'api_snapshot') savedWire.push(record);
+        if (record.toolExecution?.source_event_name === 'codex.tool_result') nativeTools.push(record);
       }
     }
     assert.equal(savedWire.length, wire.length);
@@ -497,6 +556,58 @@ async function collectProtocol(t) {
       assert.equal(sha256(saved.responseBody.value), expected.response_sha256);
       assert.equal(saved.requestBytesCaptured, Buffer.byteLength(saved.requestBody.raw));
       assert.equal(saved.responseBytesCaptured, Buffer.byteLength(saved.responseBody.value));
+    }
+    const issuedTools = model.observations.filter(item => item.call_id);
+    assert.equal(nativeTools.length, issuedTools.length, 'every real tool result must reach Collector WAL');
+    for (const issued of issuedTools) {
+      const observed = nativeTools.filter(record => record.toolExecution.call_id === issued.call_id);
+      assert.equal(observed.length, 1, `exactly one native result required for ${issued.call_id}`);
+      assert.equal(observed[0].toolExecution.runtime_tool, issued.name);
+      assert.equal(observed[0].traceContext.session_id, session);
+    }
+    const projectionRecords = async file => {
+      const text = zlib.zstdDecompressSync(await fs.readFile(path.join(projectionRoot, file))).toString('utf8');
+      return text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    };
+    const interactions = await projectionRecords('interactions/model-interactions.jsonl.zst');
+    const runtime = await projectionRecords('runtime/runtime-spans.jsonl.zst');
+    assert.equal(interactions.length, model.observations.length);
+    for (const [index, observed] of model.observations.entries()) {
+      const interaction = interactions.find(item => item.response.id === `protocol-response-${index + 1}`);
+      assert.ok(interaction, 'every actual model response must have a Canonical interaction');
+      assert.equal(interaction.response.output_items.length, 1);
+      assert.deepEqual(interaction.response.output_items[0].raw, observed.output_item);
+      const captured = savedWire.find(record => interaction.raw_capture_refs
+        .some(reference => reference.capture_id === record.captureId));
+      assert.ok(captured, 'every Canonical interaction must reference its actual Collector Wire');
+      assert.deepEqual(interaction.request.raw, JSON.parse(captured.requestBody.raw),
+        'Canonical model input must preserve complete text, tools and multimodal history');
+      assert.equal(interaction.trace_context.turn_id ?? interaction.trace_context.root_turn_id, observed.turn_id);
+    }
+    const imageResults = interactions.flatMap(item => item.tool_results_submitted)
+      .filter(item => item.call_id === 'protocol-image');
+    assert.ok(imageResults.length > 0, 'Canonical interactions must preserve the actual image result');
+    for (const result of imageResults) model.verifyImage(result.content);
+    for (const issued of issuedTools) {
+      const spans = runtime.filter(span => span.span_kind === 'tool_execution' && span.call_id === issued.call_id);
+      assert.equal(spans.length, 1, `Canonical runtime must preserve ${issued.call_id}`);
+      const observed = nativeTools.find(record => record.toolExecution.call_id === issued.call_id);
+      assert.ok(turns.includes(issued.turn_id), `tool ${issued.call_id} must be issued in an actual native Turn`);
+      // Native tool logs can inherit their Turn through exact trace ancestry.
+      // Compare the final assignment with the actual issuing Wire identity.
+      assert.equal(spans[0].trace_context.turn_id ?? spans[0].trace_context.root_turn_id, issued.turn_id);
+      assert.ok(spans[0].raw_capture_refs.includes(observed.captureId));
+      assert.ok(spans[0].tool_schema?.description, `Canonical runtime must retain the schema for ${issued.name}`);
+      assert.equal(spans[0].tool_schema.parameters?.type, 'object');
+    }
+    for (const [callId, turnId, status] of [
+      ['protocol-plan-start', turns[0], 'in_progress'],
+      ['protocol-plan-complete', turns[1], 'completed'],
+    ]) {
+      const span = runtime.find(span => span.span_kind === 'tool_execution' && span.call_id === callId);
+      assert.equal(span.trace_context.turn_id ?? span.trace_context.root_turn_id, turnId);
+      assert.equal(span.arguments.plan[0].status, status);
+      assert.equal(span.result, 'Plan updated');
     }
     assert.deepEqual(await stop(relay), { code: 0, signal: null });
     assert.deepEqual(await stop(collector), { code: 0, signal: null });
@@ -516,6 +627,10 @@ async function collectProtocol(t) {
       producer_source: source, patch_set: patchSet, producer_binary_sha256: await fileDigest(producer),
       native_turns: 2, session_epochs: 2, model_interactions: wire.length,
       tool_execution_records: inspection.session.tool_execution_records,
+      tool_types: [...new Set(issuedTools.map(item => item.name))].sort(),
+      image_evidence: { ...image, wire_and_canonical_verified: true, resume_verified: true },
+      all_tool_results_in_raw_and_runtime: true, plan_turns_verified: true,
+      all_model_items_in_canonical: true,
       source_coverage: inspection.source_coverage, scenario_evidence: inspection.scenario_evidence,
       source_audit: audit, collector_raw: rawDigests, restart_verified: true };
     // The synthetic report must never satisfy the real-upstream production gate.
@@ -529,7 +644,7 @@ async function collectProtocol(t) {
     passed = true;
 }
 
-test('newly executed producer preserves two Turns, resume, failed exits and real async polling in four sources',
+test('newly executed producer preserves two Turns, images, plans, resume, failed exits and real async polling in four sources',
   { timeout: 180000 }, async t => {
     try {
       await collectProtocol(t);
