@@ -198,7 +198,7 @@ jobs:
           bash scripts/ci/run-producer-check.sh collector-build \
             "$RUNNER_TEMP/producer-collector-build.log" \
             cargo +1.91.0 build --locked --bin chiptrace
-      - name: Collect new native Turns with tools, resume, interruption and disconnected retries
+      - name: Collect new native Turns and verify platform recovery and partial export refusal
         env:
           CHIPTRACE_PROTOCOL_PRODUCER: ${{ github.workspace }}/.ci-codex-source/codex-rs/target/debug/codex-app-server
           CHIPTRACE_PROTOCOL_SOURCE: ${{ github.workspace }}/.ci-codex-source

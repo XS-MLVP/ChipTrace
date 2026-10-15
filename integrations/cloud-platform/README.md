@@ -230,8 +230,19 @@ or bound the Rust projection/acceptance paths described above.
 The Turns endpoint also returns this overall `delivery_ready` alongside the
 scoped `summary`. A true `summary.delivery_ready` or
 `integrity.delivery_ready` alone does not certify the complete inspection.
-Legacy stored inspections without a source audit return false for the page's
-overall flag; submit a new inspection job ID to recheck the original archive.
+Job queries, idempotent submission responses and both embedded and HTTP Turn
+pages conservatively recheck the recorded native Session identity, closed
+boundaries, four-source coverage and source audit. Inspections also require
+every recorded integrity gate; exports
+require the v2 acceptance schema, passing hard gate/status, Buyer v7 counts and
+pairing, single-root/resolved-parent counts, positive Raw counts and score at
+least the recorded minimum (90–100).
+Missing or contradictory evidence overrides a historical `delivery_ready=true`:
+the returned job has `delivery_ready=false` and `not_ready` (inspection) or `fail`
+(export). Historical job files, nested evidence and Turn sidecars are not
+rewritten. Submit a new job ID to recheck the original archive. This read-time
+check does not rerun acceptance or prove current artifact integrity; Buyer
+downloads still run the complete Rust acceptance verifier.
 
 Exports require `chiptrace.cloud-acceptance.v2`. Historical v1 manifests retain
 their original contract and must be reprocessed from original Raw to qualify

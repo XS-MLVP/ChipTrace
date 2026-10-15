@@ -59,6 +59,15 @@ Session：首轮等待 App Server 实际收到文本 delta 后，用真实 threa
 与正常完整 Session 的正向门禁分开断言，不放宽交付条件。两组测试共享隔离配置与固定
 生产者身份检查，不共享原生 Session 或采集目录。
 
+取消回归还把本次新采集的同一份 Raw 经正常平台 HTTP/SDK 完成 FS 归档、磁盘恢复、
+检查、Turn 与全部交互投影下载及重启复验。原始 Segment、Turn 和全部投影 part 的
+字节/哈希必须一致，未鉴权下载返回 401。usage 使用这次实际返回的独立请求 ID；
+Buyer 导出必须真实退出 1，明确拒绝 `protocol_complete=false`。仅将新生成的派生任务
+顶层 ready 标记改为 true 后，任务查询、重复提交、嵌入式分页和 HTTP 分页仍须返回
+不可交付，历史任务文件和失败记录原字节保持不变。报告的 `platform_evidence` 声明后端为 FS、
+`real_oss_account=false`、`production_acceptance_claimed=false`；这不代表目标 OSS 或
+主平台终端用户鉴权验收。
+
 这项回归使用已打补丁生产者和合成模型响应，报告固定声明 `real_upstream=false`、
 `production_acceptance_claimed=false`，并验证真实上游 Canary 门禁拒绝它。它能发现协议、
 生产者和采集链路一起运行时的回归，不能替代未修改客户端、真实模型、阿里 OSS 或

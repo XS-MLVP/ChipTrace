@@ -77,6 +77,7 @@ async function collectInterruption(t) {
     ];
     const response = Buffer.from(events(emitted));
     const captureId = `cap-interruption-${crypto.randomUUID()}`;
+    const requestId = `request-${crypto.randomUUID()}`;
     const observation = { mode, capture_id: captureId, session_id: context.trace.session_id,
       turn_id: context.trace.turn_id, response_id: responseId, text, partial,
       request_sha256: sha256(request), response_sha256: sha256(response),
@@ -103,7 +104,7 @@ async function collectInterruption(t) {
         resolve();
       });
     });
-    const responseHeaders = { 'content-type': 'text/event-stream' };
+    const responseHeaders = { 'content-type': 'text/event-stream', 'x-request-id': requestId };
     res.writeHead(200, responseHeaders);
     // The final delta must actually reach the App Server before either fault.
     await transaction.appendResponse(response);
@@ -279,6 +280,7 @@ async function collectInterruption(t) {
   const stable = value => ({ ...value, projection: { ...value.projection, created_at_utc: null } });
   assert.deepEqual(stable(await inspect()), stable(inspection));
   for (const record of rawDigests) assert.equal(await fileDigest(path.join(capture, 'segments', record.file)), record.sha256);
+  const platformEvidence = await fixture.verifyPlatform();
   const report = { schema_version: 'chiptrace.native-interruption-ci.v1', ok: true,
     checked_at: new Date().toISOString(), real_upstream: false, unmodified_stock: false,
     production_acceptance_claimed: false, model_mode: 'local_deterministic_responses',
@@ -291,7 +293,8 @@ async function collectInterruption(t) {
     native_boundaries_verified: true, restart_verified: true,
     attempts: wire.map(({ mode, capture_id, turn_id, request_sha256, response_sha256, response_bytes, status }) =>
       ({ mode, capture_id, turn_id, request_sha256, response_sha256, response_bytes, status })),
-    source_coverage: inspection.source_coverage, source_audit: audit, collector_raw: rawDigests };
+    source_coverage: inspection.source_coverage, source_audit: audit, collector_raw: rawDigests,
+    platform_evidence: platformEvidence };
   assert.throws(() => verifyNativeCanaryReport(report, audit), /real_upstream/);
   if (process.env.CHIPTRACE_INTERRUPTION_REPORT) {
     await fs.writeFile(process.env.CHIPTRACE_INTERRUPTION_REPORT, JSON.stringify(report, null, 2) + '\n', { mode: 0o600 });

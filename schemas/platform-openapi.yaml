@@ -20,7 +20,10 @@ paths:
         '503': {description: Not started, shutting down, or storage/writer lock failure}
   /v1/jobs:
     post:
-      description: Acknowledged only after the job record is persisted. Same ID/request is idempotent; changed request returns 409.
+      description: >-
+        Acknowledged only after the job record is persisted. Same ID/request
+        is idempotent and returns the same conservative recorded-evidence view
+        as GET /v1/jobs/{id}; changed request returns 409.
       requestBody:
         required: true
         content:
@@ -46,6 +49,15 @@ paths:
     parameters:
       - {$ref: '#/components/parameters/Id'}
     get:
+      description: >-
+        Returns the recorded job with conservative delivery status. For completed
+        inspections and exports, missing or contradictory recorded Session,
+        source or integrity/acceptance gates override a historical ready flag.
+        Export checks include the recorded Buyer v7 counts/pairing, OTLP
+        root/parent counts, positive Raw counts and minimum score of 90–100.
+        The returned validation_status is not_ready for inspections or fail for
+        exports; stored job bytes and nested evidence remain unchanged. Submit
+        a new job to recheck the archive. This is not a fresh acceptance run.
       responses:
         '200': {$ref: '#/components/responses/Job'}
         '401': {$ref: '#/components/responses/Error'}
@@ -59,8 +71,11 @@ paths:
         Reads the verified Turn JSONL sidecar. Top-level delivery_ready is the
         overall inspection/acceptance status, including source context audit.
         Summary is the scoped Session view and excludes full turns; total is
-        the native Turn count. Legacy inspections without a source audit return
-        false for the overall flag and require a new inspection job.
+        the native Turn count. The overall flag applies the same conservative
+        recorded-evidence checks as the job query. Missing or contradictory
+        evidence returns false without rewriting historical files; a new job
+        is required to recheck the archive. Buyer downloads independently run
+        full acceptance verification.
         Before sending headers, a streaming CLI validates every JSONL record
         and all UTF-8 bytes and returns selected byte ranges. The server
         verifies the complete recorded digest and count on the file handle

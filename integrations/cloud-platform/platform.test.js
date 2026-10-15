@@ -513,6 +513,107 @@ test('inspection and paged Turns preserve unknown source records without claimin
   assert.deepEqual(await fs.readFile(segment), bytes);
 });
 
+test('historical delivery gates override contradictory ready flags without rewriting evidence', { timeout: 120000 }, async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-historical-readiness-'));
+  const data = await fixture(root);
+  const options = { projectId: 'project-test', root: path.join(root, 'platform'),
+    captureRoot: data.captureRoot, objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace' };
+  const token = 'platform-test-token-with-at-least-32-bytes';
+  let app;
+  t.after(async () => { if (app) await app.close(); await fs.rm(root, { recursive: true, force: true }); });
+  const reopen = async () => {
+    app = await createPlatformServer({ plugin: new ChipTracePlugin(options), token });
+    await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
+    return new ChipTraceClient({ baseUrl: `http://127.0.0.1:${app.server.address().port}`, token });
+  };
+  let client = await reopen();
+  await client.submit({ id: 'historical-archive', kind: 'archive', archive_id: 'historical-raw' });
+  assert.equal((await client.wait('historical-archive')).status, 'completed');
+  await client.submit({ id: 'historical-inspect', kind: 'inspect', archive_id: 'historical-raw', session_id: 'thread-self-test' });
+  const positive = await client.wait('historical-inspect');
+  assert.equal(positive.result.delivery_ready, true);
+  await client.putUsageLog('historical-usage', await fs.readFile(data.usage));
+  await client.submit({ id: 'historical-export', kind: 'export', archive_id: 'historical-raw',
+    session_id: 'thread-self-test', release_id: 'historical-release', usage_log_ids: ['historical-usage'] });
+  const exported = await client.wait('historical-export');
+  assert.equal(exported.status, 'completed', JSON.stringify(exported.error));
+  assert.equal(exported.result.delivery_ready, true);
+  const evidence = {};
+  for (const kind of ['inspect', 'export']) {
+    const id = `historical-${kind}`;
+    assert.equal((await app.plugin.getTurns(id, { limit: 1 })).delivery_ready, true);
+    assert.equal((await client.getTurns(id, { limit: 1 })).delivery_ready, true);
+    const jobFile = path.join(options.root, 'jobs', id + '.json');
+    const originalBytes = await fs.readFile(jobFile);
+    assert.equal((await client.submit(JSON.parse(originalBytes).request)).result.delivery_ready, true);
+    const sidecar = path.join(options.root, 'work', id, 'turns.jsonl');
+    evidence[kind] = { id, jobFile, originalBytes, original: JSON.parse(originalBytes),
+      sidecar, sidecarBytes: await fs.readFile(sidecar) };
+  }
+  const variants = [];
+  for (const field of ['artifact_valid', 'raw_bytes_complete', 'protocol_complete', 'runtime_complete', 'root_complete', 'delivery_ready']) {
+    variants.push({ name: `false ${field}`, change(result) { result.integrity[field] = false; } });
+    variants.push({ name: `missing ${field}`, change(result) { delete result.integrity[field]; } });
+  }
+  variants.push(
+    { name: 'missing source audit', change(result) { delete result.source_context_audit; } },
+    { name: 'incomplete cloud source coverage', change(result) { result.source_coverage.complete = false; } },
+    { name: 'contradictory cloud source count', change(result) { result.source_coverage.wire = 0; } },
+    { name: 'Session not ready', change(result) { result.session.delivery_ready = false; } },
+    { name: 'open native Turn', change(result) { result.session.open_turns = 1; } },
+    { name: 'wrong native Session', change(result) { result.session.session_id = 'another-native-session'; } },
+    { name: 'inspection not ready', change(result) { result.validation_status = 'not_ready'; } },
+  );
+  const allVariants = [
+    ...variants.map(variant => ({ ...variant, kind: 'inspect' })),
+    ...[
+      { name: 'score below acceptance threshold', change(result) { result.score = 89; } },
+      { name: 'weakened recorded minimum score', change(result) { result.minimum_score = 89; } },
+      { name: 'missing recorded minimum score', change(result) { delete result.minimum_score; } },
+      { name: 'score below recorded minimum', change(result) { result.minimum_score = 96; result.score = 95; } },
+      { name: 'different Buyer profile', change(result) { result.quality_profile = 'another-profile'; } },
+      { name: 'insufficient effective turns', change(result) { result.effective_turns = 9; } },
+      { name: 'insufficient different tools', change(result) { result.distinct_tool_names = 4; } },
+      { name: 'insufficient complete tool definitions', change(result) { result.complete_tool_definitions = 4; } },
+      { name: 'incomplete pairing', change(result) { result.pairing_rate_after_open_tail = 0.99; } },
+      { name: 'no eligible Session', change(result) { result.eligible_sessions = 0; } },
+      { name: 'multiple OTLP roots', change(result) { result.root_spans = 2; } },
+      { name: 'unresolved internal parent', change(result) { result.internal_parent_references += 1; } },
+      { name: 'no Raw records', change(result) { result.raw_records = 0; } },
+      { name: 'no Raw bytes', change(result) { result.raw_bytes = 0; } },
+      { name: 'failed hard gate', change(result) { result.hard_gate_pass = false; } },
+      { name: 'incomplete cloud source coverage', change(result) { result.source_coverage.complete = false; } },
+      { name: 'Session not ready', change(result) { result.session_view.delivery_ready = false; } },
+      { name: 'missing source audit', change(result) { delete result.source_context_audit; } },
+      { name: 'failed validation', change(result) { result.validation_status = 'fail'; } },
+    ].map(variant => ({ ...variant, kind: 'export' })),
+  ];
+  for (const variant of allVariants) await t.test(`${variant.kind}: ${variant.name}`, async () => {
+    await app.close(); app = null;
+    for (const record of Object.values(evidence)) await fs.writeFile(record.jobFile, record.originalBytes);
+    const { id, jobFile, original } = evidence[variant.kind];
+    const contradictory = structuredClone(original);
+    variant.change(contradictory.result);
+    assert.equal(contradictory.result.delivery_ready, true);
+    const bytes = Buffer.from(JSON.stringify(contradictory) + '\n');
+    await fs.writeFile(jobFile, bytes);
+    client = await reopen();
+    const job = await client.getJob(id);
+    const duplicate = await client.submit(original.request);
+    assert.equal(duplicate.duplicate, true);
+    const embedded = await app.plugin.getTurns(id, { limit: 1 });
+    const http = await client.getTurns(id, { limit: 1 });
+    assert.deepEqual({ job: job.result.delivery_ready, duplicate: duplicate.result.delivery_ready,
+      embedded: embedded.delivery_ready, http: http.delivery_ready },
+      { job: false, duplicate: false, embedded: false, http: false }, 'all public views must respect the recorded delivery gates');
+    assert.equal(job.result.validation_status, variant.kind === 'inspect' ? 'not_ready' : 'fail');
+    assert.deepEqual(job.result, { ...contradictory.result, delivery_ready: false, validation_status: job.result.validation_status });
+    assert.deepEqual(app.plugin.jobs.get(id).result, contradictory.result, 'read-time normalization must not mutate in-memory evidence');
+    assert.deepEqual(await fs.readFile(jobFile), bytes, 'read-time normalization must preserve historical job bytes');
+    for (const record of Object.values(evidence)) assert.deepEqual(await fs.readFile(record.sidecar), record.sidecarBytes);
+  });
+});
+
 test('platform inspection and export reject conflicting duplicate native identities', { timeout: 60000 }, async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-duplicates-'));
   let app;

@@ -52,6 +52,44 @@ function sourceContextReady(audit, sessionId) {
   });
 }
 
+function recordedDeliveryReady(result, sessionId, kind) {
+  if (result?.delivery_ready !== true || !['inspect', 'export'].includes(kind)) return false;
+  const session = kind === 'inspect' ? result.session : result.session_view;
+  if (session?.schema_version !== 'chiptrace.session-view.v2' || session.session_id !== sessionId
+      || session.delivery_ready !== true || session.latest_epoch_closed !== true
+      || session.turn_source_coverage_complete !== true
+      || !Number.isSafeInteger(session.native_turns) || session.native_turns < 1
+      || session.closed_turns !== session.native_turns
+      || !['open_turns', 'conflicted_turns', 'incomplete_turns', 'unscoped_turn_records', 'invalid_session_boundaries']
+        .every(field => session[field] === 0)
+      || !sourceContextReady(result.source_context_audit, sessionId)) return false;
+  const coverage = result.source_coverage;
+  if (coverage?.complete !== true || !Array.isArray(coverage.missing_sources) || coverage.missing_sources.length !== 0
+      || !['wire', 'otlp_logs', 'otlp_traces', 'hooks'].every(source =>
+        Number.isSafeInteger(coverage[source]) && coverage[source] > 0)) return false;
+  if (kind === 'inspect') {
+    return (result.schema_version === undefined || result.schema_version === 'chiptrace.platform-inspection.v1')
+      && result.validation_status === 'delivery_ready'
+      && ['artifact_valid', 'raw_bytes_complete', 'protocol_complete', 'runtime_complete', 'root_complete', 'delivery_ready']
+        .every(field => result.integrity?.[field] === true);
+  }
+  // Downloads still run the complete Rust acceptance verifier. This is a
+  // conservative view of recorded evidence, never a replacement for that check.
+  return result.schema_version === 'chiptrace.cloud-acceptance.v2' && result.session_id === sessionId
+    && result.validation_status === 'pass' && result.hard_gate_pass === true
+    && result.quality_profile === 'buyer-v7'
+    && typeof result.minimum_score === 'number' && Number.isFinite(result.minimum_score)
+    && result.minimum_score >= 90 && result.minimum_score <= 100
+    && typeof result.score === 'number' && Number.isFinite(result.score)
+    && result.score >= result.minimum_score && result.score <= 100
+    && [['effective_turns', 10], ['distinct_tool_names', 5], ['complete_tool_definitions', 5],
+      ['raw_records', 1], ['raw_bytes', 1]].every(([field, minimum]) =>
+      Number.isSafeInteger(result[field]) && result[field] >= minimum)
+    && result.pairing_rate_after_open_tail === 1 && result.eligible_sessions === 1
+    && result.root_spans === 1 && Number.isSafeInteger(result.internal_parent_references)
+    && result.internal_parent_references >= 0 && result.resolved_internal_parents === result.internal_parent_references;
+}
+
 async function syncDirectory(directory) {
   const handle = await fsp.open(directory, 'r');
   try { await handle.sync(); } finally { await handle.close(); }
@@ -460,7 +498,7 @@ class ChipTracePlugin {
       const existing = this.jobs.get(request.id);
       if (existing) {
         if (JSON.stringify(existing.request) !== JSON.stringify(request)) throw new PlatformError('job ID conflicts with existing request', 409, 'ID_CONFLICT');
-        return { ...structuredClone(existing), duplicate: true };
+        return { ...this.getJob(request.id), duplicate: true };
       }
       if (this.queue.length + this.running.size >= this.maxQueuedJobs || this.jobs.size >= this.maxJobs) {
         throw new PlatformError('platform job capacity is full', 503, 'CAPACITY');
@@ -592,12 +630,7 @@ class ChipTracePlugin {
   async #acceptanceSummary(report, request, output) {
     const result = report?.acceptance;
     if (report?.schema_version !== 'chiptrace.platform-acceptance.v1'
-        || result?.schema_version !== 'chiptrace.cloud-acceptance.v2'
-        || result.session_view?.schema_version !== 'chiptrace.session-view.v2'
-        || result.session_view.delivery_ready !== true
-        || !sourceContextReady(result.source_context_audit, request.session_id)
-        || result.delivery_ready !== true || result.hard_gate_pass !== true
-        || typeof result.score !== 'number' || !Number.isFinite(result.score) || result.score < 90
+        || !recordedDeliveryReady(result, request.session_id, 'export')
         || result.archive_id !== request.archive_id || result.session_id !== request.session_id || result.release_id !== request.release_id) {
       throw new PlatformError('export does not match the requested accepted Session', 422, 'ACCEPTANCE_FAILED');
     }
@@ -680,7 +713,7 @@ class ChipTracePlugin {
         || inspected.source_context_audit?.schema_version !== 'chiptrace.source-context-audit.v2'
         || inspected.source_context_audit?.session_id !== request.session_id
         || typeof inspected.delivery_ready !== 'boolean'
-        || (inspected.delivery_ready && !sourceContextReady(inspected.source_context_audit, request.session_id))) {
+        || (inspected.delivery_ready && !recordedDeliveryReady(inspected, request.session_id, 'inspect'))) {
       throw new PlatformError('inspection does not match requested Session', 502, 'ENGINE_PROTOCOL');
     }
     const projection = inspected.interaction_projection;
@@ -734,7 +767,15 @@ class ChipTracePlugin {
   getJob(id) {
     const job = this.jobs.get(component(id, 'job_id'));
     if (!job) throw new PlatformError('job not found', 404, 'NOT_FOUND');
-    return structuredClone(job);
+    const view = structuredClone(job);
+    if (view.status === 'completed' && view.result && ['inspect', 'export'].includes(view.request.kind)
+        && !recordedDeliveryReady(view.result, view.request.session_id, view.request.kind)) {
+      // Do not repair history by overwriting its bytes. A stale aggregate flag
+      // cannot override independently recorded negative or missing evidence.
+      view.result.delivery_ready = false;
+      view.result.validation_status = view.request.kind === 'inspect' ? 'not_ready' : 'fail';
+    }
+    return view;
   }
 
   listJobs({ offset = 0, limit = 50 } = {}) {
@@ -756,8 +797,7 @@ class ChipTracePlugin {
     offset = integer(offset, 0, 0, Number.MAX_SAFE_INTEGER);
     limit = integer(limit, 50, 1, 100);
     const { turns, records } = await this.#readTurnEvidence(job, offset, limit);
-    const deliveryReady = job.result.delivery_ready === true
-      && sourceContextReady(job.result.source_context_audit, job.request.session_id);
+    const deliveryReady = recordedDeliveryReady(job.result, job.request.session_id, job.request.kind);
     return { delivery_ready: deliveryReady, summary: session, total: records, offset, turns };
   }
 
@@ -800,8 +840,7 @@ class ChipTracePlugin {
       // path replacement cannot substitute unverified bytes or byte ranges.
       ({ handle } = await this.#openTurnEvidence(job, 0, 0));
       const session = job.result.session || job.result.session_view;
-      const deliveryReady = job.result.delivery_ready === true
-        && sourceContextReady(job.result.source_context_audit, job.request.session_id);
+      const deliveryReady = recordedDeliveryReady(job.result, job.request.session_id, job.request.kind);
       const prefix = Buffer.from(JSON.stringify({ delivery_ready: deliveryReady, summary: session,
         total: job.turns.records, offset, turns: [] }).slice(0, -2));
       const bytes = prefix.length + report.rows.reduce((total, row) => total + row.bytes, 0)
