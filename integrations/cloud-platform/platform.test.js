@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const zlib = require('node:zlib');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const crypto = require('node:crypto');
@@ -31,6 +32,11 @@ async function fixture(root) {
   const value = JSON.parse(result.stdout);
   assert.equal(value.ok, true, result.stderr);
   return { root: output, captureRoot: path.join(output, 'capture'), objectRoot: path.join(output, 'raw-object-store'), usage: path.join(output, 'sub2api-usage.jsonl') };
+}
+
+function decodeProjectionJsonl(bytes) {
+  const text = zlib.zstdDecompressSync(bytes).toString('utf8');
+  return text.trim() ? text.trim().split('\n').map(line => JSON.parse(line)) : [];
 }
 
 test('HTTP service and SDK run the real CLI archive/restore/inspect/export path', { timeout: 60000 }, async t => {
@@ -93,6 +99,8 @@ test('HTTP service and SDK run the real CLI archive/restore/inspect/export path'
   const projectionManifest = await projectionManifestResponse.json();
   assert.equal(projectionManifest.schema_version, inspectedProjection.schema_version);
   assert.deepEqual(projectionManifest.parts, inspectedProjection.parts);
+  const turnById = new Map(allTurns.turns.map(turn => [`${turn.session_id}/${turn.turn_id}`, turn]));
+  const downloadedProjection = {};
   for (const [part, file] of Object.entries({
     interactions: 'interactions/model-interactions.jsonl.zst',
     runtime: 'runtime/runtime-spans.jsonl.zst',
@@ -105,7 +113,33 @@ test('HTTP service and SDK run the real CLI archive/restore/inspect/export path'
     assert.equal(bytes.length, metadata.bytes);
     assert.equal(crypto.createHash('sha256').update(bytes).digest('hex'), metadata.sha256);
     assert.equal(response.headers.get('x-content-sha256'), metadata.sha256);
+    if (part !== 'manifest') downloadedProjection[part] = decodeProjectionJsonl(bytes);
   }
+  assert.equal(downloadedProjection.interactions.length, inspectedProjection.interactions);
+  for (const interaction of downloadedProjection.interactions) {
+    const key = `${interaction.trace_context.session_id}/${interaction.trace_context.turn_id}`;
+    const turn = turnById.get(key);
+    assert.ok(turn, `interaction is not assigned to a persisted Turn: ${key}`);
+    assert.ok(interaction.raw_capture_refs.length > 0);
+    const refs = new Set(turn.raw_capture_refs);
+    for (const ref of interaction.raw_capture_refs) assert.ok(refs.has(ref.capture_id));
+  }
+  assert.equal(downloadedProjection.runtime.length, inspectedProjection.runtime_spans);
+  const toolSpansByTurn = new Map();
+  for (const span of downloadedProjection.runtime) {
+    if (span.span_kind !== 'tool_execution') continue;
+    const key = `${span.trace_context.session_id}/${span.trace_context.turn_id}`;
+    const turn = turnById.get(key);
+    assert.ok(turn, `tool span is not assigned to a persisted Turn: ${key}`);
+    assert.ok(span.raw_capture_refs.length > 0);
+    const refs = new Set(turn.raw_capture_refs);
+    for (const ref of span.raw_capture_refs) assert.ok(refs.has(ref));
+    toolSpansByTurn.set(key, (toolSpansByTurn.get(key) || 0) + 1);
+  }
+  for (const turn of allTurns.turns.filter(item => item.tool_execution_records > 0)) {
+    assert.ok(toolSpansByTurn.get(`${turn.session_id}/${turn.turn_id}`) > 0);
+  }
+  assert.equal(downloadedProjection.links.length, inspectedProjection.links);
   await assert.rejects(client.downloadProjection('inspect-job', 'unknown'), error => error.status === 404);
   const projectionPartPath = path.join(root, 'platform/work/inspect-job/projection/interactions/model-interactions.jsonl.zst');
   const originalProjectionPart = await fs.readFile(projectionPartPath);
