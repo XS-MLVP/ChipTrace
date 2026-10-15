@@ -11,6 +11,8 @@ const REQUIRED_SCENARIOS = [
   'failed_tool_process',
   'delayed_write_stdin',
 ];
+const PRODUCER_MODES = new Set(['patched_stock', 'unmodified_stock']);
+const UPSTREAM_COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 
 function fail(message) {
   throw new Error(`native canary gate: ${message}`);
@@ -37,6 +39,56 @@ function requireZero(value, label) {
 function nonEmptyString(value, label) {
   if (typeof value !== 'string' || value.trim() === '') fail(`${label} must be a non-empty string`);
   return value;
+}
+
+function verifyProducerProvenance(report, { requireUnmodifiedStock = false } = {}) {
+  if (report.provenance === undefined || report.provenance === null) {
+    if (requireUnmodifiedStock) {
+      fail('production canary requires producer provenance for an unmodified Stock Codex producer');
+    }
+    return {
+      kind: 'unknown',
+      client_version: report.stock_version,
+      upstream_commit: null,
+      producer_mode: 'unknown',
+      patch_set: [],
+      unmodified_stock: false,
+    };
+  }
+  const provenance = object(report.provenance, 'report.provenance');
+  const kind = nonEmptyString(provenance.kind, 'report.provenance.kind');
+  const clientVersion = nonEmptyString(provenance.client_version, 'report.provenance.client_version');
+  const upstreamCommit = nonEmptyString(provenance.upstream_commit, 'report.provenance.upstream_commit');
+  if (!UPSTREAM_COMMIT_PATTERN.test(upstreamCommit)) {
+    fail('report.provenance.upstream_commit must be a lowercase 40-character SHA-1');
+  }
+  const producerMode = nonEmptyString(provenance.producer_mode, 'report.provenance.producer_mode');
+  if (!PRODUCER_MODES.has(producerMode)) {
+    fail(`report.provenance.producer_mode must be one of ${[...PRODUCER_MODES].join(', ')}`);
+  }
+  const patchSet = provenance.patch_set;
+  if (!Array.isArray(patchSet)) fail('report.provenance.patch_set must be an array');
+  patchSet.forEach((patch, index) => nonEmptyString(patch, `report.provenance.patch_set[${index}]`));
+  if (clientVersion !== report.stock_version) {
+    fail('report.provenance.client_version must match report.stock_version');
+  }
+  if (producerMode === 'unmodified_stock' && patchSet.length !== 0) {
+    fail('unmodified Stock Codex provenance cannot declare patches');
+  }
+  if (producerMode === 'patched_stock' && patchSet.length === 0) {
+    fail('patched Stock Codex provenance must declare patch_set');
+  }
+  if (requireUnmodifiedStock && producerMode !== 'unmodified_stock') {
+    fail('production canary requires an unmodified Stock Codex producer');
+  }
+  return {
+    kind,
+    client_version: clientVersion,
+    upstream_commit: upstreamCommit,
+    producer_mode: producerMode,
+    patch_set: [...patchSet],
+    unmodified_stock: producerMode === 'unmodified_stock',
+  };
 }
 
 function verifySourceCoverage(coverage) {
@@ -119,12 +171,17 @@ function verifyAudit(audit, expectedSessionId) {
   };
 }
 
-function verifyNativeCanaryReport(report, audit, { minimumTurns = DEFAULT_MINIMUM_TURNS } = {}) {
+function verifyNativeCanaryReport(
+  report,
+  audit,
+  { minimumTurns = DEFAULT_MINIMUM_TURNS, requireUnmodifiedStock = false } = {},
+) {
   object(report, 'report');
   object(audit, 'source_context_audit');
   if (!Number.isInteger(minimumTurns) || minimumTurns < 1) fail('minimumTurns must be a positive integer');
   if (report.real_upstream !== true) fail('real_upstream must be true');
   nonEmptyString(report.stock_version, 'report.stock_version');
+  const producer = verifyProducerProvenance(report, { requireUnmodifiedStock });
   const nativeExit = object(report.native_exit, 'report.native_exit');
   if (nativeExit.code !== 0 || nativeExit.signal !== null) fail('native client exited nonzero');
   const sourceCoverage = verifySourceCoverage(report.source_coverage);
@@ -264,6 +321,11 @@ function verifyNativeCanaryReport(report, audit, { minimumTurns = DEFAULT_MINIMU
     schema_version: 'chiptrace.native-canary-gate.v1',
     real_upstream: true,
     stock_version: report.stock_version,
+    producer_mode: producer.producer_mode,
+    upstream_commit: producer.upstream_commit,
+    patch_set: producer.patch_set,
+    unmodified_stock: producer.unmodified_stock,
+    production_ready: producer.unmodified_stock,
     scenario_coverage: scenarios,
     source_coverage: sourceCoverage,
     native_turns: session.native_turns,
@@ -286,23 +348,30 @@ function parseArgs(argv) {
   let report;
   let audit;
   let minimumTurns = DEFAULT_MINIMUM_TURNS;
+  let requireUnmodifiedStock = false;
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     const value = argv[index + 1];
     if (flag === '--report' && value) { report = value; index += 1; }
     else if (flag === '--audit' && value) { audit = value; index += 1; }
     else if (flag === '--minimum-turns' && value) { minimumTurns = Number(value); index += 1; }
-    else fail('usage: native-canary-gate.js --report REPORT.json --audit AUDIT.json [--minimum-turns N]');
+    else if (flag === '--require-unmodified-stock') { requireUnmodifiedStock = true; }
+    else fail('usage: native-canary-gate.js --report REPORT.json --audit AUDIT.json [--minimum-turns N] [--require-unmodified-stock]');
   }
-  if (!report || !audit) fail('usage: native-canary-gate.js --report REPORT.json --audit AUDIT.json [--minimum-turns N]');
-  return { report, audit, minimumTurns };
+  if (!report || !audit) fail('usage: native-canary-gate.js --report REPORT.json --audit AUDIT.json [--minimum-turns N] [--require-unmodified-stock]');
+  return { report, audit, minimumTurns, requireUnmodifiedStock };
 }
 
 if (require.main === module) {
   try {
     const args = parseArgs(process.argv.slice(2));
     console.log(JSON.stringify(verifyNativeCanaryReport(
-      readJson(args.report), readJson(args.audit), { minimumTurns: args.minimumTurns },
+      readJson(args.report),
+      readJson(args.audit),
+      {
+        minimumTurns: args.minimumTurns,
+        requireUnmodifiedStock: args.requireUnmodifiedStock,
+      },
     ), null, 2));
   } catch (error) {
     console.error(error.message || String(error));

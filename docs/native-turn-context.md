@@ -172,6 +172,9 @@ Session 记录，Wire、OTLP logs、OTLP traces、Hook 四路来源均有正数�
   "schema_version": "chiptrace.native-canary-gate.v1",
   "real_upstream": true,
   "stock_version": "0.163.0-alpha.11",
+  "producer_mode": "patched_stock",
+  "unmodified_stock": false,
+  "production_ready": false,
   "native_turns": 2,
   "selected_audit_records": 3621,
   "delivery_ready": true
@@ -181,8 +184,10 @@ Session 记录，Wire、OTLP logs、OTLP traces、Hook 四路来源均有正数�
 审计总计为 OTLP logs 580 条（Turn 573、Session 5、process 2）和 OTLP traces 3041 条
 （Turn 2190、Session 737、process 114），`unscoped_otlp_records=0`，每项分类与总数
 守恒。`process` 记录只有在来源端显式写入 `codex.context_scope=process` 时才可以这样
-分类。该结果证明补丁后的隔离生产者路径可以满足门禁，不证明未修改发行版、线上镜像或
-真实 Alibaba OSS 账户已经验收；正向 fixture 也不替代 Raw、鉴权审计或采购包。
+分类。该结果证明补丁后的隔离生产者路径可以满足数据完整性门禁，不证明未修改发行版、
+线上镜像或真实 Alibaba OSS 账户已经验收。门禁输出 `producer_mode=patched_stock`，生产
+交接命令还必须添加 `--require-unmodified-stock`；正向 fixture 也不替代 Raw、鉴权审计或
+采购包。
 
 门禁还要求 `session_view.model_interactions` 和
 `session_view.tool_execution_records` 分别等于所有 Native Turn 对应字段的总和。聚合值
@@ -208,6 +213,18 @@ chiptrace audit-session-context --input <sealed-raw-or-restored-directory> \
 node scripts/ci/native-canary-gate.js \
   --report report.json --audit source-context-audit.json --minimum-turns 2
 ```
+
+生产交接还必须声明生产者未修改：
+
+```bash
+node scripts/ci/native-canary-gate.js \
+  --report report.json --audit source-context-audit.json \
+  --minimum-turns 2 --require-unmodified-stock
+```
+
+报告的 `provenance` 必须包含 `client_version`、固定的 `upstream_commit`、
+`producer_mode` 和守恒的 `patch_set`。`patched_stock` 只用于隔离数据治理回归，不能作为
+未修改 Stock Codex 的生产证明。
 
 该门禁只输出计数和状态摘要，不读取或打印对话正文、工具参数、鉴权值或文件路径。
 失败结果必须保留 Raw 和审计报告，不能通过删除未归属记录、改写状态或降低轮次门槛来

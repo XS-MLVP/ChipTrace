@@ -3,6 +3,15 @@
   "provenance": {
     "kind": "redacted_real_canary_metadata",
     "client_version": "0.163.0-alpha.11",
+    "upstream_commit": "5425d3e625daa58eea3ad1de27c087eb3b2ffbd3",
+    "producer_mode": "patched_stock",
+    "patch_set": [
+      "upstream-sse-context.patch",
+      "upstream-sse-context-test.patch",
+      "upstream-session-scope.patch",
+      "upstream-session-scope-extension.patch",
+      "upstream-session-scope-process.patch"
+    ],
     "transform": "Native identifiers, timestamps, payloads, paths and credentials were replaced or removed; this is metadata only."
   },
   "real_upstream": true,

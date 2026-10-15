@@ -10,6 +10,13 @@ function report() {
   return {
     real_upstream: true,
     stock_version: '0.163.0-alpha.11',
+    provenance: {
+      kind: 'test_canary',
+      client_version: '0.163.0-alpha.11',
+      upstream_commit: '5425d3e625daa58eea3ad1de27c087eb3b2ffbd3',
+      producer_mode: 'patched_stock',
+      patch_set: ['test-context.patch'],
+    },
     scenario_coverage: ['second_turn', 'resume', 'failed_tool_process', 'delayed_write_stdin'],
     source_coverage: { wire: 2, otlp_logs: 2, otlp_traces: 2, hooks: 2, missing_sources: [], complete: true },
     native_exit: { code: 0, signal: null },
@@ -76,6 +83,11 @@ test('native canary gate requires a complete multi-turn four-source bundle', () 
     schema_version: 'chiptrace.native-canary-gate.v1',
     real_upstream: true,
     stock_version: '0.163.0-alpha.11',
+    producer_mode: 'patched_stock',
+    upstream_commit: '5425d3e625daa58eea3ad1de27c087eb3b2ffbd3',
+    patch_set: ['test-context.patch'],
+    unmodified_stock: false,
+    production_ready: false,
     scenario_coverage: ['delayed_write_stdin', 'failed_tool_process', 'resume', 'second_turn'],
     source_coverage: { wire: 2, otlp_logs: 2, otlp_traces: 2, hooks: 2, missing_sources: [], complete: true },
     native_turns: 2,
@@ -129,6 +141,46 @@ test('short or non-upstream reports cannot pass the production gate', () => {
   short.session_view.native_turns = 1;
   short.session_view.turns.pop();
   assert.throws(() => verifyNativeCanaryReport(short, audit()), /at least 2/);
+});
+
+test('patched producer evidence cannot satisfy the unmodified Stock Codex gate', () => {
+  assert.throws(
+    () => verifyNativeCanaryReport(report(), audit(), { requireUnmodifiedStock: true }),
+    /requires an unmodified Stock Codex producer/,
+  );
+  const unmodified = report();
+  unmodified.provenance.producer_mode = 'unmodified_stock';
+  unmodified.provenance.patch_set = [];
+  const result = verifyNativeCanaryReport(unmodified, audit(), { requireUnmodifiedStock: true });
+  assert.equal(result.unmodified_stock, true);
+  assert.deepEqual(result.patch_set, []);
+});
+
+test('producer provenance must conserve the declared patch state', () => {
+  const missing = report();
+  delete missing.provenance.upstream_commit;
+  assert.throws(
+    () => verifyNativeCanaryReport(missing, audit()),
+    /report\.provenance\.upstream_commit must be a non-empty string/,
+  );
+  const contradictory = report();
+  contradictory.provenance.producer_mode = 'unmodified_stock';
+  assert.throws(
+    () => verifyNativeCanaryReport(contradictory, audit()),
+    /unmodified Stock Codex provenance cannot declare patches/,
+  );
+});
+
+test('missing producer provenance is diagnostic-only and cannot pass the production mode', () => {
+  const missing = report();
+  delete missing.provenance;
+  const diagnostic = verifyNativeCanaryReport(missing, audit());
+  assert.equal(diagnostic.producer_mode, 'unknown');
+  assert.equal(diagnostic.production_ready, false);
+  assert.throws(
+    () => verifyNativeCanaryReport(missing, audit(), { requireUnmodifiedStock: true }),
+    /requires producer provenance for an unmodified Stock Codex producer/,
+  );
 });
 
 test('a canary must declare every required interaction scenario and source aggregate', () => {

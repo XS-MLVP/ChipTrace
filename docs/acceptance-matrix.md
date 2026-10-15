@@ -43,6 +43,9 @@ Session 输入以及缺 Tool Schema。
 
 生产部署前必须使用未修改的 Stock Codex 和普通 `codex` 命令完成一条自然长任务。该任务
 必须经隔离 18084、Relay、Collector、OSS Raw 和 `cloud-acceptance`，且满足上表全部条件。
+Canary 报告还必须记录 `provenance.upstream_commit`、`producer_mode=unmodified_stock` 和
+空的 `patch_set`，并通过 `native-canary-gate --require-unmodified-stock`；带补丁的隔离
+Canary 只能证明数据治理链路，不得作为生产者发布证据。
 Stock Codex Session 以 Hook 顺序为边界；最新 `SessionStart` 必须有后续 `SessionEnd`，历史终态、
 `response.completed`、`Stop` 和 OTLP `conversation_starts` 均不能代替该终态。
 

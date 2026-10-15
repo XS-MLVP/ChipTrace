@@ -129,6 +129,11 @@ jobs:
           result = json.load(open("native-canary-gate.json", encoding="utf-8"))
           assert result["real_upstream"] is True
           assert result["stock_version"] == "0.163.0-alpha.11"
+          assert result["producer_mode"] == "patched_stock"
+          assert result["unmodified_stock"] is False
+          assert result["production_ready"] is False
+          assert result["upstream_commit"] == "5425d3e625daa58eea3ad1de27c087eb3b2ffbd3"
+          assert len(result["patch_set"]) == 5
           assert result["native_turns"] == 2
           assert result["model_interactions"] == 8
           assert result["tool_execution_records"] == 6
@@ -140,6 +145,20 @@ jobs:
           assert result["source_coverage"]["missing_sources"] == []
           assert result["delivery_ready"] is True
           '
+      - name: Prove patched evidence cannot satisfy the production Stock Codex gate
+        run: |
+          set -euo pipefail
+          if node scripts/ci/native-canary-gate.js \
+            --report fixtures/native-canary-multiturn-0163-success-report.json \
+            --audit fixtures/native-canary-multiturn-0163-success-audit.json \
+            --minimum-turns 2 --require-unmodified-stock \
+            > patched-native-canary-production-gate.log 2>&1; then
+            cat patched-native-canary-production-gate.log
+            echo "patched canary unexpectedly passed the unmodified producer gate" >&2
+            exit 1
+          fi
+          grep -F "requires an unmodified Stock Codex producer" \
+            patched-native-canary-production-gate.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -16,6 +16,8 @@ test('redacted real multi-turn evidence remains rejected while unknown Session r
   const report = read('native-canary-multiturn-0163-report.json');
   const audit = read('native-canary-multiturn-0163-audit.json');
   assert.equal(report.real_upstream, true);
+  assert.equal(report.provenance.producer_mode, 'patched_stock');
+  assert.equal(report.provenance.patch_set.length, 5);
   assert.equal(report.session_view.native_turns, 2);
   assert.equal(audit.sources.otlp_logs.unknown_session_records, 2);
   assert.equal(audit.sources.otlp_traces.unknown_session_records, 84);
@@ -37,6 +39,9 @@ test('redacted real patched Canary passes the complete delivery gate', () => {
   const audit = read('native-canary-multiturn-0163-success-audit.json');
   const result = verifyNativeCanaryReport(report, audit);
   assert.equal(result.native_turns, 2);
+  assert.equal(result.producer_mode, 'patched_stock');
+  assert.equal(result.unmodified_stock, false);
+  assert.equal(result.production_ready, false);
   assert.equal(result.selected_audit_records, 3621);
   assert.equal(result.delivery_ready, true);
   assert.deepEqual(result.scenario_coverage, [
