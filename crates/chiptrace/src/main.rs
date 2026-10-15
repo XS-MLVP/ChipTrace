@@ -1851,6 +1851,10 @@ async fn self_test(args: SelfTestArgs) -> Result<Value> {
         "m0_interaction_delivery":interaction.integrity.delivery_ready
             && interaction.validation_status == "delivery_ready"
             && interaction_verified == interaction,
+        "turn_interaction_coverage":interaction.metrics
+            .pointer("/turn_interaction/complete")
+            .and_then(Value::as_bool)
+            == Some(true),
         "m0_otlp_tree":otlp.root_spans == 1
             && otlp.internal_parent_references == otlp.resolved_internal_parents
             && otlp.resolved_internal_parent_rate == 1.0

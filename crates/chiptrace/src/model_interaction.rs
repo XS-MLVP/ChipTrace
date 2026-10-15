@@ -363,9 +363,15 @@ pub fn project_interactions(
             && runtime.runtime_complete
             && runtime.root_complete,
     };
+    let turn_interaction = session_view
+        .as_ref()
+        .map(|view| turn_interaction_coverage(view, &interactions, &runtime_spans))
+        .transpose()?;
     let metrics = json!({
         "interactions":interaction_metrics,
         "runtime":runtime.metrics,
+        "turn_interaction":turn_interaction
+            .unwrap_or_else(|| json!({"applicable":false,"complete":true})),
     });
 
     let mut protocol_counts = BTreeMap::new();
@@ -782,6 +788,12 @@ pub(crate) fn verify_interaction_artifacts(root: &Path) -> Result<InteractionPro
     let expected_metrics = json!({
         "interactions":interaction_metrics,
         "runtime":runtime.metrics,
+        "turn_interaction":manifest
+            .session_view
+            .as_ref()
+            .map(|view| turn_interaction_coverage(view, &interactions, &runtime_spans))
+            .transpose()?
+            .unwrap_or_else(|| json!({"applicable":false,"complete":true})),
     });
     let expected_status = if expected_integrity.delivery_ready {
         "delivery_ready"
@@ -839,6 +851,191 @@ fn canonical_session_ids(interactions: &[Value], runtime_spans: &[Value]) -> BTr
                 .map(str::to_owned)
         })
         .collect()
+}
+
+fn turn_interaction_coverage(
+    view: &crate::session_view::SessionView,
+    interactions: &[Value],
+    runtime_spans: &[Value],
+) -> Result<Value> {
+    let mut turns = BTreeMap::new();
+    for turn in &view.turns {
+        let key = (turn.session_id.clone(), turn.turn_id.clone());
+        if turns.insert(key.clone(), turn).is_some() {
+            bail!(
+                "Session/Turn view contains duplicate native identity {}/{}",
+                key.0,
+                key.1
+            );
+        }
+    }
+
+    let mut model_interactions_by_turn: BTreeMap<(String, String), u64> = BTreeMap::new();
+    let mut tool_spans_by_turn: BTreeMap<(String, String), u64> = BTreeMap::new();
+
+    for (index, interaction) in interactions.iter().enumerate() {
+        let key = canonical_turn_key(interaction, "model interaction", index)?;
+        let Some(turn) = turns.get(&key) else {
+            bail!(
+                "model interaction {} is assigned to unknown Session/Turn {}/{}",
+                index + 1,
+                key.0,
+                key.1
+            );
+        };
+        let raw_refs = interaction
+            .get("raw_capture_refs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                anyhow::anyhow!("model interaction {} has no raw_capture_refs", index + 1)
+            })?;
+        let mut capture_ids = BTreeSet::new();
+        for raw_ref in raw_refs {
+            let capture_id = raw_ref
+                .get("capture_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "model interaction {} has an invalid raw_capture_refs entry",
+                        index + 1
+                    )
+                })?;
+            capture_ids.insert(capture_id.to_owned());
+        }
+        if capture_ids.is_empty() {
+            bail!("model interaction {} has empty raw_capture_refs", index + 1);
+        }
+        if capture_ids.is_disjoint(&turn.raw_capture_refs) {
+            bail!(
+                "model interaction {} has no Raw Capture evidence in Session/Turn {}/{}",
+                index + 1,
+                key.0,
+                key.1
+            );
+        }
+        *model_interactions_by_turn.entry(key).or_default() += 1;
+    }
+
+    for (index, span) in runtime_spans
+        .iter()
+        .filter(|span| string_field(span, "span_kind") == Some("tool_execution"))
+        .enumerate()
+    {
+        let key = canonical_turn_key(span, "tool execution span", index)?;
+        let Some(turn) = turns.get(&key) else {
+            bail!(
+                "tool execution span {} is assigned to unknown Session/Turn {}/{}",
+                index + 1,
+                key.0,
+                key.1
+            );
+        };
+        let raw_refs = span
+            .get("raw_capture_refs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                anyhow::anyhow!("tool execution span {} has no raw_capture_refs", index + 1)
+            })?;
+        let mut capture_ids = BTreeSet::new();
+        for raw_ref in raw_refs {
+            let capture_id = raw_ref
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "tool execution span {} has an invalid raw_capture_refs entry",
+                        index + 1
+                    )
+                })?;
+            capture_ids.insert(capture_id.to_owned());
+        }
+        if capture_ids.is_empty() {
+            bail!(
+                "tool execution span {} has empty raw_capture_refs",
+                index + 1
+            );
+        }
+        if capture_ids.is_disjoint(&turn.raw_capture_refs) {
+            bail!(
+                "tool execution span {} has no Raw Capture evidence in Session/Turn {}/{}",
+                index + 1,
+                key.0,
+                key.1
+            );
+        }
+        *tool_spans_by_turn.entry(key).or_default() += 1;
+    }
+
+    let expected_model_interactions = view.turns.iter().try_fold(0_u64, |total, turn| {
+        total.checked_add(turn.model_interactions)
+    });
+    let Some(expected_model_interactions) = expected_model_interactions else {
+        bail!("Session/Turn model interaction count overflowed");
+    };
+    if expected_model_interactions != view.model_interactions {
+        bail!(
+            "Session/Turn model interaction count {} does not equal per-Turn total {}",
+            view.model_interactions,
+            expected_model_interactions
+        );
+    }
+    if expected_model_interactions != interactions.len() as u64 {
+        bail!(
+            "canonical ModelInteraction count {} does not equal Session/Turn total {}",
+            interactions.len(),
+            expected_model_interactions
+        );
+    }
+
+    for turn in &view.turns {
+        let key = (turn.session_id.clone(), turn.turn_id.clone());
+        let actual = model_interactions_by_turn.get(&key).copied().unwrap_or(0);
+        if actual != turn.model_interactions {
+            bail!(
+                "Session/Turn {}/{} declares {} model interactions but canonical projection assigns {}",
+                key.0,
+                key.1,
+                turn.model_interactions,
+                actual
+            );
+        }
+        if turn.tool_execution_records > 0
+            && tool_spans_by_turn.get(&key).copied().unwrap_or(0) == 0
+        {
+            bail!(
+                "Session/Turn {}/{} declares tool execution records but has no canonical tool_execution span",
+                key.0,
+                key.1
+            );
+        }
+    }
+
+    Ok(json!({
+        "applicable": true,
+        "complete": true,
+        "model_interactions": interactions.len(),
+        "model_interactions_assigned_to_turn": model_interactions_by_turn.values().sum::<u64>(),
+        "tool_execution_spans": runtime_spans
+            .iter()
+            .filter(|span| string_field(span, "span_kind") == Some("tool_execution"))
+            .count(),
+        "tool_execution_spans_assigned_to_turn": tool_spans_by_turn.values().sum::<u64>(),
+    }))
+}
+
+fn canonical_turn_key(value: &Value, kind: &str, index: usize) -> Result<(String, String)> {
+    let session_id = trace_string(value, "session_id")
+        .ok_or_else(|| anyhow::anyhow!("{kind} {} has no explicit session_id", index + 1))?;
+    let turn_id = trace_string(value, "turn_id")
+        .or_else(|| trace_string(value, "root_turn_id"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{kind} {} has no explicit turn_id or root_turn_id",
+                index + 1
+            )
+        })?;
+    Ok((session_id.to_owned(), turn_id.to_owned()))
 }
 
 fn write_part(root: &Path, relative: &str, values: &[Value], level: i32) -> Result<FileManifest> {
@@ -8388,5 +8585,145 @@ mod tests {
         let incomplete = cloud_source_coverage(&without_traces);
         assert!(!incomplete.complete);
         assert_eq!(incomplete.missing_sources, ["otlp_traces"]);
+    }
+
+    fn turn_coverage_view(
+        model_interactions: u64,
+        tool_execution_records: u64,
+    ) -> crate::session_view::SessionView {
+        crate::session_view::SessionView {
+            schema_version: crate::session_view::SESSION_VIEW_SCHEMA_VERSION.to_owned(),
+            session_id: "session-coverage".to_owned(),
+            session_epochs: 1,
+            closed_session_epochs: 1,
+            latest_epoch_closed: true,
+            invalid_session_boundaries: 0,
+            native_turns: 1,
+            closed_turns: 1,
+            open_turns: 0,
+            conflicted_turns: 0,
+            incomplete_turns: 0,
+            turn_source_coverage_complete: true,
+            unscoped_turn_records: 0,
+            unscoped_source_records: BTreeMap::new(),
+            delivery_ready: true,
+            model_interactions,
+            tool_execution_records,
+            turns: vec![crate::session_view::TurnView {
+                session_id: "session-coverage".to_owned(),
+                turn_id: "turn-coverage".to_owned(),
+                root_turn_id: Some("turn-coverage".to_owned()),
+                started_at: Some("2026-01-01T00:00:00Z".to_owned()),
+                finished_at: Some("2026-01-01T00:00:01Z".to_owned()),
+                status: "closed".to_owned(),
+                start_events: 1,
+                terminal_events: 1,
+                model_interactions,
+                tool_execution_records,
+                state_conflict: false,
+                raw_capture_refs: BTreeSet::from(["capture-coverage".to_owned()]),
+                source_coverage: crate::session_view::TurnSourceCoverage {
+                    wire: 1,
+                    otlp_logs: 1,
+                    otlp_traces: 1,
+                    hooks: 1,
+                    missing_sources: Vec::new(),
+                    complete: true,
+                },
+            }],
+        }
+    }
+
+    fn turn_coverage_interaction(trace_context: Value, capture_id: &str) -> Value {
+        json!({
+            "trace_context": trace_context,
+            "raw_capture_refs":[{"capture_id":capture_id,"record_type":"api_snapshot"}],
+        })
+    }
+
+    fn turn_coverage_tool_span(trace_context: Value, capture_id: &str) -> Value {
+        json!({
+            "span_kind":"tool_execution",
+            "trace_context": trace_context,
+            "raw_capture_refs":[capture_id],
+        })
+    }
+
+    #[test]
+    fn turn_interaction_coverage_accepts_complete_projection() {
+        let view = turn_coverage_view(1, 1);
+        let interactions = vec![turn_coverage_interaction(
+            json!({"session_id":"session-coverage","turn_id":"turn-coverage"}),
+            "capture-coverage",
+        )];
+        let runtime_spans = vec![turn_coverage_tool_span(
+            json!({"session_id":"session-coverage","root_turn_id":"turn-coverage"}),
+            "capture-coverage",
+        )];
+        let metrics = turn_interaction_coverage(&view, &interactions, &runtime_spans).unwrap();
+        assert_eq!(metrics["applicable"], true);
+        assert_eq!(metrics["complete"], true);
+        assert_eq!(metrics["model_interactions_assigned_to_turn"], 1);
+        assert_eq!(metrics["tool_execution_spans_assigned_to_turn"], 1);
+    }
+
+    #[test]
+    fn turn_interaction_coverage_rejects_missing_turn_identity() {
+        let view = turn_coverage_view(1, 0);
+        let interactions = vec![turn_coverage_interaction(
+            json!({"session_id":"session-coverage"}),
+            "capture-coverage",
+        )];
+        let error = turn_interaction_coverage(&view, &interactions, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no explicit turn_id or root_turn_id")
+        );
+    }
+
+    #[test]
+    fn turn_interaction_coverage_rejects_cross_session_or_turn_assignment() {
+        let view = turn_coverage_view(1, 0);
+        let interactions = vec![turn_coverage_interaction(
+            json!({"session_id":"other-session","turn_id":"other-turn"}),
+            "capture-coverage",
+        )];
+        let error = turn_interaction_coverage(&view, &interactions, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("assigned to unknown Session/Turn other-session/other-turn")
+        );
+    }
+
+    #[test]
+    fn turn_interaction_coverage_rejects_missing_raw_capture_evidence() {
+        let view = turn_coverage_view(1, 0);
+        let interactions = vec![turn_coverage_interaction(
+            json!({"session_id":"session-coverage","turn_id":"turn-coverage"}),
+            "capture-other",
+        )];
+        let error = turn_interaction_coverage(&view, &interactions, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("has no Raw Capture evidence in Session/Turn")
+        );
+    }
+
+    #[test]
+    fn turn_interaction_coverage_requires_tool_span_for_tool_records() {
+        let view = turn_coverage_view(1, 1);
+        let interactions = vec![turn_coverage_interaction(
+            json!({"session_id":"session-coverage","turn_id":"turn-coverage"}),
+            "capture-coverage",
+        )];
+        let error = turn_interaction_coverage(&view, &interactions, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "declares tool execution records but has no canonical tool_execution span"
+            )
+        );
     }
 }

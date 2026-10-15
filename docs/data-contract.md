@@ -142,6 +142,16 @@ Turn 覆盖中的 Wire 是 Capture 数，OTLP logs/traces 是原始记录数，H
 事件数。派生生命周期和工具事件不重复计为 Hook。Session 级 `source_coverage` 的 OTLP
 数仍是批次数，两种统计不能直接相加或比较。
 
+Canonical interaction 投影还必须通过 `metrics.turn_interaction` 门禁。每条
+`ModelInteraction` 和 `span_kind=tool_execution` 的 `RuntimeSpan` 都要带明确的
+`trace_context.session_id` 与 `turn_id`（缺少时才回退到 `root_turn_id`），并至少引用一条
+属于对应 Native Turn 的 Raw Capture。对每个 Turn，Canonical ModelInteraction 数必须等于
+`turn.model_interactions`；所有 Turn 的总和必须等于 `session_view.model_interactions`。
+当 `tool_execution_records` 大于零时，该 Turn 至少要有一个 Canonical
+`tool_execution` RuntimeSpan。RuntimeSpan 可以因为 pre/post 证据去重而少于原始工具记录，
+所以不要求两者逐条相等。任一身份、Raw 引用或双向计数不一致都会使投影失败，不能只依赖
+Runtime integrity 或 Session 级计数宣称交付完整。
+
 当前交付契约为 `chiptrace.cloud-acceptance.v2`，必须包含完整的 `session-view.v2`。
 v1 Schema 保持历史定义；旧产物只能按其冻结的旧验证器进行历史复验。升级必须从同一份
 原始 Raw 重新运行全部验收，不能仅改版本字段、补写 Session 统计或沿用旧的通过标志。
