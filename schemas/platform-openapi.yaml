@@ -61,9 +61,14 @@ paths:
         Summary is the scoped Session view and excludes full turns; total is
         the native Turn count. Legacy inspections without a source audit return
         false for the overall flag and require a new inspection job.
-        Every request verifies the full sidecar, but only selected rows are
-        materialized. Memory for a selected Turn is proportional to its size;
-        use turns.jsonl for streaming retrieval of large individual Turns.
+        Before sending headers, a streaming CLI validates every JSONL record
+        and all UTF-8 bytes and returns selected byte ranges. The server
+        verifies the complete recorded digest and count on the file handle
+        used to stream the rows. Response JSON keeps the same fields and full
+        selected Turn values without materializing them on the server. SDK
+        streamTurns returns a streaming Response; getTurns parses it on the
+        client. A page's Turn count does not bound its byte size. Each request
+        still scans the full sidecar and holds a read slot until close.
       parameters:
         - {$ref: '#/components/parameters/Offset'}
         - {$ref: '#/components/parameters/Limit'}

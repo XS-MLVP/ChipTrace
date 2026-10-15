@@ -70,11 +70,19 @@ small without dropping the full interaction evidence.
 
 The writer serializes borrowed Turn fields directly into a buffered, hashing,
 quota-checked file; it does not clone a Turn or allocate its whole JSON line.
-Page reads and completion verification scan chunks, hashing all bytes and
-counting every record while materializing only selected page rows. This avoids
-retaining a huge Turn outside the requested page. For large individual Turns,
-use `client.downloadTurns(id)` (`GET /v1/jobs/{id}/turns.jsonl`) and consume the
-response body as a stream. The server checks the complete byte count, record
+Completion verification scans chunks, hashing all bytes and counting records.
+HTTP Turn pages keep the existing JSON object format but stream selected rows
+without materializing them in Node. `read-turn-page` validates every JSONL
+record and all UTF-8 bytes in Rust, returning only the recorded digest, count
+and at most 100 selected byte ranges. Node verifies that descriptor and the
+complete sidecar again on the handle used to stream the selected rows. Invalid
+records, including those outside the page, fail before response headers.
+Use `client.streamTurns(id, { offset, limit })` to consume a page's Response
+body as a stream. `client.getTurns` still parses that Response into an object
+on the client. The embedding-only `plugin.getTurns` object API also retains
+selected rows in its caller's memory; use `plugin.openTurnPage` for streaming.
+For the full file, use `client.downloadTurns(id)`
+(`GET /v1/jobs/{id}/turns.jsonl`). The server checks the complete byte count, record
 count and SHA-256 before responding, and streams from the same open file with
 `Content-Length`, `ETag` and `X-Content-SHA256`. Clients should hash downloaded
 bytes; this validates the recorded artifact and does not certify an incomplete
@@ -198,16 +206,21 @@ Turn pages still hash and count the whole
 sidecar, including records outside the requested page. These paths need
 separate scale measurements and a persistent index before capacity claims.
 One selected Turn can itself contain a large set of Raw references; a page's
-Turn count does not impose a byte limit on that response. The streaming JSONL
-endpoint avoids materializing selected Turns, but still scans the full file
-before sending bytes and consumes a read slot until the stream closes.
+Turn count does not impose a byte limit on its streamed response. HTTP pages
+perform a full Rust validation pass and a full Node digest pass before sending
+bytes; they do not use a persistent index or reduce total file I/O. Both page
+and full-file streams consume a read slot until their file handle closes,
+including cancellation before the first byte. Page JSON framing is generated
+by the server; selected row bytes, including any legal whitespace, come from
+the verified sidecar. No Raw reference is truncated or dropped.
 
 CI explicitly runs `make turn-memory-test`'s ignored Rust RSS regressions in
 separate processes and requires exactly one measured test per case: Turn
-serialization has a 128 MiB fixture budget; streaming Manifest reading has a
-48 MiB fixture budget. The platform suite also reads an 80 MB
-synthetic Turn sidecar in a Node child with a 32 MiB V8 heap, skipping a giant
-row, streaming all bytes and rejecting corruption outside the selected page.
+serialization has a 128 MiB fixture budget; streaming Manifest and Turn page
+reading each have a 48 MiB fixture budget. The platform suite also reads an
+80 MB synthetic Turn sidecar in a Node child with a 32 MiB V8 heap, skipping
+a giant row, streaming the giant selected page and the full file with exact
+byte/hash checks, and rejecting corruption outside the selected page.
 Another limited-heap test downloads an expanded Manifest and canonical part,
 rejects metadata conflicts and skipped Turn corruption, and rejects invalid
 UTF-8 even when the recorded digest is changed to match those synthetic bytes.

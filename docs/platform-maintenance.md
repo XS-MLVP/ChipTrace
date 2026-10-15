@@ -25,7 +25,8 @@ HTTP transport：原先 FS 自测可通过，而 OSS/S3 在发送前返回 Confi
 - Rust 1.91 + Node 22 平台容器在只读根文件系统和 `--network none` 下执行 HTTP/SDK
   与 OSS 协议测试，通过；Compose 配置解析通过。
 
-GitHub CI 将以上本地路径拆成 Rust/Node、引擎/平台容器、MinIO S3 三个作业。
+GitHub CI 当前包括 Rust/Node、引擎/平台容器、MinIO S3、未修改客户端受管路由和
+固定生产者上下文五个作业。
 测试报告作为 Artifact 保留，所有管道启用 `pipefail`。远端状态必须读取对应提交的
 Actions run，不能用本地通过或旧 main 的绿色结果代替。
 MinIO 公共容器标签的远端拉取已返回 access denied；CI 因此从固定的公开源码提交
@@ -54,7 +55,9 @@ HTTP 2xx 不证明协议终态，门禁始终输出 `session_delivery_claimed=fa
 
 后续优先迭代：基于 Session/Turn 索引减少两遍全量扫描；按项目设置磁盘配额和确认后的保留周期；
 在主平台完成多租户授权、计费与审计；扩大到真实并发与较大 Archive 的压力测试。
-当前 Turn 分页的内存受页面约束，但每页会扫描并校验整份 sidecar；任务历史有上限，
+HTTP Turn 分页现先流式验证全部 JSONL/UTF-8，再复核下载句柄的全文件哈希，保持原
+JSON 格式并分段返回完整选中记录。`streamTurns` 返回 Response；`getTurns` 对象 API
+仍由调用者容纳选中数据。每页仍扫描整份 sidecar，尚无持久索引；任务历史有上限，
 导出目录独立保留 Raw，因此上线前仍需安排磁盘容量和保留策略。
 
 2026-10-15 的接入复查发现系统配置和用户配置的同名 Provider 指向不同入口。现有 required

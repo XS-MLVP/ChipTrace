@@ -13,6 +13,9 @@ const CASES = [
   { test: 'platform_projection::tests::large_manifest_metadata_memory', field: 'projection_manifest_measurement',
     schema: 'chiptrace.projection-reader-memory.v1', references: 400000,
     bytesField: 'manifest_bytes', minimumBytes: 64 * 1024 * 1024, budgetKiB: 48 * 1024 },
+  { test: 'platform_turns::tests::large_turn_page_metadata_memory', field: 'turn_page_measurement',
+    schema: 'chiptrace.turn-page-reader-memory.v1', references: 400000,
+    bytesField: 'turn_bytes', minimumBytes: 64 * 1024 * 1024, budgetKiB: 48 * 1024 },
 ];
 
 async function main() {

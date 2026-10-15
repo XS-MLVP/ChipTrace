@@ -6,6 +6,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { isDeepStrictEqual } = require('node:util');
+const { Readable } = require('node:stream');
 
 const PROJECTION_PARTS = Object.freeze({
   manifest: { file: 'manifest.json', contentType: 'application/json; charset=utf-8' },
@@ -79,6 +80,47 @@ async function safeDirectory(directory) {
 function decodeUtf8(bytes) {
   try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
   catch { throw new PlatformError('body must be valid UTF-8'); }
+}
+
+function turnPageStream(handle, prefix, rows, release) {
+  async function* chunks() {
+    yield prefix;
+    for (let index = 0; index < rows.length; index += 1) {
+      if (index) yield Buffer.from(',');
+      const row = rows[index];
+      let position = row.start;
+      const end = row.start + row.bytes;
+      while (position < end) {
+        const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, end - position));
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+        if (!bytesRead) throw new PlatformError('Turn evidence changed during download', 422, 'ARTIFACT_CHANGED');
+        position += bytesRead;
+        yield buffer.subarray(0, bytesRead);
+      }
+    }
+    yield Buffer.from(']}');
+  }
+  const iterator = chunks();
+  let reading = false;
+  return new Readable({
+    highWaterMark: 64 * 1024,
+    read() {
+      if (reading) return;
+      reading = true;
+      iterator.next().then(({ value, done }) => {
+        reading = false;
+        if (!this.destroyed) this.push(done ? null : value);
+      }, error => { reading = false; this.destroy(error); });
+    },
+    destroy(error, callback) {
+      // Close even if a consumer cancels before the generator starts. Wait
+      // for an outstanding read before closing the verified file descriptor.
+      (async () => {
+        try { await iterator.return(); }
+        finally { await handle.close(); }
+      })().then(() => { release(); callback(error); }, closeError => { release(); callback(error || closeError); });
+    },
+  });
 }
 
 function projectionMetadata(value, manifest = null) {
@@ -717,6 +759,60 @@ class ChipTracePlugin {
     const deliveryReady = job.result.delivery_ready === true
       && sourceContextReady(job.result.source_context_audit, job.request.session_id);
     return { delivery_ready: deliveryReady, summary: session, total: records, offset, turns };
+  }
+
+  async openTurnPage(id, { offset = 0, limit = 50 } = {}) {
+    const release = this.#acquireRead();
+    let handle;
+    try {
+      const job = this.#turnJob(id);
+      offset = integer(offset, 0, 0, Number.MAX_SAFE_INTEGER);
+      limit = integer(limit, 50, 1, 100);
+      if (job.turns.bytes > this.maxTurnBytes) {
+        throw new PlatformError('Turn evidence exceeds disk limit', 503, 'OUTPUT_LIMIT');
+      }
+      const file = path.join(this.root, 'work', job.request.id, 'turns.jsonl');
+      let report;
+      try {
+        report = await this.#engine(['read-turn-page', '--input', file,
+          '--offset', String(offset), '--limit', String(limit), '--max-bytes', String(this.maxTurnBytes)]);
+      } catch (error) {
+        if (error.code !== 'ENGINE_FAILURE') throw error;
+        throw new PlatformError('Turn evidence changed or cannot be read', 422, 'ARTIFACT_CHANGED');
+      }
+      const expectedRows = Math.max(0, Math.min(limit, job.turns.records - offset));
+      if (report.schema_version !== 'chiptrace.turn-page-metadata.v1' || report.session_delivery_claimed !== false
+          || report.offset !== offset || report.limit !== limit || !isDeepStrictEqual(report.evidence, job.turns)
+          || !Array.isArray(report.rows) || report.rows.length !== expectedRows) {
+        throw new PlatformError('Turn page metadata does not match recorded evidence', 422, 'ARTIFACT_CHANGED');
+      }
+      let previousEnd = 0;
+      for (const row of report.rows) {
+        const end = row.start + row.bytes;
+        if (!Number.isSafeInteger(row.start) || row.start < previousEnd || !Number.isSafeInteger(row.bytes)
+            || row.bytes < 1 || !Number.isSafeInteger(end) || end > job.turns.bytes) {
+          throw new PlatformError('invalid Turn page byte ranges', 502, 'ENGINE_PROTOCOL');
+        }
+        previousEnd = end;
+      }
+      // The CLI validates all JSONL records without materializing them. Check
+      // the complete digest again on the handle used to stream the page, so a
+      // path replacement cannot substitute unverified bytes or byte ranges.
+      ({ handle } = await this.#openTurnEvidence(job, 0, 0));
+      const session = job.result.session || job.result.session_view;
+      const deliveryReady = job.result.delivery_ready === true
+        && sourceContextReady(job.result.source_context_audit, job.request.session_id);
+      const prefix = Buffer.from(JSON.stringify({ delivery_ready: deliveryReady, summary: session,
+        total: job.turns.records, offset, turns: [] }).slice(0, -2));
+      const bytes = prefix.length + report.rows.reduce((total, row) => total + row.bytes, 0)
+        + Math.max(0, report.rows.length - 1) + 2;
+      return { bytes, contentType: 'application/json; charset=utf-8',
+        stream: turnPageStream(handle, prefix, report.rows, release) };
+    } catch (error) {
+      if (handle) await handle.close();
+      release();
+      throw error;
+    }
   }
 
   #turnJob(id) {

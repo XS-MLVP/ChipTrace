@@ -1,12 +1,13 @@
 # 生产就绪评估
 
-评估日期：2026-10-15。首次线上读取窗口为 10:53–10:59（Asia/Shanghai），最新线上只读快照为 21:08。
+评估日期：2026-10-15。首次线上读取窗口为 10:53–10:59（Asia/Shanghai），最新线上只读快照为 21:22。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-21:08 的只读快照中，18084、3011、3012 均返回 200，Collector/Relay 仍为 `fe9fcf9`；
-累计投递与 Capture 均为 1,074,864，pending/inflight/failed 为 0，计数守恒。
-Wire 仍只有 1 条且已约 10.4 小时未更新，覆盖为 `degraded`；18086 连接拒绝。
+21:22 的只读快照中，18084、3011、3012 均返回 200，Collector/Relay 仍为 `fe9fcf9`；
+累计投递与 Capture 均为 1,075,861，pending/failed 为 0、inflight 为 1，计数守恒；
+该瞬时在途项不表示持续积压。Wire 仍只有 1 条且已约 10.7 小时未更新，覆盖为
+`degraded`；18086 连接拒绝，runtime gate 实际因 `stale_sources=wire` 退出 1。
 模型探针最后可用时间仍为 10 月 8 日。735 个 sealed Segment 共 84,952,380,937 bytes
 保存在共享 NFS；此观测不证明已提交目标 OSS。当前状态应区分为传输进程存活、完整
 业务链路未验收和在线交付入口不可用。
@@ -45,6 +46,22 @@ Rust 独立合成读取实测峰值 25,600 KiB，低于 48 MiB 预算；CI 在�
 2 Turn、8 次模型交互、6 条工具记录、审计、场景和 Canonical parts 保持不变，
 11,974,944 bytes 原始 Raw 的 SHA-256 不变，临时回放副本已清理。这不代替真实 OSS、
 未修改生产者或 Buyer 导出验收，也不证明 Rust 全 Session 投影内存已受限。
+
+后续受限堆负对照还复现选中巨大 Turn 时的分页分配问题：约 80 MB 的单个选中 Turn
+令旧 HTTP 服务在 32 MiB Node 堆限制下 SIGABRT，测试实际退出 1。分页现在保持原 JSON
+字段，先用只读 `read-turn-page` 流式验证全部 JSONL/UTF-8 和哈希，再由 Node 在实际
+下载句柄上复核全文件，将选中记录原字节分段写入响应。相同用例实际退出 0，分页
+80,400,534 bytes 的字节数与 SHA-256 完整一致；CRLF、末尾无换行、空页、文件替换、
+取消读取和匹配记录哈希的非法 UTF-8/JSON 均有拒绝或兼容回归。独立 Rust 合成读取
+峰值 RSS 24,576 KiB，低于 48 MiB 预算；CI 在三个独立进程中执行 writer、Manifest
+reader 和 Turn page reader。SDK 新增 `streamTurns`；`getTurns` 对象 API 仍由调用者
+容纳完整选中数据。每页仍有全文件语法校验和哈希扫描，Rust 全 Session 投影与验收的
+内存、持久索引和真实生产容量尚未解决；本修复也未部署到线上。
+本轮完整 `cloud-test` 实际退出 0：301 个 Rust 库测试、1 个 CLI 测试、平台/OSS 协议
+60/60；三项 RSS 用例另行执行通过。M0 自测与受限平台容器 60/60 也实际退出 0，
+镜像标记为 `working-tree-turn-pages`。真实 patched Raw 经正常 HTTP/SDK 任务重放后仍
+保留 2 Turn、8 模型交互、6 工具记录及原 Session/审计/场景/Canonical parts；原始
+11,974,944 bytes Raw SHA-256 不变。该回放使用临时 FS 对象后端，未修改线上数据。
 
 代码侧本轮复现并修正 Canary 的声明式误通过：旧门禁仅凭四个场景标签，即使只有一个
 Session epoch、零工具执行也接受。新门禁要求同快照引擎生成的具体事件证据，真实
@@ -105,14 +122,14 @@ parts，2 Turn、8 模型交互、6 工具记录不变，Raw SHA-256 一致。
 | --- | --- | --- |
 | 18084、3011、3012 | HTTP 200 | 入口与采集进程存活 |
 | Collector/Relay | revision `fe9fcf924b226099202cb770b7cf0da29e0c2310` | 运行版本已固定；仓库新增修复尚未部署 |
-| 投递 | 21:08 同一快照已投递 1,074,864 条，pending/inflight/failed 为 0，计数守恒 | 持续传输；不能当作并发压测结果或完整 Session 数 |
-| Collector 磁盘 | 21:08 有 735 个 sealed Segment，84,952,380,937 bytes；活动段仍在增长 | 云端共享 NFS 上的 WAL 持续保存；不能证明 OSS 已提交 |
+| 投递 | 21:22 同一快照已投递 1,075,861 条，pending/failed 为 0、inflight 为 1，计数守恒 | 持续传输；瞬时在途项不能当作持续积压，也不是完整 Session 数 |
+| Collector 磁盘 | 21:22 有 735 个 sealed Segment，84,952,380,937 bytes；活动段仍在增长 | 云端共享 NFS 上的 WAL 持续保存；不能证明 OSS 已提交 |
 | Wire | 新进程内仅 1 条；活动 WAL 中为无原生 Session/Turn 的 HTTP 403 | 无真实成功 Turn Wire 的证据 |
-| 来源新鲜度 | 21:08 OTLP/Hook 有流量，Wire 约 10.4 小时未更新；runtime gate 仍实际因 Wire 过期退出 1 | 当前采集覆盖降级 |
+| 来源新鲜度 | 21:22 OTLP/Hook 有流量，Wire 约 10.7 小时未更新；runtime gate 仍实际因 Wire 过期退出 1 | 当前采集覆盖降级 |
 | 历史失败 | 293 个文件，267,219,223 bytes | 保留失败取证，不能删除换取健康状态 |
 | 平台 18086 | 无法连接 | 当前无法交接在线管理、导出入口 |
 | 部署隔离 | Relay 要求 ingest token；Collector/Relay 绑定 loopback；两容器有重启策略 | 有内部入口保护；两容器尚无内存/CPU 上限或只读根文件系统 |
-| GitHub CI | 本轮 Manifest 变更前的 `73407d5`：[run 38735130731](https://github.com/XS-MLVP/ChipTrace/actions/runs/38735130731) 已确认成功；该轮 5/5 作业、16 份报告元数据均未过期 | 含流式 Turn、精简检查/导出及独立容器平台报告；不能代替新提交或线上验收 |
+| GitHub CI | 已核验基线 `c38c1c6`：[run 38741033586](https://github.com/XS-MLVP/ChipTrace/actions/runs/38741033586) 已确认成功；该轮 5/5 作业、16 份报告元数据均未过期、带 SHA-256 | 含流式 Manifest、Turn 和独立容器平台报告；未下载报告正文，后续分页变更须另验同 SHA CI |
 | GitHub 集成 | 远端 main 仍为 `514d4cf`；维护分支修复尚未合并 | 需完成评审、同 SHA 验证和受控发布；分支 CI 不等于部署 |
 
 11:26 复查时三个既有服务仍返回 HTTP 200，Relay 已投递 1,036,522 条，pending 为 1、

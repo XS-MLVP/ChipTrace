@@ -1,12 +1,10 @@
 //! Streaming metadata for an already recorded projection Manifest download.
 //! This does not replace full projection or Session acceptance verification.
 
+use crate::platform_evidence::JsonEvidence;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::fs::{self, OpenOptions};
-use std::io::{BufReader, Read};
 use std::path::Path;
 
 pub const PROJECTION_METADATA_SCHEMA_VERSION: &str = "chiptrace.projection-manifest-metadata.v1";
@@ -33,113 +31,32 @@ struct PartMetadata {
     uncompressed_bytes: Option<u64>,
 }
 
-struct ManifestReader<R> {
-    inner: R,
-    digest: Sha256,
-    bytes: u64,
-    limit: u64,
-    utf8: Vec<u8>,
-}
-
-impl<R> ManifestReader<R> {
-    fn new(inner: R, limit: u64) -> Self {
-        Self {
-            inner,
-            digest: Sha256::new(),
-            bytes: 0,
-            limit,
-            utf8: Vec::new(),
-        }
-    }
-}
-
-impl<R: Read> Read for ManifestReader<R> {
-    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-        // Read at most one extra byte so a concurrently growing file cannot
-        // make this inspection unbounded or escape the original size check.
-        let limit = self
-            .limit
-            .saturating_sub(self.bytes)
-            .saturating_add(1)
-            .min(output.len() as u64) as usize;
-        let count = self.inner.read(&mut output[..limit])?;
-        self.bytes += count as u64;
-        if self.bytes > self.limit {
-            return Err(std::io::Error::other("projection Manifest grew"));
-        }
-        // Serde's IgnoredAny skips strings without checking their raw UTF-8.
-        // Validate every byte, including skipped Turn data, across read splits.
-        self.utf8.extend_from_slice(&output[..count]);
-        match std::str::from_utf8(&self.utf8) {
-            Ok(_) => self.utf8.clear(),
-            Err(error) if error.error_len().is_none() && count > 0 => {
-                self.utf8.drain(..error.valid_up_to());
-            }
-            Err(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "projection Manifest must be valid UTF-8",
-                ));
-            }
-        }
-        self.digest.update(&output[..count]);
-        Ok(count)
-    }
-}
-
 /// Read-only metadata and digest, with large Session/Turn/metrics values
 /// skipped by Serde. Callers must compare both to the recorded job evidence.
 pub fn projection_manifest_metadata(input: &Path) -> Result<Value> {
-    let stat = fs::symlink_metadata(input)?;
-    if !stat.is_file() || stat.file_type().is_symlink() {
-        bail!("projection Manifest is not a regular file");
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options.open(input)?;
-    let before = file.metadata()?;
-    if !before.is_file() {
-        bail!("projection Manifest is not a regular file");
-    }
-    let mut reader = BufReader::with_capacity(64 * 1024, ManifestReader::new(file, before.len()));
+    let mut file = JsonEvidence::open(input, None)?;
     let projection: ProjectionMetadata =
-        serde_json::from_reader(&mut reader).context("read projection Manifest metadata")?;
+        serde_json::from_reader(&mut file.reader).context("read projection Manifest metadata")?;
     if projection.schema_version != crate::model_interaction::INTERACTION_PROJECTION_SCHEMA_VERSION
     {
         bail!("unsupported projection Manifest schema");
     }
-    let reader = reader.into_inner();
-    let after = reader.inner.metadata()?;
-    let changed = before.len() != after.len() || before.modified()? != after.modified()?;
-    #[cfg(unix)]
-    let changed = {
-        use std::os::unix::fs::MetadataExt;
-        changed || before.ctime() != after.ctime() || before.ctime_nsec() != after.ctime_nsec()
-    };
-    if changed || reader.bytes != before.len() {
-        bail!("projection Manifest changed during inspection");
-    }
+    let digest = file.finish()?;
     Ok(json!({
         "schema_version":PROJECTION_METADATA_SCHEMA_VERSION,
         "session_delivery_claimed":false,
         "projection":projection,
-        "manifest":{"file":"manifest.json","bytes":reader.bytes,
-            "sha256":hex::encode(reader.digest.finalize())}
+        "manifest":{"file":"manifest.json","bytes":digest.bytes,
+            "sha256":digest.sha256}
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufWriter, Cursor, Write};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::io::{BufWriter, Write};
 
     fn manifest() -> Value {
         json!({"schema_version":"chiptrace.interaction-projection.v1",
@@ -230,32 +147,6 @@ mod tests {
             std::os::unix::fs::symlink(&file, &link).unwrap();
             assert!(projection_manifest_metadata(&link).is_err());
         }
-    }
-
-    #[test]
-    fn whole_file_utf8_validation_handles_read_boundaries_and_eof() {
-        for input in ["边界🙂", "a🙂中z"] {
-            for width in 1..=4 {
-                let mut reader =
-                    ManifestReader::new(Cursor::new(input.as_bytes()), input.len() as u64);
-                let mut output = Vec::new();
-                let mut buffer = vec![0; width];
-                loop {
-                    let count = reader.read(&mut buffer).unwrap();
-                    if count == 0 {
-                        break;
-                    }
-                    output.extend_from_slice(&buffer[..count]);
-                }
-                assert_eq!(output, input.as_bytes());
-            }
-        }
-        for input in [vec![0xc3], vec![0xf0, 0x9f, 0x99], vec![0xc3, b'x']] {
-            let mut reader = ManifestReader::new(Cursor::new(&input), input.len() as u64);
-            assert!(reader.read_to_end(&mut Vec::new()).is_err());
-        }
-        let mut reader = ManifestReader::new(Cursor::new(b"grew"), 3);
-        assert!(reader.read_to_end(&mut Vec::new()).is_err());
     }
 
     #[test]

@@ -75,7 +75,12 @@ function createPlatformHandler(plugin, token) {
       const jobPath = url.pathname.match(/^\/v1\/jobs\/([^/]+)(?:\/(turns|turns\.jsonl|packages\/([^/]+)))?$/);
       if (jobPath && req.method === 'GET') {
         const id = decodeURIComponent(jobPath[1]);
-        if (jobPath[2] === 'turns') return json(res, 200, await plugin.getTurns(id, page()));
+        if (jobPath[2] === 'turns') {
+          const artifact = await plugin.openTurnPage(id, page());
+          res.writeHead(200, { 'content-type': artifact.contentType, 'content-length': artifact.bytes });
+          await pipeline(artifact.stream, res);
+          return;
+        }
         if (jobPath[2] === 'turns.jsonl') {
           const artifact = await plugin.openTurns(id);
           res.writeHead(200, { 'content-type': artifact.contentType, 'content-length': artifact.bytes,

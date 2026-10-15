@@ -63,7 +63,7 @@ async function verifyTurnDownload(client, id, expected, evidence) {
   assert.deepEqual(Buffer.from(await response.arrayBuffer()), expected);
 }
 
-test('limited-heap readers skip a huge Turn and stream all checksummed metadata', { timeout: 120000 }, async t => {
+test('limited-heap readers stream selected huge Turns and all checksummed metadata', { timeout: 180000 }, async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-turn-reader-memory-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const options = { root, projectId: 'synthetic-turn-memory', binary, maxTurnBytes: 128 * 1024 * 1024 };
@@ -87,6 +87,7 @@ test('limited-heap readers skip a huge Turn and stream all checksummed metadata'
   const small = { finished_at: null, model_interactions: 0, raw_capture_refs: ['cap-small'], root_turn_id: null,
     session_id: 'synthetic-memory-session', source_coverage: coverage, start_events: 1, started_at: null,
     state_conflict: false, status: 'open', terminal_events: 0, tool_execution_records: 0, turn_id: 'small' };
+  let hugeBytes;
   try {
     await append('{"finished_at":null,"model_interactions":0,"raw_capture_refs":[');
     for (let offset = 0; offset < 400000; offset += 2000) {
@@ -99,11 +100,19 @@ test('limited-heap readers skip a huge Turn and stream all checksummed metadata'
     delete tail.model_interactions;
     delete tail.raw_capture_refs;
     tail.turn_id = 'huge';
-    await append(`],${JSON.stringify(tail).slice(1)}\n${JSON.stringify(small)}\n`);
+    await append(`],${JSON.stringify(tail).slice(1)}\n`);
+    hugeBytes = bytes - 1;
+    await append(`${JSON.stringify(small)}\n`);
     await handle.sync();
   } finally { await handle.close(); }
   assert.ok(bytes > 64 * 1024 * 1024);
   const evidence = { records: 2, bytes, sha256: digest.digest('hex') };
+  const summary = { session_id: 'synthetic-memory-session', native_turns: 2 };
+  const prefix = Buffer.from(JSON.stringify({ delivery_ready: false, summary, total: 2, offset: 0, turns: [] }).slice(0, -2));
+  const pageDigest = crypto.createHash('sha256').update(prefix);
+  const pageHandle = await fs.open(file, 'r');
+  for await (const chunk of pageHandle.createReadStream({ start: 0, end: hugeBytes - 1 })) pageDigest.update(chunk);
+  const expectedPage = { bytes: prefix.length + hugeBytes + 2, sha256: pageDigest.update(']}').digest('hex') };
   const script = String.raw`
     const assert = require('node:assert/strict');
     const fs = require('node:fs/promises');
@@ -115,6 +124,7 @@ test('limited-heap readers skip a huge Turn and stream all checksummed metadata'
     (async () => {
       const root = process.argv[2];
       const evidence = JSON.parse(process.argv[4]);
+      const expectedPage = JSON.parse(process.argv[5]);
       const plugin = new ChipTracePlugin({ root, projectId: 'synthetic-turn-memory', binary: process.argv[3], maxTurnBytes: 128 * 1024 * 1024 });
       let app;
       try {
@@ -142,22 +152,32 @@ test('limited-heap readers skip a huge Turn and stream all checksummed metadata'
         for await (const chunk of response.body) { bytes += chunk.length; digest.update(chunk); }
         assert.equal(bytes, evidence.bytes);
         assert.equal(digest.digest('hex'), evidence.sha256);
+        const selected = await client.request('/v1/jobs/memory/turns?offset=0&limit=1');
+        assert.equal(selected.headers.get('content-type'), 'application/json; charset=utf-8');
+        assert.equal(Number(selected.headers.get('content-length')), expectedPage.bytes);
+        const selectedDigest = crypto.createHash('sha256');
+        let selectedBytes = 0;
+        for await (const chunk of selected.body) { selectedBytes += chunk.length; selectedDigest.update(chunk); }
+        assert.equal(selectedBytes, expectedPage.bytes);
+        assert.equal(selectedDigest.digest('hex'), expectedPage.sha256);
         const handle = await fs.open(path.join(root, 'work/memory/turns.jsonl'), 'r+');
         try { await handle.write(Buffer.from('!'), 0, 1, 200); await handle.sync(); }
         finally { await handle.close(); }
         await assert.rejects(client.getTurns('memory', { offset: 1, limit: 1 }), error => error.code === 'ARTIFACT_CHANGED');
+        await assert.rejects(client.request('/v1/jobs/memory/turns?offset=0&limit=1'), error => error.code === 'ARTIFACT_CHANGED');
         await assert.rejects(client.downloadTurns('memory'), error => error.code === 'ARTIFACT_CHANGED');
         assert.equal(plugin.activeReads, 0);
         console.log(JSON.stringify({ synthetic: true, session_delivery_claimed: false, max_old_space_mib: 32,
-          turn_file_bytes: bytes, records: 2, small_page_records: page.turns.length, full_stream_verified: true }));
+          turn_file_bytes: bytes, records: 2, small_page_records: page.turns.length,
+          selected_page_bytes: selectedBytes, selected_page_verified: true, full_stream_verified: true }));
       } finally { if (app) await app.close(); else await plugin.close(); }
     })().catch(error => { console.error(error.message); process.exitCode = 1; });
   `;
   let result;
   try {
     result = await run('/bin/sh', ['-c', 'ulimit -c 0 && exec "$@"', 'chiptrace-turn-memory', process.execPath,
-      '--max-old-space-size=32', '-e', script, path.join(__dirname, 'plugin.js'), root, binary, JSON.stringify(evidence)],
-    { maxBuffer: 64 * 1024, timeout: 110000 });
+      '--max-old-space-size=32', '-e', script, path.join(__dirname, 'plugin.js'), root, binary, JSON.stringify(evidence), JSON.stringify(expectedPage)],
+    { maxBuffer: 64 * 1024, timeout: 170000 });
   } catch (error) {
     t.diagnostic(JSON.stringify({ child_exit_code: typeof error.code === 'number' ? error.code : null,
       child_signal: error.signal ?? null, stderr_bytes: Buffer.byteLength(error.stderr || ''),
@@ -166,6 +186,7 @@ test('limited-heap readers skip a huge Turn and stream all checksummed metadata'
   }
   const observed = JSON.parse(result.stdout);
   assert.equal(observed.full_stream_verified, true);
+  assert.equal(observed.selected_page_verified, true);
   assert.equal(observed.turn_file_bytes, bytes);
   t.diagnostic(result.stdout.trim());
 });
@@ -332,6 +353,16 @@ test('Turn scanning preserves line boundaries and pins downloads to the verified
     await setEvidence(text, expected.length);
     assert.deepEqual((await plugin.getTurns('boundary')).turns, expected);
     assert.deepEqual((await plugin.getTurns('boundary', { offset: 1, limit: 1 })).turns, expected.slice(1));
+    for (const offset of [0, 1, 10]) {
+      const page = await plugin.openTurnPage('boundary', { offset });
+      await assert.rejects(plugin.openTurnPage('boundary'), error => error.code === 'CAPACITY');
+      const chunks = [];
+      for await (const chunk of page.stream) chunks.push(chunk);
+      const body = Buffer.concat(chunks);
+      assert.equal(body.length, page.bytes);
+      assert.deepEqual(JSON.parse(body).turns, expected.slice(offset));
+      assert.equal(plugin.activeReads, 0);
+    }
     const artifact = await plugin.openTurns('boundary');
     await assert.rejects(plugin.getTurns('boundary'), error => error.code === 'CAPACITY');
     const chunks = [];
@@ -357,9 +388,36 @@ test('Turn scanning preserves line boundaries and pins downloads to the verified
   const aborted = await plugin.openTurns('boundary');
   await new Promise(resolve => { aborted.stream.once('close', resolve); aborted.stream.destroy(); });
   assert.equal(plugin.activeReads, 0);
+  const cancelledPage = await plugin.openTurnPage('boundary');
+  await new Promise(resolve => { cancelledPage.stream.once('close', resolve); cancelledPage.stream.destroy(); });
+  assert.equal(plugin.activeReads, 0);
+  const interruptedPage = await plugin.openTurnPage('boundary');
+  await new Promise((resolve, reject) => {
+    let chunks = 0;
+    interruptedPage.stream.once('error', reject);
+    interruptedPage.stream.once('close', resolve);
+    interruptedPage.stream.on('data', () => {
+      if (++chunks === 2) interruptedPage.stream.destroy();
+    });
+  });
+  assert.equal(plugin.activeReads, 0);
+  const originalPage = await plugin.openTurnPage('boundary');
+  await fs.rename(file, `${file}.original`);
+  await fs.writeFile(file, 'changed');
+  const originalChunks = [];
+  for await (const chunk of originalPage.stream) originalChunks.push(chunk);
+  assert.deepEqual(JSON.parse(Buffer.concat(originalChunks)).turns, [first]);
+  await assert.rejects(plugin.openTurnPage('boundary'), error => error.code === 'ARTIFACT_CHANGED');
+  assert.equal(plugin.activeReads, 0);
   // A descriptor matching invalid UTF-8 still cannot produce a selected page.
   await setEvidence(Buffer.from([123, 34, 120, 34, 58, 34, 195, 34, 125, 10]), 1);
   await assert.rejects(plugin.getTurns('boundary'), error => error.code === 'ARTIFACT_CHANGED');
+  await assert.rejects(plugin.openTurnPage('boundary'), error => error.code === 'ARTIFACT_CHANGED');
+  for (const invalid of ['{}\n\n', '{} {}\n', '{"private":"synthetic-private-text"\n', '{}\n{"x":"bad\\q"}\n']) {
+    await setEvidence(invalid, invalid.split('\n').length - 1);
+    await assert.rejects(plugin.openTurnPage('boundary', { offset: 100 }), error => error.code === 'ARTIFACT_CHANGED'
+      && !error.message.includes('synthetic-private-text'));
+  }
   assert.equal(plugin.activeReads, 0);
 });
 
@@ -897,6 +955,9 @@ test('HTTP service and SDK run the real CLI archive/restore/inspect/export path'
   assert.equal(Object.prototype.hasOwnProperty.call(page.summary, 'turns'), false);
   assert.equal(page.turns[0].raw_capture_refs.length > 0, true);
   const allTurns = await client.getTurns('inspect-job', { offset: 0, limit: 100 });
+  const streamedPage = await client.streamTurns('inspect-job', { offset: 0, limit: 100 });
+  assert.equal(streamedPage.headers.get('content-type'), 'application/json; charset=utf-8');
+  assert.deepEqual(await streamedPage.json(), allTurns);
   assert.equal(allTurns.turns.length, page.total);
   assert.equal(allTurns.turns.reduce((sum, turn) => sum + turn.model_interactions, 0), page.summary.model_interactions);
   assert.equal(allTurns.turns.reduce((sum, turn) => sum + turn.tool_execution_records, 0), page.summary.tool_execution_records);

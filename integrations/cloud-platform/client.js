@@ -29,7 +29,8 @@ class ChipTraceClient {
   async submit(job, options) { return (await this.request('/v1/jobs', { ...options, method: 'POST', body: JSON.stringify(job) })).json(); }
   async getJob(id, options) { return (await this.request(`/v1/jobs/${encodeURIComponent(id)}`, options)).json(); }
   async listJobs({ offset = 0, limit = 50, ...options } = {}) { return (await this.request(`/v1/jobs?offset=${offset}&limit=${limit}`, options)).json(); }
-  async getTurns(id, { offset = 0, limit = 50, ...options } = {}) { return (await this.request(`/v1/jobs/${encodeURIComponent(id)}/turns?offset=${offset}&limit=${limit}`, options)).json(); }
+  async getTurns(id, options) { return (await this.streamTurns(id, options)).json(); }
+  streamTurns(id, { offset = 0, limit = 50, ...options } = {}) { return this.request(`/v1/jobs/${encodeURIComponent(id)}/turns?offset=${offset}&limit=${limit}`, options); }
   downloadTurns(id, options) { return this.request(`/v1/jobs/${encodeURIComponent(id)}/turns.jsonl`, options); }
   downloadProjection(id, part, options) { return this.request(`/v1/jobs/${encodeURIComponent(id)}/projection/${encodeURIComponent(part)}`, options); }
   async putUsageLog(id, bytes, options) { return (await this.request(`/v1/usage/${encodeURIComponent(id)}`, { ...options, method: 'PUT', body: bytes, contentType: 'application/x-ndjson' })).json(); }

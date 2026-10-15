@@ -16,6 +16,7 @@ use chiptrace::otlp_delivery::{OtlpDeliveryConfig, send_otlp};
 use chiptrace::platform_acceptance::platform_acceptance_report;
 use chiptrace::platform_inspection::platform_inspection_report;
 use chiptrace::platform_projection::projection_manifest_metadata;
+use chiptrace::platform_turns::turn_page_metadata;
 use chiptrace::publish::{
     ArtifactKind, Backend, PublishConfig, PublishSource, VerifyPublishedConfig, publish,
     verify_published,
@@ -76,6 +77,8 @@ enum Command {
     VerifyInteractions(VerifyInteractionsArgs),
     /// 只读流式提取投影 Manifest 下载元数据与哈希；不代表完整 Session 验收。
     ReadProjectionManifest(ReadProjectionManifestArgs),
+    /// 只读流式校验 Turn JSONL，返回分页字节范围与完整哈希；不代表 Session 验收。
+    ReadTurnPage(ReadTurnPageArgs),
     /// 从 delivery-ready canonical Trace 生成单一 OTLP 树。
     ExportOtlp(ExportOtlpArgs),
     /// 只读验证 OTLP 文件、SHA-256 和内部父子关系。
@@ -283,6 +286,18 @@ struct VerifyInteractionsArgs {
 struct ReadProjectionManifestArgs {
     #[arg(long)]
     input: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ReadTurnPageArgs {
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    offset: u64,
+    #[arg(long, default_value_t = 50)]
+    limit: u64,
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    max_bytes: u64,
 }
 
 #[derive(Debug, Args)]
@@ -910,6 +925,9 @@ async fn main() -> Result<()> {
             serde_json::to_value(verify_interaction_projection(&args.projection)?)?
         }
         Command::ReadProjectionManifest(args) => projection_manifest_metadata(&args.input)?,
+        Command::ReadTurnPage(args) => {
+            turn_page_metadata(&args.input, args.offset, args.limit, args.max_bytes)?
+        }
         Command::ExportOtlp(args) => serde_json::to_value(export_otlp(OtlpExportConfig {
             projection: args.projection,
             output: args.output,
@@ -2958,6 +2976,7 @@ mod cli_tests {
             "project-interactions",
             "publish",
             "read-projection-manifest",
+            "read-turn-page",
             "relay",
             "release",
             "restore-raw-archive",

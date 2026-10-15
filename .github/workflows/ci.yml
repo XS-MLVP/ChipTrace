@@ -171,7 +171,7 @@ jobs:
         with:
           name: rust-tests-report
           path: rust-tests.log
-      - name: Verify streaming Turn writer and projection Manifest reader RSS
+      - name: Verify streaming Turn writer, page reader and projection Manifest reader RSS
         run: |
           set -euo pipefail
           node scripts/ci/turn-memory-gate.js --report turn-memory.json 2>&1 | tee turn-memory.log
@@ -309,7 +309,7 @@ jobs:
         with:
           name: native-context-report
           path: native-context.tap
-      - name: Verify bounded inspection/export transport, native result quality, recovery and OSS protocol
+      - name: Verify streaming Turn pages, inspection/export, native result quality, recovery and OSS protocol
         run: |
           set -euo pipefail
           node --test integrations/cloud-platform/platform.test.js integrations/cloud-platform/storage-oss.test.js 2>&1 | tee platform.tap
@@ -418,7 +418,7 @@ jobs:
         with:
           name: container-ingest-receipt-report
           path: container-ingest-receipt.tap
-      - name: Verify inspection/export transport and delivery refusal under container limits
+      - name: Verify streaming Turn pages and inspection/export refusal under container limits
         run: |
           set -euo pipefail
           docker run --rm --network none --read-only \

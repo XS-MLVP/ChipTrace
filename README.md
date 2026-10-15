@@ -50,8 +50,8 @@ Wire、OTLP 和 Hook 使用 Stock Codex 自带的 Session、Turn、call ID 和 W
 原生 Session/Turn 的 HTTP 403，不能作为真实 Turn 的采集证据。OTLP/Hook 仍有流量，
 随后 Wire 超过 5 分钟未更新，runtime gate 真实退出 1。18084 保留 293 个历史失败文件
 （约 267 MB），trace exporter 未启用，
-watchdog 仍有错误；18086 没有监听。`91bcd79` 的远端 CI 已确认 5/5 作业通过，覆盖
-原生 Hook 持久化确认、生产者缓存及固定 Go 工具链；
+watchdog 仍有错误；18086 没有监听。已核验基线 `c38c1c6` 的远端 CI 已确认 5/5 作业通过，覆盖
+原生 Hook 持久化确认、生产者缓存、固定 Go 工具链及流式 Manifest 下载；
 真实 OSS 账号及未修改客户端的 v2 多轮验收仍未完成，因此尚不能按生产就绪对外交付。
 
 接入排查还复现了系统默认 Provider 被用户配置覆盖、使 Wire 绕过采集的风险。
@@ -114,6 +114,8 @@ OTLP 单根且内部父引用全部可解析。
 并只下载经过完整校验的 Buyer 包。插件的 ACK、任务状态、Turn sidecar 和输出校验均落到
 磁盘；服务重启会重新排队未完成任务。平台 API、Node SDK、容器镜像和 Compose 示例见
 [cloud-platform](integrations/cloud-platform/README.md)。
+Turn 分页保持原 JSON 格式，校验后流式返回完整选中记录；`streamTurns` 可流式读取分页，
+`downloadTurns` 可下载全量 JSONL。对象形式的 `getTurns` 仍需由调用者容纳所选数据。
 
 ## 许可证
 
