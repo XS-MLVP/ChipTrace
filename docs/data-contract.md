@@ -116,10 +116,16 @@ Session 级记录不参与逐 Turn 四源计数。SSE、工具结果/决策、�
 
 SSE `[DONE]` 只是 framing，不代表模型成功。返回文本不能用于推断工具状态。
 `output_truncated != false` 表示工具结果不完整。`codex.tool_result.success=true` 只证明工具
-调度器成功返回结果，不代表子进程退出码为 0。ChipTrace 仅解析 Stock Codex 在 `Output:`
-之前生成的固定进程结果头，并将其独立保存为 `process_outcome`；`Output:` 后的业务正文不能
-改变任何状态。OTLP Span 状态使用有证据的语义结果，同时以独立属性保留 lifecycle、
-dispatch 和 process 三类事实。
+调度器成功返回结果，不代表子进程退出码为 0。ChipTrace 仅对默认 `functions` 命名空间中的
+`exec_command` / `write_stdin` 解析 Stock Codex 在 `Output:` 之前生成的固定进程结果头，
+并将其独立保存为 `process_outcome`；旧遥测缺省或空命名空间按上游默认空间兼容。
+`client.exec_command` 等外部同名工具的全部返回文本均为正文，不能声明 Stock 进程结果；
+`Output:` 后的业务正文也不能改变任何状态。OTLP Span 状态使用有证据的语义结果，
+同时以独立属性保留 lifecycle、dispatch 和 process 三类事实。
+
+历史 Capture 如果把 Stock 进程来源标记附在外部工具上，新版投影会拒绝生成产物，
+保留原始 Capture。此类 Session 需要从原始 OTLP 重新验证与迁移，不能原地改写 Raw
+或将旧导出作为新版通过的证明。
 
 ## Canonical
 

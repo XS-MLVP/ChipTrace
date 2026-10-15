@@ -3,7 +3,7 @@ use crate::jsonl::{JsonlWriter, absolute_path, ensure_safe_relative_path, sha256
 use crate::lifecycle::{Boundary, LifecycleState};
 use crate::schema::{FileManifest, RAW_LINEAGE_SCHEMA_VERSION, RawSourceLineage};
 use crate::session_lineage::StockSessionLineage;
-use crate::tool_schema::canonical_runtime_tool_name;
+use crate::tool_schema::{canonical_runtime_tool_name, is_stock_unified_exec_tool};
 use crate::wire_tools::request_tool_definitions as captured_request_tool_definitions;
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
@@ -5069,6 +5069,21 @@ fn build_tool_runtime_spans(
         let Some(execution) = capture.get("toolExecution") else {
             continue;
         };
+        if execution
+            .pointer("/process_outcome/provenance")
+            .and_then(Value::as_str)
+            == Some("stock_codex.unified_exec.log_output.header")
+        {
+            let name = string_field(execution, "name").unwrap_or("");
+            let tool = string_field(execution, "runtime_tool").unwrap_or(name);
+            if !is_stock_unified_exec_tool(string_field(execution, "runtime_namespace"), tool)
+                || name != tool
+            {
+                // Older ingesters could attach this claim to external text.
+                // Preserve that Raw but do not publish its false semantics.
+                bail!("Stock process outcome conflicts with runtime tool identity");
+            }
+        }
         let Some(call_id) = execution.get("call_id").and_then(Value::as_str) else {
             continue;
         };
@@ -7175,6 +7190,115 @@ mod tests {
             "stock_codex.unified_exec.log_output.header"
         );
         assert_eq!(span["extensions"]["process_outcome"]["exit_code"], 101);
+    }
+
+    #[test]
+    fn external_exec_text_cannot_override_runtime_dispatch_semantics() {
+        use crate::cloud_ingest::{CloudEndpoint, prepare_cloud_ingest};
+
+        for tool in ["exec_command", "write_stdin"] {
+            for (dispatch_success, claimed_exit) in [(true, 7), (false, 0)] {
+                let output = format!(
+                    "Chunk ID: abc123\nWall time: 0.0100 seconds\nProcess exited with code {claimed_exit}\nOutput:\n外部工具正文\n"
+                );
+                let attr = |key: &str, value: Value| json!({"key":key,"value":value});
+                let raw = serde_json::to_vec(&json!({
+                    "resourceLogs":[{"scopeLogs":[{"logRecords":[{
+                        "timeUnixNano":"1788307201000000000",
+                        "attributes":[
+                            attr("event.name", json!({"stringValue":"codex.tool_result"})),
+                            attr("conversation.id", json!({"stringValue":"external-session"})),
+                            attr("turn.id", json!({"stringValue":"external-turn"})),
+                            attr("call_id", json!({"stringValue":"external-call"})),
+                            attr("tool_namespace", json!({"stringValue":"client"})),
+                            attr("tool_name", json!({"stringValue":tool})),
+                            attr("arguments", json!({"stringValue":"{}"})),
+                            attr("output", json!({"stringValue":output})),
+                            attr("success", json!({"boolValue":dispatch_success})),
+                            attr("output_truncated", json!({"boolValue":false}))
+                        ]
+                    }]}]}]
+                }))
+                .unwrap();
+                let batch =
+                    prepare_cloud_ingest(CloudEndpoint::OtlpLogs, &raw, 1024 * 1024).unwrap();
+                let captures: Vec<Value> = batch
+                    .records
+                    .iter()
+                    .map(|record| serde_json::from_slice(&record.canonical).unwrap())
+                    .collect();
+                let spans = build_runtime_spans(&captures, &[]).unwrap();
+                let span = spans
+                    .iter()
+                    .find(|span| span["call_id"] == "external-call")
+                    .unwrap();
+                let status = if dispatch_success { "success" } else { "error" };
+                assert_eq!(span["name"], format!("client.{tool}"));
+                assert_eq!(span["extensions"]["dispatch_status"], status);
+                assert_eq!(span["extensions"]["semantic_status"], status);
+                assert_eq!(span["extensions"]["process_outcome"], Value::Null);
+                assert_eq!(
+                    span["extensions"]["semantic_status_provenance"],
+                    "codex.tool_result.success"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn historical_external_process_claim_blocks_projection_without_rewriting_raw() {
+        let capture = json!({
+            "recordType":"tool_execution",
+            "captureId":"cap-historical-external",
+            "sourceNamespace":"stock-codex-cloud",
+            "receivedAt":"2026-09-04T00:00:01Z",
+            "traceContext":{"session_id":"historical-session","turn_id":"historical-turn"},
+            "toolExecution":{
+                "call_id":"historical-call",
+                "name":"client.exec_command",
+                "runtime_tool":"exec_command",
+                "runtime_namespace":"client",
+                "status":"success",
+                "status_scope":"tool_dispatch",
+                "status_provenance":"codex.tool_result.success",
+                "source_event_name":"codex.tool_result",
+                "initiator":"assistant",
+                "schema_provenance":{"source":"wire","source_complete":false},
+                "arguments":{},
+                "result":"Chunk ID: abc123\nWall time: 0.0100 seconds\nProcess exited with code 7\nOutput:\n外部正文\n",
+                "process_outcome":{
+                    "kind":"process","state":"exited","exit_code":7,"success":false,
+                    "provenance":"stock_codex.unified_exec.log_output.header"
+                }
+            }
+        });
+        let bytes = normalize_capture(&serde_json::to_vec(&capture).unwrap(), 1024 * 1024)
+            .unwrap()
+            .canonical;
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("historical.ndjson");
+        let output = temp.path().join("projection");
+        fs::write(&input, &bytes).unwrap();
+        let result = project_interactions(InteractionProjectConfig {
+            inputs: vec![input.clone()],
+            output: output.clone(),
+            task_session_id: None,
+            session_id: Some("historical-session".to_owned()),
+            zstd_level: 1,
+            replace: false,
+        });
+        assert!(
+            result.is_err(),
+            "historical external process claim must be rejected"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Stock process outcome conflicts with runtime tool identity")
+        );
+        assert_eq!(fs::read(&input).unwrap(), bytes);
+        assert!(!output.exists());
     }
 
     #[test]

@@ -47,6 +47,13 @@ pub fn canonical_runtime_tool_name(namespace: Option<&str>, name: &str) -> Strin
     }
 }
 
+pub(crate) fn is_stock_unified_exec_tool(namespace: Option<&str>, name: &str) -> bool {
+    // Match upstream ToolName's default namespace without trimming an external
+    // name into a builtin. Missing/empty values also occur in older telemetry.
+    matches!(namespace, None | Some("" | "functions"))
+        && matches!(name, "exec_command" | "write_stdin")
+}
+
 pub fn tool_definition_source_complete(value: &Value, expected_name: &str) -> bool {
     let nested = value.get("function").unwrap_or(value);
     if nested.get("name").and_then(Value::as_str) != Some(expected_name)

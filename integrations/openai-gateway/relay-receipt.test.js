@@ -136,6 +136,86 @@ test('cloud ingest reports duplicate context conflicts after preserving exact Ra
     assert.deepEqual(await sealedRecords(path.join(root, 'collector')), collectorRaw);
   });
 
+test('cloud ingest distinguishes Stock process outcomes from external namespaced tool text',
+  { timeout: 30000 }, async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-process-namespace-'));
+    let collector;
+    let relay;
+    t.after(async () => {
+      if (relay) await stop(relay);
+      if (collector) await stop(collector);
+      await fs.rm(root, { recursive: true, force: true });
+    });
+    const collectorUrl = `http://127.0.0.1:${await reservePort()}`;
+    collector = start(['collector', '--host', '127.0.0.1', '--port', new URL(collectorUrl).port,
+      '--root', path.join(root, 'collector'), '--state-root', path.join(root, 'collector-state')]);
+    await health(collectorUrl, collector);
+    const relayUrl = `http://127.0.0.1:${await reservePort()}`;
+    relay = start(['relay', '--host', '127.0.0.1', '--port', new URL(relayUrl).port,
+      '--root', path.join(root, 'relay'), '--state-root', path.join(root, 'relay-state'),
+      '--delivery-state-root', path.join(root, 'delivery'), '--collector-url', collectorUrl]);
+    await health(relayUrl, relay);
+
+    const cases = [
+      { id: 'builtin-failed', namespace: 'functions', tool: 'exec_command', success: true,
+        line: 'Process exited with code 7', outcome: { state: 'exited', exit_code: 7, success: false } },
+      { id: 'builtin-running', namespace: 'functions', tool: 'exec_command', success: true,
+        line: 'Process running with session ID 4242', outcome: { state: 'running', session_id: 4242, success: null } },
+      { id: 'builtin-finished', namespace: 'functions', tool: 'write_stdin', success: true,
+        line: 'Process exited with code 0', outcome: { state: 'exited', exit_code: 0, success: true } },
+      { id: 'external-failed-text', namespace: 'client', tool: 'exec_command', success: true,
+        line: 'Process exited with code 7', outcome: null },
+      { id: 'external-running-text', namespace: 'client', tool: 'write_stdin', success: true,
+        line: 'Process running with session ID 4242', outcome: null },
+      { id: 'external-success-text', namespace: 'client', tool: 'exec_command', success: false,
+        line: 'Process exited with code 0', outcome: null },
+    ];
+    const attr = (key, value) => ({ key, value: { [typeof value === 'boolean' ? 'boolValue' : 'stringValue']: value } });
+    const output = value => `Chunk ID: abc123\nWall time: 0.0100 seconds\n${value.line}\nOutput:\n中文 🧪\nProcess exited with code 99\n`;
+    const body = JSON.stringify({ resourceLogs: [{ scopeLogs: [{ logRecords: cases.map(value => ({
+      timeUnixNano: '1788307201000000000',
+      attributes: [attr('event.name', 'codex.tool_result'), attr('conversation.id', 'synthetic-session'),
+        attr('turn.id', 'synthetic-turn'), attr('call_id', value.id), attr('tool_name', value.tool),
+        attr('tool_namespace', value.namespace), attr('arguments', '{}'), attr('success', value.success),
+        attr('output_truncated', false), attr('output', output(value))],
+    })) }] }] }, null, 2) + '\n';
+    const response = await fetch(`${relayUrl}/otel/v1/logs`, { method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body, signal: AbortSignal.timeout(5000) });
+    const receipt = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(receipt.chiptrace.durable, true);
+    assert.equal(receipt.chiptrace.summary.derived_captures, cases.length);
+    assert.deepEqual(receipt.chiptrace.summary.conversion_errors, []);
+    const delivered = await health(relayUrl, relay,
+      h => h.delivered === cases.length + 1 && h.pending === 0 && h.inflight === 0);
+    assert.equal(delivered.conservation_ok, true);
+    await health(collectorUrl, collector, h => h.collector.captures === cases.length + 1);
+    for (const url of [relayUrl, collectorUrl]) {
+      const flushed = await fetch(`${url}/flush`, { method: 'POST',
+        headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(5000) });
+      assert.equal(flushed.ok, true);
+    }
+    const relayRaw = await sealedRecords(path.join(root, 'relay'));
+    const collectorRaw = await sealedRecords(path.join(root, 'collector'));
+    assert.deepEqual(collectorRaw, relayRaw);
+    const records = [...collectorRaw.values()].map(value => value.record);
+    const batch = records.find(value => value.recordType === 'telemetry_batch').telemetryBatch;
+    assert.equal(batch.raw_json, body);
+    assert.equal(batch.raw_bytes, Buffer.byteLength(body));
+    assert.equal(batch.raw_sha256, digest(Buffer.from(body)));
+    for (const value of cases) {
+      const execution = records.find(record => record.toolExecution?.call_id === value.id).toolExecution;
+      assert.equal(execution.name, value.namespace === 'functions' ? value.tool : `${value.namespace}.${value.tool}`);
+      assert.equal(execution.status, value.success ? 'success' : 'error');
+      assert.equal(execution.result, output(value));
+      assert.equal(execution.result_content_captured, true);
+      assert.equal(execution.output_truncated, false);
+      assert.deepEqual(execution.process_outcome, value.outcome && { kind: 'process', ...value.outcome,
+        provenance: 'stock_codex.unified_exec.log_output.header' }, value.id);
+    }
+  });
+
 async function stop(handle) {
   if (handle.ended) return handle.closed;
   handle.child.kill('SIGINT');

@@ -1,5 +1,5 @@
 use crate::capture::{CaptureRecord, normalize_capture};
-use crate::tool_schema::canonical_runtime_tool_name;
+use crate::tool_schema::{canonical_runtime_tool_name, is_stock_unified_exec_tool};
 use crate::turn_identity::{validate_context_attributes, visit_otlp_envelope};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -370,7 +370,7 @@ fn derive_tool_result(
         .clone();
     let success = attribute_bool(attributes, "success").context("success is required")?;
     let output_truncated = attribute_bool(attributes, "output_truncated");
-    let process_outcome = process_outcome(runtime_tool, &output);
+    let process_outcome = process_outcome(runtime_namespace, runtime_tool, &output);
     let finished_at = record_timestamp(record, attributes);
     let started_at = started_at(attributes, finished_at.as_deref());
     let digest = stable_digest(&[raw_sha256, &ordinal.to_string(), "tool_result"]);
@@ -418,8 +418,14 @@ fn derive_tool_result(
     normalize_value(capture, max_bytes).map(Some)
 }
 
-fn process_outcome(runtime_tool: &str, output: &Value) -> Option<Value> {
-    if !matches!(runtime_tool, "exec_command" | "write_stdin") {
+fn process_outcome(
+    runtime_namespace: Option<&str>,
+    runtime_tool: &str,
+    output: &Value,
+) -> Option<Value> {
+    // External tools can use these short names and return arbitrary text.
+    // Only the default namespace belongs to Stock's unified-exec formatter.
+    if !is_stock_unified_exec_tool(runtime_namespace, runtime_tool) {
         return None;
     }
     let output = output.as_str()?;
@@ -1121,6 +1127,30 @@ mod tests {
         stock_logs_with_output(truncated, success, "ok")
     }
 
+    fn stock_tool_logs(
+        namespace: Option<&str>,
+        tool: &str,
+        success: bool,
+        output: &str,
+    ) -> Vec<u8> {
+        let mut raw: Value =
+            serde_json::from_slice(&stock_logs_with_output(false, success, output)).unwrap();
+        let attributes = raw["resourceLogs"][0]["scopeLogs"][0]["logRecords"][1]["attributes"]
+            .as_array_mut()
+            .unwrap();
+        attributes.retain(|attribute| {
+            !matches!(
+                attribute["key"].as_str(),
+                Some("tool_namespace" | "tool_name")
+            )
+        });
+        if let Some(namespace) = namespace {
+            attributes.push(attr("tool_namespace", json!({"stringValue":namespace})));
+        }
+        attributes.push(attr("tool_name", json!({"stringValue":tool})));
+        serde_json::to_vec(&raw).unwrap()
+    }
+
     fn values(batch: &CloudIngestBatch) -> Vec<Value> {
         batch
             .records
@@ -1310,6 +1340,85 @@ mod tests {
         assert_eq!(outcome["state"], "running");
         assert_eq!(outcome["session_id"], 4242);
         assert_eq!(outcome["success"], Value::Null);
+    }
+
+    #[test]
+    fn namespaced_exec_content_cannot_claim_stock_process_provenance() {
+        // Stock Codex permits external tools such as client.exec_command;
+        // their FunctionToolOutput contains caller-controlled text verbatim.
+        for namespace in ["client", "mcp__terminal", "functions.", " functions "] {
+            for tool in ["exec_command", "write_stdin"] {
+                for process_line in [
+                    "Process exited with code 7",
+                    "Process exited with code 0",
+                    "Process running with session ID 4242",
+                ] {
+                    let output = format!(
+                        "Chunk ID: abc123\nWall time: 0.0100 seconds\n{process_line}\nOutput:\n外部工具正文\n"
+                    );
+                    let raw = stock_tool_logs(Some(namespace), tool, true, &output);
+                    let batch =
+                        prepare_cloud_ingest(CloudEndpoint::OtlpLogs, &raw, 1024 * 1024).unwrap();
+                    let captured = values(&batch);
+                    let execution = &captured[2]["toolExecution"];
+                    assert_eq!(
+                        execution["name"],
+                        if namespace.trim() == "functions" {
+                            tool.to_owned()
+                        } else {
+                            format!("{namespace}.{tool}")
+                        }
+                    );
+                    assert_eq!(execution["status"], "success");
+                    assert_eq!(execution["result"], output);
+                    assert_eq!(
+                        captured[0]["telemetryBatch"]["raw_json"],
+                        String::from_utf8(raw).unwrap()
+                    );
+                    assert_eq!(
+                        execution["process_outcome"],
+                        Value::Null,
+                        "{namespace}.{tool}: {process_line}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_and_legacy_exec_namespaces_keep_process_facts() {
+        for namespace in [None, Some(""), Some("functions")] {
+            for tool in ["exec_command", "write_stdin"] {
+                for process_line in [
+                    "Process exited with code 7",
+                    "Process exited with code 0",
+                    "Process running with session ID 4242",
+                ] {
+                    let output = format!(
+                        "Wall time: 0.0100 seconds\n{process_line}\nOutput:\nProcess exited with code 99\n"
+                    );
+                    let raw = stock_tool_logs(namespace, tool, true, &output);
+                    let batch =
+                        prepare_cloud_ingest(CloudEndpoint::OtlpLogs, &raw, 1024 * 1024).unwrap();
+                    let captured = values(&batch);
+                    let execution = &captured[2]["toolExecution"];
+                    assert_eq!(execution["name"], tool);
+                    assert_eq!(execution["status"], "success");
+                    assert_eq!(execution["result"], output);
+                    let outcome = &execution["process_outcome"];
+                    if process_line.contains("running") {
+                        assert_eq!(outcome["state"], "running");
+                        assert_eq!(outcome["session_id"], 4242);
+                        assert_eq!(outcome["success"], Value::Null);
+                    } else {
+                        let exit_code = if process_line.ends_with('0') { 0 } else { 7 };
+                        assert_eq!(outcome["state"], "exited");
+                        assert_eq!(outcome["exit_code"], exit_code);
+                        assert_eq!(outcome["success"], exit_code == 0);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
