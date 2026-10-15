@@ -6,7 +6,6 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { isDeepStrictEqual } = require('node:util');
-const readline = require('node:readline');
 
 const PROJECTION_PARTS = Object.freeze({
   manifest: { file: 'manifest.json', contentType: 'application/json; charset=utf-8' },
@@ -710,10 +709,8 @@ class ChipTracePlugin {
   }
 
   async #readTurns(id, { offset, limit }) {
-    const job = this.getJob(id);
-    if (job.status !== 'completed') throw new PlatformError('job has no completed inspection', 409, 'JOB_NOT_READY');
+    const job = this.#turnJob(id);
     const session = job.result?.session || job.result?.session_view;
-    if (!session || !job.turns) throw new PlatformError('job has no Session/Turn view', 404, 'NOT_FOUND');
     offset = integer(offset, 0, 0, Number.MAX_SAFE_INTEGER);
     limit = integer(limit, 50, 1, 100);
     const { turns, records } = await this.#readTurnEvidence(job, offset, limit);
@@ -722,33 +719,97 @@ class ChipTracePlugin {
     return { delivery_ready: deliveryReady, summary: session, total: records, offset, turns };
   }
 
+  #turnJob(id) {
+    const job = this.getJob(id);
+    if (job.status !== 'completed') throw new PlatformError('job has no completed inspection', 409, 'JOB_NOT_READY');
+    if (!(job.result?.session || job.result?.session_view) || !job.turns) {
+      throw new PlatformError('job has no Session/Turn view', 404, 'NOT_FOUND');
+    }
+    return job;
+  }
+
   async #readTurnEvidence(job, offset, limit) {
+    const evidence = await this.#openTurnEvidence(job, offset, limit);
+    try { return { turns: evidence.turns, records: evidence.records }; }
+    finally { await evidence.handle.close(); }
+  }
+
+  async #openTurnEvidence(job, offset, limit) {
     const file = path.join(this.root, 'work', job.request.id, 'turns.jsonl');
-    const stat = await fsp.lstat(file);
-    if (stat.size > this.maxTurnBytes) {
-      throw new PlatformError('Turn evidence exceeds disk limit', 503, 'OUTPUT_LIMIT');
-    }
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== job.turns.bytes) {
-      throw new PlatformError('Turn evidence changed', 422, 'ARTIFACT_CHANGED');
-    }
-    const digest = crypto.createHash('sha256');
-    const input = fs.createReadStream(file);
-    input.on('data', chunk => digest.update(chunk));
-    const lines = readline.createInterface({ input, crlfDelay: Infinity });
-    const turns = [];
-    let records = 0;
+    let handle;
     try {
-      for await (const line of lines) {
-        if (records >= offset && records < offset + limit) turns.push(JSON.parse(line));
-        records += 1;
+      // NOFOLLOW prevents path substitution; NONBLOCK avoids blocking on a
+      // substituted FIFO. Verification and download use this same regular file.
+      handle = await fsp.open(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+      const stat = await handle.stat();
+      if (stat.size > this.maxTurnBytes) {
+        throw new PlatformError('Turn evidence exceeds disk limit', 503, 'OUTPUT_LIMIT');
       }
-    } catch {
+      if (!stat.isFile() || stat.size !== job.turns.bytes) throw new Error('invalid Turn file');
+      const digest = crypto.createHash('sha256');
+      const buffer = Buffer.alloc(64 * 1024);
+      const turns = [];
+      let records = 0;
+      let position = 0;
+      let lineBytes = 0;
+      let fragments = [];
+      const selected = () => records >= offset && records - offset < limit;
+      const finishLine = () => {
+        if (selected()) turns.push(JSON.parse(decodeUtf8(Buffer.concat(fragments, lineBytes))));
+        records += 1;
+        fragments = [];
+        lineBytes = 0;
+      };
+      for (;;) {
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+        if (!bytesRead) break;
+        position += bytesRead;
+        if (position > stat.size) throw new Error('Turn file grew');
+        const chunk = buffer.subarray(0, bytesRead);
+        digest.update(chunk);
+        let start = 0;
+        while (start < chunk.length) {
+          const newline = chunk.indexOf(10, start);
+          const end = newline < 0 ? chunk.length : newline;
+          // Only selected records retain fragments. Unrequested lines, even
+          // huge individual Turns, are counted and hashed with fixed memory.
+          if (selected()) fragments.push(Buffer.from(chunk.subarray(start, end)));
+          lineBytes += end - start;
+          if (newline < 0) break;
+          finishLine();
+          start = newline + 1;
+        }
+      }
+      if (lineBytes) finishLine();
+      const after = await handle.stat();
+      if (position !== job.turns.bytes || after.size !== stat.size
+          || after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs
+          || records !== job.turns.records || digest.digest('hex') !== job.turns.sha256) {
+        throw new Error('Turn evidence changed');
+      }
+      return { handle, turns, records };
+    } catch (error) {
+      if (handle) await handle.close();
+      if (error instanceof PlatformError && error.code === 'OUTPUT_LIMIT') throw error;
       throw new PlatformError('Turn evidence changed or cannot be read', 422, 'ARTIFACT_CHANGED');
-    } finally { lines.close(); input.destroy(); }
-    if (records !== job.turns.records || digest.digest('hex') !== job.turns.sha256) {
-      throw new PlatformError('Turn evidence changed', 422, 'ARTIFACT_CHANGED');
     }
-    return { turns, records };
+  }
+
+  async openTurns(id) {
+    const release = this.#acquireRead();
+    let handle;
+    try {
+      const job = this.#turnJob(id);
+      ({ handle } = await this.#openTurnEvidence(job, 0, 0));
+      const stream = handle.createReadStream({ start: 0, autoClose: true });
+      stream.once('close', release);
+      return { file: 'turns.jsonl', bytes: job.turns.bytes, sha256: job.turns.sha256,
+        contentType: 'application/x-ndjson', stream };
+    } catch (error) {
+      if (handle) await handle.close();
+      release();
+      throw error;
+    }
   }
 
   async openArtifact(id, file) {

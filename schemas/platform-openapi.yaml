@@ -61,11 +61,42 @@ paths:
         Summary is the scoped Session view and excludes full turns; total is
         the native Turn count. Legacy inspections without a source audit return
         false for the overall flag and require a new inspection job.
+        Every request verifies the full sidecar, but only selected rows are
+        materialized. Memory for a selected Turn is proportional to its size;
+        use turns.jsonl for streaming retrieval of large individual Turns.
       parameters:
         - {$ref: '#/components/parameters/Offset'}
         - {$ref: '#/components/parameters/Limit'}
       responses:
         '200': {description: 'Object containing delivery_ready, summary, total, offset and turns (at most limit entries)'}
+        '401': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}/turns.jsonl:
+    parameters:
+      - {$ref: '#/components/parameters/Id'}
+    get:
+      description: >-
+        Streams the complete recorded Turn sidecar for a completed inspection
+        or export job. Checks size, SHA-256 and record count before sending
+        headers, then streams from the same open regular file. A successful
+        download verifies artifact bytes, not overall Session delivery status;
+        consult the job's delivery_ready and source audit.
+      responses:
+        '200':
+          description: Verified Turn JSONL bytes without buffering full rows
+          headers:
+            Content-Length:
+              schema: {type: integer, minimum: 0}
+            X-Content-SHA256:
+              schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+            ETag:
+              schema: {type: string}
+          content:
+            application/x-ndjson:
+              schema: {type: string, format: binary}
         '401': {$ref: '#/components/responses/Error'}
         '404': {$ref: '#/components/responses/Error'}
         '409': {$ref: '#/components/responses/Error'}

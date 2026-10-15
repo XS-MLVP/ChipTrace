@@ -68,6 +68,18 @@ parts are available through the projection endpoint and are rechecked against
 their recorded SHA-256 before every download. This keeps the paged Turn summary
 small without dropping the full interaction evidence.
 
+The writer serializes borrowed Turn fields directly into a buffered, hashing,
+quota-checked file; it does not clone a Turn or allocate its whole JSON line.
+Page reads and completion verification scan chunks, hashing all bytes and
+counting every record while materializing only selected page rows. This avoids
+retaining a huge Turn outside the requested page. For large individual Turns,
+use `client.downloadTurns(id)` (`GET /v1/jobs/{id}/turns.jsonl`) and consume the
+response body as a stream. The server checks the complete byte count, record
+count and SHA-256 before responding, and streams from the same open file with
+`Content-Length`, `ETag` and `X-Content-SHA256`. Clients should hash downloaded
+bytes; this validates the recorded artifact and does not certify an incomplete
+Session as delivery-ready. Host storage must prevent in-place evidence writes.
+
 Restores and inspections reuse one verified disk snapshot per archive ID.
 Jobs for the same archive are serialized; distinct archives can run up to the
 configured concurrency. Queue length, job history, usage bodies, engine output
@@ -86,6 +98,7 @@ POST /v1/jobs
 GET  /v1/jobs?offset=0&limit=50
 GET  /v1/jobs/{id}
 GET  /v1/jobs/{id}/turns?offset=0&limit=50
+GET  /v1/jobs/{id}/turns.jsonl
 GET  /v1/jobs/{id}/projection/{part}
 PUT  /v1/usage/{id}
 GET  /v1/jobs/{id}/packages/{file}
@@ -173,8 +186,17 @@ Projection-manifest downloads currently parse the full manifest in Node.
 Turn pages still hash and count the whole
 sidecar, including records outside the requested page. These paths need
 separate scale measurements and a persistent index before capacity claims.
-One Turn can itself contain a large set of Raw references; a page's Turn count
-does not impose a byte limit on that response.
+One selected Turn can itself contain a large set of Raw references; a page's
+Turn count does not impose a byte limit on that response. The streaming JSONL
+endpoint avoids materializing selected Turns, but still scans the full file
+before sending bytes and consumes a read slot until the stream closes.
+
+CI explicitly runs `make turn-memory-test`'s ignored Rust RSS regression and
+requires exactly one measured test. The platform suite also reads an 80 MB
+synthetic Turn sidecar in a Node child with a 32 MiB V8 heap, skipping a giant
+row, streaming all bytes and rejecting corruption outside the selected page.
+These synthetic metadata checks do not establish production capture capacity
+or bound the Rust projection/acceptance paths described above.
 
 The Turns endpoint also returns this overall `delivery_ready` alongside the
 scoped `summary`. A true `summary.delivery_ready` or

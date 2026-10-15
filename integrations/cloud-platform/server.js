@@ -72,10 +72,18 @@ function createPlatformHandler(plugin, token) {
         await pipeline(artifact.stream, res);
         return;
       }
-      const jobPath = url.pathname.match(/^\/v1\/jobs\/([^/]+)(?:\/(turns|packages\/([^/]+)))?$/);
+      const jobPath = url.pathname.match(/^\/v1\/jobs\/([^/]+)(?:\/(turns|turns\.jsonl|packages\/([^/]+)))?$/);
       if (jobPath && req.method === 'GET') {
         const id = decodeURIComponent(jobPath[1]);
         if (jobPath[2] === 'turns') return json(res, 200, await plugin.getTurns(id, page()));
+        if (jobPath[2] === 'turns.jsonl') {
+          const artifact = await plugin.openTurns(id);
+          res.writeHead(200, { 'content-type': artifact.contentType, 'content-length': artifact.bytes,
+            'content-disposition': 'attachment; filename="turns.jsonl"', etag: `"${artifact.sha256}"`,
+            'x-content-sha256': artifact.sha256 });
+          await pipeline(artifact.stream, res);
+          return;
+        }
         if (jobPath[3]) {
           const artifact = await plugin.openArtifact(id, decodeURIComponent(jobPath[3]));
           res.writeHead(200, { 'content-type': 'application/gzip', 'content-length': artifact.bytes,
