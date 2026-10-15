@@ -91,9 +91,9 @@ test('real Cargo reuses identical source and executes tests again; changed sourc
   write('src/lib.rs', 'pub const VALUE: u8 = 1;\n#[test] fn value_is_current() { assert_eq!(VALUE, 1); }\n');
   execFileSync('cargo', ['generate-lockfile', '--offline'], { cwd: root, stdio: 'pipe' });
   commit();
-  const run = digest => spawnSync('cargo', ['test', '--locked', '--offline', '--lib', '-v'], {
+  const run = digest => spawnSync('cargo', ['test', '--color', 'never', '--locked', '--offline', '--lib', '-v'], {
     cwd: root, encoding: 'utf8', maxBuffer: 1024 * 1024,
-    env: { ...process.env, CARGO_INCREMENTAL: '0', RUSTC_WRAPPER: '',
+    env: { ...process.env, CARGO_INCREMENTAL: '0', CARGO_TERM_COLOR: 'always', RUSTC_WRAPPER: '',
       RUSTC_WORKSPACE_WRAPPER: '', CARGO_TARGET_DIR: path.join(temporary, 'targets', digest) },
   });
   const first = prepareProducerSourceCache(root);

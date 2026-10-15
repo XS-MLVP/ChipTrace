@@ -110,6 +110,13 @@ SHA-256 放入 `rust-cache` 的 key，因而 fallback prefix 也限制在同一�
 覆盖相同源码复用、测试重新执行及源码变化后重新编译并保留真实失败。首次远端缓存填充
 和后续命中的耗时需要分别观测，不能从本地回归宣称 GitHub 已获得加速。
 
+新增缓存回归首次在远端 Rust 作业失败；本地使用同一 Rust 1.91 和
+`CARGO_TERM_COLOR=always` 真实复现了 9/10：Cargo 已编译成功，但 ANSI 颜色打断了
+测试读取的 `Compiling` 文本。子进程现在显式使用 `--color never`，并保留强制彩色环境的
+负载来覆盖该差异，仍要求真实编译、复用、测试执行和源码变化后的 exit 101。
+CI 另将完整 TAP 上传为 `producer-ci-regressions-report`。收到 runner 的 Ubuntu 26
+迁移通知后，五个作业均固定 `ubuntu-24.04`，避免操作系统别名变化使构建环境漂移。
+
 宿主网关还须使用 `openCaptureHealthy` 门禁。独立部署 smoke：
 
 ```bash

@@ -13,7 +13,7 @@ defaults:
 
 jobs:
   stock-managed-route:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +37,7 @@ jobs:
           path: stock-managed-route.tap
 
   upstream-context:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
@@ -98,7 +98,7 @@ jobs:
           # bytes can never receive artifacts with normalized old timestamps.
           key: source-${{ steps.producer-source.outputs.digest }}
           cache-workspace-crates: "true"
-      - name: Normalize only the verified source snapshot and record cache observation
+      - name: "Verify source and normalize timestamps (exact cache hit: ${{ steps.producer-cache.outputs.cache-hit }})"
         env:
           PRODUCER_SOURCE_DIGEST: ${{ steps.producer-source.outputs.digest }}
           PRODUCER_CACHE_HIT: ${{ steps.producer-cache.outputs.cache-hit }}
@@ -146,7 +146,7 @@ jobs:
             ${{ runner.temp }}/producer-regression-check-with-session.json
 
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -172,7 +172,15 @@ jobs:
         with:
           name: native-hook-ack-report
           path: native-hook-ack.tap
-      - run: node --test scripts/ci/upstream-context.test.js scripts/ci/producer-source-cache.test.js
+      - name: Verify producer lock, regressions and actual Cargo cache invalidation
+        run: |
+          node --test scripts/ci/upstream-context.test.js scripts/ci/producer-source-cache.test.js \
+            | tee producer-ci-regressions.tap
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: producer-ci-regressions-report
+          path: producer-ci-regressions.tap
       - run: node --test scripts/ci/native-canary-gate.test.js
       - run: node --test scripts/ci/native-canary-evidence.test.js
       - name: Verify runtime delivery and Turn Wire evidence fails closed
@@ -269,7 +277,7 @@ jobs:
           name: audit-memory-report
           path: audit-memory.json
   container:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - run: docker build --build-arg CHIPTRACE_REVISION="$GITHUB_SHA" -t chiptrace:ci .
@@ -345,7 +353,7 @@ jobs:
             chiptrace-platform:ci --test /tests/codex/native-context.test.js
 
   storage-s3-minio:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
       AWS_ACCESS_KEY_ID: chiptrace-ci
