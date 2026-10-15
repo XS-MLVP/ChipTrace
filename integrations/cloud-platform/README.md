@@ -182,7 +182,18 @@ The full identity/parent index still grows with corpus size and is not yet a
 disk index.
 The Rust projection still holds the selected Session and Turn metadata in
 memory; these compact reports do not bound Rust projection or acceptance RSS.
-Projection-manifest downloads currently parse the full manifest in Node.
+Projection downloads use `read-projection-manifest --input FILE` to extract
+only the recorded schema/session/counts/parts metadata in Rust. The command
+streams the complete file with UTF-8, JSON syntax, length and SHA-256 checks,
+skipping large Session/Turn/metrics values. Its
+`chiptrace.projection-manifest-metadata.v1` report explicitly sets
+`session_delivery_claimed=false`; it does not run full projection or Session
+acceptance. The plugin compares both the complete Manifest descriptor and
+metadata to the recorded job, with strict values and order-independent object
+keys. It then hashes the requested regular file and streams from that same
+open handle. Original Manifest bytes and part hashes remain unchanged.
+Each download uses a CLI process under the existing timeout/output limits and
+holds a read slot until its stream closes. Plugin and CLI builds must match.
 Turn pages still hash and count the whole
 sidecar, including records outside the requested page. These paths need
 separate scale measurements and a persistent index before capacity claims.
@@ -191,10 +202,15 @@ Turn count does not impose a byte limit on that response. The streaming JSONL
 endpoint avoids materializing selected Turns, but still scans the full file
 before sending bytes and consumes a read slot until the stream closes.
 
-CI explicitly runs `make turn-memory-test`'s ignored Rust RSS regression and
-requires exactly one measured test. The platform suite also reads an 80 MB
+CI explicitly runs `make turn-memory-test`'s ignored Rust RSS regressions in
+separate processes and requires exactly one measured test per case: Turn
+serialization has a 128 MiB fixture budget; streaming Manifest reading has a
+48 MiB fixture budget. The platform suite also reads an 80 MB
 synthetic Turn sidecar in a Node child with a 32 MiB V8 heap, skipping a giant
 row, streaming all bytes and rejecting corruption outside the selected page.
+Another limited-heap test downloads an expanded Manifest and canonical part,
+rejects metadata conflicts and skipped Turn corruption, and rejects invalid
+UTF-8 even when the recorded digest is changed to match those synthetic bytes.
 These synthetic metadata checks do not establish production capture capacity
 or bound the Rust projection/acceptance paths described above.
 

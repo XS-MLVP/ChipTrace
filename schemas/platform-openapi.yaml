@@ -112,7 +112,12 @@ paths:
           type: string
           enum: [manifest, interactions, runtime, links]
     get:
-      description: Streams a reverified canonical interaction projection part for a completed inspection job.
+      description: >-
+        Streams a reverified canonical interaction projection part for a
+        completed inspection job. Reads Manifest metadata in a streaming CLI
+        process, checks its complete recorded digest and metadata, and checks
+        the requested file before streaming from the same open handle. The
+        original Manifest and compressed part bytes are returned unchanged.
       responses:
         '200':
           description: Manifest JSON or compressed canonical JSONL projection

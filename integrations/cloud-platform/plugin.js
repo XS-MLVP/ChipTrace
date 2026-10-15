@@ -892,14 +892,21 @@ class ChipTracePlugin {
     if (!manifestStat?.isFile() || manifestStat.isSymbolicLink() || manifestStat.size !== expectedManifest.bytes) {
       throw new PlatformError('interaction projection manifest changed', 422, 'ARTIFACT_CHANGED');
     }
-    const manifestBytes = await fsp.readFile(manifestPath);
-    if (crypto.createHash('sha256').update(manifestBytes).digest('hex') !== expectedManifest.sha256) {
+    let manifest;
+    try {
+      manifest = await this.#engine(['read-projection-manifest', '--input', manifestPath]);
+    } catch (error) {
+      if (error.code !== 'ENGINE_FAILURE') throw error;
+      throw new PlatformError('interaction projection manifest is invalid', 422, 'ARTIFACT_CHANGED');
+    }
+    if (manifest.schema_version !== 'chiptrace.projection-manifest-metadata.v1'
+        || manifest.session_delivery_claimed !== false || !manifest.projection) {
+      throw new PlatformError('invalid projection Manifest metadata report', 502, 'ENGINE_PROTOCOL');
+    }
+    if (!isDeepStrictEqual(manifest.manifest, expectedManifest)) {
       throw new PlatformError('interaction projection manifest changed', 422, 'ARTIFACT_CHANGED');
     }
-    let manifest;
-    try { manifest = JSON.parse(decodeUtf8(manifestBytes)); }
-    catch { throw new PlatformError('interaction projection manifest is invalid', 422, 'ARTIFACT_CHANGED'); }
-    if (JSON.stringify(projectionMetadata(manifest, expected.manifest)) !== JSON.stringify(expected)) {
+    if (!isDeepStrictEqual(projectionMetadata(manifest.projection, manifest.manifest), expected)) {
       throw new PlatformError('interaction projection metadata changed', 422, 'ARTIFACT_CHANGED');
     }
     const expectedPart = descriptor.file === 'manifest.json'
@@ -911,8 +918,13 @@ class ChipTracePlugin {
     if (!stat?.isFile() || stat.isSymbolicLink() || stat.size !== expectedPart.bytes) {
       throw new PlatformError('interaction projection part changed', 422, 'ARTIFACT_CHANGED');
     }
-    const handle = await fsp.open(file, 'r');
+    const handle = await fsp.open(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)
+      .catch(() => { throw new PlatformError('interaction projection part changed', 422, 'ARTIFACT_CHANGED'); });
     try {
+      const before = await handle.stat();
+      if (!before.isFile() || before.size !== expectedPart.bytes) {
+        throw new PlatformError('interaction projection part changed', 422, 'ARTIFACT_CHANGED');
+      }
       const digest = crypto.createHash('sha256');
       const buffer = Buffer.alloc(1024 * 1024);
       let position = 0;
@@ -921,8 +933,12 @@ class ChipTracePlugin {
         if (!bytesRead) break;
         digest.update(buffer.subarray(0, bytesRead));
         position += bytesRead;
+        if (position > expectedPart.bytes) break;
       }
-      if (position !== expectedPart.bytes || digest.digest('hex') !== expectedPart.sha256) {
+      const after = await handle.stat();
+      if (position !== expectedPart.bytes || after.size !== before.size
+          || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs
+          || digest.digest('hex') !== expectedPart.sha256) {
         throw new PlatformError('interaction projection part checksum mismatch', 422, 'ARTIFACT_CHANGED');
       }
       return { file: descriptor.file, bytes: expectedPart.bytes, sha256: expectedPart.sha256,

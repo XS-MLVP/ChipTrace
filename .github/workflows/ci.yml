@@ -171,7 +171,7 @@ jobs:
         with:
           name: rust-tests-report
           path: rust-tests.log
-      - name: Verify streaming Turn writer RSS and require an actual test execution
+      - name: Verify streaming Turn writer and projection Manifest reader RSS
         run: |
           set -euo pipefail
           node scripts/ci/turn-memory-gate.js --report turn-memory.json 2>&1 | tee turn-memory.log

@@ -170,6 +170,141 @@ test('limited-heap readers skip a huge Turn and stream all checksummed metadata'
   t.diagnostic(result.stdout.trim());
 });
 
+test('limited-heap projection downloads verify large manifests without retaining their Turns', { timeout: 180000 }, async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-projection-reader-memory-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const data = await fixture(root);
+  const platformRoot = path.join(root, 'platform');
+  const initial = new ChipTracePlugin({ root: platformRoot, projectId: 'synthetic-projection-memory', binary });
+  await initial.start();
+  await initial.close();
+  const projection = path.join(platformRoot, 'work/projection-memory/projection');
+  await fs.cp(path.join(data.root, 'interactions'), projection, { recursive: true });
+  const file = path.join(projection, 'manifest.json');
+  const manifest = JSON.parse(await fs.readFile(file, 'utf8'));
+  const { session_view: session, ...rest } = manifest;
+  const { raw_capture_refs: refs, ...turn } = session.turns[0];
+  const { turns, ...summary } = session;
+  const handle = await fs.open(file, 'w');
+  const digest = crypto.createHash('sha256');
+  let bytes = 0;
+  const append = async text => {
+    const chunk = Buffer.from(text);
+    await handle.writeFile(chunk);
+    digest.update(chunk);
+    bytes += chunk.length;
+  };
+  try {
+    await append('{"session_view":{"turns":[{"raw_capture_refs":[');
+    for (let offset = 0; offset < 400000; offset += 2000) {
+      const references = Array.from({ length: 2000 }, (_, index) =>
+        `cap-memory-${String(offset + index).padStart(6, '0')}-${'x'.repeat(180)}`);
+      await append(`${offset ? ',' : ''}${JSON.stringify(references).slice(1, -1)}`);
+    }
+    await append(`,${JSON.stringify(refs).slice(1, -1)}],${JSON.stringify(turn).slice(1)}`);
+    for (const remaining of turns.slice(1)) await append(`,${JSON.stringify(remaining)}`);
+    await append(`],${JSON.stringify(summary).slice(1)},${JSON.stringify(rest).slice(1)}\n`);
+    await handle.sync();
+  } finally { await handle.close(); }
+  assert.ok(bytes > 64 * 1024 * 1024);
+  const metadata = { schema_version: manifest.schema_version, session_id: manifest.session_id,
+    interactions: manifest.interactions, runtime_spans: manifest.runtime_spans, links: manifest.links,
+    parts: manifest.parts.map(part => ({ file: part.file, bytes: part.bytes, records: part.records ?? null,
+      sha256: part.sha256, uncompressed_bytes: part.uncompressed_bytes ?? null })),
+    manifest: { file: 'manifest.json', bytes, sha256: digest.digest('hex') } };
+  const script = String.raw`
+    const assert = require('node:assert/strict');
+    const fs = require('node:fs/promises');
+    const path = require('node:path');
+    const crypto = require('node:crypto');
+    const { ChipTracePlugin } = require(process.argv[1]);
+    const { createPlatformServer } = require(path.join(path.dirname(process.argv[1]), 'server.js'));
+    const { ChipTraceClient } = require(path.join(path.dirname(process.argv[1]), 'client.js'));
+    (async () => {
+      const root = process.argv[2];
+      const expected = JSON.parse(process.argv[4]);
+      const plugin = new ChipTracePlugin({ root, projectId: 'synthetic-projection-memory', binary: process.argv[3],
+        maxOutputBytes: 65536, engineEnv: { TOKIO_WORKER_THREADS: '2' } });
+      let app;
+      const verify = async (stream, metadata) => {
+        let bytes = 0;
+        const digest = crypto.createHash('sha256');
+        for await (const chunk of stream) { bytes += chunk.length; digest.update(chunk); }
+        assert.equal(bytes, metadata.bytes);
+        assert.equal(digest.digest('hex'), metadata.sha256);
+      };
+      try {
+        await plugin.start();
+        plugin.jobs.set('projection-memory', { request: { id: 'projection-memory', kind: 'inspect', session_id: expected.session_id },
+          status: 'completed', result: { delivery_ready: false, interaction_projection: expected } });
+        const token = 'synthetic-projection-platform-token-at-least-32-bytes';
+        app = await createPlatformServer({ plugin, token });
+        await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
+        const baseUrl = 'http://127.0.0.1:' + app.server.address().port;
+        const unauthenticated = await fetch(baseUrl + '/v1/jobs/projection-memory/projection/manifest');
+        assert.equal(unauthenticated.status, 401);
+        await unauthenticated.body.cancel();
+        const client = new ChipTraceClient({ baseUrl, token });
+        for (const part of ['manifest', 'interactions']) {
+          const response = await client.downloadProjection('projection-memory', part);
+          const metadata = part === 'manifest' ? expected.manifest : expected.parts.find(part => part.file.startsWith('interactions/'));
+          assert.equal(response.headers.get('x-content-sha256'), metadata.sha256);
+          assert.equal(Number(response.headers.get('content-length')), metadata.bytes);
+          await verify(response.body, metadata);
+        }
+        const stored = plugin.jobs.get('projection-memory').result.interaction_projection;
+        stored.parts = stored.parts.map(part => Object.fromEntries(Object.entries(part).reverse()));
+        const reordered = await client.downloadProjection('projection-memory', 'interactions');
+        await verify(reordered.body, expected.parts.find(part => part.file.startsWith('interactions/')));
+        stored.interactions += 1;
+        await assert.rejects(client.downloadProjection('projection-memory', 'interactions'), error => error.code === 'ARTIFACT_CHANGED');
+        stored.interactions -= 1;
+        const file = path.join(root, 'work/projection-memory/projection/manifest.json');
+        const artifact = await plugin.openProjection('projection-memory', 'manifest');
+        await fs.rename(file, file + '.original');
+        await fs.writeFile(file, 'changed');
+        await verify(artifact.stream, expected.manifest);
+        await fs.rename(file + '.original', file);
+        const handle = await fs.open(file, 'r+');
+        try { await handle.write(Buffer.from('!'), 0, 1, 200); await handle.sync(); }
+        finally { await handle.close(); }
+        for (const part of ['manifest', 'interactions']) {
+          await assert.rejects(client.downloadProjection('projection-memory', part), error => error.code === 'ARTIFACT_CHANGED');
+        }
+        const invalid = await fs.open(file, 'r+');
+        try { await invalid.write(Buffer.from([255]), 0, 1, 200); await invalid.sync(); }
+        finally { await invalid.close(); }
+        const invalidDigest = crypto.createHash('sha256');
+        for await (const chunk of require('node:fs').createReadStream(file)) invalidDigest.update(chunk);
+        // Matching recorded bytes still cannot make invalid UTF-8 in a skipped
+        // Turn acceptable. This is synthetic reader evidence, not acceptance.
+        stored.manifest.sha256 = invalidDigest.digest('hex');
+        await assert.rejects(client.downloadProjection('projection-memory', 'manifest'), error => error.code === 'ARTIFACT_CHANGED');
+        assert.equal(plugin.activeReads, 0);
+        console.log(JSON.stringify({ synthetic: true, session_delivery_claimed: false, max_old_space_mib: 32,
+          manifest_bytes: expected.manifest.bytes, full_stream_verified: true, metadata_conflict_refused: true,
+          skipped_turn_corruption_refused: true, invalid_utf8_refused_with_matching_digest: true }));
+      } finally { if (app) await app.close(); else await plugin.close(); }
+    })().catch(error => { console.error(error.message); process.exitCode = 1; });
+  `;
+  let result;
+  try {
+    result = await run('/bin/sh', ['-c', 'ulimit -c 0 && exec "$@"', 'chiptrace-projection-memory', process.execPath,
+      '--max-old-space-size=32', '-e', script, path.join(__dirname, 'plugin.js'), platformRoot, binary, JSON.stringify(metadata)],
+    { maxBuffer: 64 * 1024, timeout: 170000 });
+  } catch (error) {
+    t.diagnostic(JSON.stringify({ child_exit_code: typeof error.code === 'number' ? error.code : null,
+      child_signal: error.signal ?? null, stderr_bytes: Buffer.byteLength(error.stderr || ''),
+      stderr_tail: (error.stderr || '').slice(-4000),
+      diagnostics: (error.stderr || '').split('\n').filter(line => /FATAL ERROR|heap limit|allocation failure/.test(line)).slice(0, 4) }));
+    assert.fail(`limited-heap projection reader failed (exit=${error.code ?? null}, signal=${error.signal ?? null})`);
+  }
+  const observed = JSON.parse(result.stdout);
+  assert.equal(observed.full_stream_verified, true);
+  assert.equal(observed.manifest_bytes, bytes);
+  t.diagnostic(result.stdout.trim());
+});
+
 test('Turn scanning preserves line boundaries and pins downloads to the verified file', async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-turn-reader-boundaries-'));
   const plugin = new ChipTracePlugin({ root, projectId: 'synthetic-turn-boundaries', binary, concurrency: 1 });
