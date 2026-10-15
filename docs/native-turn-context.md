@@ -80,6 +80,14 @@ Buyer 导出必须真实退出 1，明确拒绝 `protocol_complete=false`。仅�
 `native-compaction-ci.json` 报告只记录元数据与校验结论，声明合成模型、带补丁生产者，
 不能作为未修改客户端或生产验收证据。
 
+[protocol-auto-compaction.test.js](../integrations/codex/protocol-auto-compaction.test.js) 另通过
+合成 usage 触发真实轮前、轮中和轮后自动压缩，包含实际 exit 7 工具和新进程 resume。
+4 个业务 Native Turn、2 个 epoch、8 次模型请求保持独立；三个压缩均使用其业务 Turn
+的原生身份，不新增虚构 Turn。完整输入、输出、摘要延续和 Hook 均保留，并经过 FS
+归档恢复、投影下载和重启复验。派生副本移除轮中/轮后业务 Stop，或从同一 Turn 的
+多个压缩中移除一个实际 Pre/Post 事件，均须拒绝完整交付。报告为
+`native-auto-compaction-ci.json`；生产者源码与补丁保持固定，测试仍声明非生产验收。
+
 这项回归使用已打补丁生产者和合成模型响应，报告固定声明 `real_upstream=false`、
 `production_acceptance_claimed=false`，并验证真实上游 Canary 门禁拒绝它。它能发现协议、
 生产者和采集链路一起运行时的回归，不能替代未修改客户端、真实模型、阿里 OSS 或
@@ -94,7 +102,10 @@ GitHub 还核对构建前的源码摘要。仅同版本号、补丁文件名或�
 CHIPTRACE_PROTOCOL_SOURCE=/absolute/path/to/pinned-codex-checkout \
 CHIPTRACE_PROTOCOL_PRODUCER=/absolute/path/to/codex-app-server \
 CHIPTRACE_PROTOCOL_REPORT=/private/path/native-protocol-ci.json \
+CHIPTRACE_BUYER_PROTOCOL_REPORT=/private/path/native-buyer-protocol-ci.json \
 CHIPTRACE_INTERRUPTION_REPORT=/private/path/native-interruption-ci.json \
+CHIPTRACE_COMPACTION_REPORT=/private/path/native-compaction-ci.json \
+CHIPTRACE_AUTO_COMPACTION_REPORT=/private/path/native-auto-compaction-ci.json \
   make protocol-collection-test
 ```
 

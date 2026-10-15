@@ -4653,8 +4653,10 @@ fn build_task_root_spans(
         let wire_turn_start = record_type(capture) == "api_snapshot"
             && trace_string(capture, "root_turn_id").is_some();
         let compaction_boundary = compaction.is_start(capture) || compaction.is_terminal(capture);
+        let compaction_hook = matches!(event_type, Some("compaction_start" | "compaction_end"));
         if !wire_turn_start
             && !compaction_boundary
+            && !compaction_hook
             && !event_type.is_some_and(|event_type| {
                 is_task_root_start(event_type)
                     || is_task_root_terminal(event_type)
@@ -4671,6 +4673,7 @@ fn build_task_root_spans(
             "turn" => {
                 wire_turn_start
                     || compaction_boundary
+                    || compaction_hook
                     || event_type.is_some_and(|event_type| {
                         is_turn_root_event(event_type) || is_subagent_root_event(event_type)
                     })
@@ -4789,15 +4792,20 @@ fn build_task_root_spans(
                 )
             })
             .collect();
-        let root_complete = if scope_kind == "session" {
-            lifecycle_state.start_count > 0
-                && lifecycle_state.terminal_count > 0
-                && lifecycle_state.invalid_boundary_count == 0
-                && lifecycle_state.latest_epoch_closed
-                && terminal_statuses.len() == 1
-        } else {
-            !starts.is_empty() && !terminals.is_empty() && terminal_statuses.len() == 1
-        };
+        let compaction_complete = scope_kind != "turn"
+            || observations
+                .iter()
+                .all(|capture| compaction.capture_is_complete(capture));
+        let root_complete = compaction_complete
+            && if scope_kind == "session" {
+                lifecycle_state.start_count > 0
+                    && lifecycle_state.terminal_count > 0
+                    && lifecycle_state.invalid_boundary_count == 0
+                    && lifecycle_state.latest_epoch_closed
+                    && terminal_statuses.len() == 1
+            } else {
+                !starts.is_empty() && !terminals.is_empty() && terminal_statuses.len() == 1
+            };
         let selected = if scope_kind == "session" && !lifecycle_state.latest_epoch_closed {
             starts.last().copied().unwrap_or(first)
         } else {
@@ -4832,7 +4840,7 @@ fn build_task_root_spans(
         } else {
             None
         };
-        spans.push(json!({
+        let mut span = json!({
             "schema_version":RUNTIME_SPAN_SCHEMA_VERSION,
             "span_id":canonical_scope_root_span_id(scope_kind, &scope_id),
             "trace_context":scope_index.trace_context(selected, false),
@@ -4863,7 +4871,8 @@ fn build_task_root_spans(
             "raw_capture_refs":capture_ids,
             "extensions":{
                 "state_conflict":terminal_statuses.len() > 1
-                    || lifecycle_state.invalid_boundary_count > 0,
+                    || lifecycle_state.invalid_boundary_count > 0
+                    || !compaction_complete,
                 "root_complete":root_complete,
                 "scope_root":true,
                 "parent_span_required":scope_kind == "turn",
@@ -4884,7 +4893,15 @@ fn build_task_root_spans(
                 "observed_native_span_ids":native_span_ids,
                 "lifecycle":observations.iter().filter_map(|capture| capture.get("lifecycleEvent")).cloned().collect::<Vec<_>>(),
             },
-        }));
+        });
+        if scope_kind == "turn"
+            && let Some(summary) = observations
+                .iter()
+                .find_map(|capture| compaction.summary_for_capture(capture))
+        {
+            span["extensions"]["compaction"] = serde_json::to_value(summary)?;
+        }
+        spans.push(span);
     }
     Ok(spans)
 }

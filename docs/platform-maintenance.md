@@ -32,12 +32,13 @@ Actions run，不能用本地通过或旧 main 的绿色结果代替。
 MinIO 公共容器标签的远端拉取已返回 access denied；CI 因此从固定的公开源码提交
 `07c3a429bfed433e49018cb0f78a52145d4bedeb` 构建隔离服务，避免依赖本机镜像缓存。
 
-固定生产者上下文作业中的 `make protocol-collection-test` 另执行四项新采集联测：
+固定生产者上下文作业中的 `make protocol-collection-test` 另执行五项新采集联测：
 模型切换完整保存但拒绝混合模型采购、同模型双轮成功导出并独立检查下载包、取消/
-断流保留部分证据并拒绝采购、独立手动压缩后继续和新进程 resume。
+断流保留部分证据并拒绝采购、独立手动压缩后继续和新进程 resume，以及真实轮前/轮中/
+轮后自动压缩与业务终态的完整性。
 `producer-context-report` 中分别保留
 `native-protocol-ci.json`、`native-buyer-protocol-ci.json`、`native-interruption-ci.json`、
-`native-compaction-ci.json`
+`native-compaction-ci.json`、`native-auto-compaction-ci.json`
 及实际 TAP。正向 usage 来自合成 endpoint 的逐请求观察，按真实响应 request ID 关联；
 全部报告均声明非真实模型、非未修改生产者和非生产验收。不能用检查阶段的 ready
 代替 Buyer 准入，也不能删除模型切换或部分交付负例来获得绿色 CI。
@@ -48,6 +49,11 @@ HTTP/SDK 的 FS 归档、恢复、投影下载和重启复验。独立手动压�
 Wire 阶段和成对成功 Hook 闭合；内联压缩及缺 Hook 仍拒绝交付。该样本仅一种工具，
 `buyer_export_checked=false`，Buyer 准入继续由独立多工具正向用例负责。详见
 [生产就绪评估](production-readiness.md)与[原生 Turn 记录](native-turn-context.md)。
+
+自动压缩用例另保留 4 个业务 Turn、2 个 epoch、8 次请求和一个实际 exit 7 工具结果。
+其 Pre/Post 只作为业务 Turn 内的压缩证据，不能替代业务 Stop；缺少任意一个压缩 Hook
+仍拒绝完整交付。同一窗口/阶段的重试不增加压缩操作计数；原始 Hook 与 Wire 不改写。
+该场景同样只验证采集、恢复、投影下载与重启，不宣称一工具样本通过 Buyer 准入。
 
 ## 迭代与发布流程
 

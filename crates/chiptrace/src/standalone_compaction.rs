@@ -1,7 +1,9 @@
+//! Compaction requires its own complete lifecycle inside a native Turn.
 //! Standalone manual compaction has PreCompact/PostCompact, not a Stop hook.
 //! Inline compaction must never close its enclosing business Turn. Match exact
 //! native IDs and operation metadata; gateway and producer clocks may differ.
 
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
@@ -11,6 +13,15 @@ use time::format_description::well_known::Rfc3339;
 pub(crate) struct CompactionBoundaries {
     starts: BTreeSet<String>,
     terminals: BTreeSet<String>,
+    summaries: BTreeMap<(String, String), CompactionSummary>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CompactionSummary {
+    operations: usize,
+    pre_hooks: usize,
+    post_hooks: usize,
+    complete: bool,
 }
 
 #[derive(Default)]
@@ -32,6 +43,12 @@ fn timestamp(capture: &Value, pointer: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(string(capture, pointer)?, &Rfc3339).ok()
 }
 
+fn native_session(capture: &Value) -> Option<&str> {
+    // Session selection may reparent a child while retaining its native ID.
+    string(capture, "/traceContext/source_session_id")
+        .or_else(|| string(capture, "/traceContext/session_id"))
+}
+
 fn metadata(capture: &Value) -> Option<Value> {
     let headers = capture.get("requestHeaders")?.as_object()?;
     let mut values = BTreeSet::new();
@@ -46,13 +63,110 @@ fn metadata(capture: &Value) -> Option<Value> {
         .and_then(|value| serde_json::from_str(value).ok())
 }
 
-fn valid_hook(capture: &Value, name: &str, status: &str, session: &str, turn: &str) -> bool {
-    string(capture, "/lifecycleEvent/source_event_name") == Some(name)
+fn valid_hook(
+    capture: &Value,
+    name: &str,
+    status: &str,
+    session: &str,
+    turn: &str,
+    trigger: &str,
+) -> bool {
+    string(capture, "/recordType") == Some("lifecycle_event")
+        && string(capture, "/lifecycleEvent/source_event_name") == Some(name)
         && string(capture, "/lifecycleEvent/source_event/hook_event_name") == Some(name)
         && string(capture, "/lifecycleEvent/status") == Some(status)
         && string(capture, "/lifecycleEvent/source_event/session_id") == Some(session)
         && string(capture, "/lifecycleEvent/source_event/turn_id") == Some(turn)
-        && string(capture, "/lifecycleEvent/source_event/trigger") == Some("manual")
+        && string(capture, "/lifecycleEvent/source_event/trigger") == Some(trigger)
+}
+
+fn summarize(group: &Evidence<'_>, session: &str, turn: &str) -> Option<CompactionSummary> {
+    let mut operations = BTreeSet::new();
+    let mut valid = true;
+    for capture in &group.wire {
+        let Some(metadata) = metadata(capture) else {
+            valid = false;
+            continue;
+        };
+        if string(&metadata, "/request_kind") != Some("compaction") {
+            continue;
+        }
+        let trigger = string(&metadata, "/compaction/trigger").unwrap_or("");
+        let phase = string(&metadata, "/compaction/phase").unwrap_or("");
+        let window = string(&metadata, "/window_id").unwrap_or("");
+        valid &= string(&metadata, "/session_id") == Some(session)
+            && string(&metadata, "/turn_id") == Some(turn)
+            && match (trigger, phase) {
+                ("manual", "standalone_turn") => true,
+                ("auto", "pre_turn" | "mid_turn" | "post_turn") => {
+                    !window.is_empty() && string(capture, "/traceContext/window_id") == Some(window)
+                }
+                _ => false,
+            };
+        // Native windows distinguish repeated compactions within one Turn.
+        // HTTP retries for the same window/phase remain one operation.
+        operations.insert((trigger.to_owned(), phase.to_owned(), window.to_owned()));
+    }
+    if operations.is_empty() && group.starts.is_empty() && group.terminals.is_empty() {
+        return None;
+    }
+    if operations.iter().any(|(trigger, _, _)| trigger == "manual") {
+        valid &= !group.business_turn
+            && operations.len() == 1
+            && group.wire.iter().all(|capture| {
+                metadata(capture).is_some_and(|metadata| {
+                    string(&metadata, "/request_kind") == Some("compaction")
+                        && string(&metadata, "/compaction/trigger") == Some("manual")
+                        && string(&metadata, "/compaction/phase") == Some("standalone_turn")
+                })
+            });
+    }
+    for trigger in ["manual", "auto"] {
+        let expected = operations
+            .iter()
+            .filter(|(kind, _, _)| kind == trigger)
+            .count();
+        let mut hooks = Vec::new();
+        for (captures, name, status, terminal) in [
+            (&group.starts, "PreCompact", "started", false),
+            (&group.terminals, "PostCompact", "completed", true),
+        ] {
+            let mut count = 0;
+            for capture in captures {
+                if string(capture, "/lifecycleEvent/source_event/trigger") != Some(trigger) {
+                    continue;
+                }
+                count += 1;
+                valid &= valid_hook(capture, name, status, session, turn, trigger);
+                if let Some(time) = timestamp(capture, "/lifecycleEvent/occurred_at") {
+                    hooks.push((time, terminal));
+                } else {
+                    valid = false;
+                }
+            }
+            valid &= count == expected;
+        }
+        // Only compare producer Hook times, never gateway timestamps or time
+        // windows to infer native identity or associate an HTTP request.
+        hooks.sort_unstable();
+        valid &= hooks.len() == expected * 2
+            && hooks
+                .iter()
+                .enumerate()
+                .all(|(index, (_, terminal))| *terminal == (index % 2 == 1));
+    }
+    valid &= group.starts.iter().chain(&group.terminals).all(|capture| {
+        matches!(
+            string(capture, "/lifecycleEvent/source_event/trigger"),
+            Some("manual" | "auto")
+        )
+    });
+    Some(CompactionSummary {
+        operations: operations.len(),
+        pre_hooks: group.starts.len(),
+        post_hooks: group.terminals.len(),
+        complete: valid && !operations.is_empty(),
+    })
 }
 
 impl CompactionBoundaries {
@@ -60,7 +174,7 @@ impl CompactionBoundaries {
         let mut groups: BTreeMap<(&str, &str), Evidence<'_>> = BTreeMap::new();
         for capture in captures {
             let (Some(session), Some(turn)) = (
-                string(capture, "/traceContext/session_id"),
+                native_session(capture),
                 string(capture, "/traceContext/turn_id"),
             ) else {
                 continue;
@@ -80,7 +194,15 @@ impl CompactionBoundaries {
         }
         let mut boundaries = Self::default();
         for ((session, turn), group) in groups {
-            if group.business_turn
+            let Some(summary) = summarize(&group, session, turn) else {
+                continue;
+            };
+            let complete = summary.complete;
+            boundaries
+                .summaries
+                .insert((session.to_owned(), turn.to_owned()), summary);
+            if !complete
+                || group.business_turn
                 || group.wire.is_empty()
                 || group.starts.len() != 1
                 || group.terminals.len() != 1
@@ -89,8 +211,15 @@ impl CompactionBoundaries {
             }
             let start = group.starts[0];
             let terminal = group.terminals[0];
-            if !valid_hook(start, "PreCompact", "started", session, turn)
-                || !valid_hook(terminal, "PostCompact", "completed", session, turn)
+            if !valid_hook(start, "PreCompact", "started", session, turn, "manual")
+                || !valid_hook(
+                    terminal,
+                    "PostCompact",
+                    "completed",
+                    session,
+                    turn,
+                    "manual",
+                )
             {
                 continue;
             }
@@ -130,6 +259,27 @@ impl CompactionBoundaries {
 
     pub(crate) fn is_terminal(&self, capture: &Value) -> bool {
         string(capture, "/captureId").is_some_and(|id| self.terminals.contains(id))
+    }
+
+    pub(crate) fn summary(&self, session: &str, turn: &str) -> Option<&CompactionSummary> {
+        self.summaries.get(&(session.to_owned(), turn.to_owned()))
+    }
+
+    pub(crate) fn is_complete(&self, session: &str, turn: &str) -> bool {
+        self.summary(session, turn)
+            .is_none_or(|summary| summary.complete)
+    }
+
+    pub(crate) fn summary_for_capture(&self, capture: &Value) -> Option<&CompactionSummary> {
+        self.summary(
+            native_session(capture)?,
+            string(capture, "/traceContext/turn_id")?,
+        )
+    }
+
+    pub(crate) fn capture_is_complete(&self, capture: &Value) -> bool {
+        self.summary_for_capture(capture)
+            .is_none_or(|summary| summary.complete)
     }
 }
 
@@ -228,5 +378,113 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    fn automatic_captures() -> Vec<Value> {
+        let mut result = Vec::new();
+        for (index, phase) in ["pre_turn", "mid_turn"].into_iter().enumerate() {
+            let mut operation = captures();
+            for (offset, hook) in [(0, "PreCompact"), (2, "PostCompact")] {
+                operation[offset]["captureId"] = json!(format!("{hook}-{index}"));
+                operation[offset]["lifecycleEvent"]["source_event"]["trigger"] = json!("auto");
+                operation[offset]["lifecycleEvent"]["occurred_at"] =
+                    json!(format!("2026-10-16T00:00:{:02}Z", index * 3 + offset));
+            }
+            let window = format!("s:{index}");
+            operation[1]["captureId"] = json!(format!("wire-{index}"));
+            operation[1]["traceContext"]["window_id"] = json!(window);
+            operation[1]["requestHeaders"]["x-codex-turn-metadata"] =
+                json!(json!({
+                "session_id":"s","turn_id":"t","window_id":window,"request_kind":"compaction",
+                "compaction":{"phase":phase,"trigger":"auto"}
+            }).to_string());
+            result.extend(operation);
+        }
+        result.push(
+            json!({"captureId":"business-tool","recordType":"tool_execution",
+            "traceContext":{"session_id":"s","turn_id":"t"}}),
+        );
+        result
+    }
+
+    #[test]
+    fn automatic_windows_require_all_hook_pairs_without_closing_the_business_turn() {
+        let mut captures = automatic_captures();
+        // A completed retry is still the same operation identity, independent
+        // of arrival order and the gateway clock.
+        let mut retry = captures[1].clone();
+        retry["captureId"] = json!("retry");
+        retry["startedAt"] = json!("2000-01-01T00:00:00Z");
+        captures.push(retry);
+        captures.reverse();
+        let boundaries = CompactionBoundaries::from_captures(&captures);
+        assert!(boundaries.is_complete("s", "t"));
+        assert_eq!(boundaries.summary("s", "t").unwrap().operations, 2);
+        assert!(boundaries.starts.is_empty());
+        assert!(boundaries.terminals.is_empty());
+        for missing in [0, 2, 3, 5] {
+            let mut captures = automatic_captures();
+            captures.remove(missing);
+            assert!(!CompactionBoundaries::from_captures(&captures).is_complete("s", "t"));
+        }
+    }
+
+    #[test]
+    fn automatic_compaction_rejects_ambiguous_windows_or_hook_identity_and_order() {
+        for case in 0..9 {
+            let mut captures = automatic_captures();
+            match case {
+                0 => captures[1]["traceContext"]["window_id"] = json!("other-window"),
+                1 => captures[2]["lifecycleEvent"]["source_event"]["turn_id"] = json!("other-turn"),
+                2 => captures[2]["lifecycleEvent"]["source_event"]["trigger"] = json!("manual"),
+                3 => captures[2]["lifecycleEvent"]["occurred_at"] = json!("2026-10-16T00:00:04Z"),
+                4 => captures[2]["lifecycleEvent"]["status"] = json!("failed"),
+                5 => captures.push(captures[2].clone()),
+                6 => captures[1]["requestHeaders"] = json!({"x-codex-turn-metadata":"invalid"}),
+                7 => captures[2]["recordType"] = json!("api_snapshot"),
+                8 => {
+                    let mut metadata = metadata(&captures[1]).unwrap();
+                    metadata["window_id"] = Value::Null;
+                    captures[1]["requestHeaders"]["x-codex-turn-metadata"] =
+                        json!(metadata.to_string());
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !CompactionBoundaries::from_captures(&captures).is_complete("s", "t"),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_parent_and_child_with_the_same_turn_id_keep_native_compaction_evidence_separate() {
+        let mut captures = automatic_captures();
+        let mut child = automatic_captures();
+        child.remove(2); // Child has one missing PostCompact; parent is complete.
+        for capture in &mut child {
+            capture["captureId"] =
+                json!(format!("child-{}", string(capture, "/captureId").unwrap()));
+            capture["traceContext"]["source_session_id"] = json!("child");
+            if capture.get("lifecycleEvent").is_some() {
+                capture["lifecycleEvent"]["source_event"]["session_id"] = json!("child");
+            }
+            if let Some(mut metadata) = metadata(capture) {
+                metadata["session_id"] = json!("child");
+                capture["requestHeaders"]["x-codex-turn-metadata"] = json!(metadata.to_string());
+            }
+        }
+        let child_wire = child
+            .iter()
+            .find(|capture| metadata(capture).is_some())
+            .unwrap()
+            .clone();
+        captures.extend(child);
+        let boundaries = CompactionBoundaries::from_captures(&captures);
+        assert!(boundaries.is_complete("s", "t"));
+        assert!(!boundaries.is_complete("child", "t"));
+        assert!(!boundaries.capture_is_complete(&child_wire));
+        assert_eq!(boundaries.summary("s", "t").unwrap().operations, 2);
+        assert_eq!(boundaries.summary("child", "t").unwrap().operations, 2);
     }
 }

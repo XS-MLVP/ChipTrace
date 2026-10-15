@@ -207,6 +207,7 @@ jobs:
           CHIPTRACE_BUYER_PROTOCOL_REPORT: ${{ runner.temp }}/native-buyer-protocol-ci.json
           CHIPTRACE_INTERRUPTION_REPORT: ${{ runner.temp }}/native-interruption-ci.json
           CHIPTRACE_COMPACTION_REPORT: ${{ runner.temp }}/native-compaction-ci.json
+          CHIPTRACE_AUTO_COMPACTION_REPORT: ${{ runner.temp }}/native-auto-compaction-ci.json
         run: |
           set -euo pipefail
           if make protocol-collection-test 2>&1 | tee "$RUNNER_TEMP/native-protocol-ci.tap"; then
@@ -242,6 +243,7 @@ jobs:
             ${{ runner.temp }}/native-buyer-protocol-ci.json
             ${{ runner.temp }}/native-interruption-ci.json
             ${{ runner.temp }}/native-compaction-ci.json
+            ${{ runner.temp }}/native-auto-compaction-ci.json
             ${{ runner.temp }}/native-protocol-ci.tap
 
   rust:

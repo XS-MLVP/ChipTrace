@@ -210,6 +210,18 @@ Hook；它不把 OTLP trace 重写成第二套 Runtime 真相，缺一路时云�
 关联不依赖网关与生产者时钟一致。内联压缩的 PostCompact 不会关闭业务 Turn，缺少
 Pre/Post 或独立阶段证据仍保持 open；`SessionStart.source=compact` 也不新开 Session epoch。
 
+已声明的自动压缩也必须有完整生命周期，不能仅凭业务 Stop 和每轮四源存在就交付。
+同一原生 Session/Turn 下，Wire 以 `window_id`、阶段和 trigger 区分压缩操作；投影后的
+子会话使用保留的 `source_session_id`，不与父会话同名 Turn 混合。同窗口/阶段
+的 HTTP 重试不增加操作数。自动压缩只接受明确的 `pre_turn`、`mid_turn`、`post_turn`，
+Wire 窗口与 Capture 一致；同一 trigger 的 PreCompact/成功 PostCompact 数量必须与
+操作数相等，Hook 身份、合法时间及来源端交替顺序都须成立。Hook 不携带窗口 ID，
+因此这里只核对同一 Turn 的完整性，不按网关时间猜测某条请求对应哪个 Hook。
+Runtime 根保留实际压缩 Hook 引用和 `extensions.compaction` 操作/Hook 数量及完整性。
+自动 PostCompact 不能代替业务终态；压缩证据缺失或矛盾时，业务终态计数保留，已闭合
+Turn 标为 `state_conflict`，Session、根和 Runtime 的完整交付均拒绝。旧产物需要从 Raw
+重新检查，不会因原有 ready 标志而自动获得这项新增完整性证明。
+
 原生 OTLP 不要求重复附带所有身份属性。Turn 可通过原始 Wire 中的 W3C Trace Context、
 精确 Span/parentSpan 和原生 Turn ID 关联；同一 Trace 包含多个 Turn 时，必须有足够的
 Span 或显式身份消歧。全量快照中发现的身份歧义在 Session 选择后仍保留，不能因为其他

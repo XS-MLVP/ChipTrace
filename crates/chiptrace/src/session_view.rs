@@ -430,9 +430,10 @@ pub(crate) fn summarize_session_with_scopes(
             event,
             "turn_end" | "turn_stop" | "turn_interrupt" | "turn_aborted"
         ) || compaction.is_terminal(capture);
+        let compaction_hook = matches!(event, "compaction_start" | "compaction_end");
         model_interactions += u64::from(is_wire);
         tool_execution_records += u64::from(is_tool);
-        if !(is_wire || is_tool || is_start || is_terminal) {
+        if !(is_wire || is_tool || is_start || is_terminal || compaction_hook) {
             continue;
         }
         let native_turn_id = string(capture, "/traceContext/turn_id")
@@ -565,6 +566,10 @@ pub(crate) fn summarize_session_with_scopes(
         }
     }
     for (key, turn) in &mut turns {
+        // Preserve the actual business terminal count. Missing/contradictory
+        // compaction lifecycle evidence cannot turn that observation into a
+        // complete Turn, nor can PostCompact substitute for a missing Stop.
+        turn.state_conflict |= turn.terminal_events > 0 && !compaction.is_complete(&key.0, &key.1);
         turn.state_conflict |= terminal_statuses
             .get(key)
             .is_some_and(|statuses| statuses.len() > 1);
