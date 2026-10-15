@@ -83,6 +83,15 @@ Wire 比对，不能在 Lite 请求明确禁用并行时发送并行调用来宣
 相同的 Session 检查结果和原始 Segment 哈希。工作流保留 `native-protocol-ci.tap` 和
 `chiptrace.native-protocol-ci.v1` 元数据报告，不上传 Raw 或对话正文。
 
+五场景还将各自的同一份 sealed Raw 分别经过 FS 和私有 MinIO S3 的平台 HTTP/SDK。
+S3 路径独立读取远端 Checkpoint、Manifest 和每个 Segment 对象，校验提交状态、原始
+字节/哈希及规范化分片路径，再完成磁盘恢复、完整 Turn/投影下载、重启和相同的导出
+准入。归档路径按协议规范化，不能直接与 Collector 的扁平目录路径比较。
+每份报告在 `platform_evidence.additional_storage_backends` 中保存 S3 结果及实际 MinIO
+二进制摘要；正向导出还保存实际下载的完整 Session JSONL 字节数/哈希，要求两后端及
+重启前后相同。CI 要求五份均有 S3 证据。服务仅监听私有回环端口，使用本次临时凭据和
+目录，不读取宿主云凭据。真实模型、真实 OSS 账号及租户授权仍需独立生产验收。
+
 图片验证比较实际 inline PNG 的完整字节数和 SHA-256，包括新进程 resume 后的请求以及
 Canonical 交互投影；不能只检查图片占位文字。五类工具的每次实际调用都须有唯一原生
 `codex.tool_result`、精确 Raw 引用、完整 Tool Schema 和 Canonical RuntimeSpan；其 Turn
@@ -160,6 +169,7 @@ GitHub 还核对构建前的源码摘要。仅同版本号、补丁文件名或�
 CHIPTRACE_PROTOCOL_MODE=patched_stock_cli \
 CHIPTRACE_PROTOCOL_SOURCE=/absolute/path/to/pinned-codex-checkout \
 CHIPTRACE_PROTOCOL_PRODUCER=/absolute/path/to/codex \
+CHIPTRACE_PROTOCOL_MINIO_BINARY=/absolute/path/to/minio \
 CHIPTRACE_PROTOCOL_REPORT=/private/path/native-protocol-ci.json \
 CHIPTRACE_BUYER_PROTOCOL_REPORT=/private/path/native-buyer-protocol-ci.json \
 CHIPTRACE_INTERRUPTION_REPORT=/private/path/native-interruption-ci.json \
@@ -167,6 +177,10 @@ CHIPTRACE_COMPACTION_REPORT=/private/path/native-compaction-ci.json \
 CHIPTRACE_AUTO_COMPACTION_REPORT=/private/path/native-auto-compaction-ci.json \
   make protocol-collection-test
 ```
+
+`CHIPTRACE_PROTOCOL_MINIO_BINARY` 缺省时只执行 FS 平台联测；CI 必须设置它，并核对
+五份报告的实际 S3 证据。CI 从固定 MinIO commit
+`07c3a429bfed433e49018cb0f78a52145d4bedeb` 以 Go 1.24.2 构建该私有服务。
 
 本地仍可显式选择 `patched_stock_debug_app_server` 并传入 `codex-app-server` 进行调试；
 该路径关闭插件启动任务，不能用它的通过代替完整 CLI 的启动边界验证。

@@ -53,9 +53,16 @@ MinIO 公共容器标签的远端拉取已返回 access denied；CI 因此从固
 全部报告均声明非真实模型、非未修改生产者和非生产验收。不能用检查阶段的 ready
 代替 Buyer 准入，也不能删除模型切换或部分交付负例来获得绿色 CI。
 
+每个场景用同一份新采集 Raw 分别完成 FS 和私有 MinIO S3 的平台联测；S3 端另经签名
+请求独立读取远端 Checkpoint、Manifest 及全部 Segment，逐字节数/哈希验证，再恢复到
+磁盘并核对相同 Turn、来源审计、投影与下载内容。每次创建独立端口、目录和临时凭据；
+全部五份报告都必须含实际 S3 证据，任一缺失使 CI 失败。MinIO 仍从上述固定源码构建，
+版本和构建日志随生产者报告保留。独立 6 MiB multipart/损坏拒绝回归继续执行。
+这补齐新采集到网络存储的协议路径，不代替目标 OSS 账号或线上租户验收。
+
 压缩用例从真实 `thread/compact/start` 采集 4 Native Turn、2 个 epoch、5 次模型请求，
 验证原始输入/摘要输出、失败工具结果、Pre/Post Hook、后续历史和跨进程恢复，并走正常
-HTTP/SDK 的 FS 归档、恢复、投影下载和重启复验。独立手动压缩只能以精确身份、明确
+HTTP/SDK 的 FS/S3 归档、恢复、投影下载和重启复验。独立手动压缩只能以精确身份、明确
 Wire 阶段和成对成功 Hook 闭合；内联压缩及缺 Hook 仍拒绝交付。该样本仅一种工具，
 `buyer_export_checked=false`，Buyer 准入继续由独立多工具正向用例负责。详见
 [生产就绪评估](production-readiness.md)与[原生 Turn 记录](native-turn-context.md)。

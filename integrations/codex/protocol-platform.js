@@ -1,7 +1,7 @@
 'use strict';
 
 // Consume newly collected native evidence through the normal HTTP/SDK path.
-// Run in an isolated child environment; this filesystem backend is not OSS
+// Run in an isolated child environment. FS/private MinIO are not real OSS
 // account acceptance, and the service token is not end-user tenant identity.
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
@@ -14,6 +14,7 @@ const { promisify, isDeepStrictEqual } = require('node:util');
 const { ChipTracePlugin } = require('../cloud-platform/plugin');
 const { createPlatformServer } = require('../cloud-platform/server');
 const { ChipTraceClient } = require('../cloud-platform/client');
+const { startS3Fixture } = require('../cloud-platform/s3-fixture');
 
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const run = promisify(execFile);
@@ -38,7 +39,45 @@ async function segments(root) {
   return files.sort((a, b) => a.name.localeCompare(b.name) || a.sha256.localeCompare(b.sha256));
 }
 
-async function verifyPlatform(root, binary, mode = 'partial') {
+async function verifyRemoteArchive(service, archive, input, reference) {
+  const read = async key => {
+    const response = await service.request(key);
+    assert.equal(response.status, 200, 'the committed native Raw object must exist on the private S3 service');
+    return response;
+  };
+  const checkpoint = await (await read(archive.checkpoint_key)).json();
+  const manifestBytes = Buffer.from(await (await read(archive.manifest_key)).arrayBuffer());
+  assert.equal(checkpoint.state, 'committed');
+  assert.equal(checkpoint.manifest_key, archive.manifest_key);
+  assert.equal(checkpoint.manifest_sha256, sha256(manifestBytes));
+  const manifest = JSON.parse(manifestBytes);
+  for (const value of [checkpoint, manifest]) {
+    assert.equal(value.archive_id, archive.archive_id);
+    assert.equal(value.completeness, 'complete');
+    assert.equal(value.total_bytes, archive.total_bytes);
+    assert.equal(value.total_records, archive.total_records);
+    assert.equal(value.segment_count, input.length);
+  }
+  // Raw archives normalize flat Collector paths into explicit shard paths.
+  // Compare canonical identities with the already verified FS archive, then
+  // independently compare and download the original Segment bytes from S3.
+  const identity = ({ shard, segment_id, source_path, object_key, bytes, records, sha256 }) =>
+    ({ shard, segment_id, source_path, object_key, bytes, records, sha256 });
+  assert.deepEqual(manifest.segments.map(identity), reference.segments.map(identity));
+  assert.deepEqual(manifest.segments.map(item => ({ name: path.basename(item.source_path), bytes: item.bytes, sha256: item.sha256 })),
+    input.map(({ name, bytes, sha256 }) => ({ name, bytes, sha256 })));
+  for (const item of manifest.segments) {
+    const hash = crypto.createHash('sha256');
+    let bytes = 0;
+    for await (const chunk of (await read(item.object_key)).body) { hash.update(chunk); bytes += chunk.length; }
+    assert.equal(bytes, item.bytes);
+    assert.equal(hash.digest('hex'), item.sha256, 'S3 must contain the actual native Raw bytes, not only local restored copies');
+  }
+  return { remote_checkpoint_verified: true, remote_segment_objects_verified: input.length,
+    remote_manifest_sha256: sha256(manifestBytes) };
+}
+
+async function verifyPlatform(root, binary, mode = 'partial', storage = { backend: 'fs' }) {
   assert.ok(['partial', 'model-switch', 'complete', 'compaction'].includes(mode), 'expected explicit native platform regression mode');
   const complete = mode !== 'partial';
   const accepted = mode === 'complete';
@@ -82,9 +121,12 @@ async function verifyPlatform(root, binary, mode = 'partial') {
     const requestedModels = new Set(usage.map(item => item.requested_model));
     if (complete) assert.equal(requestedModels.size, accepted ? 1 : 2);
   }
-  const options = { projectId: 'synthetic-native-protocol', root: path.join(root, 'platform'),
+  assert.ok(['fs', 's3'].includes(storage.backend));
+  const options = { projectId: 'synthetic-native-protocol', root: path.join(root, storage.backend === 'fs' ? 'platform' : 'platform-s3'),
     captureRoot, objectRoot: path.join(root, 'platform-objects'), binary,
-    prefix: 'datasets/native-protocol-ci', concurrency: 1 };
+    prefix: 'datasets/native-protocol-ci', concurrency: 1, backend: storage.backend,
+    ...(storage.backend === 's3' ? { endpoint: storage.service.endpoint, bucket: storage.service.bucket,
+      region: storage.service.region, engineEnv: storage.service.engineEnv } : {}) };
   const token = crypto.randomBytes(32).toString('hex');
   let app;
   const open = async () => {
@@ -151,6 +193,7 @@ async function verifyPlatform(root, binary, mode = 'partial') {
     return job;
   };
   let downloadRound = 0;
+  let buyerSessionEvidence;
   const verifyAcceptedExport = async client => {
     await idleReads();
     const job = await client.getJob('native-export');
@@ -172,9 +215,10 @@ async function verifyPlatform(root, binary, mode = 'partial') {
     assert.deepEqual(page.turns, expectedTurns);
     await idleReads();
     assert.ok(job.artifacts.length > 0);
-    const downloaded = path.join(root, `verified-buyer-download-${++downloadRound}`);
+    const downloaded = path.join(options.root, `verified-buyer-download-${++downloadRound}`);
     await fs.mkdir(downloaded);
     const deliveredSessions = [];
+    const sessionEvidence = [];
     for (const artifact of job.artifacts) {
       const denied = await fetch(`${client.baseUrl}/v1/jobs/native-export/packages/${encodeURIComponent(artifact.file)}`);
       assert.equal(denied.status, 401);
@@ -205,6 +249,7 @@ async function verifyPlatform(root, binary, mode = 'partial') {
       assert.equal(metadata.session_atomic, true);
       assert.equal(metadata.jsonl_bytes, jsonl.length);
       assert.equal(metadata.jsonl_sha256, sha256(jsonl));
+      sessionEvidence.push({ bytes: jsonl.length, sha256: sha256(jsonl) });
       const lines = new TextDecoder('utf-8', { fatal: true }).decode(jsonl).trim().split('\n');
       assert.equal(lines.length, metadata.records);
       deliveredSessions.push(...lines.map(line => JSON.parse(line)));
@@ -227,6 +272,8 @@ async function verifyPlatform(root, binary, mode = 'partial') {
           `download must retain complete tool result content for ${item.call_id} (payload omitted)`);
       }
     }
+    if (buyerSessionEvidence) assert.deepEqual(sessionEvidence, buyerSessionEvidence, 'restart must preserve all downloaded Buyer Session bytes');
+    buyerSessionEvidence = sessionEvidence;
     return job;
   };
   const verifyRejectedExport = async client => {
@@ -246,6 +293,8 @@ async function verifyPlatform(root, binary, mode = 'partial') {
     assert.equal(archive.result.completeness, 'complete', 'Raw byte completeness is distinct from model protocol completeness');
     assert.equal(archive.result.total_records, records);
     assert.equal(archive.result.total_bytes, input.reduce((total, item) => total + item.bytes, 0));
+    const remoteEvidence = storage.backend === 's3'
+      ? await verifyRemoteArchive(storage.service, archive.result, input, storage.referenceManifest) : {};
     const restored = await submit(client, { id: 'native-restore', kind: 'restore', archive_id: archiveId });
     assert.equal(restored.status, 'completed', restored.error?.message);
     assert.equal(restored.result.total_records, records);
@@ -269,7 +318,9 @@ async function verifyPlatform(root, binary, mode = 'partial') {
       await verifyView(client);
       assert.deepEqual(stable(await segments(path.join(captureRoot, 'segments'))), stable(input));
       assert.deepEqual(stable(await segments(path.join(options.root, 'snapshots', archiveId, 'segments'))), stable(input));
-      return { backend: 'fs', real_oss_account: false, production_acceptance_claimed: false,
+      return { backend: storage.backend, real_oss_account: false, production_acceptance_claimed: false,
+        ...remoteEvidence,
+        archive_id: archiveId, session_id: sessionId,
         archive_restore_verified: true, raw_bytes: archive.result.total_bytes, raw_records: records,
         native_turns: expectedTurns.length, model_interactions: wire.length,
         all_projection_parts_verified: true, authenticated_downloads_verified: true,
@@ -305,14 +356,16 @@ async function verifyPlatform(root, binary, mode = 'partial') {
     assert.deepEqual(await fs.readFile(exportFile), exportBytes);
     assert.deepEqual(stable(await segments(path.join(captureRoot, 'segments'))), stable(input));
     assert.deepEqual(stable(await segments(path.join(options.root, 'snapshots', archiveId, 'segments'))), stable(input));
-    return { backend: 'fs', real_oss_account: false, production_acceptance_claimed: false,
+    return { backend: storage.backend, real_oss_account: false, production_acceptance_claimed: false,
+      ...remoteEvidence,
+      archive_id: archiveId, session_id: sessionId,
       usage_source: complete ? 'synthetic_endpoint_observations' : 'synthetic_raw_fixture',
       archive_restore_verified: true, raw_bytes: archive.result.total_bytes, raw_records: records,
       native_turns: expectedTurns.length, model_interactions: wire.length,
       all_projection_parts_verified: true, authenticated_downloads_verified: true,
       ...(accepted ? { accepted_export_verified: true, buyer_score: exported.result.score,
         effective_turns: exported.result.effective_turns, buyer_packages: exported.artifacts.length,
-        downloaded_session_content_verified: true }
+        downloaded_session_content_verified: true, downloaded_session_jsonl: buyerSessionEvidence }
         : complete ? { mixed_model_export_exit_code: exported.error.exit_code, mixed_model_export_rejected: true,
           failure_reason_counts: { model: 1 } }
         : { partial_export_exit_code: exported.error.exit_code, partial_export_rejected: true,
@@ -322,15 +375,33 @@ async function verifyPlatform(root, binary, mode = 'partial') {
   } finally { if (app) await app.close(); }
 }
 
+async function verifyPlatforms(root, binary, mode) {
+  const primary = await verifyPlatform(root, binary, mode);
+  const minio = process.env.CHIPTRACE_PROTOCOL_MINIO_BINARY;
+  if (!minio) return primary;
+  const service = await startS3Fixture(minio, path.join(root, 's3-service'));
+  try {
+    const referenceManifest = JSON.parse(await fs.readFile(path.join(root, 'platform', 'snapshots', primary.archive_id, 'RAW_MANIFEST.json'), 'utf8'));
+    const additional = await verifyPlatform(root, binary, mode, { backend: 's3', service, referenceManifest });
+    for (const [key, value] of Object.entries(primary)) {
+      if (key !== 'backend') assert.deepEqual(additional[key], value, `network storage must preserve the same native evidence: ${key}`);
+    }
+    assert.equal(additional.remote_checkpoint_verified, true);
+    assert.ok(additional.remote_segment_objects_verified > 0);
+    primary.additional_storage_backends = [{ ...additional, storage_service: service.evidence }];
+    return primary;
+  } finally { await service.close(); }
+}
+
 if (require.main === module) {
   const [root, binary, mode] = process.argv.slice(2);
   if (!root || !path.isAbsolute(root) || !binary || !path.isAbsolute(binary)) {
     throw new Error('expected absolute isolated fixture root and ChipTrace binary');
   }
-  verifyPlatform(root, binary, mode).then(value => console.log(JSON.stringify(value))).catch(error => {
+  verifyPlatforms(root, binary, mode).then(value => console.log(JSON.stringify(value))).catch(error => {
     console.error(error.stack);
     process.exitCode = 1;
   });
 }
 
-module.exports = { verifyPlatform };
+module.exports = { verifyPlatform, verifyPlatforms };

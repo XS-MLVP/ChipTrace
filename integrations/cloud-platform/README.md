@@ -140,6 +140,14 @@ The repository CI exercises the S3 protocol against an isolated MinIO service;
 real Alibaba Cloud OSS credentials and regional endpoint behavior must be
 verified in the deployment account before production enablement.
 
+The native producer CI also sends each of its five newly collected Raw samples
+through both the FS and private MinIO S3 platform paths. It independently reads
+the remote checkpoint, manifest and every Segment object, verifies their hashes,
+then checks disk restore, complete Turn/projection downloads, restart recovery
+and the same Buyer acceptance or refusal. The reports retain both backend
+results and the actual private MinIO binary hash. Model data is synthetic, the
+producer is patched, and this does not qualify a real OSS account or tenant.
+
 CI also exercises the actual OpenDAL OSS adapter against a signed HTTP
 protocol fixture, including checksum failures and single-pass disk downloads.
 That fixture is a protocol regression test, not Alibaba Cloud acceptance.

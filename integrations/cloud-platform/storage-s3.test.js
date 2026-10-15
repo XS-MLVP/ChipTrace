@@ -8,28 +8,15 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
+const { signedS3Request } = require('./s3-fixture');
 
 const run = promisify(execFile);
 const binary = process.env.CHIPTRACE_BIN || path.resolve(__dirname, '../../target/debug/chiptrace');
-const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
-const hmac = (key, text) => crypto.createHmac('sha256', key).update(text).digest();
 
 // Sign fixture setup/corruption requests without installing another S3 SDK.
 async function put(endpoint, resource, bytes = Buffer.alloc(0)) {
-  const url = new URL(resource, endpoint);
-  const timestamp = new Date().toISOString().replace(/[-:]|\.\d{3}/g, '');
-  const day = timestamp.slice(0, 8);
-  const digest = sha(bytes);
-  const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
-  const headers = `host:${url.host}\nx-amz-content-sha256:${digest}\nx-amz-date:${timestamp}\n`;
-  const canonical = `PUT\n${url.pathname}\n\n${headers}\n${signedHeaders}\n${digest}`;
-  const scope = `${day}/us-east-1/s3/aws4_request`;
-  const key = hmac(hmac(hmac(hmac(`AWS4${process.env.AWS_SECRET_ACCESS_KEY}`, day), 'us-east-1'), 's3'), 'aws4_request');
-  const signature = hmac(key, `AWS4-HMAC-SHA256\n${timestamp}\n${scope}\n${sha(canonical)}`).toString('hex');
-  return fetch(url, { method: 'PUT', body: bytes, signal: AbortSignal.timeout(10000), headers: {
-    'x-amz-content-sha256': digest, 'x-amz-date': timestamp,
-    authorization: `AWS4-HMAC-SHA256 Credential=${process.env.AWS_ACCESS_KEY_ID}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
-  } });
+  return signedS3Request(endpoint, resource, { method: 'PUT', body: bytes,
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY });
 }
 
 test('MinIO S3 multipart archive, idempotency, disk restore and corruption rejection', { timeout: 60000 }, async t => {
