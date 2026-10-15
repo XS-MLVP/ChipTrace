@@ -231,10 +231,10 @@ async function protocolFixture(t, prefix) {
     collectorArgs, relayArgs, collector, relay, outbox, launch,
     assertHealthy() { if (failure) throw failure; },
     passed() { passed = true; },
-    async verifyPlatform() {
-      const result = await run(process.execPath, [path.join(__dirname, 'protocol-platform.js'), root, path.resolve(chiptrace)],
+    async verifyPlatform(mode = 'partial') {
+      const result = await run(process.execPath, [path.join(__dirname, 'protocol-platform.js'), root, path.resolve(chiptrace), mode],
         { env: { PATH: process.env.PATH, HOME: root, TMPDIR: root, LANG: 'C.UTF-8',
-          TOKIO_WORKER_THREADS: '2', RAYON_NUM_THREADS: '2' }, timeout: 90000, maxBuffer: 1024 * 1024 });
+          TOKIO_WORKER_THREADS: '2', RAYON_NUM_THREADS: '2' }, timeout: 120000, maxBuffer: 1024 * 1024 });
       return JSON.parse(result.stdout);
     },
     async serve(handler) {

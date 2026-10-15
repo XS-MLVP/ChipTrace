@@ -24,7 +24,7 @@ function sse(id, items, streamedItems = items) {
     .map(value => `event: ${value.type}\ndata: ${JSON.stringify(value)}\n\n`).join('');
 }
 
-function deterministicModel(image) {
+function deterministicModel(image, switchModel) {
   let phase = 'plan-start';
   let polls = 0;
   let processId;
@@ -69,9 +69,10 @@ function deterministicModel(image) {
     get finished() { return phase === 'done'; },
     respond(body, turnId) {
       const secondTurn = ['resumed', 'plan-complete', 'final'].includes(phase);
-      assert.equal(body.model, secondTurn ? 'gpt-6-astra' : 'gpt-5.6-sol');
-      assert.equal(body.parallel_tool_calls, secondTurn,
-        'actual requests must distinguish default Lite and explicit parallel Responses modes');
+      const upstreamModel = !switchModel || secondTurn ? 'gpt-6-astra' : 'gpt-5.6-sol';
+      assert.equal(body.model, upstreamModel);
+      assert.equal(body.parallel_tool_calls, !switchModel || secondTurn,
+        'actual requests must retain the selected Lite or parallel Responses profile');
       assert.equal(body.stream, true);
       if (phase === 'resumed' && !retried) {
         retried = true;
@@ -80,7 +81,7 @@ function deterministicModel(image) {
         observations.push({ turn_id: turnId, model: body.model, parallel_tool_calls: body.parallel_tool_calls,
           response_id: null, http_status: 503, error_response: error, output_items: [], tool_calls: [],
           input_sha256: sha256(JSON.stringify(body.input)), input_items: body.input.length });
-        return { status: 503, content_type: 'application/json', body: JSON.stringify(error) };
+        return { status: 503, content_type: 'application/json', upstream_model: upstreamModel, body: JSON.stringify(error) };
       }
       let item;
       const exec = (callId, cmd, yieldTime = 250) => tool(callId, 'exec_command',
@@ -189,12 +190,13 @@ function deterministicModel(image) {
         response_id: responseId, http_status: 200,
         output_items: items, streamed_output_items: streamedItems.length, tool_calls: tools,
         input_sha256: sha256(JSON.stringify(body.input)), input_items: body.input.length });
-      return { status: 200, content_type: 'text/event-stream', body: sse(responseId, items, streamedItems) };
+      return { status: 200, content_type: 'text/event-stream', upstream_model: upstreamModel,
+        body: sse(responseId, items, streamedItems) };
     },
   };
 }
 
-async function collectProtocol(t) {
+async function collectProtocol(t, switchModel) {
     const fixture = await protocolFixture(t, 'chiptrace-protocol-');
     const { root, token, source, producer, patchSet, capture, collectorUrl, relayUrl,
       collectorArgs, relayArgs, outbox, launch } = fixture;
@@ -203,11 +205,12 @@ async function collectProtocol(t) {
     const imageSource = path.resolve(__dirname, '../../', imagePath);
     const image = { path: imagePath, bytes: (await fs.stat(imageSource)).size,
       sha256: await fileDigest(imageSource) };
-    const model = deterministicModel(image);
+    const model = deterministicModel(image, switchModel);
     const wire = [];
+    const syntheticUsage = [];
     const catalog = JSON.parse(await fs.readFile(path.join(__dirname, 'managed-models.json'), 'utf8'));
-    // Keep the default Lite profile in Turn 1. Only this isolated catalog opts
-    // the second model into ordinary Responses for real parallel calls.
+    // Keep the default Lite profile for the switch regression. The single-model
+    // Buyer regression uses ordinary Responses in both Turns, with real tools.
     catalog.models.find(model => model.slug === 'gpt-6-astra').use_responses_lite = false;
     const endpoint = await fixture.serve(async (req, res) => {
         const chunks = [];
@@ -248,7 +251,7 @@ async function collectProtocol(t) {
           fieldEvidenceConflicts: context.conflicts, traceContextErrors: context.errors });
         await transaction.appendRequest(request);
         // Split in the middle of UTF-8 and SSE tokens as well as normal lines.
-        const responseHeaders = { 'content-type': reply.content_type,
+        const responseHeaders = { 'content-type': reply.content_type, 'x-request-id': `request-${crypto.randomUUID()}`,
           ...(reply.status === 503 ? { 'retry-after-ms': '1' } : {}) };
         res.writeHead(reply.status, responseHeaders);
         for (let offset = 0; offset < response.length; offset += 37) {
@@ -268,6 +271,11 @@ async function collectProtocol(t) {
           finishedAt: new Date().toISOString(), upstreamResponseCompleted: true,
           clientRequestAborted: req.aborted, clientResponseClosedBeforeFinish: res.destroyed && !res.writableFinished,
           clientResponseFinished: res.writableFinished, responseBytesForwarded: response.length });
+        // Independent endpoint observations, not identities reconstructed from
+        // Collector Raw. OpenAI is a synthetic route label, never a real claim.
+        syntheticUsage.push({ request_id: responseHeaders['x-request-id'],
+          requested_model: JSON.parse(request).model, upstream_model: reply.upstream_model,
+          provider: 'OpenAI', input_tokens: 0, output_tokens: 0 });
         wire.push({ capture_id: captureId, session_id: context.trace.session_id, turn_id: context.trace.turn_id,
           request_sha256: sha256(request), response_sha256: sha256(response) });
     });
@@ -276,8 +284,9 @@ async function collectProtocol(t) {
     await fs.copyFile(imageSource, path.join(root, image.path));
     const connect = await fixture.configure(endpoint, catalog, true);
     const first = await connect();
+    const firstModel = switchModel ? 'gpt-5.6-sol' : 'gpt-6-astra';
     const started = await first.client.request('thread/start', {
-      model: 'gpt-5.6-sol', cwd: root, approvalPolicy: 'never', sandbox: 'read-only', ephemeral: false });
+      model: firstModel, cwd: root, approvalPolicy: 'never', sandbox: 'read-only', ephemeral: false });
     const session = started.thread.id;
     const begin = async (client, prompt, model) => {
       const result = await client.request('turn/start', { threadId: session,
@@ -286,7 +295,7 @@ async function collectProtocol(t) {
       fixture.assertHealthy();
       return result.turn.id;
     };
-    const turns = [await begin(first.client, 'FIRST_TURN_REQUEST', 'gpt-5.6-sol')];
+    const turns = [await begin(first.client, 'FIRST_TURN_REQUEST', firstModel)];
     assert.deepEqual(await stop(first.handle, true), { code: 0, signal: null }, first.handle.stderr);
     const second = await connect();
     const resumed = await second.client.request('thread/resume', { threadId: session,
@@ -308,6 +317,9 @@ async function collectProtocol(t) {
     assert.equal(state.pending + state.processing + state.openTransactions + state.failed, 0);
     assert.equal(state.durable, model.observations.length);
     assert.equal(wire.length, model.observations.length);
+    assert.equal(syntheticUsage.length, wire.length);
+    await fs.writeFile(path.join(root, 'synthetic-usage.jsonl'),
+      syntheticUsage.map(item => JSON.stringify(item)).join('\n') + '\n', { flag: 'wx', mode: 0o600 });
     assert.ok(wire.every(record => record.session_id === session && turns.includes(record.turn_id)));
     const delivered = await health(relayUrl, relay, value => value.pending === 0 && value.inflight === 0);
     assert.equal(delivered.conservation_ok, true);
@@ -514,9 +526,11 @@ async function collectProtocol(t) {
     const stable = value => ({ ...value, projection: { ...value.projection, created_at_utc: null } });
     assert.deepEqual(stable(await inspect()), stable(inspection), 'restart must preserve the complete Session view');
     for (const record of rawDigests) assert.equal(await fileDigest(path.join(capture, 'segments', record.file)), record.sha256);
+    const platformEvidence = await fixture.verifyPlatform(switchModel ? 'model-switch' : 'complete');
     const report = { schema_version: 'chiptrace.native-protocol-ci.v1', ok: true,
       checked_at: new Date().toISOString(), real_upstream: false, unmodified_stock: false,
       production_acceptance_claimed: false, model_mode: 'local_deterministic_responses',
+      model_switch: switchModel,
       producer_mode: 'patched_stock_debug_app_server', client_version: version,
       producer_source: source, patch_set: patchSet, producer_binary_sha256: await fileDigest(producer),
       native_turns: 2, session_epochs: 2, model_interactions: wire.length,
@@ -535,11 +549,13 @@ async function collectProtocol(t) {
       retry_evidence: { failed_http_status: retry.http_status, successful_http_status: recovery.http_status,
         same_native_turn: true, input_history_preserved: true, both_attempts_preserved: true },
       source_coverage: inspection.source_coverage, scenario_evidence: inspection.scenario_evidence,
-      source_audit: audit, collector_raw: rawDigests, restart_verified: true };
+      source_audit: audit, collector_raw: rawDigests, restart_verified: true,
+      platform_evidence: platformEvidence };
     // The synthetic report must never satisfy the real-upstream production gate.
     assert.throws(() => verifyNativeCanaryReport(report, audit), /real_upstream/);
-    if (process.env.CHIPTRACE_PROTOCOL_REPORT) {
-      await fs.writeFile(process.env.CHIPTRACE_PROTOCOL_REPORT, JSON.stringify(report, null, 2) + '\n', { mode: 0o600 });
+    const reportFile = process.env[switchModel ? 'CHIPTRACE_PROTOCOL_REPORT' : 'CHIPTRACE_BUYER_PROTOCOL_REPORT'];
+    if (reportFile) {
+      await fs.writeFile(reportFile, JSON.stringify(report, null, 2) + '\n', { mode: 0o600 });
     }
     t.diagnostic(JSON.stringify({ native_turns: 2, model_interactions: wire.length,
       tool_execution_records: report.tool_execution_records, restart_verified: true,
@@ -547,10 +563,13 @@ async function collectProtocol(t) {
     fixture.passed();
 }
 
-test('native collection preserves complete multi-output Turns through model switch, parallel tools, HTTP retry and process resume',
-  { timeout: 180000 }, async t => {
+for (const switchModel of [true, false]) {
+  test(switchModel
+    ? 'native collection preserves model switching and rejects mixed-model Buyer export'
+    : 'native collection delivers a single-model multi-output Session through Buyer download and restart',
+  { timeout: 240000 }, async t => {
     try {
-      await collectProtocol(t);
+      await collectProtocol(t, switchModel);
     } catch (error) {
       if (process.env.GITHUB_ACTIONS === 'true') {
         // Only the isolated synthetic experiment runs here. Keep actionable
@@ -562,3 +581,4 @@ test('native collection preserves complete multi-output Turns through model swit
       throw error;
     }
   });
+}

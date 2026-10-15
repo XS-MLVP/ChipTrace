@@ -32,6 +32,14 @@ Actions run，不能用本地通过或旧 main 的绿色结果代替。
 MinIO 公共容器标签的远端拉取已返回 access denied；CI 因此从固定的公开源码提交
 `07c3a429bfed433e49018cb0f78a52145d4bedeb` 构建隔离服务，避免依赖本机镜像缓存。
 
+固定生产者上下文作业中的 `make protocol-collection-test` 另执行三项新采集联测：
+模型切换完整保存但拒绝混合模型采购、同模型双轮成功导出并独立检查下载包、取消/
+断流保留部分证据并拒绝采购。`producer-context-report` 中分别保留
+`native-protocol-ci.json`、`native-buyer-protocol-ci.json`、`native-interruption-ci.json`
+及实际 TAP。正向 usage 来自合成 endpoint 的逐请求观察，按真实响应 request ID 关联；
+全部报告均声明非真实模型、非未修改生产者和非生产验收。不能用检查阶段的 ready
+代替 Buyer 准入，也不能删除模型切换或部分交付负例来获得绿色 CI。
+
 ## 迭代与发布流程
 
 1. 在修复分支提交源码、Schema 和 API 契约；完成 `make cloud-test`，以及隔离 S3 回归。

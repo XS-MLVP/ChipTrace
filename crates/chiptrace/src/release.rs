@@ -324,9 +324,10 @@ pub fn build_release(config: ReleaseConfig) -> Result<ReleaseManifest> {
     verify_release(&staging, false)?;
     if config.require_pass && manifest.validation_status != "pass" {
         bail!(
-            "Release failed closed: eligible_sessions={}, parse_failures={}, conserved={conserved}",
+            "Release failed closed: eligible_sessions={}, parse_failures={}, conserved={conserved}, failure_reasons={}",
             manifest.counts.eligible_sessions,
-            manifest.counts.parse_failures
+            manifest.counts.parse_failures,
+            serde_json::to_string(&manifest.failure_reason_counts)?
         );
     }
     if output.exists() {
@@ -1551,6 +1552,38 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("Release failed closed"));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn strict_release_reports_gate_counts_without_session_content() {
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("sessions.jsonl");
+        let output = temporary.path().join("release");
+        let mut session = eligible_session("PRIVATE_SESSION_SENTINEL");
+        session["meta"]["model_evidence"]["consistent"] = json!(false);
+        fs::write(&input, format!("{session}\n")).unwrap();
+        let error = build_release(ReleaseConfig {
+            inputs: vec![input],
+            output: output.clone(),
+            release_id: "gate-diagnostics".to_owned(),
+            profile: Profile::BuyerV7,
+            minimum_score: 90.0,
+            target_part_bytes: 1024 * 1024,
+            dedup_partitions: 1,
+            zstd_level: 1,
+            workers: 1,
+            replace: false,
+            require_pass: true,
+        })
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("failure_reasons={\"model\":1}"),
+            "{message}"
+        );
+        assert!(!message.contains("PRIVATE_SESSION_SENTINEL"));
+        assert!(message.len() < 512);
         assert!(!output.exists());
     }
 

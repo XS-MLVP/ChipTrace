@@ -1,14 +1,15 @@
 # 生产就绪评估
 
-评估日期：2026-10-16。最新线上只读快照为 03:15（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-16。最新线上只读快照为 03:50（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-03:14 的本机回环只读快照中，18084、3011、3012 均返回 200，Collector/Relay 仍为 `fe9fcf9`；
-Relay 累计投递 1,100,490，pending/inflight/failed 均为 0，计数守恒。
+03:50 的本机回环只读快照中，18084、3011、3012 均返回 200，Collector/Relay 仍为 `fe9fcf9`；
+Relay 累计投递 1,103,138，pending=0、inflight=1、failed=0，计数守恒。
 这只是瞬时队列状态，不构成持续 SLO 或完整 Session 的证明。Wire 仍只有 1 条且已约
-16.5 小时未更新，覆盖为
-`degraded`；18086 连接拒绝，runtime gate 实际因 `stale_sources=wire` 退出 1。
+17.1 小时未更新，覆盖为
+`degraded`；18086 连接拒绝。两次 runtime gate 均真实退出 1，首个失败项分别为瞬时
+inflight 与 pending 非零；这不改变 Relay 独立报告 `stale_sources=["wire"]` 的事实。
 模型探针最后可用时间仍为 10 月 8 日，网关 trace exporter 未启用。
 03:15 Collector 累计保存 1,100,521 条 Capture；741 个 sealed Segment 共 87,431,090,167 bytes
 保存在共享 NFS；此观测不证明已提交目标 OSS。当前状态应区分为传输进程存活、完整
@@ -25,6 +26,29 @@ FS 后端的隔离回归，尚未部署，不能代替真实 OSS、终端租户�
 38 类缺失或矛盾历史状态负例修复后通过；最终 `cloud-test` 实际退出 0，包含 306 个
 Rust 库测试、1 个 CLI 测试和 280 个 Node 测试。正常与取消平台联测另行新执行，
 2/2 通过；三项默认忽略的 RSS 回归仍由独立 CI 门禁执行。
+
+## 原生采集到采购下载的联测
+
+新增正向平台联测首先真实失败：同一份正常采集 Raw 的 Session 完整性检查通过、评分
+95，但 Buyer 拒绝，唯一失败项为 `model`。该 Session 在 resume 后从 `gpt-5.6-sol`
+切换到 `gpt-6-astra`，不符合当前单个 Buyer Session 的有效模型一致要求。原始数据和
+失败记录保留；没有放宽门禁、重写模型身份或切分原始 Session。严格 Release 现在返回
+不含正文的失败门禁计数，同份派生数据重放仍真实退出 1，Raw SHA-256 不变。
+
+新执行三项原生协议回归实际全部通过：模型切换保留并按 `model` 拒绝导出；同模型双轮
+采集完成真实 HTTP/SDK 的 FS 归档、恢复、检查、投影下载、Buyer 导出与重启复验；取消/
+断流仍保留部分证据并拒绝采购交付。正向 Session 有 2 Native Turn、2 个 epoch、12 次
+HTTP 尝试、10 条真实工具结果、5 类工具，score=100、采购有效轮次=12，生成 1 个包。
+下载端独立读取 tar 条目，复核 UTF-8、包内字节/SHA、完整 Session、每次请求引用、两轮
+身份和全部实际工具结果正文；未鉴权下载返回 401。usage 来自隔离合成 endpoint 的逐次
+独立观察，以真实响应 request ID 关联，不能视为真实 OpenAI 身份或模型执行证据。
+
+这些测试使用固定的带补丁 App Server、合成模型与 FS 后端，CI 新增独立正向报告。
+它们补上从新采集到实际下载内容的实现证据；线上升级、未修改客户端、真实 OSS 账号、
+租户授权及生产容量仍未验收。
+本轮完整 `cloud-test` 实际退出 0：307 个 Rust 库测试、1 个 CLI 测试、280 个 Node
+测试通过，fmt/Clippy 通过；上述三项新采集联测另行全部通过。三项默认忽略的 RSS
+测试继续由独立 CI 门禁负责，不能用默认套件的成功代替其实际执行。
 
 ## HTTP 重试与全量交互回归
 
@@ -176,14 +200,14 @@ parts，2 Turn、8 模型交互、6 工具记录不变，Raw SHA-256 一致。
 | --- | --- | --- |
 | 18084、3011、3012 | HTTP 200 | 入口与采集进程存活 |
 | Collector/Relay | revision `fe9fcf924b226099202cb770b7cf0da29e0c2310` | 运行版本已固定；仓库新增修复尚未部署 |
-| 投递 | 03:14 已投递 1,100,490 条，pending/inflight/failed 均为 0，计数守恒 | 该快照队列排空；不是持续 SLO 或完整 Session 数 |
+| 投递 | 03:50 已投递 1,103,138 条，pending=0、inflight=1、failed=0，计数守恒 | 瞬时传输状态；不是持续 SLO 或完整 Session 数 |
 | Collector 磁盘 | 03:15 有 741 个 sealed Segment，87,431,090,167 bytes | 云端共享 NFS 上的 WAL 持续保存；不能证明 OSS 已提交 |
 | Wire | 新进程内仅 1 条；活动 WAL 中为无原生 Session/Turn 的 HTTP 403 | 无真实成功 Turn Wire 的证据 |
-| 来源新鲜度 | 03:14 OTLP/Hook 有流量，Wire 约 16.5 小时未更新；runtime gate 仍实际因 Wire 过期退出 1 | 当前采集覆盖降级 |
+| 来源新鲜度 | 03:50 OTLP/Hook 有流量，Wire 约 17.1 小时未更新；覆盖 `degraded`；runtime gate 非零 | 当前采集覆盖降级 |
 | 历史失败 | 293 个文件，267,219,223 bytes | 保留失败取证，不能删除换取健康状态 |
 | 平台 18086 | 无法连接 | 当前无法交接在线管理、导出入口 |
-| 部署隔离 | Relay 要求 ingest token；Collector/Relay 绑定 loopback；两容器有重启策略 | 有内部入口保护；两容器尚无内存/CPU 上限或只读根文件系统 |
-| GitHub CI | 已核验基线 `06086cd`：[run 38788773961](https://github.com/XS-MLVP/ChipTrace/actions/runs/38788773961) 已确认成功；5/5 作业、16 份正大小报告元数据均未过期、带 SHA-256 | 包含完整终态输出保真、图片、五类真实工具、双轮 resume、HTTP 重试、模型切换、实际并行、原生取消与断连继续；使用带补丁生产者和合成模型，未下载报告正文；本轮平台修复仍需独立提交后核验 CI |
+| 部署隔离 | 本轮只读复查：两容器均为旧镜像、绑定 loopback，有 `unless-stopped` 重启策略，CPU/内存/PID 无上限，根文件系统可写 | 有内部入口保护；尚缺资源配额与只读隔离 |
+| GitHub CI | 已核验基线 `3ebb0c4`：[run 38794336670](https://github.com/XS-MLVP/ChipTrace/actions/runs/38794336670) 已确认成功；5/5 作业、16 份有效报告元数据 | 包括历史交付状态复核、原生取消与断连的平台回归；使用带补丁生产者和合成模型，未下载报告正文；本轮正向采购联测修改仍需独立提交后核验 CI |
 | GitHub 集成 | 远端 main 仍为 `514d4cf`，公共分支 API 返回 `protected=false`；维护分支修复尚未合并 | 需设置评审和必需检查约束、完成同 SHA 验证及受控发布；分支 CI 不等于部署 |
 
 11:26 复查时三个既有服务仍返回 HTTP 200，Relay 已投递 1,036,522 条，pending 为 1、

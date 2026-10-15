@@ -303,6 +303,12 @@ Buyer acceptance、语义证据和 Token。正式准入至少要求：
 - Session 明确闭合，模型/Provider 路由一致；
 - `delivery_ready=true`、score 不低于 90、全部 hard gate 通过。
 
+当前 Buyer v7 的一个交付 Session 要求有效上游模型一致；不同请求别名只有在精确
+网关证据指向同一有效模型时才可接受。原生 Session 中的真实模型切换、失败尝试和
+resume 仍完整保存并提供 Canonical/Turn 投影，但混合有效模型不能直接成为合格采购包，
+也不能为通过评分而拆改原始 Session 或补写模型身份。模型字符串推导的 Provider
+不构成身份观察；需要逐请求的上游/运行时观察或精确关联的网关路由证据。
+
 结构分数不证明任务语义正确。测试、构建、搜索引用、用户修正和最终验收作为独立
 semantic reward 证据保留。
 
