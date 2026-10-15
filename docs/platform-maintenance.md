@@ -121,6 +121,26 @@ CI 另将完整 TAP 上传为 `producer-ci-regressions-report`。收到 runner �
 setup-node 7.1.0、upload-artifact 7.0.2 固定到 SHA；三者原生使用 Node 24。测试运行时
 继续显式选择 Node 22，关闭 setup-node 新的自动包管理器缓存，保留原来的安装和报告路径。
 
+生产者作业的真实远端观测如下。每轮均执行补丁检查、锁文件检查、全部生产者回归和 CLI
+构建；表中成功仅指该作业，整轮 CI 仍需按对应 SHA 独立检查。
+
+| 配置 | 提交 / Actions run | 生产者作业耗时 |
+| --- | --- | --- |
+| 原先仅缓存依赖 | `eb70405` / [38683383719](https://github.com/XS-MLVP/ChipTrace/actions/runs/38683383719) | 9 分 51 秒 |
+| 工作区缓存首次填充 | `fd5fd0f` / [38684659151](https://github.com/XS-MLVP/ChipTrace/actions/runs/38684659151) | 19 分 44 秒 |
+| 工作区缓存实际命中 | `dd3de61` / [38686561355](https://github.com/XS-MLVP/ChipTrace/actions/runs/38686561355) | 2 分 04 秒 |
+
+命中轮的步骤实际返回 `exact cache hit: true`，随后生产者测试和 CLI 构建分别执行 7 秒和
+13 秒，均成功。新缓存为 2,562,094,057 bytes，源码身份与隔离 clean checkout 的完整
+哈希一致。源码变化仍需重新填充缓存，耗时会随 runner 负载变化。
+
+`dd3de61` 的 S3 作业在初始化阶段下载 `actions/setup-go@v6` 归档失败，尚未执行协议
+测试。只读 HEAD 复查确认 tag API 可用，但 v6 对应提交与稳定 v7.0.0 的 codeload
+归档均返回 HTTP 404。工作流改由 runner 预装 Go 的原生 `GOTOOLCHAIN=go1.24.2`
+机制选择工具链，构建前检查真实 `go env GOVERSION`；MinIO 源码仍固定同一 commit。
+工具链日志和完整构建日志另随 S3 报告保留。该路径必须由后续实际 CI 构建与 S3 测试
+验收，不能用原作业的初始化失败或本地 YAML 检查推断通过。
+
 宿主网关还须使用 `openCaptureHealthy` 门禁。独立部署 smoke：
 
 ```bash

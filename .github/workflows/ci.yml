@@ -363,6 +363,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: chiptrace-ci-secret
       AWS_EC2_METADATA_DISABLED: "true"
       CHIPTRACE_S3_ENDPOINT: http://127.0.0.1:9000
+      GOTOOLCHAIN: go1.24.2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable
@@ -379,13 +380,16 @@ jobs:
           repository: minio/minio
           ref: 07c3a429bfed433e49018cb0f78a52145d4bedeb
           path: .ci-minio-source
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: .ci-minio-source/go.mod
-          cache-dependency-path: .ci-minio-source/go.sum
+      - name: Select and verify the pinned Go toolchain using the runner's Go bootstrap
+        working-directory: .ci-minio-source
+        run: |
+          go version 2>&1 | tee "$RUNNER_TEMP/chiptrace-go-version.log"
+          test "$(go env GOVERSION)" = "go1.24.2"
       - name: Build isolated S3 test service
         working-directory: .ci-minio-source
-        run: CGO_ENABLED=0 go build -p 4 -o "$RUNNER_TEMP/chiptrace-minio" .
+        run: |
+          CGO_ENABLED=0 go build -p 4 -o "$RUNNER_TEMP/chiptrace-minio" . \
+            2>&1 | tee "$RUNNER_TEMP/chiptrace-minio-build.log"
       - name: Start isolated S3 service
         run: |
           MINIO_ROOT_USER=chiptrace-ci MINIO_ROOT_PASSWORD=chiptrace-ci-secret \
@@ -402,6 +406,8 @@ jobs:
           name: storage-s3-report
           path: |
             storage-s3.tap
+            ${{ runner.temp }}/chiptrace-go-version.log
+            ${{ runner.temp }}/chiptrace-minio-build.log
             ${{ runner.temp }}/chiptrace-minio.log
       - name: MinIO diagnostics
         if: failure()
