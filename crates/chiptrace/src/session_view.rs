@@ -1,6 +1,7 @@
 //! Native Session/Turn accounting, separate from Buyer-v7 effective rounds.
 
 use crate::lifecycle::LifecycleState;
+use crate::standalone_compaction::CompactionBoundaries;
 use crate::turn_identity::{
     ExactTurnIndex, SourceScope, session_attribute, turn_attribute, visit_otlp,
 };
@@ -395,6 +396,7 @@ pub(crate) fn summarize_session_with_scopes(
         index.observe_capture(capture)?;
     }
     let allowed_sessions = allowed_source_sessions(captures, session_id);
+    let compaction = CompactionBoundaries::from_captures(captures);
     let mut lifecycle = LifecycleState::new("stock_codex_hook");
     let mut turns: BTreeMap<(String, String), TurnView> = BTreeMap::new();
     let mut terminal_statuses: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
@@ -423,11 +425,11 @@ pub(crate) fn summarize_session_with_scopes(
         let event = string(capture, "/lifecycleEvent/type").unwrap_or("");
         let is_wire = kind == "api_snapshot";
         let is_tool = kind == "tool_execution";
-        let is_start = event == "turn_start";
+        let is_start = event == "turn_start" || compaction.is_start(capture);
         let is_terminal = matches!(
             event,
             "turn_end" | "turn_stop" | "turn_interrupt" | "turn_aborted"
-        );
+        ) || compaction.is_terminal(capture);
         model_interactions += u64::from(is_wire);
         tool_execution_records += u64::from(is_tool);
         if !(is_wire || is_tool || is_start || is_terminal) {

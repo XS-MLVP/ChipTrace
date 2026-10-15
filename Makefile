@@ -31,7 +31,7 @@ managed-route-test:
 	node --test integrations/codex/managed-route.test.js
 
 protocol-collection-test:
-	node --test --test-concurrency=1 integrations/codex/protocol-collection.test.js integrations/codex/protocol-interruption.test.js
+	node --test --test-concurrency=1 integrations/codex/protocol-collection.test.js integrations/codex/protocol-interruption.test.js integrations/codex/protocol-compaction.test.js
 
 native-context-test:
 	cargo build --locked --bin chiptrace

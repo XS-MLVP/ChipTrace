@@ -1,15 +1,14 @@
 # 生产就绪评估
 
-评估日期：2026-10-16。最新线上只读快照为 03:50（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-16。最新线上只读快照为 04:32（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-03:50 的本机回环只读快照中，18084、3011、3012 均返回 200，Collector/Relay 仍为 `fe9fcf9`；
-Relay 累计投递 1,103,138，pending=0、inflight=1、failed=0，计数守恒。
+04:32 的本机回环只读快照中，18084、3011、3012 均返回 200，Collector/Relay 仍为 `fe9fcf9`；
+Collector Capture 与 Relay 累计投递均为 1,106,357，pending/inflight/failed 均为 0，计数守恒。
 这只是瞬时队列状态，不构成持续 SLO 或完整 Session 的证明。Wire 仍只有 1 条且已约
-17.1 小时未更新，覆盖为
-`degraded`；18086 连接拒绝。两次 runtime gate 均真实退出 1，首个失败项分别为瞬时
-inflight 与 pending 非零；这不改变 Relay 独立报告 `stale_sources=["wire"]` 的事实。
+17.8 小时未更新，覆盖为 `degraded`；18086 连接拒绝。runtime gate 真实退出 1，明确
+报告 `stale_sources=wire`。
 模型探针最后可用时间仍为 10 月 8 日，网关 trace exporter 未启用。
 03:15 Collector 累计保存 1,100,521 条 Capture；741 个 sealed Segment 共 87,431,090,167 bytes
 保存在共享 NFS；此观测不证明已提交目标 OSS。当前状态应区分为传输进程存活、完整
@@ -49,6 +48,30 @@ HTTP 尝试、10 条真实工具结果、5 类工具，score=100、采购有效�
 本轮完整 `cloud-test` 实际退出 0：307 个 Rust 库测试、1 个 CLI 测试、280 个 Node
 测试通过，fmt/Clippy 通过；上述三项新采集联测另行全部通过。三项默认忽略的 RSS
 测试继续由独立 CI 门禁负责，不能用默认套件的成功代替其实际执行。
+
+## 独立手动压缩与 Turn 边界
+
+新执行真实 `thread/compact/start` 首先复现了独立压缩 Turn 一直 open：生产者只有
+PreCompact/PostCompact，没有 Stop。四个原生 Turn 中仅三个闭合，虽协议和四源完整，
+`root_complete`、`runtime_complete` 和整体交付状态仍为 false；失败 Raw 已保留。
+
+SessionView 和 Canonical Runtime 现共享严格边界规则：精确相同原生 Session/Turn 的
+全部 Wire 必须声明手动独立压缩，且恰有一对身份一致、顺序合法的 PreCompact/成功
+PostCompact；存在普通请求、业务开始或实际工具执行时不得使用此规则。只引用真实
+Hook，不补造 Stop，不以网关/生产者时钟相等推断关联，不修改 Raw。
+
+同一失败 Raw 只读回放后 4/4 Turn 闭合，5 次交互的投影字节、来源计数和审计不变，
+原始 SHA-256 不变。新采集另完成 4 Turn、2 个 epoch、5 次 HTTP 请求、真实 exit 7
+工具结果，压缩摘要跨后续轮次和新进程 resume 保留；FS 归档恢复、全部投影下载和
+平台重启均通过。内联阶段、缺 PreCompact、缺 PostCompact 三份派生负例协议仍完整，
+但根边界、Runtime 和整体交付均被拒绝，原始 Segment 不变。
+
+新增场景与正常 Buyer、混合模型拒绝、取消/断流一起执行，四项原生联测实际 4/4 通过。
+完整 `cloud-test` 实际退出 0：fmt/Clippy、309 个 Rust 库测试、1 个 CLI 测试和 280 个
+Node 测试通过；三项 RSS 默认忽略，仍由独立 CI 门禁验证。
+压缩样本只有一种工具，明确报告 `buyer_export_checked=false`；采购准入仍由独立多工具
+正向用例验证，未放宽门槛。所有场景仍使用固定带补丁生产者、合成模型和 FS 后端，
+不证明未修改客户端、真实 OSS 或线上已完成验收。
 
 ## HTTP 重试与全量交互回归
 
@@ -200,14 +223,14 @@ parts，2 Turn、8 模型交互、6 工具记录不变，Raw SHA-256 一致。
 | --- | --- | --- |
 | 18084、3011、3012 | HTTP 200 | 入口与采集进程存活 |
 | Collector/Relay | revision `fe9fcf924b226099202cb770b7cf0da29e0c2310` | 运行版本已固定；仓库新增修复尚未部署 |
-| 投递 | 03:50 已投递 1,103,138 条，pending=0、inflight=1、failed=0，计数守恒 | 瞬时传输状态；不是持续 SLO 或完整 Session 数 |
+| 投递 | 04:32 Collector Capture/Relay 投递均为 1,106,357，pending/inflight/failed 均为 0，计数守恒 | 瞬时传输状态；不是持续 SLO 或完整 Session 数 |
 | Collector 磁盘 | 03:15 有 741 个 sealed Segment，87,431,090,167 bytes | 云端共享 NFS 上的 WAL 持续保存；不能证明 OSS 已提交 |
 | Wire | 新进程内仅 1 条；活动 WAL 中为无原生 Session/Turn 的 HTTP 403 | 无真实成功 Turn Wire 的证据 |
-| 来源新鲜度 | 03:50 OTLP/Hook 有流量，Wire 约 17.1 小时未更新；覆盖 `degraded`；runtime gate 非零 | 当前采集覆盖降级 |
+| 来源新鲜度 | 04:32 Wire 约 17.8 小时未更新；覆盖 `degraded`；runtime gate 因 `stale_sources=wire` 退出 1 | 当前采集覆盖降级 |
 | 历史失败 | 293 个文件，267,219,223 bytes | 保留失败取证，不能删除换取健康状态 |
 | 平台 18086 | 无法连接 | 当前无法交接在线管理、导出入口 |
 | 部署隔离 | 本轮只读复查：两容器均为旧镜像、绑定 loopback，有 `unless-stopped` 重启策略，CPU/内存/PID 无上限，根文件系统可写 | 有内部入口保护；尚缺资源配额与只读隔离 |
-| GitHub CI | 已核验基线 `3ebb0c4`：[run 38794336670](https://github.com/XS-MLVP/ChipTrace/actions/runs/38794336670) 已确认成功；5/5 作业、16 份有效报告元数据 | 包括历史交付状态复核、原生取消与断连的平台回归；使用带补丁生产者和合成模型，未下载报告正文；本轮正向采购联测修改仍需独立提交后核验 CI |
+| GitHub CI | 已核验基线 `7eed6d6`：[run 38798759458](https://github.com/XS-MLVP/ChipTrace/actions/runs/38798759458) 已确认成功；5/5 作业、16 份有效报告元数据 | 包括原生采集到 Buyer 下载的正向与拒绝回归、独立 RSS 门禁；使用带补丁生产者和合成模型，未下载报告正文；新增压缩修复仍需对应提交的 CI |
 | GitHub 集成 | 远端 main 仍为 `514d4cf`，公共分支 API 返回 `protected=false`；维护分支修复尚未合并 | 需设置评审和必需检查约束、完成同 SHA 验证及受控发布；分支 CI 不等于部署 |
 
 11:26 复查时三个既有服务仍返回 HTTP 200，Relay 已投递 1,036,522 条，pending 为 1、

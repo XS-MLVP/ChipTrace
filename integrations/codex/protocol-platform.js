@@ -39,9 +39,10 @@ async function segments(root) {
 }
 
 async function verifyPlatform(root, binary, mode = 'partial') {
-  assert.ok(['partial', 'model-switch', 'complete'].includes(mode), 'expected explicit native platform regression mode');
+  assert.ok(['partial', 'model-switch', 'complete', 'compaction'].includes(mode), 'expected explicit native platform regression mode');
   const complete = mode !== 'partial';
   const accepted = mode === 'complete';
+  const inspectOnly = mode === 'compaction';
   const baseline = JSON.parse(await fs.readFile(path.join(root, 'inspection.json'), 'utf8'));
   const sessionId = baseline.session.session_id;
   assert.equal(baseline.delivery_ready, complete);
@@ -61,7 +62,7 @@ async function verifyPlatform(root, binary, mode = 'partial') {
   }
   assert.equal(wire.length, baseline.session.model_interactions);
   if (!complete) assert.equal(wire.length, 4);
-  const usage = complete
+  const usage = inspectOnly ? [] : complete
     ? (await fs.readFile(path.join(root, 'synthetic-usage.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
     : wire.map(record => {
     const requestId = record.responseHeaders['x-request-id'];
@@ -70,15 +71,17 @@ async function verifyPlatform(root, binary, mode = 'partial') {
     return { request_id: requestId, requested_model: model, upstream_model: model,
       provider: 'OpenAI', input_tokens: 0, output_tokens: 0 };
   });
-  assert.equal(usage.length, wire.length);
-  assert.equal(new Set(usage.map(item => item.request_id)).size, wire.length);
-  for (const record of wire) {
-    const matched = usage.find(item => item.request_id === record.responseHeaders['x-request-id']);
-    assert.ok(matched, 'each independent endpoint observation must join an actual Wire attempt');
-    assert.equal(matched.requested_model, JSON.parse(record.requestBody.raw).model);
+  if (!inspectOnly) {
+    assert.equal(usage.length, wire.length);
+    assert.equal(new Set(usage.map(item => item.request_id)).size, wire.length);
+    for (const record of wire) {
+      const matched = usage.find(item => item.request_id === record.responseHeaders['x-request-id']);
+      assert.ok(matched, 'each independent endpoint observation must join an actual Wire attempt');
+      assert.equal(matched.requested_model, JSON.parse(record.requestBody.raw).model);
+    }
+    const requestedModels = new Set(usage.map(item => item.requested_model));
+    if (complete) assert.equal(requestedModels.size, accepted ? 1 : 2);
   }
-  const requestedModels = new Set(usage.map(item => item.requested_model));
-  if (complete) assert.equal(requestedModels.size, accepted ? 1 : 2);
   const options = { projectId: 'synthetic-native-protocol', root: path.join(root, 'platform'),
     captureRoot, objectRoot: path.join(root, 'platform-objects'), binary,
     prefix: 'datasets/native-protocol-ci', concurrency: 1 };
@@ -258,6 +261,20 @@ async function verifyPlatform(root, binary, mode = 'partial') {
       await response.body.cancel();
     }
     await verifyView(client);
+    if (inspectOnly) {
+      // This native sample has one tool type; Buyer-size acceptance is covered
+      // separately by the complete multi-tool regression, without relaxing it.
+      await app.close(); app = null;
+      client = await open();
+      await verifyView(client);
+      assert.deepEqual(stable(await segments(path.join(captureRoot, 'segments'))), stable(input));
+      assert.deepEqual(stable(await segments(path.join(options.root, 'snapshots', archiveId, 'segments'))), stable(input));
+      return { backend: 'fs', real_oss_account: false, production_acceptance_claimed: false,
+        archive_restore_verified: true, raw_bytes: archive.result.total_bytes, raw_records: records,
+        native_turns: expectedTurns.length, model_interactions: wire.length,
+        all_projection_parts_verified: true, authenticated_downloads_verified: true,
+        buyer_export_checked: false, restart_verified: true, idempotent_responses_verified: true };
+    }
     await client.putUsageLog('native-usage', Buffer.from(usage.map(item => JSON.stringify(item)).join('\n') + '\n'));
     const exported = await submit(client, { id: 'native-export', kind: 'export', archive_id: archiveId,
       session_id: sessionId, release_id: `native-${mode}-${accepted ? 'accepted' : 'rejected'}`,

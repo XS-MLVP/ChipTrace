@@ -68,6 +68,18 @@ Buyer 导出必须真实退出 1，明确拒绝 `protocol_complete=false`。仅�
 `real_oss_account=false`、`production_acceptance_claimed=false`；这不代表目标 OSS 或
 主平台终端用户鉴权验收。
 
+同一作业新增 [protocol-compaction.test.js](../integrations/codex/protocol-compaction.test.js)，
+通过真实 `thread/compact/start` 新执行独立手动压缩：实际失败工具输出进入压缩请求，
+生成的摘要必须出现在后续请求和新进程 resume 的历史中。共 4 Native Turn、2 个 epoch、
+5 次模型请求；压缩为其中一个独立 Turn，真实生产者只发 PreCompact/PostCompact，
+不会发 Stop。严格检查明确的 Wire 独立阶段、Hook 身份、配对、成功状态和来源端顺序，
+再将原有 Hook 作为边界证据；Raw 事件类型保持原样。
+
+回归还对本次派生副本分别改为内联压缩、移除 PreCompact、移除 PostCompact；三者
+协议仍完整，但根边界、Runtime 和 Session 交付必须拒绝。原始 Segment 保持不变。
+`native-compaction-ci.json` 报告只记录元数据与校验结论，声明合成模型、带补丁生产者，
+不能作为未修改客户端或生产验收证据。
+
 这项回归使用已打补丁生产者和合成模型响应，报告固定声明 `real_upstream=false`、
 `production_acceptance_claimed=false`，并验证真实上游 Canary 门禁拒绝它。它能发现协议、
 生产者和采集链路一起运行时的回归，不能替代未修改客户端、真实模型、阿里 OSS 或

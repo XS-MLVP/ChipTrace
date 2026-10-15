@@ -202,6 +202,14 @@ Hook；它不把 OTLP trace 重写成第二套 Runtime 真相，缺一路时云�
 时只作为 Session 边界，不会被错误分配到某个 Turn；缺少 Turn ID 的业务证据继续计入
 `unscoped_turn_records`。
 
+独立手动压缩 Turn 使用实际 PreCompact/PostCompact Hook 闭合，不补造 Stop。该例外要求
+同一显式原生 Session/Turn 的全部 Wire 均声明 `request_kind=compaction`、
+`compaction.phase=standalone_turn`、`compaction.trigger=manual`，且元数据身份与 Capture
+一致；必须恰有配对的手动 Pre/Post Hook、成功 PostCompact 和合法的来源端事件顺序。
+同一 Turn 有普通 Wire、UserPromptSubmit/turn_start 或实际工具执行时不能使用此例外。
+关联不依赖网关与生产者时钟一致。内联压缩的 PostCompact 不会关闭业务 Turn，缺少
+Pre/Post 或独立阶段证据仍保持 open；`SessionStart.source=compact` 也不新开 Session epoch。
+
 原生 OTLP 不要求重复附带所有身份属性。Turn 可通过原始 Wire 中的 W3C Trace Context、
 精确 Span/parentSpan 和原生 Turn ID 关联；同一 Trace 包含多个 Turn 时，必须有足够的
 Span 或显式身份消歧。全量快照中发现的身份歧义在 Session 选择后仍保留，不能因为其他

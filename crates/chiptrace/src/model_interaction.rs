@@ -3,6 +3,7 @@ use crate::jsonl::{JsonlWriter, absolute_path, ensure_safe_relative_path, sha256
 use crate::lifecycle::{Boundary, LifecycleState};
 use crate::schema::{FileManifest, RAW_LINEAGE_SCHEMA_VERSION, RawSourceLineage};
 use crate::session_lineage::StockSessionLineage;
+use crate::standalone_compaction::CompactionBoundaries;
 use crate::tool_schema::{canonical_runtime_tool_name, is_stock_unified_exec_tool};
 use crate::wire_tools::request_tool_definitions as captured_request_tool_definitions;
 use anyhow::{Context, Result, bail};
@@ -4643,6 +4644,7 @@ fn build_task_root_spans(
     captures: &[Value],
     scope_index: &RuntimeScopeIndex,
 ) -> Result<Vec<Value>> {
+    let compaction = CompactionBoundaries::from_captures(captures);
     let mut groups: BTreeMap<String, (&'static str, String, Vec<&Value>)> = BTreeMap::new();
     for capture in captures {
         let event_type = capture
@@ -4650,7 +4652,9 @@ fn build_task_root_spans(
             .and_then(Value::as_str);
         let wire_turn_start = record_type(capture) == "api_snapshot"
             && trace_string(capture, "root_turn_id").is_some();
+        let compaction_boundary = compaction.is_start(capture) || compaction.is_terminal(capture);
         if !wire_turn_start
+            && !compaction_boundary
             && !event_type.is_some_and(|event_type| {
                 is_task_root_start(event_type)
                     || is_task_root_terminal(event_type)
@@ -4666,6 +4670,7 @@ fn build_task_root_spans(
             "session" => event_type.is_some_and(is_session_root_event),
             "turn" => {
                 wire_turn_start
+                    || compaction_boundary
                     || event_type.is_some_and(|event_type| {
                         is_turn_root_event(event_type) || is_subagent_root_event(event_type)
                     })
@@ -4710,12 +4715,18 @@ fn build_task_root_spans(
         let starts: Vec<&Value> = boundary_observations
             .iter()
             .copied()
-            .filter(|capture| root_observation_is_start(capture, scope_kind))
+            .filter(|capture| {
+                root_observation_is_start(capture, scope_kind)
+                    || (scope_kind == "turn" && compaction.is_start(capture))
+            })
             .collect();
         let terminals: Vec<&Value> = boundary_observations
             .iter()
             .copied()
-            .filter(|capture| root_observation_is_terminal(capture, scope_kind))
+            .filter(|capture| {
+                root_observation_is_terminal(capture, scope_kind)
+                    || (scope_kind == "turn" && compaction.is_terminal(capture))
+            })
             .collect();
         let mut lifecycle_state = LifecycleState::new(if stock_hook_boundaries {
             "stock_codex_hook"
