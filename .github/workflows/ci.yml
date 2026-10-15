@@ -298,7 +298,7 @@ jobs:
         with:
           name: native-context-report
           path: native-context.tap
-      - name: Verify platform namespace binding, recovery, delivery gates and signed OSS protocol
+      - name: Verify platform recovery, native tool payload conflicts, delivery gates and OSS protocol
         run: |
           set -euo pipefail
           node --test integrations/cloud-platform/platform.test.js integrations/cloud-platform/storage-oss.test.js 2>&1 | tee platform.tap
@@ -407,12 +407,19 @@ jobs:
         with:
           name: container-ingest-receipt-report
           path: container-ingest-receipt.tap
-      - name: Verify platform namespace isolation, service and SDK in a container
+      - name: Verify platform isolation, native tool payload conflicts and export refusal in a container
         run: |
+          set -euo pipefail
           docker run --rm --network none --read-only \
             --tmpfs /tmp:size=1g,mode=1777 \
             -v "$PWD/integrations/cloud-platform:/tests:ro" \
-            chiptrace-platform:ci --test /tests/platform.test.js /tests/storage-oss.test.js
+            chiptrace-platform:ci --test /tests/platform.test.js /tests/storage-oss.test.js \
+            2>&1 | tee container-platform.tap
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: container-platform-report
+          path: container-platform.tap
       - name: Verify source auditing and Process conflicts in the container
         run: |
           docker run --rm --network none --read-only \

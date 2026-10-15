@@ -5258,11 +5258,14 @@ fn build_tool_runtime_spans(
                 || (!authoritative_names.is_empty()
                     && model_names.is_disjoint(&authoritative_names))
         });
+        let native_result_consistency = native_tool_result_payload_consistency(&captures);
         let conflict = authoritative_statuses.len() > 1
             || process_outcomes.len() > 1
             || authoritative_names.len() > 1
             || model_name_conflict
-            || parent_call_ids.len() > 1;
+            || parent_call_ids.len() > 1
+            || native_result_consistency.arguments_conflict
+            || native_result_consistency.result_conflict;
         spans.push(json!({
             "schema_version":RUNTIME_SPAN_SCHEMA_VERSION,
             "span_id":span_id,
@@ -5290,6 +5293,7 @@ fn build_tool_runtime_spans(
                 "model_call_required":true,
                 "state_observations":statuses,
                 "state_conflict":conflict,
+                "native_result_consistency":native_result_consistency,
                 "producer":captures.iter().filter_map(|capture| capture.get("producerEvent")).cloned().collect::<Vec<_>>(),
                 "codex":native_runtime_extension(&captures),
                 "schema_provenance":execution.get("schema_provenance")
@@ -5322,6 +5326,37 @@ fn runtime_observation_is_authoritative(capture: &Value) -> bool {
     string_field(execution, "source_event_name") == Some("codex.tool_result")
         || string_field(execution, "status")
             .is_some_and(|status| !matches!(status, "started" | "unknown"))
+}
+
+#[derive(Default, Serialize)]
+struct NativeToolResultPayloadConsistency {
+    observations: usize,
+    arguments_conflict: bool,
+    result_conflict: bool,
+}
+
+fn native_tool_result_payload_consistency(
+    captures: &[&Value],
+) -> NativeToolResultPayloadConsistency {
+    let mut consistency = NativeToolResultPayloadConsistency::default();
+    let mut first: Option<&Value> = None;
+    for capture in captures {
+        let execution = &capture["toolExecution"];
+        if string_field(execution, "source_event_name") != Some("codex.tool_result") {
+            continue;
+        }
+        consistency.observations += 1;
+        if let Some(first) = first {
+            // Arguments have already been parsed as JSON by cloud ingestion.
+            // Borrow both payloads: conflict detection must not keep another
+            // serialized copy of large tool results in memory.
+            consistency.arguments_conflict |= execution.get("arguments") != first.get("arguments");
+            consistency.result_conflict |= execution.get("result") != first.get("result");
+        } else {
+            first = Some(execution);
+        }
+    }
+    consistency
 }
 
 fn interaction_model_call_names(interactions: &[Value]) -> HashMap<String, BTreeSet<String>> {
@@ -7212,6 +7247,88 @@ mod tests {
             "stock_codex.unified_exec.log_output.header"
         );
         assert_eq!(span["extensions"]["process_outcome"]["exit_code"], 101);
+    }
+
+    fn native_payload_observation(arguments: &str, output: &str) -> Value {
+        use crate::cloud_ingest::{CloudEndpoint, prepare_cloud_ingest};
+
+        let attr = |key: &str, value: Value| json!({"key":key,"value":value});
+        let raw = serde_json::to_vec(&json!({
+            "resourceLogs":[{"scopeLogs":[{"logRecords":[{
+                "timeUnixNano":"1788307201000000000",
+                "attributes":[
+                    attr("event.name", json!({"stringValue":"codex.tool_result"})),
+                    attr("conversation.id", json!({"stringValue":"payload-session"})),
+                    attr("turn.id", json!({"stringValue":"payload-turn"})),
+                    attr("call_id", json!({"stringValue":"payload-call"})),
+                    attr("tool_name", json!({"stringValue":"read_workspace"})),
+                    attr("tool_namespace", json!({"stringValue":"functions"})),
+                    attr("arguments", json!({"stringValue":arguments})),
+                    attr("output", json!({"stringValue":output})),
+                    attr("success", json!({"boolValue":true})),
+                    attr("output_truncated", json!({"boolValue":false}))
+                ]
+            }]}]}]
+        }))
+        .unwrap();
+        prepare_cloud_ingest(CloudEndpoint::OtlpLogs, &raw, 1024 * 1024)
+            .unwrap()
+            .records
+            .into_iter()
+            .map(|record| serde_json::from_slice::<Value>(&record.canonical).unwrap())
+            .find(|capture| capture.get("toolExecution").is_some())
+            .unwrap()
+    }
+
+    #[test]
+    fn contradictory_native_tool_result_payloads_mark_conflict() {
+        let first = native_payload_observation(r#"{"target":"original"}"#, "original result");
+        let alternatives = [
+            native_payload_observation(r#"{"target":"changed"}"#, "original result"),
+            native_payload_observation(r#"{"target":"original"}"#, "changed result"),
+        ];
+        let conflicts: Vec<bool> = alternatives
+            .into_iter()
+            .map(|alternative| {
+                let spans = build_runtime_spans(&[first.clone(), alternative], &[]).unwrap();
+                let span = spans
+                    .iter()
+                    .find(|span| span["call_id"] == "payload-call")
+                    .unwrap();
+                span["extensions"]["state_conflict"].as_bool().unwrap()
+            })
+            .collect();
+        assert_eq!(
+            conflicts,
+            [true, true],
+            "arguments and output are independent native facts"
+        );
+    }
+
+    #[test]
+    fn equivalent_native_payloads_and_hook_views_do_not_conflict() {
+        let first = native_payload_observation(r#"{"target":"original","limit":1}"#, "same result");
+        let repeated =
+            native_payload_observation(r#"{ "limit": 1, "target": "original" }"#, "same result");
+        let mut hook = first.clone();
+        hook["captureId"] = json!("payload-hook");
+        hook["toolExecution"]["source_event_name"] = json!("PostToolUse");
+        hook["toolExecution"]["status"] = json!("unknown");
+        hook["toolExecution"]["arguments"] = json!({"hook_view":"different representation"});
+        hook["toolExecution"]["result"] = json!({"hook_view":"different representation"});
+        let captures = [first, repeated, hook];
+        let spans = build_runtime_spans(&captures, &[]).unwrap();
+        let span = spans
+            .iter()
+            .find(|span| span["call_id"] == "payload-call")
+            .unwrap();
+        assert_eq!(span["extensions"]["state_conflict"], false);
+        assert_eq!(span["raw_capture_refs"].as_array().unwrap().len(), 3);
+        assert_eq!(span["result"], "same result");
+        assert_eq!(
+            span["extensions"]["native_result_consistency"],
+            json!({"observations":2,"arguments_conflict":false,"result_conflict":false})
+        );
     }
 
     #[test]

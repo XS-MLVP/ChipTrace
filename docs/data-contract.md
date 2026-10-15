@@ -127,6 +127,14 @@ SSE `[DONE]` 只是 framing，不代表模型成功。返回文本不能用于�
 保留原始 Capture。此类 Session 需要从原始 OTLP 重新验证与迁移，不能原地改写 Raw
 或将旧导出作为新版通过的证明。
 
+同一精确执行作用域与 `call_id` 下，多个原生 `codex.tool_result` 的参数和输出必须一致。
+参数按采集时解析的 JSON 值比较，键顺序及空白差异不构成冲突；输出保留原始值，不按
+业务含义归一化。任一参数或输出冲突使 RuntimeSpan 的 `state_conflict=true`，进而使
+Runtime/Session 检查不可交付并阻止 Buyer 导出。所有原始 Capture 和 Raw 引用继续保留；
+不能按最后到达的结果消除冲突。`extensions.native_result_consistency` 只记录原生结果
+观察数及两类冲突标志，不复制正文。Hook 的参数/输出是独立视图，不参加这项原生结果
+一致性比较；其来源及其他生命周期、状态冲突检查继续保留。
+
 ## Canonical
 
 `project-interactions` 将一条显式 Stock Codex Session 投影为：

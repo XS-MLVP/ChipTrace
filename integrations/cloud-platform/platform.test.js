@@ -185,6 +185,64 @@ test('platform inspection and export reject conflicting duplicate native identit
   assert.deepEqual(await fs.readFile(segment), bytes);
 });
 
+test('conflicting native tool payloads prevent delivery and Buyer export while preserving Raw', { timeout: 120000 }, async t => {
+  for (const field of ['arguments', 'result']) await t.test(field, async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-tool-conflict-'));
+    let app;
+    t.after(async () => { if (app) await app.close(); await fs.rm(root, { recursive: true, force: true }); });
+    const data = await fixture(root);
+    const segmentsRoot = path.join(data.captureRoot, 'segments');
+    const segments = (await fs.readdir(segmentsRoot)).filter(name => name.endsWith('.sealed.ndjson')).sort();
+    const records = [];
+    for (const name of segments) records.push(...(await fs.readFile(path.join(segmentsRoot, name), 'utf8'))
+      .trim().split('\n').filter(Boolean).map(line => JSON.parse(line)));
+    const original = records.find(record => record.toolExecution?.source_event_name === 'codex.tool_result'
+      && record.toolExecution.call_id === 'call-2');
+    assert.ok(original, 'the fixture must include a native OTLP result');
+    const marker = `private-conflicting-tool-${field}`;
+    const changed = structuredClone(original);
+    changed.captureId = `cap-conflicting-native-tool-${field}`;
+    changed.toolExecution[field] = field === 'arguments' ? { target: marker } : marker;
+    const segment = path.join(segmentsRoot, segments.at(-1));
+    await fs.appendFile(segment, JSON.stringify(changed) + '\n');
+    const bytes = await fs.readFile(segment);
+    const token = 'platform-test-token-with-at-least-32-bytes';
+    app = await createPlatformServer({ plugin: new ChipTracePlugin({ projectId: 'project-test', root: path.join(root, 'platform'),
+      captureRoot: data.captureRoot, objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace' }), token });
+    await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
+    const client = new ChipTraceClient({ baseUrl: `http://127.0.0.1:${app.server.address().port}`, token });
+    await client.submit({ id: 'archive-tool-conflict', kind: 'archive', archive_id: 'raw-tool-conflict' });
+    assert.equal((await client.wait('archive-tool-conflict')).status, 'completed');
+    await client.submit({ id: 'inspect-tool-conflict', kind: 'inspect', archive_id: 'raw-tool-conflict', session_id: 'thread-self-test' });
+    const inspected = await client.wait('inspect-tool-conflict');
+    assert.equal(inspected.status, 'completed');
+    assert.equal(inspected.result.delivery_ready, false);
+    assert.equal(inspected.result.session.delivery_ready, true);
+    assert.equal(inspected.result.integrity.runtime_complete, false);
+    assert.ok(!JSON.stringify(inspected).includes(marker));
+    const page = await client.getTurns('inspect-tool-conflict');
+    assert.equal(page.delivery_ready, false);
+    const response = await client.downloadProjection('inspect-tool-conflict', 'runtime');
+    const spans = decodeProjectionJsonl(Buffer.from(await response.arrayBuffer()));
+    const tool = spans.find(span => span.span_kind === 'tool_execution' && span.call_id === 'call-2');
+    assert.equal(tool.extensions.state_conflict, true);
+    assert.equal(tool.extensions.native_result_consistency.observations, 2);
+    assert.equal(tool.extensions.native_result_consistency[`${field}_conflict`], true);
+    assert.ok(tool.raw_capture_refs.includes(original.captureId));
+    assert.ok(tool.raw_capture_refs.includes(changed.captureId));
+    await client.putUsageLog('tool-conflict-usage', await fs.readFile(data.usage));
+    await client.submit({ id: 'export-tool-conflict', kind: 'export', archive_id: 'raw-tool-conflict',
+      session_id: 'thread-self-test', release_id: 'release-tool-conflict', usage_log_ids: ['tool-conflict-usage'] });
+    const exported = await client.wait('export-tool-conflict');
+    assert.equal(exported.status, 'failed');
+    assert.equal(exported.error.exit_code, 1);
+    assert.match(exported.error.message, /interaction projection is not delivery ready; failed gates: runtime_complete/);
+    assert.ok(!JSON.stringify(exported).includes(marker));
+    await assert.rejects(client.download('export-tool-conflict', 'buyer-package.tar.gz'), error => error.status === 409);
+    assert.deepEqual(await fs.readFile(segment), bytes);
+  });
+});
+
 test('HTTP service and SDK run the real CLI archive/restore/inspect/export path', { timeout: 60000 }, async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-'));
   let app;
