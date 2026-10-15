@@ -35,6 +35,107 @@ function start(args) {
   return handle;
 }
 
+test('cloud ingest reports duplicate context conflicts after preserving exact Raw in both WALs',
+  { timeout: 30000 }, async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-cloud-context-'));
+    let collector;
+    let relay;
+    t.after(async () => {
+      if (relay) await stop(relay);
+      if (collector) await stop(collector);
+      await fs.rm(root, { recursive: true, force: true });
+    });
+    const collectorPort = await reservePort();
+    const collectorUrl = `http://127.0.0.1:${collectorPort}`;
+    const collectorArgs = ['collector', '--host', '127.0.0.1', '--port', String(collectorPort),
+      '--root', path.join(root, 'collector'), '--state-root', path.join(root, 'collector-state')];
+    collector = start(collectorArgs);
+    await health(collectorUrl, collector);
+    const relayPort = await reservePort();
+    const relayUrl = `http://127.0.0.1:${relayPort}`;
+    const relayArgs = ['relay', '--host', '127.0.0.1', '--port', String(relayPort),
+      '--root', path.join(root, 'relay'), '--state-root', path.join(root, 'relay-state'),
+      '--delivery-state-root', path.join(root, 'delivery'), '--collector-url', collectorUrl];
+    relay = start(relayArgs);
+    await health(relayUrl, relay);
+    const marker = 'private-conflicting-context-value';
+    const attr = (key, value) => ({ key, value: { stringValue: value } });
+    const expected = new Map();
+    for (const endpoint of ['logs', 'traces']) {
+      for (const layer of ['resource', 'scope', 'record', 'equal']) {
+        await t.test(`${endpoint}: ${layer}`, async () => {
+          const duplicate = [attr('conversation.id', layer === 'equal' ? 'native-session' : marker),
+            attr('conversation.id', 'native-session')];
+          const attributes = [attr('event.name', 'codex.user_prompt'), attr('turn.id', 'native-turn'),
+            attr('test.utf8', '中文 🧪 原样保存')];
+          const record = endpoint === 'logs' ? { body: { stringValue: '原始日志' } } : { name: 'codex.turn' };
+          const records = [{ ...record, attributes },
+            { ...record, attributes: [...attributes,
+              ...(layer === 'record' || layer === 'equal' ? duplicate : [])] }];
+          const scope = { scope: { attributes: layer === 'scope' ? duplicate : [] },
+            [endpoint === 'logs' ? 'logRecords' : 'spans']: records };
+          const envelope = { [endpoint === 'logs' ? 'resourceLogs' : 'resourceSpans']: [{
+            resource: { attributes: layer === 'resource' ? duplicate : [] },
+            [endpoint === 'logs' ? 'scopeLogs' : 'scopeSpans']: [scope],
+          }] };
+          const body = JSON.stringify(envelope, null, 2) + '\n';
+          expected.set(digest(Buffer.from(body)), body);
+          for (let attempt = 0; attempt < (layer === 'equal' ? 1 : 2); attempt++) {
+            const response = await fetch(`${relayUrl}/otel/v1/${endpoint}`, { method: 'POST',
+              headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+              body, signal: AbortSignal.timeout(5000) });
+            const receipt = await response.json();
+            const detail = layer === 'equal' ? receipt.chiptrace : receipt;
+            assert.equal(response.status, layer === 'equal' ? 200 : 400);
+            assert.equal(detail.ok, layer === 'equal');
+            assert.equal(detail.durable, true);
+            assert.equal(detail.captures, 1);
+            assert.equal(detail.duplicates, attempt);
+            assert.equal(detail.summary.source_records, 2);
+            assert.equal(detail.summary.derived_captures, 0);
+            if (layer === 'equal') assert.deepEqual(detail.summary.conversion_errors, []);
+            else {
+              assert.equal(receipt.local_durable, true);
+              assert.equal(receipt.reason, 'cloud_ingest_quality_error');
+              assert.equal(detail.summary.conversion_errors.length, 1);
+              assert.match(receipt.detail, /conflicting duplicate context attribute/);
+            }
+            assert.ok(!JSON.stringify(receipt).includes(marker));
+          }
+        });
+      }
+    }
+    const delivered = await health(relayUrl, relay,
+      h => h.delivered === 8 && h.pending === 0 && h.inflight === 0);
+    assert.equal(delivered.conservation_ok, true);
+    assert.equal(delivered.ingest_coverage.quality_errors, 12);
+    await health(collectorUrl, collector, h => h.collector.captures === 8);
+    for (const url of [relayUrl, collectorUrl]) {
+      const response = await fetch(`${url}/flush`, { method: 'POST',
+        headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(5000) });
+      assert.equal(response.ok, true);
+    }
+    const relayRaw = await sealedRecords(path.join(root, 'relay'));
+    const collectorRaw = await sealedRecords(path.join(root, 'collector'));
+    assert.equal(relayRaw.size, 8);
+    assert.deepEqual(collectorRaw, relayRaw);
+    for (const { record } of collectorRaw.values()) {
+      assert.equal(record.recordType, 'telemetry_batch');
+      const batch = record.telemetryBatch;
+      const body = expected.get(batch.raw_sha256);
+      assert.equal(typeof body, 'string');
+      assert.equal(batch.raw_json, body);
+      assert.equal(batch.raw_bytes, Buffer.byteLength(body));
+    }
+    assert.equal((await stop(relay)).code, 0);
+    assert.equal((await stop(collector)).code, 0);
+    collector = start(collectorArgs);
+    await health(collectorUrl, collector, h => h.collector.captures === 8);
+    relay = start(relayArgs);
+    await health(relayUrl, relay, h => h.delivered === 8 && h.conservation_ok);
+    assert.deepEqual(await sealedRecords(path.join(root, 'collector')), collectorRaw);
+  });
+
 async function stop(handle) {
   if (handle.ended) return handle.closed;
   handle.child.kill('SIGINT');

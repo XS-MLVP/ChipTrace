@@ -181,6 +181,11 @@ Session 被移出载荷而宣称唯一。`thread.id` 是 OS 线程号，不是 S
 之前检测，诊断只输出已知属性名，不输出冲突值或正文。完全相同的重复值不增加记录数，
 原始 Raw 保持不变。
 
+在线 OTLP logs/traces 入口使用同一重复属性校验。冲突 Raw 先写入 Relay WAL，再返回
+`HTTP 400`、`reason=cloud_ingest_quality_error` 和 `durable/local_durable=true`；持久化确认
+不代表质量合格。源记录数仍按实际输入统计，重试同一正文不新增 Capture。logs 只从上下文
+有效的记录派生事实，按 resource → scope → record 合并属性，保留合法 scope 中的原生身份。
+
 Turn 覆盖中的 Wire 是 Capture 数，OTLP logs/traces 是原始记录数，Hook 是原始批次中的
 事件数。派生生命周期和工具事件不重复计为 Hook。Session 级 `source_coverage` 的 OTLP
 数仍是批次数，两种统计不能直接相加或比较。

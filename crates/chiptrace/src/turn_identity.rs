@@ -563,8 +563,7 @@ pub(crate) fn turn_attribute(attributes: &BTreeMap<String, String>) -> Result<Op
     )?))
 }
 
-fn attributes(value: Option<&Value>) -> Result<BTreeMap<String, String>> {
-    let mut output = BTreeMap::new();
+pub(crate) fn validate_context_attributes(value: Option<&Value>) -> Result<()> {
     let mut context_values = BTreeMap::new();
     for attribute in value.and_then(Value::as_array).into_iter().flatten() {
         let (Some(key), Some(value)) = (
@@ -598,18 +597,27 @@ fn attributes(value: Option<&Value>) -> Result<BTreeMap<String, String>> {
         {
             bail!("OTLP has conflicting duplicate context attribute {key:?}");
         }
-        let Some(parsed) = value.get("stringValue").or_else(|| value.get("intValue")) else {
-            continue;
-        };
-        if let Some(parsed) = parsed
-            .as_str()
-            .map(str::to_owned)
-            .or_else(|| parsed.as_i64().map(|n| n.to_string()))
-        {
-            output.insert(key.to_owned(), parsed);
-        }
     }
-    Ok(output)
+    Ok(())
+}
+
+fn attributes(value: Option<&Value>) -> Result<BTreeMap<String, String>> {
+    validate_context_attributes(value)?;
+    Ok(value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|attribute| {
+            let key = attribute.get("key")?.as_str()?;
+            let value = attribute.get("value")?;
+            let parsed = value.get("stringValue").or_else(|| value.get("intValue"))?;
+            let parsed = parsed
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| parsed.as_i64().map(|n| n.to_string()))?;
+            Some((key.to_owned(), parsed))
+        })
+        .collect())
 }
 
 fn raw_batch(capture: &Value) -> Result<Value> {
@@ -623,17 +631,29 @@ fn raw_batch(capture: &Value) -> Result<Value> {
 
 pub(crate) fn visit_otlp(
     capture: &Value,
-    mut visit: impl FnMut(&'static str, &Value, BTreeMap<String, String>) -> Result<()>,
+    visit: impl FnMut(&'static str, &Value, BTreeMap<String, String>) -> Result<()>,
 ) -> Result<()> {
-    let (source, resources, scopes, records) = match capture
+    let endpoint = match capture
         .pointer("/telemetryBatch/endpoint")
         .and_then(Value::as_str)
     {
-        Some("otlp_logs") => ("otlp_logs", "resourceLogs", "scopeLogs", "logRecords"),
-        Some("otlp_traces") => ("otlp_traces", "resourceSpans", "scopeSpans", "spans"),
+        Some(endpoint @ ("otlp_logs" | "otlp_traces")) => endpoint,
         _ => return Ok(()),
     };
     let raw = raw_batch(capture)?;
+    visit_otlp_envelope(endpoint, &raw, visit)
+}
+
+pub(crate) fn visit_otlp_envelope(
+    endpoint: &str,
+    raw: &Value,
+    mut visit: impl FnMut(&'static str, &Value, BTreeMap<String, String>) -> Result<()>,
+) -> Result<()> {
+    let (source, resources, scopes, records) = match endpoint {
+        "otlp_logs" => ("otlp_logs", "resourceLogs", "scopeLogs", "logRecords"),
+        "otlp_traces" => ("otlp_traces", "resourceSpans", "scopeSpans", "spans"),
+        _ => return Ok(()),
+    };
     for resource in raw
         .get(resources)
         .and_then(Value::as_array)

@@ -62,7 +62,7 @@ await outbox.enqueue(capture);
 
 ```bash
 node --test integrations/openai-gateway/durable-outbox.test.js
-# 隔离启动真实 Relay/Collector，验证确认丢失、重启、幂等与两份 WAL 的字节和哈希：
+# 隔离启动真实 Relay/Collector，验证确认链、OTLP 质量错误、重试与重启后的 Raw：
 make gateway-receipt-test
 # 部署前对实际宿主网关执行，脚本必须加载本版本 outbox 并接入上述健康门禁：
 CHIPTRACE_GATEWAY_SCRIPT=/absolute/path/to/server.js make gateway-host-test

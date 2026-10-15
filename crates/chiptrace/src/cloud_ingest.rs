@@ -1,5 +1,6 @@
 use crate::capture::{CaptureRecord, normalize_capture};
 use crate::tool_schema::canonical_runtime_tool_name;
+use crate::turn_identity::{validate_context_attributes, visit_otlp_envelope};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -80,7 +81,9 @@ pub fn prepare_cloud_ingest(
             Err(error) => (Vec::new(), 0, 0, vec![format!("{error:#}")]),
         },
         CloudEndpoint::OtlpTraces => match validate_otlp_traces(&envelope) {
-            Ok(source_records) => (Vec::new(), source_records, 0, Vec::new()),
+            Ok((source_records, conversion_errors)) => {
+                (Vec::new(), source_records, 0, conversion_errors)
+            }
             Err(error) => (Vec::new(), 0, 0, vec![format!("{error:#}")]),
         },
         CloudEndpoint::CodexHook => match derive_codex_hook(&envelope, &raw_sha256, max_bytes) {
@@ -160,23 +163,37 @@ fn derive_otlp_logs(envelope: &Value, raw_sha256: &str, max_bytes: usize) -> Res
     let mut source_records = 0_u64;
     let mut unknown_events = 0_u64;
     let mut errors = Vec::new();
-    for resource_log in envelope
+    for (resource_index, resource_log) in envelope
         .get("resourceLogs")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
+        .enumerate()
     {
-        let resource_attributes = attributes_map(
-            resource_log
-                .pointer("/resource/attributes")
-                .and_then(Value::as_array),
-        );
-        for scope_log in resource_log
+        let resource_attributes = match attributes_map(resource_log.pointer("/resource/attributes"))
+        {
+            Ok(attributes) => Some(attributes),
+            Err(error) => {
+                errors.push(format!("resourceLogs[{resource_index}]: {error}"));
+                None
+            }
+        };
+        for (scope_index, scope_log) in resource_log
             .get("scopeLogs")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
+            .enumerate()
         {
+            let scope_attributes = match attributes_map(scope_log.pointer("/scope/attributes")) {
+                Ok(attributes) => Some(attributes),
+                Err(error) => {
+                    errors.push(format!(
+                        "resourceLogs[{resource_index}].scopeLogs[{scope_index}]: {error}"
+                    ));
+                    None
+                }
+            };
             for log_record in scope_log
                 .get("logRecords")
                 .and_then(Value::as_array)
@@ -185,10 +202,21 @@ fn derive_otlp_logs(envelope: &Value, raw_sha256: &str, max_bytes: usize) -> Res
             {
                 let ordinal = source_records;
                 source_records = source_records.saturating_add(1);
+                let (Some(resource_attributes), Some(scope_attributes)) =
+                    (&resource_attributes, &scope_attributes)
+                else {
+                    continue;
+                };
+                let record_attributes = match attributes_map(log_record.get("attributes")) {
+                    Ok(attributes) => attributes,
+                    Err(error) => {
+                        errors.push(format!("logRecords[{ordinal}]: {error}"));
+                        continue;
+                    }
+                };
                 let mut attributes = resource_attributes.clone();
-                attributes.extend(attributes_map(
-                    log_record.get("attributes").and_then(Value::as_array),
-                ));
+                attributes.extend(scope_attributes.clone());
+                attributes.extend(record_attributes);
                 let event_name = attribute_string(&attributes, "event.name").unwrap_or("");
                 let derived = match event_name {
                     "codex.conversation_starts" => derive_conversation_start(
@@ -823,16 +851,16 @@ fn value_alias(value: &Value, keys: &[&str]) -> Option<Value> {
     keys.iter().find_map(|key| value.get(*key).cloned())
 }
 
-fn validate_otlp_traces(envelope: &Value) -> Result<u64> {
+fn validate_otlp_traces(envelope: &Value) -> Result<(u64, Vec<String>)> {
     if !envelope.get("resourceSpans").is_some_and(Value::is_array) {
         bail!("OTLP traces body requires resourceSpans");
     }
-    Ok(count_nested_records(
-        envelope,
-        "resourceSpans",
-        "scopeSpans",
-        "spans",
-    ))
+    let source_records = count_nested_records(envelope, "resourceSpans", "scopeSpans", "spans");
+    let conversion_errors = match visit_otlp_envelope("otlp_traces", envelope, |_, _, _| Ok(())) {
+        Ok(()) => Vec::new(),
+        Err(error) => vec![error.to_string()],
+    };
+    Ok((source_records, conversion_errors))
 }
 
 fn trace_context(record: &Value, attributes: &BTreeMap<String, Value>, session_id: &str) -> Value {
@@ -853,9 +881,10 @@ fn trace_context(record: &Value, attributes: &BTreeMap<String, Value>, session_i
     trace
 }
 
-fn attributes_map(attributes: Option<&Vec<Value>>) -> BTreeMap<String, Value> {
+fn attributes_map(attributes: Option<&Value>) -> Result<BTreeMap<String, Value>> {
+    validate_context_attributes(attributes)?;
     let mut output = BTreeMap::new();
-    for attribute in attributes.into_iter().flatten() {
+    for attribute in attributes.and_then(Value::as_array).into_iter().flatten() {
         let Some(key) = attribute.get("key").and_then(Value::as_str) else {
             continue;
         };
@@ -864,7 +893,7 @@ fn attributes_map(attributes: Option<&Vec<Value>>) -> BTreeMap<String, Value> {
         };
         output.insert(key.to_owned(), value);
     }
-    output
+    Ok(output)
 }
 
 fn otlp_any_value(value: &Value) -> Value {
@@ -1137,6 +1166,71 @@ mod tests {
                 .map(|record| (&record.capture_id, &record.sha256))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn duplicate_log_identity_preserves_raw_and_valid_neighbors_without_deriving_an_owner() {
+        let mut raw: Value = serde_json::from_slice(&stock_logs(false, true)).unwrap();
+        let attributes = raw["resourceLogs"][0]["scopeLogs"][0]["logRecords"][1]["attributes"]
+            .as_array_mut()
+            .unwrap();
+        attributes.insert(
+            0,
+            attr(
+                "conversation.id",
+                json!({"stringValue":"private-conflicting-owner"}),
+            ),
+        );
+        let raw = serde_json::to_vec_pretty(&raw).unwrap();
+        let batch = prepare_cloud_ingest(CloudEndpoint::OtlpLogs, &raw, 1024 * 1024).unwrap();
+        assert_eq!(batch.summary.source_records, 2);
+        assert_eq!(batch.summary.conversion_errors.len(), 1);
+        assert!(
+            batch.summary.conversion_errors[0].contains("conflicting duplicate context attribute")
+        );
+        assert!(!batch.summary.conversion_errors[0].contains("private-conflicting-owner"));
+        assert_eq!(batch.summary.derived_captures, 1);
+        let captured = values(&batch);
+        assert_eq!(
+            captured[0]["telemetryBatch"]["raw_json"],
+            String::from_utf8(raw.clone()).unwrap()
+        );
+        assert_eq!(captured[0]["telemetryBatch"]["raw_sha256"], sha256(&raw));
+        assert_eq!(captured[1]["lifecycleEvent"]["type"], "session_start");
+        assert_eq!(batch.records.len(), 2);
+        let replay = prepare_cloud_ingest(CloudEndpoint::OtlpLogs, &raw, 1024 * 1024).unwrap();
+        assert_eq!(batch.summary, replay.summary);
+        assert_eq!(batch.records[0].canonical, replay.records[0].canonical);
+    }
+
+    #[test]
+    fn scope_attributes_preserve_native_tool_context_without_replacing_record_values() {
+        let mut raw: Value = serde_json::from_slice(&stock_logs(false, true)).unwrap();
+        let scope = &mut raw["resourceLogs"][0]["scopeLogs"][0];
+        let tool = scope["logRecords"].as_array_mut().unwrap().remove(1);
+        scope["logRecords"] = json!([tool]);
+        scope["logRecords"][0]["attributes"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|a| a["key"] != "conversation.id");
+        scope["scope"]["attributes"] = json!([
+            attr("conversation.id", json!({"stringValue":"session-1"})),
+            attr("turn.id", json!({"stringValue":"native-turn"})),
+            attr(
+                "tool_name",
+                json!({"stringValue":"scope-tool-must-not-replace-record"})
+            )
+        ]);
+        let raw = serde_json::to_vec(&raw).unwrap();
+        let batch = prepare_cloud_ingest(CloudEndpoint::OtlpLogs, &raw, 1024 * 1024).unwrap();
+        assert!(batch.summary.conversion_errors.is_empty());
+        assert_eq!(batch.summary.source_records, 1);
+        assert_eq!(batch.summary.derived_captures, 1);
+        let captured = values(&batch);
+        assert_eq!(captured[1]["traceContext"]["session_id"], "session-1");
+        assert_eq!(captured[1]["traceContext"]["turn_id"], "native-turn");
+        assert_eq!(captured[1]["toolExecution"]["name"], "exec_command");
+        assert_eq!(captured[0]["telemetryBatch"]["raw_sha256"], sha256(&raw));
     }
 
     #[test]

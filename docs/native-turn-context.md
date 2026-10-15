@@ -80,6 +80,9 @@ Session、显式 Process 和身份未知的 batch，可能大于投影的 `input
 各层都会拒绝这些冲突；相同重复值仍只对应一条原始记录。真实 CLI 的合成负例覆盖 logs
 和 traces 的四类冲突，要求退出 1、stdout 为空、诊断不含正文且 Raw 字节不变。
 平台 HTTP/SDK 还验证冲突 Raw 可归档取证，但检查和导出任务失败、分页和下载不可用。
+在线 logs/traces 的三层冲突也须在 Raw 持久化后返回质量错误，不能以 `durable=true`
+报告采集质量成功。真实 Relay/Collector 回归验证重试幂等、两份 WAL 的原始 UTF-8 字节及
+哈希一致、重启后恢复。logs 派生路径同时保留 scope 身份，record 属性仍有覆盖优先级。
 这些协议负例不表示实际生产者已经发射了同类冲突，也不替代未修改客户端的真实验收。
 
 [精简回归 fixture](../fixtures/native-context-README.md) 只保留实际字段和父链，用一致
