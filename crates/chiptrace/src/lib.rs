@@ -13,6 +13,7 @@ pub mod managed_models;
 pub mod model_interaction;
 pub mod object_store;
 pub mod otlp_delivery;
+pub mod platform_inspection;
 pub mod publish;
 pub mod raw_archive;
 pub mod relay;

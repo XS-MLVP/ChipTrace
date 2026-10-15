@@ -131,6 +131,7 @@ if (require.main === module) {
     maxJobs: Number(process.env.CHIPTRACE_MAX_JOBS || '10000'),
     maxUsageBytes: Number(process.env.CHIPTRACE_MAX_USAGE_BYTES || String(64 * 1024 * 1024)),
     maxOutputBytes: Number(process.env.CHIPTRACE_MAX_OUTPUT_BYTES || String(64 * 1024 * 1024)),
+    maxTurnBytes: Number(process.env.CHIPTRACE_MAX_TURN_BYTES || String(64 * 1024 * 1024)),
     jobTimeoutMs: Number(process.env.CHIPTRACE_JOB_TIMEOUT_MS || String(60 * 60 * 1000)),
   }).then(app => {
     app.server.listen(Number(process.env.CHIPTRACE_PLATFORM_PORT || '18086'), process.env.CHIPTRACE_PLATFORM_HOST || '127.0.0.1', () => {

@@ -231,6 +231,23 @@ v1 Schema 保持历史定义；旧产物只能按其冻结的旧验证器进行�
 只有场景标签的旧 Canary 报告须从 Raw 重生成；具体字段来源与组装命令见
 [原生 Turn 验收记录](native-turn-context.md#下一轮验收)。
 
+## 平台检查传输
+
+默认 `inspect-session` 继续返回完整检查结果。显式使用 `--platform-report` 时必须同时
+指定 `--projection-output`；外层报告版本为 `chiptrace.platform-inspection.v1`，保留同快照的
+交付状态、协议/Runtime 完整性、来源审计和场景证据，但不把全部 Turn 重复写入 stdout。
+`session` 是去掉 `turns` 数组的同版本摘要，完整的 `session-view.v2` 仍保存在 Canonical
+投影 Manifest 中，不能把摘要冒充满足完整 Session Schema 的独立文件。
+
+引擎逐 Turn 将规范 JSONL 写入投影目录同级的 `turns.jsonl`，返回 `turns.records/bytes/sha256`
+及投影各部分和 Manifest 的描述。文件与父目录同步后才确认；既有文件只有在逐字节哈希
+一致时才能复用，冲突或 symlink 保留并拒绝。平台完成任务前复验整个 Turn 文件的长度、
+记录数与 SHA-256，每次分页仍检查全文件；页外损坏也必须拒绝。原始 Raw 不因此改写。
+
+引擎 stdout 与 Turn 磁盘配额独立，默认均为 64 MiB；增加磁盘配额不能提高 JSON 输出上限。
+此传输格式没有放宽任何交付门禁，也不证明 Rust 投影内存、导出报告或逐页全文件扫描已
+达到大规模处理要求。历史已完成任务继续按原描述读取；旧二进制不支持该格式时显式失败。
+
 ## Tool Schema
 
 采购工具定义只取自模型实际收到的 Responses Wire。每个被调用工具必须包含明确

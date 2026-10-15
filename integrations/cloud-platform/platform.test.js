@@ -304,6 +304,119 @@ test('native result incompleteness blocks delivery in either arrival order', { t
   }
 });
 
+test('large Turn evidence stays on disk while engine and job JSON remain bounded', { timeout: 120000 }, async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-turn-report-'));
+  let app;
+  t.after(async () => { if (app) await app.close(); await fs.rm(root, { recursive: true, force: true }); });
+  const data = await fixture(root);
+  const segmentsRoot = path.join(data.captureRoot, 'segments');
+  const segments = (await fs.readdir(segmentsRoot)).filter(name => name.endsWith('.sealed.ndjson')).sort();
+  const records = [];
+  for (const name of segments) records.push(...(await fs.readFile(path.join(segmentsRoot, name), 'utf8'))
+    .trim().split('\n').filter(Boolean).map(line => JSON.parse(line)));
+  const batch = records.find(record => record.recordType === 'telemetry_batch' && record.telemetryBatch?.endpoint === 'otlp_logs');
+  assert.ok(batch, 'the fixture must contain exact native OTLP identities');
+  const extra = Array.from({ length: 400 }, (_, index) => ({ ...structuredClone(batch),
+    captureId: `cap-large-turn-${index}-${'x'.repeat(200)}` }));
+  const segment = path.join(segmentsRoot, segments.at(-1));
+  await fs.appendFile(segment, extra.map(record => JSON.stringify(record)).join('\n') + '\n');
+  const inputBytes = await fs.readFile(segment);
+  const maxOutputBytes = 64 * 1024;
+  const maxTurnBytes = 4 * 1024 * 1024;
+  const platformRoot = path.join(root, 'platform');
+  const token = 'platform-test-token-with-at-least-32-bytes';
+  app = await createPlatformServer({ plugin: new ChipTracePlugin({ projectId: 'project-test', root: platformRoot,
+    captureRoot: data.captureRoot, objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace', maxOutputBytes, maxTurnBytes }), token });
+  await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
+  const client = new ChipTraceClient({ baseUrl: `http://127.0.0.1:${app.server.address().port}`, token });
+  await client.submit({ id: 'archive-large', kind: 'archive', archive_id: 'raw-large' });
+  assert.equal((await client.wait('archive-large')).status, 'completed');
+  await client.submit({ id: 'inspect-large', kind: 'inspect', archive_id: 'raw-large', session_id: 'thread-self-test' });
+  const inspected = await client.wait('inspect-large');
+  assert.equal(inspected.status, 'completed', JSON.stringify(inspected.error));
+  assert.equal(inspected.result.delivery_ready, true);
+  assert.equal(inspected.result.session.native_turns, 5);
+  assert.equal(inspected.result.session.turns, undefined);
+  assert.ok(Buffer.byteLength(JSON.stringify(inspected)) < maxOutputBytes);
+  assert.ok(inspected.turns.bytes > maxOutputBytes);
+  assert.ok(inspected.turns.bytes <= maxTurnBytes);
+  const turns = [];
+  for (let offset = 0; offset < 5; offset += 2) {
+    const page = await client.getTurns('inspect-large', { offset, limit: 2 });
+    assert.equal(page.delivery_ready, true);
+    assert.equal(page.total, 5);
+    turns.push(...page.turns);
+  }
+  assert.equal(turns.length, 5);
+  const references = new Set(turns.flatMap(turn => turn.raw_capture_refs));
+  for (const capture of extra) assert.ok(references.has(capture.captureId));
+  const persisted = await fs.readFile(path.join(platformRoot, 'work/inspect-large/turns.jsonl'));
+  assert.equal(persisted.length, inspected.turns.bytes);
+  assert.equal(crypto.createHash('sha256').update(persisted).digest('hex'), inspected.turns.sha256);
+  assert.deepEqual(persisted.toString('utf8').trim().split('\n').map(JSON.parse), turns);
+  t.diagnostic(JSON.stringify({ max_output_bytes: maxOutputBytes, max_turn_bytes: maxTurnBytes,
+    job_json_bytes: Buffer.byteLength(JSON.stringify(inspected)), turn_bytes: persisted.length, turns: turns.length }));
+  const turnFile = path.join(platformRoot, 'work/inspect-large/turns.jsonl');
+  const corrupted = Buffer.from(persisted);
+  corrupted[corrupted.length - 2] ^= 1;
+  await fs.writeFile(turnFile, corrupted);
+  await assert.rejects(client.getTurns('inspect-large', { offset: 0, limit: 1 }), error => error.status === 422 && error.code === 'ARTIFACT_CHANGED');
+  await fs.writeFile(turnFile, persisted);
+  assert.deepEqual(await fs.readFile(segment), inputBytes);
+});
+
+test('compact CLI report preserves inspection facts, reuses exact legacy sidecars and refuses changed evidence', { timeout: 60000 }, async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-compact-cli-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const data = await fixture(root);
+  const command = ['inspect-session', '--input', data.captureRoot, '--session-id', 'thread-self-test'];
+  const full = JSON.parse((await run(binary, command, { maxBuffer: 16 * 1024 * 1024 })).stdout);
+  const projection = path.join(root, 'inspection/projection');
+  await fs.mkdir(path.dirname(projection));
+  const sidecar = path.join(root, 'inspection/turns.jsonl');
+  const legacy = Buffer.from(full.session.turns.map(turn => JSON.stringify(turn)).join('\n') + '\n');
+  await fs.writeFile(sidecar, legacy, { mode: 0o600 });
+  const before = await fs.stat(sidecar);
+  const compactCommand = [...command, '--projection-output', projection, '--platform-report', '--max-turn-bytes', '65536'];
+  const report = JSON.parse((await run(binary, compactCommand)).stdout);
+  assert.equal(report.schema_version, 'chiptrace.platform-inspection.v1');
+  const summary = { ...full.session };
+  delete summary.turns;
+  assert.deepEqual(report.session, summary);
+  for (const field of ['delivery_ready', 'validation_status', 'integrity', 'source_coverage', 'source_context_audit', 'scenario_evidence']) {
+    assert.deepEqual(report[field], full[field], field);
+  }
+  assert.equal(report.projection, undefined);
+  assert.deepEqual(report.interaction_projection.parts, full.projection.parts);
+  assert.equal(report.turns.records, full.session.native_turns);
+  assert.equal(report.turns.bytes, legacy.length);
+  assert.equal(report.turns.sha256, crypto.createHash('sha256').update(legacy).digest('hex'));
+  assert.deepEqual(await fs.readFile(sidecar), legacy);
+  assert.equal((await fs.stat(sidecar)).ino, before.ino);
+  await run(binary, compactCommand);
+  assert.equal((await fs.stat(sidecar)).ino, before.ino);
+  const changed = Buffer.from(legacy);
+  changed[0] ^= 1;
+  await fs.writeFile(sidecar, changed);
+  await assert.rejects(run(binary, compactCommand), error => error.code === 1
+    && /existing platform Turn evidence does not match inspected Session/.test(error.stderr));
+  assert.deepEqual(await fs.readFile(sidecar), changed);
+  await fs.unlink(sidecar);
+  const privateTarget = path.join(root, 'private-target');
+  const privateBytes = Buffer.from('synthetic-private-sidecar-target');
+  await fs.writeFile(privateTarget, privateBytes);
+  await fs.symlink(privateTarget, sidecar);
+  await assert.rejects(run(binary, compactCommand), error => error.code === 1
+    && !error.stderr.includes(privateBytes.toString()));
+  assert.equal((await fs.lstat(sidecar)).isSymbolicLink(), true);
+  assert.deepEqual(await fs.readFile(privateTarget), privateBytes);
+  const limitedProjection = path.join(root, 'limited/projection');
+  await assert.rejects(run(binary, [...command, '--projection-output', limitedProjection, '--platform-report', '--max-turn-bytes', '1']),
+    error => error.code === 1 && /platform Turn evidence exceeds disk limit/.test(error.stderr));
+  await assert.rejects(fs.stat(path.join(root, 'limited/turns.jsonl')), { code: 'ENOENT' });
+  assert.ok((await fs.readdir(path.join(root, 'limited'))).every(name => !name.startsWith('.turns-')));
+});
+
 test('HTTP service and SDK run the real CLI archive/restore/inspect/export path', { timeout: 60000 }, async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-'));
   let app;

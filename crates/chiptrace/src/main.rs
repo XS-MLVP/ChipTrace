@@ -13,6 +13,7 @@ use chiptrace::model_interaction::{
     verify_interaction_projection,
 };
 use chiptrace::otlp_delivery::{OtlpDeliveryConfig, send_otlp};
+use chiptrace::platform_inspection::platform_inspection_report;
 use chiptrace::publish::{
     ArtifactKind, Backend, PublishConfig, PublishSource, VerifyPublishedConfig, publish,
     verify_published,
@@ -283,6 +284,12 @@ struct InspectSessionArgs {
     /// 将 canonical interaction projection 持久化到指定目录；省略时使用临时目录。
     #[arg(long)]
     projection_output: Option<PathBuf>,
+    /// 返回平台精简报告，并将完整 Turn JSONL 保存到 projection 目录的同级。
+    #[arg(long, requires = "projection_output")]
+    platform_report: bool,
+    /// 平台 Turn JSONL 的独立磁盘上限；不提高 stdout JSON 上限。
+    #[arg(long, requires = "platform_report")]
+    max_turn_bytes: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -838,14 +845,23 @@ async fn main() -> Result<()> {
                     .path()
                     .join("projection")
             });
-            serde_json::to_value(inspect_session(InteractionProjectConfig {
+            let inspection = inspect_session(InteractionProjectConfig {
                 inputs: args.input,
-                output: projection_output,
+                output: projection_output.clone(),
                 task_session_id: None,
                 session_id: Some(args.session_id),
                 zstd_level: 1,
                 replace: args.projection_output.is_some(),
-            })?)?
+            })?;
+            if args.platform_report {
+                platform_inspection_report(
+                    &inspection,
+                    &projection_output,
+                    args.max_turn_bytes.unwrap_or(64 * 1024 * 1024),
+                )?
+            } else {
+                serde_json::to_value(inspection)?
+            }
         }
         Command::AuditSessionContext(args) => serde_json::to_value(audit_session_context(
             &args.input,

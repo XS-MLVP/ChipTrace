@@ -104,6 +104,24 @@ function projectionMetadata(value, manifest = null) {
   return metadata;
 }
 
+async function fileDigest(file) {
+  const handle = await fsp.open(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new PlatformError('engine artifact is not a regular file', 502, 'ENGINE_PROTOCOL');
+    const digest = crypto.createHash('sha256');
+    const buffer = Buffer.alloc(64 * 1024);
+    let bytes = 0;
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, bytes);
+      if (!bytesRead) break;
+      digest.update(buffer.subarray(0, bytesRead));
+      bytes += bytesRead;
+    }
+    return { bytes, sha256: digest.digest('hex') };
+  } finally { await handle.close(); }
+}
+
 function normalizeRequest(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new PlatformError('job must be an object');
   const allowed = new Set(['id', 'kind', 'archive_id', 'session_id', 'release_id', 'usage_log_ids']);
@@ -151,6 +169,7 @@ class ChipTracePlugin {
     this.maxQueuedJobs = integer(options.maxQueuedJobs, 128, 1, 10000);
     this.maxJobs = integer(options.maxJobs, 10000, 1, 1000000);
     this.maxOutputBytes = integer(options.maxOutputBytes, 64 * 1024 * 1024, 1024, 1024 * 1024 * 1024);
+    this.maxTurnBytes = integer(options.maxTurnBytes, 64 * 1024 * 1024, 1024, 16 * 1024 * 1024 * 1024);
     this.maxUsageBytes = integer(options.maxUsageBytes, 64 * 1024 * 1024, 1024, 1024 * 1024 * 1024);
     this.jobTimeoutMs = integer(options.jobTimeoutMs, 60 * 60 * 1000, 100, 24 * 60 * 60 * 1000);
     this.engineEnv = { ...process.env, RAYON_NUM_THREADS: '2', ...options.engineEnv };
@@ -470,6 +489,19 @@ class ChipTracePlugin {
   async #persistTurns(job) {
     const session = job.result?.session || job.result?.session_view;
     if (!session) return;
+    if (job.result.schema_version === 'chiptrace.platform-inspection.v1') {
+      const evidence = job.result.turns;
+      if (session.turns !== undefined || !evidence
+          || !Number.isSafeInteger(evidence.records) || evidence.records < 0 || evidence.records !== session.native_turns
+          || !Number.isSafeInteger(evidence.bytes) || evidence.bytes < 0
+          || typeof evidence.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(evidence.sha256)) {
+        throw new PlatformError('invalid engine Turn evidence descriptor', 502, 'ENGINE_PROTOCOL');
+      }
+      job.turns = { records: evidence.records, bytes: evidence.bytes, sha256: evidence.sha256 };
+      delete job.result.turns;
+      await this.#readTurnEvidence(job, 0, 0);
+      return;
+    }
     if (!Array.isArray(session.turns) || session.turns.length !== session.native_turns) {
       throw new PlatformError('invalid engine Session/Turn view', 502, 'ENGINE_PROTOCOL');
     }
@@ -483,7 +515,7 @@ class ChipTracePlugin {
       for (const turn of session.turns) {
         const line = Buffer.from(`${JSON.stringify(turn)}\n`);
         bytes += line.length;
-        if (bytes > this.maxOutputBytes) throw new Error('turn metadata limit exceeded');
+        if (bytes > this.maxTurnBytes) throw new Error('turn metadata limit exceeded');
         await handle.writeFile(line);
         digest.update(line);
       }
@@ -576,30 +608,26 @@ class ChipTracePlugin {
     }
     const inspected = await this.#engine([
       'inspect-session', '--input', output, '--session-id', request.session_id,
-      '--projection-output', projectionRoot,
+      '--projection-output', projectionRoot, '--platform-report', '--max-turn-bytes', String(this.maxTurnBytes),
     ]);
-    if (inspected.session?.session_id !== request.session_id || inspected.session.schema_version !== 'chiptrace.session-view.v2'
+    if (inspected.schema_version !== 'chiptrace.platform-inspection.v1'
+        || inspected.session?.session_id !== request.session_id || inspected.session.schema_version !== 'chiptrace.session-view.v2'
         || inspected.source_context_audit?.schema_version !== 'chiptrace.source-context-audit.v2'
         || inspected.source_context_audit?.session_id !== request.session_id
         || typeof inspected.delivery_ready !== 'boolean'
         || (inspected.delivery_ready && !sourceContextReady(inspected.source_context_audit, request.session_id))) {
       throw new PlatformError('inspection does not match requested Session', 502, 'ENGINE_PROTOCOL');
     }
-    const projection = inspected.projection;
+    const projection = inspected.interaction_projection;
     const manifestPath = path.join(projectionRoot, 'manifest.json');
-    const manifestBytes = await fsp.readFile(manifestPath);
-    const metadata = projectionMetadata(projection, {
-      file: 'manifest.json',
-      bytes: manifestBytes.length,
-      sha256: crypto.createHash('sha256').update(manifestBytes).digest('hex'),
-    });
+    const manifest = await fileDigest(manifestPath);
+    const metadata = projectionMetadata(projection, { file: 'manifest.json', ...manifest });
     if (!metadata || metadata.schema_version !== 'chiptrace.interaction-projection.v1'
         || metadata.session_id !== request.session_id
-        || projection.session_view?.schema_version !== 'chiptrace.session-view.v2'
-        || JSON.stringify(projection.session_view) !== JSON.stringify(inspected.session)) {
+        || projection.manifest?.file !== 'manifest.json'
+        || projection.manifest?.bytes !== manifest.bytes || projection.manifest?.sha256 !== manifest.sha256) {
       throw new PlatformError('interaction projection does not match inspected Session', 502, 'ENGINE_PROTOCOL');
     }
-    delete inspected.projection;
     inspected.interaction_projection = metadata;
     return inspected;
   }
@@ -664,9 +692,19 @@ class ChipTracePlugin {
     if (!session || !job.turns) throw new PlatformError('job has no Session/Turn view', 404, 'NOT_FOUND');
     offset = integer(offset, 0, 0, Number.MAX_SAFE_INTEGER);
     limit = integer(limit, 50, 1, 100);
+    const { turns, records } = await this.#readTurnEvidence(job, offset, limit);
+    const deliveryReady = job.result.delivery_ready === true
+      && sourceContextReady(job.result.source_context_audit, job.request.session_id);
+    return { delivery_ready: deliveryReady, summary: session, total: records, offset, turns };
+  }
+
+  async #readTurnEvidence(job, offset, limit) {
     const file = path.join(this.root, 'work', job.request.id, 'turns.jsonl');
     const stat = await fsp.lstat(file);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== job.turns.bytes || stat.size > this.maxOutputBytes) {
+    if (stat.size > this.maxTurnBytes) {
+      throw new PlatformError('Turn evidence exceeds disk limit', 503, 'OUTPUT_LIMIT');
+    }
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== job.turns.bytes) {
       throw new PlatformError('Turn evidence changed', 422, 'ARTIFACT_CHANGED');
     }
     const digest = crypto.createHash('sha256');
@@ -686,9 +724,7 @@ class ChipTracePlugin {
     if (records !== job.turns.records || digest.digest('hex') !== job.turns.sha256) {
       throw new PlatformError('Turn evidence changed', 422, 'ARTIFACT_CHANGED');
     }
-    const deliveryReady = job.result.delivery_ready === true
-      && sourceContextReady(job.result.source_context_audit, job.request.session_id);
-    return { delivery_ready: deliveryReady, summary: session, total: records, offset, turns };
+    return { turns, records };
   }
 
   async openArtifact(id, file) {

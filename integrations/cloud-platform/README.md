@@ -30,8 +30,27 @@ state reuse; host authentication and tenant authorization remain required.
 The plugin persists job acknowledgements before returning, uses the Rust
 engine's OS lock for a single writer, resumes queued/running jobs after a
 restart, and stores native Session/Turn records in a checksummed JSONL sidecar.
-The `turns` endpoint reads that sidecar by page, so a large Session does not
-remain in the service's heap. Inspection jobs also retain the verified canonical
+Inspection uses `inspect-session --platform-report --projection-output DIR`:
+the engine durably writes the full `turns.jsonl` beside the projection and
+returns a `chiptrace.platform-inspection.v1` summary with its byte count,
+SHA-256 and record count. The platform verifies the sidecar before completing
+the job. Full Turn arrays are absent from engine stdout and job JSON; the
+default CLI inspection output retains its existing full format. The projection
+manifest is hashed in chunks during job setup. Use a matching plugin/CLI build;
+an older CLI that lacks this report fails explicitly.
+
+The engine JSON limit (`maxOutputBytes` / `CHIPTRACE_MAX_OUTPUT_BYTES`) and Turn
+disk limit (`maxTurnBytes` / `CHIPTRACE_MAX_TURN_BYTES`) are independent; both
+default to 64 MiB. A host can provision more Turn disk capacity without raising
+the engine stdout/heap guard. The engine refuses to publish a sidecar above
+the configured disk limit. Restarts can reuse an existing sidecar only when
+its exact canonical bytes match the inspected snapshot, including sidecars
+written by the previous platform. Changed evidence and symlinks are preserved
+and refused. Completed legacy jobs remain readable through their recorded
+hashes.
+
+The `turns` endpoint reads that sidecar by page; completed inspection jobs keep
+only the summary in their long-lived state. Inspection jobs also retain the verified canonical
 interaction projection; its manifest, ModelInteraction, RuntimeSpan and Link
 parts are available through the projection endpoint and are rechecked against
 their recorded SHA-256 before every download. This keeps the paged Turn summary
@@ -136,6 +155,14 @@ canonical projection. They cannot be presumed unrelated. Inspection reuses one
 read snapshot for both projection and auditing; its audit disables ID samples.
 The full identity/parent index still grows with corpus size and is not yet a
 disk index.
+The Rust projection still holds the selected Session and Turn metadata in
+memory; this compact transport does not bound its RSS. Buyer export still
+returns its full engine report, and projection-manifest downloads currently
+parse the full manifest in Node. Turn pages still hash and count the whole
+sidecar, including records outside the requested page. These paths need
+separate scale measurements and a persistent index before capacity claims.
+One Turn can itself contain a large set of Raw references; a page's Turn count
+does not impose a byte limit on that response.
 
 The Turns endpoint also returns this overall `delivery_ready` alongside the
 scoped `summary`. A true `summary.delivery_ready` or
