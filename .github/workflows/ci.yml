@@ -69,6 +69,8 @@ jobs:
           git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-session-scope-extension.patch"
           git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-session-scope-process.patch"
           git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-session-scope-process.patch"
+          git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-config-read-scope.patch"
+          git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-config-read-scope.patch"
           git -C .ci-codex-source diff --check
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -128,9 +130,23 @@ jobs:
             "$RUNNER_TEMP/producer-callbacks.log" "$RUNNER_TEMP/producer-parallel.log" \
             "$RUNNER_TEMP/producer-session.log" \
             | tee "$RUNNER_TEMP/producer-regression-check-with-session.json"
-      - name: Build the patched CLI from the exact producer source
+      - name: Build the patched CLI and debug App Server from the exact producer source
         working-directory: .ci-codex-source/codex-rs
-        run: cargo build -p codex-cli --bin codex --locked
+        run: cargo build -p codex-cli --bin codex -p codex-app-server --bin codex-app-server --locked
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91.0"
+      - name: Build the current Collector and Relay for newly executed protocol collection
+        run: cargo +1.91.0 build --locked --bin chiptrace
+      - name: Collect two new native Turns with real tools, resume, failure and async results
+        env:
+          CHIPTRACE_PROTOCOL_PRODUCER: ${{ github.workspace }}/.ci-codex-source/codex-rs/target/debug/codex-app-server
+          CHIPTRACE_PROTOCOL_SOURCE: ${{ github.workspace }}/.ci-codex-source
+          CHIPTRACE_PROTOCOL_EXPECTED_SOURCE_DIGEST: ${{ steps.producer-source.outputs.digest }}
+          CHIPTRACE_PROTOCOL_REPORT: ${{ runner.temp }}/native-protocol-ci.json
+        run: |
+          set -euo pipefail
+          make protocol-collection-test 2>&1 | tee "$RUNNER_TEMP/native-protocol-ci.tap"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -146,6 +162,8 @@ jobs:
             ${{ runner.temp }}/producer-client.log
             ${{ runner.temp }}/producer-session.log
             ${{ runner.temp }}/producer-regression-check-with-session.json
+            ${{ runner.temp }}/native-protocol-ci.json
+            ${{ runner.temp }}/native-protocol-ci.tap
 
   rust:
     runs-on: ubuntu-24.04

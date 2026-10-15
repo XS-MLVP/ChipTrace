@@ -4,6 +4,47 @@
 目前已实现精确关联和拒绝不完整交付，但真实 Stock Codex 仍有来源上下文缺口。
 上线、完整交付或新客户端版本支持均需重新完成真实验收。
 
+## 每次 CI 新执行的协议采集
+
+`upstream-context` 除生产者单元测试和 CLI 构建外，还构建固定源码的 debug App Server，
+运行 [protocol-collection.test.js](../integrations/codex/protocol-collection.test.js)。它使用临时
+受管配置、本地确定性 Responses 服务、真实 shell 工具、当前 Relay/Collector 和原生
+OTLP/Hook；不读取宿主客户端配置或模型凭据。先执行 README 读取、故意 exit 7 和
+sleep/write_stdin，再关闭客户端、启动新进程实际 resume，在第二个 Turn 保留 exit 9。
+异步轮询只能使用第一次工具输出中的真实 process session ID。
+
+检查直接来自本次 Collector Raw：原生 Session/Turn 身份、四源覆盖、来源计数守恒、闭合
+边界、失败/异步场景见证及 Wire 请求/响应正文哈希。Relay/Collector 重启后还须得到完全
+相同的 Session 检查结果和原始 Segment 哈希。工作流保留 `native-protocol-ci.tap` 和
+`chiptrace.native-protocol-ci.v1` 元数据报告，不上传 Raw 或对话正文。
+
+这项回归使用已打补丁生产者和合成模型响应，报告固定声明 `real_upstream=false`、
+`production_acceptance_claimed=false`，并验证真实上游 Canary 门禁拒绝它。它能发现协议、
+生产者和采集链路一起运行时的回归，不能替代未修改客户端、真实模型、阿里 OSS 或
+生产环境的交付验收。原有脱敏真实 Canary fixture 仍用于验证门禁本身。
+
+回归执行前，在源码副本上逆序撤销完整六补丁集，并逐文件核对固定 upstream 原文；
+GitHub 还核对构建前的源码摘要。仅同版本号、补丁文件名或编译成功不能证明实验基线一致。
+
+本地复验需先构建 ChipTrace，以及固定源码、六个补丁和协调锁文件对应的 debug App Server：
+
+```bash
+CHIPTRACE_PROTOCOL_SOURCE=/absolute/path/to/pinned-codex-checkout \
+CHIPTRACE_PROTOCOL_PRODUCER=/absolute/path/to/codex-app-server \
+CHIPTRACE_PROTOCOL_REPORT=/private/path/native-protocol-ci.json \
+  make protocol-collection-test
+```
+
+运行只创建新的临时采集目录。通过后清理本次临时数据；失败时保留证据目录并返回非零。
+`CHIPTRACE_PROTOCOL_KEEP=1` 可保留通过的本地实验数据，须按运维数据权限管理。
+
+本轮新执行的实验在完整五补丁基线上发现 `config/read` 及其文件读取子 span 没有作用域，
+导致 62 个 span 的 Session 身份未知，交付检查实际退出为不通过。此请求读取进程配置，
+没有原生 Session/Turn 参数。[第六个补丁](upstream-config-read-scope.patch) 在来源端为
+`config/read` 和同类 `configRequirements/read` 明确声明 process scope；两种请求均在
+新回归每次连接时实际执行。子文件操作只沿其精确父链继承 scope，不按 span 名称豁免。
+原始五补丁真实 Canary 的历史证据和生产门禁保持原样；新实验仍须使用独立的合成报告。
+
 ## 2026-10-14 的真实新版客户端检查
 
 使用当前唯一终端安装的 Stock Codex `0.163.0-alpha.11`，在只读容器中执行一次短采集任务。

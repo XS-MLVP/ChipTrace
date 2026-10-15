@@ -1,0 +1,13 @@
+diff --git a/codex-rs/app-server/src/app_server_tracing.rs b/codex-rs/app-server/src/app_server_tracing.rs
+--- a/codex-rs/app-server/src/app_server_tracing.rs
++++ b/codex-rs/app-server/src/app_server_tracing.rs
+@@ -129,5 +129,8 @@
+ fn record_process_scope_for_method(span: &Span, method: &str) {
+-    if matches!(method, "initialize" | "model/list") {
++    if matches!(
++        method,
++        "initialize" | "model/list" | "config/read" | "configRequirements/read"
++    ) {
+         span.record("codex.context_scope", "process");
+     }
+ }
