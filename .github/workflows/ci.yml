@@ -75,10 +75,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: .ci-codex-source/codex-rs -> target
-          prefix-key: upstream-context
       - name: Reconcile only the pinned tag's local package release versions
         working-directory: .ci-codex-source/codex-rs
         run: |
@@ -86,6 +82,32 @@ jobs:
           node "$GITHUB_WORKSPACE/scripts/ci/check-producer-lock.js" --prepare \
             "$GITHUB_WORKSPACE/.ci-codex-source" "$RUNNER_TEMP/producer-metadata.json" \
             0.163.0-alpha.11 | tee "$RUNNER_TEMP/producer-lock-check.json"
+      - name: Identify the complete patched producer source before restoring artifacts
+        id: producer-source
+        run: |
+          node scripts/ci/producer-source-cache.js .ci-codex-source \
+            | tee "$RUNNER_TEMP/producer-cache-identity.json"
+          digest=$(node -p 'require(process.argv[1]).source_sha256' "$RUNNER_TEMP/producer-cache-identity.json")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        id: producer-cache
+        with:
+          workspaces: .ci-codex-source/codex-rs -> target
+          prefix-key: upstream-context-workspace-v1
+          # The key is also in rust-cache's fallback prefix. Different source
+          # bytes can never receive artifacts with normalized old timestamps.
+          key: source-${{ steps.producer-source.outputs.digest }}
+          cache-workspace-crates: "true"
+      - name: Normalize only the verified source snapshot and record cache observation
+        env:
+          PRODUCER_SOURCE_DIGEST: ${{ steps.producer-source.outputs.digest }}
+          PRODUCER_CACHE_HIT: ${{ steps.producer-cache.outputs.cache-hit }}
+        run: |
+          node scripts/ci/producer-source-cache.js --normalize \
+            .ci-codex-source "$PRODUCER_SOURCE_DIGEST" \
+            | tee "$RUNNER_TEMP/producer-cache-prepared.json"
+          node -e 'console.log(JSON.stringify({exact_cache_hit: process.env.PRODUCER_CACHE_HIT === "true"}))' \
+            | tee "$RUNNER_TEMP/producer-cache-observation.json"
       - name: Compile and test detached callbacks and successful/failed/parallel stream terminals
         working-directory: .ci-codex-source/codex-rs
         run: |
@@ -113,6 +135,9 @@ jobs:
           name: producer-context-report
           path: |
             ${{ runner.temp }}/producer-lock-check.json
+            ${{ runner.temp }}/producer-cache-identity.json
+            ${{ runner.temp }}/producer-cache-prepared.json
+            ${{ runner.temp }}/producer-cache-observation.json
             ${{ runner.temp }}/producer-callbacks.log
             ${{ runner.temp }}/producer-parallel.log
             ${{ runner.temp }}/producer-regression-check.json
@@ -147,7 +172,7 @@ jobs:
         with:
           name: native-hook-ack-report
           path: native-hook-ack.tap
-      - run: node --test scripts/ci/upstream-context.test.js
+      - run: node --test scripts/ci/upstream-context.test.js scripts/ci/producer-source-cache.test.js
       - run: node --test scripts/ci/native-canary-gate.test.js
       - run: node --test scripts/ci/native-canary-evidence.test.js
       - name: Verify runtime delivery and Turn Wire evidence fails closed

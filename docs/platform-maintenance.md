@@ -100,6 +100,16 @@ patch 的顺序 `apply --check`、应用和 `git diff --check`。GitHub CI 会�
 commit，先应用已有补丁，再应用 Session 扩展和独立的 process 作用域补丁；任何 patch 漂移
 或锁文件依赖变化都应使 job 失败。
 
+生产者编译缓存保存工作区 crate，但缓存身份必须覆盖固定 upstream commit、补丁应用后
+全部已跟踪文件、未跟踪的补丁新增文件、协调后的锁文件、执行位和缓存脚本自身。完整
+SHA-256 放入 `rust-cache` 的 key，因而 fallback prefix 也限制在同一份源码；Rust 版本、
+构建环境与依赖键仍由该 Action 校验。只有恢复缓存后再次核对源码身份，才把源码时间戳
+归一化，以避免新 checkout 导致重复编译。源码变化会使用新缓存，身份不符直接失败。
+缓存命中也继续执行全部回调、并行、Session 和客户端测试，以及 CLI 构建。
+`producer-context-report` 另保留身份、归一化复验和实际 cache-hit 观察；真实 Cargo 回归
+覆盖相同源码复用、测试重新执行及源码变化后重新编译并保留真实失败。首次远端缓存填充
+和后续命中的耗时需要分别观测，不能从本地回归宣称 GitHub 已获得加速。
+
 宿主网关还须使用 `openCaptureHealthy` 门禁。独立部署 smoke：
 
 ```bash
