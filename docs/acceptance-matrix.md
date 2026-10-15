@@ -9,7 +9,7 @@
 | --- | --- | --- |
 | Raw 完整性 | WAL、sealed Segment、OSS Manifest/Checkpoint | complete；逐对象和逐行 SHA-256 通过 |
 | 云端来源 | Wire、OTLP logs、OTLP traces、required Hook | Session 与每个 Native Turn 均精确归属四路来源；缺一路即拒绝 |
-| Wire 完整性 | 18084 原字节 Capture | 请求/响应长度与 SHA 一致；Responses 有协议终态 |
+| Wire 完整性 | 18084 原字节 Capture | 请求/响应长度与 SHA 一致；Responses 有协议终态，或有完整证据的 SSE 前 HTTP 错误/响应前传输失败；保留失败语义 |
 | Session/Turn 身份 | Stock Codex headers、OTLP、required Hook | 显式 `session_id`/`turn_id`；Session start/end 闭合；每个 Turn 无 open/conflict/unscoped |
 | Runtime | `codex.tool_result` + lifecycle | 输出未截断；调度状态明确；Shell 进程结果独立；无 open/conflict span |
 | 调用关联 | ModelInteraction、RuntimeSpan、InteractionLink | call/result/execution 精确配对；内部父引用 100% |

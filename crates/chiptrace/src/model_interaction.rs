@@ -212,6 +212,7 @@ struct StreamState {
     client_delivery_status: &'static str,
     protocol_terminal_observed: bool,
     framing_done_observed: bool,
+    http_error_response_complete: bool,
     error_event: Option<Value>,
 }
 
@@ -2396,14 +2397,22 @@ fn non_stream_state(capture: &Value, response: &Value) -> StreamState {
         client_delivery_status: client_delivery_status(capture),
         protocol_terminal_observed: model_outcome.is_some(),
         framing_done_observed: true,
+        http_error_response_complete: false,
         error_event: None,
     }
 }
 
-fn responses_stream_state(capture: &Value, view: &ResponsesStreamView) -> StreamState {
+fn responses_stream_state(
+    capture: &Value,
+    view: &ResponsesStreamView,
+    body: &WireBody,
+) -> StreamState {
     let transport_error = explicit_transport_error(capture);
+    let http_error_response_complete = complete_http_error_response(capture, view, body);
     let outcome = view.terminal_outcome.unwrap_or({
-        if transport_error {
+        if http_error_response_complete {
+            StreamOutcome::Failed
+        } else if transport_error {
             StreamOutcome::TransportError
         } else {
             StreamOutcome::EofWithoutTerminal
@@ -2416,11 +2425,12 @@ fn responses_stream_state(capture: &Value, view: &ResponsesStreamView) -> Stream
             Some(StreamOutcome::Failed) => "failed",
             Some(StreamOutcome::Cancelled) => "cancelled",
             Some(StreamOutcome::Incomplete) => "incomplete",
+            _ if http_error_response_complete => "failed",
             _ => "incomplete",
         },
         upstream_transport_status: if transport_error {
             "transport_error"
-        } else if view.protocol_terminal_observed {
+        } else if view.protocol_terminal_observed || http_error_response_complete {
             "completed"
         } else {
             "eof_without_terminal"
@@ -2428,6 +2438,7 @@ fn responses_stream_state(capture: &Value, view: &ResponsesStreamView) -> Stream
         client_delivery_status: client_delivery_status(capture),
         protocol_terminal_observed: view.protocol_terminal_observed,
         framing_done_observed: view.framing_done_observed,
+        http_error_response_complete,
         error_event: view.error_event.clone(),
     }
 }
@@ -2469,19 +2480,68 @@ fn chat_stream_state(capture: &Value, response: &Value, framing_done: bool) -> S
         client_delivery_status: client_delivery_status(capture),
         protocol_terminal_observed,
         framing_done_observed: framing_done,
+        http_error_response_complete: false,
         error_event: None,
     }
 }
 
 fn stream_state_value(state: &StreamState) -> Value {
-    json!({
+    let mut value = json!({
         "outcome":state.outcome.as_str(),
         "model_status":state.model_status,
         "upstream_transport_status":state.upstream_transport_status,
         "client_delivery_status":state.client_delivery_status,
         "protocol_terminal_observed":state.protocol_terminal_observed,
         "framing_done_observed":state.framing_done_observed,
-    })
+    });
+    if state.http_error_response_complete {
+        value["http_error_response_complete"] = json!(true);
+    }
+    value
+}
+
+// An HTTP JSON error can terminate an attempted streaming request before any
+// SSE event exists. Preserve that failure without inventing a model terminal
+// or framing event. Missing completion evidence keeps the attempt incomplete.
+fn complete_http_error_response(
+    capture: &Value,
+    view: &ResponsesStreamView,
+    body: &WireBody,
+) -> bool {
+    capture
+        .get("responseStatus")
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+        .is_some_and(|status| (400..600).contains(&status))
+        && !explicit_transport_error(capture)
+        && view.events.as_array().is_some_and(Vec::is_empty)
+        && view.malformed_events == 0
+        && body.parsed.get("error").is_some_and(|error| {
+            error.as_object().is_some_and(|value| !value.is_empty())
+                || error.as_str().is_some_and(|value| !value.trim().is_empty())
+        })
+        && body
+            .parsed
+            .get("status")
+            .is_none_or(|status| model_outcome(status.as_str()) == Some(StreamOutcome::Failed))
+        && raw_body_complete(body)
+        && capture.get("responseTruncated").and_then(Value::as_bool) == Some(false)
+        && capture
+            .get("responseBytesForwarded")
+            .and_then(Value::as_u64)
+            == body.declared_bytes
+        && capture
+            .get("upstreamResponseCompleted")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && capture.get("clientRequestAborted").and_then(Value::as_bool) == Some(false)
+        && capture
+            .get("clientResponseClosedBeforeFinish")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && capture
+            .get("clientResponseFinished")
+            .and_then(Value::as_bool)
+            == Some(true)
 }
 
 fn capture_error(capture: &Value, response: &Value, stream_error: Option<&Value>) -> Value {
@@ -2636,7 +2696,9 @@ fn interaction_integrity(
     let protocol_complete = shape.family == "openai"
         && shape.endpoint == "responses"
         && shape.transport == "stream"
-        && (protocol_terminal_complete || pre_response_transport_failure_complete)
+        && (protocol_terminal_complete
+            || pre_response_transport_failure_complete
+            || state.http_error_response_complete)
         && malformed_events == 0
         && status_dimensions_complete
         && trace_identity_complete;
@@ -3292,7 +3354,7 @@ fn adapt_responses(
     let request = request_body.parsed.as_object().cloned().unwrap_or_default();
     let stream_view = responses_response_view(&response_body, &shape);
     let state = if shape.transport == "stream" {
-        responses_stream_state(capture, &stream_view)
+        responses_stream_state(capture, &stream_view, &response_body)
     } else {
         non_stream_state(capture, &stream_view.response)
     };
@@ -3528,6 +3590,7 @@ fn adapt_opaque(
             client_delivery_status: client_delivery_status(capture),
             protocol_terminal_observed: false,
             framing_done_observed: false,
+            http_error_response_complete: false,
             error_event: None,
         }
     } else {
@@ -4084,7 +4147,13 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
             }
         }
     }
-    let mut response = terminal.or(created).unwrap_or_else(|| json!({}));
+    let mut response = terminal.or(created).unwrap_or_else(|| {
+        if body.parsed.is_object() {
+            body.parsed.clone()
+        } else {
+            json!({})
+        }
+    });
     if !output.is_empty() {
         response["output"] = Value::Array(output.into_values().collect());
     }
@@ -7546,6 +7615,152 @@ mod tests {
         );
         assert_eq!(interaction["response"]["model_status"], "incomplete");
         assert_eq!(interaction["integrity"]["protocol_complete"], false);
+    }
+
+    #[test]
+    fn responses_http_json_error_preserves_a_complete_failed_attempt() {
+        for status in [400, 401, 403, 429, 500, 503, 599] {
+            for error in [
+                json!({"type":"server_error","code":"retryable","message":"synthetic upstream failure"}),
+                json!("synthetic upstream failure"),
+            ] {
+                for response in [
+                    json!({"error":error.clone()}),
+                    json!({"status":"failed","error":error.clone()}),
+                    json!({"status":"error","error":error.clone()}),
+                ] {
+                    let mut capture = fixture_capture(
+                        "http-json-error",
+                        "/v1/responses",
+                        false,
+                        RESPONSES_STREAM_REQUEST,
+                        &serde_json::to_string(&response).unwrap(),
+                    );
+                    capture["responseStatus"] = json!(status);
+                    capture["responseBytesForwarded"] = capture["responseBytesCaptured"].clone();
+                    let interaction = model_interaction_from_capture(&capture).unwrap();
+                    assert_eq!(interaction["protocol"]["transport"], "stream");
+                    assert_eq!(interaction["response"]["raw"], response);
+                    assert_eq!(interaction["response"]["model_status"], "failed");
+                    assert_eq!(
+                        interaction["response"]["upstream_transport_status"],
+                        "completed"
+                    );
+                    assert_eq!(interaction["error"]["response_error"], error);
+                    assert_eq!(interaction["error"]["http_status"], status);
+                    assert_eq!(interaction["error"]["stream_error"], Value::Null);
+                    assert_eq!(interaction["response"]["output_items"], json!([]));
+                    assert_eq!(interaction["extensions"]["wire"]["sse_events"], json!([]));
+                    let state = &interaction["extensions"]["wire"]["stream_state"];
+                    assert_eq!(state["protocol_terminal_observed"], false);
+                    assert_eq!(state["framing_done_observed"], false);
+                    assert_eq!(state["http_error_response_complete"], true);
+                    assert_eq!(interaction["integrity"]["raw_bytes_complete"], true);
+                    assert_eq!(interaction["integrity"]["protocol_complete"], true);
+                    assert_eq!(interaction["integrity"]["stream_outcome"], "failed");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn responses_http_json_error_requires_complete_failure_evidence() {
+        let response = r#"{"error":{"message":"synthetic upstream failure"}}"#;
+        let mut complete = fixture_capture(
+            "http-json-error-guards",
+            "/v1/responses",
+            false,
+            RESPONSES_STREAM_REQUEST,
+            response,
+        );
+        complete["responseStatus"] = json!(503);
+        complete["responseBytesForwarded"] = complete["responseBytesCaptured"].clone();
+        assert_eq!(
+            model_interaction_from_capture(&complete).unwrap()["integrity"]["protocol_complete"],
+            true,
+            "negative controls must start from a complete failed attempt"
+        );
+        for (field, value) in [
+            ("responseStatus", json!(200)),
+            ("responseStatus", json!(399)),
+            ("responseStatus", json!(600)),
+            ("responseStatus", json!("600")),
+            ("responseStatus", Value::Null),
+            ("upstreamResponseCompleted", json!(false)),
+            ("upstreamResponseCompleted", Value::Null),
+            ("clientRequestAborted", json!(true)),
+            ("clientRequestAborted", Value::Null),
+            ("clientResponseClosedBeforeFinish", json!(true)),
+            ("clientResponseClosedBeforeFinish", Value::Null),
+            ("clientResponseFinished", json!(false)),
+            ("clientResponseFinished", Value::Null),
+            ("responseTruncated", json!(true)),
+            ("responseTruncated", Value::Null),
+            ("responseBodySha256", json!("0".repeat(64))),
+            ("responseBodySha256", Value::Null),
+            ("responseBytesCaptured", json!(1)),
+            ("responseBytesCaptured", Value::Null),
+            ("responseBytesForwarded", json!(1)),
+            ("responseBytesForwarded", json!(u64::MAX)),
+            ("responseBytesForwarded", Value::Null),
+            ("captureError", json!("synthetic transport interruption")),
+        ] {
+            let mut capture = complete.clone();
+            capture[field] = value;
+            let interaction = model_interaction_from_capture(&capture).unwrap();
+            assert_eq!(
+                interaction["integrity"]["protocol_complete"], false,
+                "{field}"
+            );
+            assert!(
+                interaction["extensions"]["wire"]["stream_state"]
+                    .get("http_error_response_complete")
+                    .is_none(),
+                "{field}"
+            );
+            assert_eq!(
+                interaction["response"]["raw"],
+                serde_json::from_str::<Value>(response).unwrap(),
+                "failure diagnostics must remain available even when delivery is refused"
+            );
+        }
+        for body in [
+            r#"{"status":"completed","output":[]}"#,
+            r#"{"status":"completed","error":{"message":"conflicting model status"}}"#,
+            r#"{"status":"incomplete","error":{"message":"conflicting model status"}}"#,
+            r#"{"status":"cancelled","error":{"message":"conflicting model status"}}"#,
+            r#"{"status":"in_progress","error":{"message":"conflicting model status"}}"#,
+            r#"{"status":null,"error":{"message":"unknown model status"}}"#,
+            r#"{"status":"unknown","error":{"message":"unknown model status"}}"#,
+            r#"{"status":503,"error":{"message":"invalid model status"}}"#,
+            r#"{"error":null}"#,
+            r#"{"error":{}}"#,
+            r#"{"error":""}"#,
+            r#"{"error":"   "}"#,
+            r#"{"error":false}"#,
+            r#"{"error":503}"#,
+            r#"{"error":[]}"#,
+            r#"{"error":["invalid error type"]}"#,
+            r#"{"error":"unterminated"#,
+        ] {
+            let mut capture = fixture_capture(
+                "http-json-error-invalid-body",
+                "/v1/responses",
+                false,
+                RESPONSES_STREAM_REQUEST,
+                body,
+            );
+            capture["responseStatus"] = json!(503);
+            capture["responseBytesForwarded"] = capture["responseBytesCaptured"].clone();
+            let interaction = model_interaction_from_capture(&capture).unwrap();
+            assert_eq!(interaction["integrity"]["raw_bytes_complete"], true);
+            assert_eq!(interaction["integrity"]["protocol_complete"], false);
+            assert!(
+                interaction["extensions"]["wire"]["stream_state"]
+                    .get("http_error_response_complete")
+                    .is_none()
+            );
+        }
     }
 
     #[test]

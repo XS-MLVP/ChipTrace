@@ -13,6 +13,10 @@
 `view_image` 打开仓库 PNG，再执行 README 读取、故意 exit 7 和 sleep/write_stdin。
 关闭客户端并启动新进程实际 resume 后，必须仍能读取第一轮的图片和工具结果；第二轮
 保留 exit 9 并完成计划。异步轮询只能使用第一次工具输出中的真实 process session ID。
+第一轮保留仓库默认 Responses Lite 模式；第二轮通过本次临时模型目录将另一模型切到
+普通 Responses 模式。先返回真实 HTTP 503，再由客户端自行重试，随后在一个响应中
+发出两个只读 shell 调用。两个原生执行区间必须实际重叠。模型名称和轮次均与实际
+Wire 比对，不能在 Lite 请求明确禁用并行时发送并行调用来宣称验证成功。
 计划工具只在临时测试配置显式启用；每次调用还检查真实请求的 `tools` 或
 `input[].additional_tools` 声明，不能靠模型服务返回一个未注册的工具调用制造成功。
 
@@ -29,6 +33,14 @@ Canonical 交互投影；不能只检查图片占位文字。五类工具的每�
 全部模型输入须与实际保存的 Wire JSON 相等，全部输出项目（包含两轮最终文本）须与
 本次 Responses 返回的项目相等；交互和工具的条数均以实际执行为准。完整正文仍参与
 严格比较，但失败断言只报告不一致的输入或输出类别，不展开正文或 inline 图片。
+每个 RuntimeSpan 的参数、结果、错误和进程状态还须与对应原生 Raw 逐项相等；参数再与
+实际发出的模型调用比较，完整 Schema 与本次请求中的工具声明比较。exit 7 和 exit 9
+都必须保留进程失败语义，不能用工具调度成功替代实际进程结果。
+一个响应可含多个项目，包括合成 reasoning、多个工具调用和带 commentary 阶段的
+助手消息。Canonical 必须保留全部实际项目及顺序；新进程 resume 后还须保留合成的
+opaque reasoning、summary、commentary 阶段及图片。报告只记录元数据和完整性结论。
+503 与后续 200 必须各有独立 Capture/交互，保持同一原生 Turn 和输入历史；相同请求
+正文不能使失败尝试被折叠。完整 JSON 错误正文须保留，失败不能被后续成功覆盖。
 
 这项回归使用已打补丁生产者和合成模型响应，报告固定声明 `real_upstream=false`、
 `production_acceptance_claimed=false`，并验证真实上游 Canary 门禁拒绝它。它能发现协议、

@@ -107,7 +107,7 @@ Session 级记录不参与逐 Turn 四源计数。SSE、工具结果/决策、�
 
 | 状态 | 权威来源 |
 | --- | --- |
-| 模型完成、失败或取消 | Responses 协议终态 |
+| 模型请求完成、失败或取消 | Responses 协议终态；SSE 前的完整 HTTP 错误响应单独记录失败 |
 | 上游传输完成或错误 | 18084 转发器 |
 | 客户端完整接收或提前关闭 | 18084 客户连接 |
 | 工具调度是否返回结果 | `codex.tool_result.success` |
@@ -115,6 +115,13 @@ Session 级记录不参与逐 Turn 四源计数。SSE、工具结果/决策、�
 | Session/Turn 闭合 | required lifecycle Hook |
 
 SSE `[DONE]` 只是 framing，不代表模型成功。返回文本不能用于推断工具状态。
+声明 `stream=true` 的 Responses 请求也可能在 SSE 开始前收到 HTTP 4xx/5xx JSON 错误。
+Canonical 保留这个实际 JSON 错误及 HTTP 状态；有独立字节数、SHA-256、转发与捕获字节数一致、明确未截断和
+完整上游/客户端接收证据时，将其记为完整的失败尝试，`model_status=failed`，并在
+`extensions.wire.stream_state` 标记 `http_error_response_complete=true`。没有观察到的
+SSE 终态、framing 和错误事件继续保持未观察到，不补写事件。缺少完成证据、传输中断、
+截断、空或非法错误正文仍不可完整交付；HTTP 200 JSON 也不能替代必需的流式终态。
+客户端后续重试是同一原生 Turn 中另一条独立交互，不能删除失败尝试或改写为成功。
 `output_truncated != false` 表示工具结果不完整。`codex.tool_result.success=true` 只证明工具
 调度器成功返回结果，不代表子进程退出码为 0。ChipTrace 仅对默认 `functions` 命名空间中的
 `exec_command` / `write_stdin` 解析 Stock Codex 在 `Output:` 之前生成的固定进程结果头，

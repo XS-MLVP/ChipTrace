@@ -182,9 +182,9 @@ function rpc(handle, externalFailure) {
   };
 }
 
-function sse(id, item) {
+function sse(id, items) {
   return [{ type: 'response.created', response: { id } },
-    { type: 'response.output_item.done', item },
+    ...items.map((item, output_index) => ({ type: 'response.output_item.done', output_index, item })),
     { type: 'response.completed', response: { id,
       usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } } }]
     .map(value => `event: ${value.type}\ndata: ${JSON.stringify(value)}\n\n`).join('');
@@ -194,7 +194,12 @@ function deterministicModel(image) {
   let phase = 'plan-start';
   let polls = 0;
   let processId;
+  let retried = false;
   const observations = [];
+  // Synthetic protocol content only; this is never a real model's reasoning.
+  const reasoning = { type: 'reasoning', id: 'protocol-reasoning',
+    summary: [{ type: 'summary_text', text: 'SYNTHETIC_PROTOCOL_SUMMARY 中文 🧪' }],
+    encrypted_content: 'SYNTHETIC_OPAQUE_REASONING_CONTEXT' };
   const tool = (callId, name, args) => ({ type: 'function_call', call_id: callId,
     name, arguments: JSON.stringify(args) });
   const result = (body, callId) => {
@@ -217,13 +222,32 @@ function deterministicModel(image) {
     assert.equal(bytes.length, image.bytes);
     assert.equal(sha256(bytes), image.sha256, 'view_image must retain the fixture image bytes');
   };
+  const verifyReasoning = input => {
+    const item = input.find(item => item.type === 'reasoning'
+      && item.encrypted_content === reasoning.encrypted_content);
+    assert.ok(item, 'the real producer must replay its actual opaque reasoning context');
+    assert.ok(isDeepStrictEqual(item.summary, reasoning.summary),
+      'the real producer must retain the synthetic reasoning summary (payload omitted)');
+  };
   return {
     observations,
     verifyImage,
     get finished() { return phase === 'done'; },
     respond(body, turnId) {
-      assert.equal(body.model, 'gpt-5.6-sol');
+      const secondTurn = ['resumed', 'plan-complete', 'final'].includes(phase);
+      assert.equal(body.model, secondTurn ? 'gpt-6-astra' : 'gpt-5.6-sol');
+      assert.equal(body.parallel_tool_calls, secondTurn,
+        'actual requests must distinguish default Lite and explicit parallel Responses modes');
       assert.equal(body.stream, true);
+      if (phase === 'resumed' && !retried) {
+        retried = true;
+        const error = { error: { type: 'server_error', code: 'protocol_expected_retry',
+          message: 'SYNTHETIC_EXPECTED_RETRY_503' } };
+        observations.push({ turn_id: turnId, model: body.model, parallel_tool_calls: body.parallel_tool_calls,
+          response_id: null, http_status: 503, error_response: error, output_items: [], tool_calls: [],
+          input_sha256: sha256(JSON.stringify(body.input)), input_items: body.input.length });
+        return { status: 503, content_type: 'application/json', body: JSON.stringify(error) };
+      }
       let item;
       const exec = (callId, cmd, yieldTime = 250) => tool(callId, 'exec_command',
         { cmd, shell: '/bin/sh', login: false, yield_time_ms: yieldTime, max_output_tokens: 2000 });
@@ -233,6 +257,7 @@ function deterministicModel(image) {
         });
         phase = 'goal';
       } else if (phase === 'goal') {
+        verifyReasoning(body.input);
         assert.equal(output(body, 'protocol-plan-start'), 'Plan updated');
         item = tool('protocol-goal', 'get_goal', {});
         phase = 'image';
@@ -280,12 +305,18 @@ function deterministicModel(image) {
         assert.equal(output(body, 'protocol-plan-start'), 'Plan updated');
         assert.equal(JSON.parse(output(body, 'protocol-goal')).goal, null);
         verifyImage(result(body, 'protocol-image'));
-        item = exec('protocol-resumed', 'printf RESUMED_TURN_OK; printf CHIPTRACE_EXPECTED_EXIT_9 >&2; exit 9');
+        verifyReasoning(body.input);
+        const commentary = body.input.find(item => item.type === 'message' && item.role === 'assistant'
+          && item.content?.some(content => content.text === 'FIRST_TURN_COMMENTARY'));
+        assert.equal(commentary?.phase, 'commentary', 'resume must retain the actual assistant message phase');
+        item = exec('protocol-resumed', 'sleep 1; printf RESUMED_TURN_OK; printf CHIPTRACE_EXPECTED_EXIT_9 >&2; exit 9', 10000);
         phase = 'plan-complete';
       } else if (phase === 'plan-complete') {
         const actual = output(body, 'protocol-resumed');
         assert.match(actual, /Process exited with code 9/);
         assert.match(actual, /RESUMED_TURN_OK/);
+        assert.match(output(body, 'protocol-count'), /16 README.md/,
+          'the second real tool in the same model response must execute');
         item = tool('protocol-plan-complete', 'update_plan', {
           plan: [{ step: 'Verify native multimodal collection and resume', status: 'completed' }],
         });
@@ -296,17 +327,31 @@ function deterministicModel(image) {
           content: [{ type: 'output_text', text: 'SECOND_TURN_COMPLETE' }] };
         phase = 'done';
       } else assert.fail('unexpected model request after terminal response');
-      if (item.type === 'function_call') {
-        const names = specs => specs.flatMap(spec => spec.type === 'namespace'
-          ? names(spec.tools) : [spec.name ?? spec.function?.name]);
-        const declarations = [...(body.tools || []), ...body.input
-          .filter(input => input.type === 'additional_tools').flatMap(input => input.tools)];
-        assert.ok(names(declarations).includes(item.name), `the real producer must advertise ${item.name}`);
+      let items = [item];
+      if (item.call_id === 'protocol-plan-start') items.unshift(reasoning);
+      if (item.call_id === 'protocol-resumed') {
+        assert.equal(body.parallel_tool_calls, true, 'the real request must enable parallel tool calls');
+        items.push(exec('protocol-count', 'sleep 1; wc -l README.md', 10000));
       }
-      observations.push({ call_id: item.call_id || null, name: item.name || 'assistant',
-        turn_id: turnId, output_item: item,
+      if (item.id === 'protocol-first-final') items.unshift({ type: 'message', role: 'assistant',
+        id: 'protocol-first-commentary', phase: 'commentary',
+        content: [{ type: 'output_text', text: 'FIRST_TURN_COMMENTARY' }] });
+      const definitions = specs => specs.flatMap(spec => spec.type === 'namespace'
+        ? definitions(spec.tools) : [spec]);
+      const declarations = definitions([...(body.tools || []), ...body.input
+        .filter(input => input.type === 'additional_tools').flatMap(input => input.tools)]);
+      const tools = items.filter(item => item.type === 'function_call').map(call => {
+        const definition = declarations.find(spec => (spec.name ?? spec.function?.name) === call.name);
+        assert.ok(definition, `the real producer must advertise ${call.name}`);
+        return { call_id: call.call_id, name: call.name, turn_id: turnId,
+          output_item: call, tool_definition: definition };
+      });
+      const responseId = `protocol-response-${observations.length + 1}`;
+      observations.push({ turn_id: turnId, model: body.model, parallel_tool_calls: body.parallel_tool_calls,
+        response_id: responseId, http_status: 200,
+        output_items: items, tool_calls: tools,
         input_sha256: sha256(JSON.stringify(body.input)), input_items: body.input.length });
-      return sse(`protocol-response-${observations.length}`, item);
+      return { status: 200, content_type: 'text/event-stream', body: sse(responseId, items) };
     },
   };
 }
@@ -366,6 +411,9 @@ async function collectProtocol(t) {
     const model = deterministicModel(image);
     const wire = [];
     const catalog = JSON.parse(await fs.readFile(path.join(__dirname, 'managed-models.json'), 'utf8'));
+    // Keep the default Lite profile in Turn 1. Only this isolated catalog opts
+    // the second model into ordinary Responses for real parallel calls.
+    catalog.models.find(model => model.slug === 'gpt-6-astra').use_responses_lite = false;
     server = http.createServer((req, res) => {
       (async () => {
         const chunks = [];
@@ -395,15 +443,20 @@ async function collectProtocol(t) {
         assert.deepEqual(context.conflicts, []);
         assert.ok(context.trace.session_id && context.trace.turn_id, 'actual Wire native identities required');
         const request = Buffer.concat(chunks);
-        const response = Buffer.from(model.respond(JSON.parse(request), context.trace.turn_id));
-        const transaction = await outbox.beginCapture({ captureId: `cap-protocol-${crypto.randomUUID()}`,
+        const reply = model.respond(JSON.parse(request), context.trace.turn_id);
+        const response = Buffer.from(reply.body);
+        const captureId = `cap-protocol-${crypto.randomUUID()}`;
+        model.observations.at(-1).capture_id = captureId;
+        const transaction = await outbox.beginCapture({ captureId,
           version: 'chiptrace.capture.v2', recordType: 'api_snapshot', sourceNamespace: 'synthetic-protocol-ci',
           method: req.method, proxiedPath: req.url, startedAt: new Date().toISOString(),
           traceContext: context.trace, fieldEvidence: context.evidence,
           fieldEvidenceConflicts: context.conflicts, traceContextErrors: context.errors });
         await transaction.appendRequest(request);
         // Split in the middle of UTF-8 and SSE tokens as well as normal lines.
-        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        const responseHeaders = { 'content-type': reply.content_type,
+          ...(reply.status === 503 ? { 'retry-after-ms': '1' } : {}) };
+        res.writeHead(reply.status, responseHeaders);
         for (let offset = 0; offset < response.length; offset += 37) {
           const chunk = response.subarray(offset, offset + 37);
           await transaction.appendResponse(chunk);
@@ -417,11 +470,11 @@ async function collectProtocol(t) {
         });
         res.end();
         await completion;
-        await transaction.finalize({ responseStatus: 200, stream: true,
+        await transaction.finalize({ responseStatus: reply.status, stream: reply.status === 200, responseHeaders,
           finishedAt: new Date().toISOString(), upstreamResponseCompleted: true,
           clientRequestAborted: req.aborted, clientResponseClosedBeforeFinish: res.destroyed && !res.writableFinished,
           clientResponseFinished: res.writableFinished, responseBytesForwarded: response.length });
-        wire.push({ session_id: context.trace.session_id, turn_id: context.trace.turn_id,
+        wire.push({ capture_id: captureId, session_id: context.trace.session_id, turn_id: context.trace.turn_id,
           request_sha256: sha256(request), response_sha256: sha256(response) });
       })().catch(error => {
         failure ||= error;
@@ -443,7 +496,10 @@ async function collectProtocol(t) {
       .replaceAll(`${endpoint}/otel/`, `${relayUrl}/otel/`);
     const requirements = substitute(await fs.readFile(path.join(__dirname, 'requirements.toml.example'), 'utf8'))
       .replaceAll(`${endpoint}/hooks/codex`, `${relayUrl}/hooks/codex`);
-    await fs.writeFile(path.join(home, 'config.toml'), config + '\n[tools.update_plan]\nenabled = true\n', { mode: 0o600 });
+    const catalogPath = path.join(home, 'models.json');
+    await fs.writeFile(catalogPath, JSON.stringify(catalog), { mode: 0o600 });
+    await fs.writeFile(path.join(home, 'config.toml'), `model_catalog_json = ${JSON.stringify(catalogPath)}\n`
+      + config + '\n[tools.update_plan]\nenabled = true\n', { mode: 0o600 });
     await fs.writeFile(path.join(managed, 'requirements.toml'), requirements, { mode: 0o600 });
     const producerEnv = { CODEX_HOME: home, CHIPTRACE_PROTOCOL_API_KEY: 'synthetic-protocol-provider',
       CHIPTRACE_INGEST_TOKEN: token, OTEL_EXPORTER_OTLP_HEADERS: `Authorization=Bearer%20${token}`,
@@ -466,20 +522,20 @@ async function collectProtocol(t) {
     const started = await first.client.request('thread/start', {
       model: 'gpt-5.6-sol', cwd: root, approvalPolicy: 'never', sandbox: 'read-only', ephemeral: false });
     const session = started.thread.id;
-    const begin = async (client, prompt) => {
+    const begin = async (client, prompt, model) => {
       const result = await client.request('turn/start', { threadId: session,
-        input: [{ type: 'text', text: prompt, text_elements: [] }] });
+        input: [{ type: 'text', text: prompt, text_elements: [] }], model });
       await client.completed(session, result.turn.id);
       if (failure) throw failure;
       return result.turn.id;
     };
-    const turns = [await begin(first.client, 'FIRST_TURN_REQUEST')];
+    const turns = [await begin(first.client, 'FIRST_TURN_REQUEST', 'gpt-5.6-sol')];
     assert.deepEqual(await stop(first.handle, true), { code: 0, signal: null }, first.handle.stderr);
     const second = await connect();
     const resumed = await second.client.request('thread/resume', { threadId: session,
       cwd: root, approvalPolicy: 'never', sandbox: 'read-only' });
     assert.equal(resumed.thread.id, session);
-    turns.push(await begin(second.client, 'SECOND_TURN_REQUEST'));
+    turns.push(await begin(second.client, 'SECOND_TURN_REQUEST', 'gpt-6-astra'));
     assert.notEqual(turns[0], turns[1]);
     assert.deepEqual(await stop(second.handle, true), { code: 0, signal: null }, second.handle.stderr);
     assert.equal(model.finished, true);
@@ -548,16 +604,17 @@ async function collectProtocol(t) {
     }
     assert.equal(savedWire.length, wire.length);
     for (const expected of wire) {
-      const saved = savedWire.find(record => record.requestBodySha256 === expected.request_sha256);
+      const saved = savedWire.find(record => record.captureId === expected.capture_id);
       assert.ok(saved, 'actual request bytes must reach Collector WAL');
       assert.equal(typeof saved.requestBody.raw, 'string');
-      assert.equal(typeof saved.responseBody.value, 'string');
+      const responseRaw = saved.responseBody.raw ?? saved.responseBody.value;
+      assert.equal(typeof responseRaw, 'string');
       assert.equal(sha256(saved.requestBody.raw), expected.request_sha256);
-      assert.equal(sha256(saved.responseBody.value), expected.response_sha256);
+      assert.equal(sha256(responseRaw), expected.response_sha256);
       assert.equal(saved.requestBytesCaptured, Buffer.byteLength(saved.requestBody.raw));
-      assert.equal(saved.responseBytesCaptured, Buffer.byteLength(saved.responseBody.value));
+      assert.equal(saved.responseBytesCaptured, Buffer.byteLength(responseRaw));
     }
-    const issuedTools = model.observations.filter(item => item.call_id);
+    const issuedTools = model.observations.flatMap(item => item.tool_calls);
     assert.equal(nativeTools.length, issuedTools.length, 'every real tool result must reach Collector WAL');
     for (const issued of issuedTools) {
       const observed = nativeTools.filter(record => record.toolExecution.call_id === issued.call_id);
@@ -572,18 +629,51 @@ async function collectProtocol(t) {
     const interactions = await projectionRecords('interactions/model-interactions.jsonl.zst');
     const runtime = await projectionRecords('runtime/runtime-spans.jsonl.zst');
     assert.equal(interactions.length, model.observations.length);
-    for (const [index, observed] of model.observations.entries()) {
-      const interaction = interactions.find(item => item.response.id === `protocol-response-${index + 1}`);
-      assert.ok(interaction, 'every actual model response must have a Canonical interaction');
-      assert.equal(interaction.response.output_items.length, 1);
-      assert.ok(isDeepStrictEqual(interaction.response.output_items[0].raw, observed.output_item),
-        'Canonical model output must preserve the actual response item (payload omitted)');
+    for (const observed of model.observations) {
+      const matches = interactions.filter(item => item.raw_capture_refs
+        .some(reference => reference.capture_id === observed.capture_id));
+      assert.equal(matches.length, 1, 'every actual HTTP attempt must have a unique Canonical interaction');
+      const interaction = matches[0];
+      assert.equal(interaction.response.id, observed.response_id);
+      assert.ok(isDeepStrictEqual(interaction.response.output_items.map(item => item.raw), observed.output_items),
+        'Canonical model output must preserve every actual response item in order (payload omitted)');
       const captured = savedWire.find(record => interaction.raw_capture_refs
         .some(reference => reference.capture_id === record.captureId));
       assert.ok(captured, 'every Canonical interaction must reference its actual Collector Wire');
+      assert.equal(captured.responseStatus, observed.http_status);
+      if (observed.http_status === 503) {
+        assert.ok(isDeepStrictEqual(interaction.response.raw, observed.error_response),
+          'Canonical retry must preserve the actual HTTP error body (payload omitted)');
+        assert.equal(interaction.response.model_status, 'failed');
+        assert.equal(interaction.response.upstream_transport_status, 'completed');
+        assert.equal(interaction.response.client_delivery_status, 'delivered');
+        assert.ok(isDeepStrictEqual(interaction.error.response_error, observed.error_response.error),
+          'Canonical retry diagnostics must preserve the actual HTTP error (payload omitted)');
+        assert.equal(interaction.error.http_status, 503);
+        assert.equal(interaction.error.stream_error, null, 'an HTTP error must not invent a stream error event');
+        const stream = interaction.extensions.wire.stream_state;
+        assert.equal(stream.http_error_response_complete, true);
+        assert.equal(stream.protocol_terminal_observed, false);
+        assert.equal(stream.framing_done_observed, false);
+        assert.equal(interaction.extensions.wire.sse_events.length, 0);
+        assert.equal(interaction.integrity.protocol_complete, true);
+      }
       assert.ok(isDeepStrictEqual(interaction.request.raw, JSON.parse(captured.requestBody.raw)),
         'Canonical model input must preserve complete text, tools and multimodal history (payload omitted)');
+      assert.equal(interaction.request.model, observed.model);
       assert.equal(interaction.trace_context.turn_id ?? interaction.trace_context.root_turn_id, observed.turn_id);
+    }
+    const retryIndex = model.observations.findIndex(item => item.http_status === 503);
+    assert.ok(retryIndex >= 0, 'the real client must observe the injected HTTP failure');
+    const retry = model.observations[retryIndex];
+    const recovery = model.observations[retryIndex + 1];
+    assert.equal(recovery.http_status, 200);
+    assert.equal(recovery.turn_id, retry.turn_id, 'retry must keep its actual native Turn identity');
+    assert.equal(recovery.input_sha256, retry.input_sha256, 'retry must preserve the actual model input history');
+    assert.equal(model.observations.filter(item => item.http_status === 503).length, 1);
+    for (const turn of inspection.session.turns) {
+      assert.equal(turn.model_interactions, wire.filter(item => item.turn_id === turn.turn_id).length,
+        'each native Turn must include all actual HTTP attempts');
     }
     const imageResults = interactions.flatMap(item => item.tool_results_submitted)
       .filter(item => item.call_id === 'protocol-image');
@@ -593,6 +683,29 @@ async function collectProtocol(t) {
       const spans = runtime.filter(span => span.span_kind === 'tool_execution' && span.call_id === issued.call_id);
       assert.equal(spans.length, 1, `Canonical runtime must preserve ${issued.call_id}`);
       const observed = nativeTools.find(record => record.toolExecution.call_id === issued.call_id);
+      const execution = observed.toolExecution;
+      const span = spans[0];
+      assert.ok(isDeepStrictEqual(execution.arguments, JSON.parse(issued.output_item.arguments)),
+        `native tool arguments must match the actual issued call ${issued.call_id} (payload omitted)`);
+      assert.ok(isDeepStrictEqual(span.arguments, execution.arguments),
+        `Canonical tool arguments must match native Raw for ${issued.call_id} (payload omitted)`);
+      assert.ok(isDeepStrictEqual(span.result, execution.result),
+        `Canonical tool result must match native Raw for ${issued.call_id} (payload omitted)`);
+      assert.ok(isDeepStrictEqual(span.error, execution.error ?? null),
+        `Canonical tool error must match native Raw for ${issued.call_id} (payload omitted)`);
+      assert.ok(isDeepStrictEqual(span.extensions.process_outcome, execution.process_outcome ?? null),
+        `Canonical process outcome must match native Raw for ${issued.call_id} (payload omitted)`);
+      assert.equal(span.extensions.dispatch_status, execution.status);
+      assert.equal(span.extensions.dispatch_status_provenance, execution.status_provenance);
+      assert.equal(span.extensions.output_truncated, execution.output_truncated);
+      assert.equal(span.extensions.result_content_captured, execution.result_content_captured);
+      assert.ok(isDeepStrictEqual(span.tool_schema?.raw, issued.tool_definition),
+        `Canonical tool schema must match its actual request declaration for ${issued.call_id} (payload omitted)`);
+      const definition = issued.tool_definition.function ?? issued.tool_definition;
+      assert.ok(isDeepStrictEqual(span.tool_schema.parameters, definition.parameters ?? definition.input_schema),
+        `Canonical tool parameters must match the complete declaration for ${issued.call_id} (payload omitted)`);
+      assert.ok(span.tool_schema.description === definition.description,
+        `Canonical tool description must match the complete declaration for ${issued.call_id} (payload omitted)`);
       assert.ok(turns.includes(issued.turn_id), `tool ${issued.call_id} must be issued in an actual native Turn`);
       // Native tool logs can inherit their Turn through exact trace ancestry.
       // Compare the final assignment with the actual issuing Wire identity.
@@ -610,6 +723,21 @@ async function collectProtocol(t) {
       assert.equal(span.arguments.plan[0].status, status);
       assert.equal(span.result, 'Plan updated');
     }
+    for (const [callId, exitCode] of [['protocol-fail', 7], ['protocol-resumed', 9]]) {
+      const span = runtime.find(span => span.span_kind === 'tool_execution' && span.call_id === callId);
+      assert.equal(span.extensions.process_outcome.exit_code, exitCode);
+      assert.equal(span.extensions.semantic_status, 'error', 'a failed process must retain its failure semantics');
+    }
+    const parallelIntervals = ['protocol-resumed', 'protocol-count'].map(callId => {
+      const execution = nativeTools.find(record => record.toolExecution.call_id === callId).toolExecution;
+      const interval = { call_id: callId, start: Date.parse(execution.started_at), end: Date.parse(execution.finished_at) };
+      assert.ok(Number.isFinite(interval.start) && interval.end > interval.start,
+        'parallel execution evidence requires actual native start and finish times');
+      return interval;
+    });
+    const parallelOverlapMs = Math.min(...parallelIntervals.map(item => item.end))
+      - Math.max(...parallelIntervals.map(item => item.start));
+    assert.ok(parallelOverlapMs > 0, 'the two actual read-only shell executions must overlap');
     assert.deepEqual(await stop(relay), { code: 0, signal: null });
     assert.deepEqual(await stop(collector), { code: 0, signal: null });
     collector = launch(chiptrace, collectorArgs, { CHIPTRACE_INGEST_TOKEN: token });
@@ -631,7 +759,15 @@ async function collectProtocol(t) {
       tool_types: [...new Set(issuedTools.map(item => item.name))].sort(),
       image_evidence: { ...image, wire_and_canonical_verified: true, resume_verified: true },
       all_tool_results_in_raw_and_runtime: true, plan_turns_verified: true,
+      tool_payloads_verified: true, tool_schemas_verified: true, process_outcomes_verified: true,
       all_model_items_in_canonical: true,
+      model_output_items: model.observations.reduce((count, item) => count + item.output_items.length, 0),
+      reasoning_evidence: { canonical_verified: true, resume_verified: true },
+      model_profiles: [...new Map(model.observations.map(item => [item.model,
+        { model: item.model, parallel_tool_calls: item.parallel_tool_calls }])).values()],
+      parallel_tool_evidence: { issued_in_one_response: true, native_overlap_ms: parallelOverlapMs },
+      retry_evidence: { failed_http_status: retry.http_status, successful_http_status: recovery.http_status,
+        same_native_turn: true, input_history_preserved: true, both_attempts_preserved: true },
       source_coverage: inspection.source_coverage, scenario_evidence: inspection.scenario_evidence,
       source_audit: audit, collector_raw: rawDigests, restart_verified: true };
     // The synthetic report must never satisfy the real-upstream production gate.
@@ -645,7 +781,7 @@ async function collectProtocol(t) {
     passed = true;
 }
 
-test('newly executed producer preserves two Turns, images, plans, resume, failed exits and real async polling in four sources',
+test('native collection preserves complete multi-output Turns through model switch, parallel tools, HTTP retry and process resume',
   { timeout: 180000 }, async t => {
     try {
       await collectProtocol(t);
