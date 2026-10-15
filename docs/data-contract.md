@@ -115,6 +115,12 @@ Session 级记录不参与逐 Turn 四源计数。SSE、工具结果/决策、�
 | Session/Turn 闭合 | required lifecycle Hook |
 
 SSE `[DONE]` 只是 framing，不代表模型成功。返回文本不能用于推断工具状态。
+Responses 终态携带 `output` 时，Canonical 保留该数组的全部实际项目、顺序和字段；
+不能用先前逐项事件的子集覆盖它。省略 `output` 的 Lite 终态仍从实际逐项事件重建。
+已完成项目的字段必须在终态保留，终态可以增加字段；added 占位项目可在终态补全。
+项目缺失、已完成正文冲突或非数组的终态 `output` 计入协议矛盾并拒绝完整交付，
+原始 SSE 继续保留。只在终态完整出现的工具调用，字节范围必须覆盖该终态，不能把
+added 占位事件当作完整调用已到达客户端的证明。
 声明 `stream=true` 的 Responses 请求也可能在 SSE 开始前收到 HTTP 4xx/5xx JSON 错误。
 Canonical 保留这个实际 JSON 错误及 HTTP 状态；有独立字节数、SHA-256、转发与捕获字节数一致、明确未截断和
 完整上游/客户端接收证据时，将其记为完整的失败尝试，`model_status=failed`，并在

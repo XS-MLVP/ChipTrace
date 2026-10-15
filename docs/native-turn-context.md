@@ -41,6 +41,11 @@ Canonical 交互投影；不能只检查图片占位文字。五类工具的每�
 opaque reasoning、summary、commentary 阶段及图片。报告只记录元数据和完整性结论。
 503 与后续 200 必须各有独立 Capture/交互，保持同一原生 Turn 和输入历史；相同请求
 正文不能使失败尝试被折叠。完整 JSON 错误正文须保留，失败不能被后续成功覆盖。
+服务还在实际终态 `output` 中返回一个没有独立 `output_item.done` 的项目，必须从
+Collector Raw 的终态复核其完整数组，并与 Canonical 全部项目逐项、按顺序比较。
+报告的 `terminal_output_evidence` 只保存验证结论及这类项目的数量，不包含正文。
+四类终态、added 占位补全、矛盾已完成项目和工具调用字节边界另有 Rust 回归；这些
+协议用例不能代替真实客户端取消和断连的端到端验收。
 
 这项回归使用已打补丁生产者和合成模型响应，报告固定声明 `real_upstream=false`、
 `production_acceptance_claimed=false`，并验证真实上游 Canary 门禁拒绝它。它能发现协议、

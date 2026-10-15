@@ -3962,6 +3962,25 @@ fn contains_object_key(value: &Value, expected: &str) -> bool {
     }
 }
 
+fn response_item_retains_observation(observed: &Value, terminal: &Value) -> bool {
+    match (observed, terminal) {
+        (Value::Object(observed), Value::Object(terminal)) => {
+            observed.iter().all(|(key, value)| {
+                terminal.get(key).is_some_and(|final_value| {
+                    response_item_retains_observation(value, final_value)
+                })
+            })
+        }
+        (Value::Array(observed), Value::Array(terminal)) => {
+            observed.len() == terminal.len()
+                && observed.iter().zip(terminal).all(|(value, final_value)| {
+                    response_item_retains_observation(value, final_value)
+                })
+        }
+        _ => observed == terminal,
+    }
+}
+
 fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesStreamView {
     if shape.transport != "stream" {
         return ResponsesStreamView {
@@ -3997,6 +4016,7 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
     let mut created = None;
     let mut terminal = None;
     let mut output = BTreeMap::new();
+    let mut completed_output = BTreeSet::new();
     let mut tool_call_event_ranges: BTreeMap<String, SseByteRange> = BTreeMap::new();
     let mut item_call_ids: BTreeMap<String, String> = BTreeMap::new();
     let mut terminal_outcome = None;
@@ -4070,6 +4090,14 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
                 .get("output_index")
                 .and_then(Value::as_u64)
                 .unwrap_or(output.len() as u64);
+            if kind.ends_with("done") {
+                if completed_output.contains(&index)
+                    && output.get(&index).is_some_and(|previous| previous != item)
+                {
+                    malformed = malformed.saturating_add(1);
+                }
+                completed_output.insert(index);
+            }
             if kind.ends_with("done") || !output.contains_key(&index) {
                 output.insert(index, item.clone());
             }
@@ -4106,7 +4134,7 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
             } else {
                 terminal = value.get("response").cloned();
                 if let Some(items) = value.pointer("/response/output").and_then(Value::as_array) {
-                    for item in items.iter().filter(|item| {
+                    for (index, item) in items.iter().enumerate().filter(|(_, item)| {
                         matches!(
                             item.get("type").and_then(Value::as_str),
                             Some("function_call" | "custom_tool_call")
@@ -4118,13 +4146,21 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
                             .and_then(Value::as_str)
                             .filter(|value| !value.trim().is_empty())
                         {
-                            tool_call_event_ranges.entry(call_id.to_owned()).or_insert(
-                                SseByteRange {
-                                    event_index: event.index,
-                                    byte_start: event.byte_start,
-                                    byte_end: event.byte_end,
-                                },
-                            );
+                            let range = SseByteRange {
+                                event_index: event.index,
+                                byte_start: event.byte_start,
+                                byte_end: event.byte_end,
+                            };
+                            tool_call_event_ranges
+                                .entry(call_id.to_owned())
+                                .and_modify(|existing| {
+                                    // An added placeholder is not a complete tool call.
+                                    // Its arguments may first arrive in the terminal.
+                                    if !completed_output.contains(&(index as u64)) {
+                                        existing.byte_end = existing.byte_end.max(range.byte_end);
+                                    }
+                                })
+                                .or_insert(range);
                         }
                     }
                 }
@@ -4147,6 +4183,35 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
             }
         }
     }
+    let terminal_output = terminal
+        .as_ref()
+        .and_then(|response| response.get("output"));
+    let terminal_has_output = terminal_output.is_some();
+    if let Some(terminal_output) = terminal_output {
+        if let Some(items) = terminal_output.as_array() {
+            for (index, observed) in &output {
+                let consistent = usize::try_from(*index)
+                    .ok()
+                    .and_then(|index| items.get(index))
+                    .is_some_and(|item| {
+                        if completed_output.contains(index) {
+                            response_item_retains_observation(observed, item)
+                        } else {
+                            ["type", "id", "call_id", "name"].iter().all(|key| {
+                                observed
+                                    .get(key)
+                                    .is_none_or(|value| item.get(key) == Some(value))
+                            })
+                        }
+                    });
+                if !consistent {
+                    malformed = malformed.saturating_add(1);
+                }
+            }
+        } else {
+            malformed = malformed.saturating_add(1);
+        }
+    }
     let mut response = terminal.or(created).unwrap_or_else(|| {
         if body.parsed.is_object() {
             body.parsed.clone()
@@ -4154,7 +4219,10 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
             json!({})
         }
     });
-    if !output.is_empty() {
+    // A terminal can contain additional or completed items that did not have
+    // a separate output_item.done event. Never overwrite its actual array.
+    // Lite responses may omit it; only then rebuild from observed items.
+    if !terminal_has_output && !output.is_empty() {
         response["output"] = Value::Array(output.into_values().collect());
     }
     ResponsesStreamView {
@@ -7093,6 +7161,154 @@ mod tests {
         assert!(
             call["source_byte_start"].as_u64().unwrap() < call["source_byte_end"].as_u64().unwrap()
         );
+    }
+
+    #[test]
+    fn responses_stream_terminal_output_retains_all_actual_items() {
+        let streamed = json!({"type":"message","id":"streamed-message","role":"assistant",
+            "content":[{"type":"output_text","text":"streamed output 中文 🧪"}]});
+        let mut enriched = streamed.clone();
+        enriched["status"] = json!("completed");
+        let output = json!([enriched,
+            {"type":"reasoning","id":"terminal-reasoning","summary":[],
+             "encrypted_content":"synthetic opaque context"},
+            {"type":"function_call","id":"terminal-tool","call_id":"terminal-call",
+             "name":"run_query","arguments":"{\"sql\":\"select 42\"}"}]);
+        for (event, status) in [
+            ("response.completed", "completed"),
+            ("response.failed", "failed"),
+            ("response.incomplete", "incomplete"),
+            ("response.cancelled", "cancelled"),
+        ] {
+            let terminal = json!({"id":"terminal-response","status":status,"output":output});
+            let response = [
+                json!({"type":"response.created","response":{"id":"terminal-response"}}),
+                json!({"type":"response.output_item.done","output_index":0,"item":streamed}),
+                json!({"type":event,"response":terminal}),
+            ]
+            .iter()
+            .map(|value| format!("data: {value}\n\n"))
+            .collect::<String>();
+            let capture = fixture_capture(
+                "terminal-output",
+                "/v1/responses",
+                true,
+                RESPONSES_STREAM_REQUEST,
+                &response,
+            );
+            let interaction = model_interaction_from_capture(&capture).unwrap();
+            assert_eq!(interaction["response"]["raw"], terminal);
+            assert_eq!(
+                interaction["response"]["output_items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["raw"].clone())
+                    .collect::<Vec<_>>(),
+                output.as_array().unwrap().clone()
+            );
+            assert_eq!(interaction["model_tool_calls"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                interaction["model_tool_calls"][0]["call_id"],
+                "terminal-call"
+            );
+            assert_eq!(
+                interaction["model_tool_calls"][0]["source_byte_end"],
+                response.len()
+            );
+            assert_eq!(interaction["integrity"]["protocol_complete"], true);
+            assert_eq!(
+                interaction["extensions"]["wire"]["response"]["raw_utf8"],
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn responses_stream_terminal_output_completes_added_items_at_the_terminal_byte_boundary() {
+        let added = json!({"type":"function_call","id":"item-added","call_id":"call-added",
+            "name":"run_query","arguments":""});
+        let mut completed = added.clone();
+        completed["arguments"] = json!("{\"sql\":\"select 42\"}");
+        for done in [false, true] {
+            let prefix = format!(
+                "data: {}\n\n",
+                json!({"type":if done {
+            "response.output_item.done"
+        } else { "response.output_item.added" },
+            "output_index":0,"item":if done { &completed } else { &added }})
+            );
+            let response = format!(
+                "{prefix}data: {}\n\n",
+                json!({"type":"response.completed",
+            "response":{"id":"completed-added","output":[completed]}})
+            );
+            let mut capture = fixture_capture(
+                "completed-added",
+                "/v1/responses",
+                true,
+                RESPONSES_STREAM_REQUEST,
+                &response,
+            );
+            capture["clientResponseFinished"] = json!(false);
+            capture["clientResponseClosedBeforeFinish"] = json!(true);
+            capture["responseBytesForwarded"] = json!(response.len());
+            capture["responseBytesForwardedAtClientClose"] = json!(prefix.len() + 1);
+            capture["responseProtocolTerminalObservedAtClientClose"] = json!(false);
+            let interaction = model_interaction_from_capture(&capture).unwrap();
+            assert_eq!(interaction["response"]["output_items"][0]["raw"], completed);
+            assert_eq!(
+                interaction["model_tool_calls"][0]["source_byte_end"],
+                if done { prefix.len() } else { response.len() }
+            );
+            assert_eq!(
+                interaction["model_tool_calls"][0]["delivery_evidence"]["available"],
+                true
+            );
+            assert_eq!(
+                interaction["model_tool_calls"][0]["delivery_evidence"]["abandoned"],
+                !done
+            );
+            assert_eq!(interaction["integrity"]["protocol_complete"], true);
+        }
+    }
+
+    #[test]
+    fn responses_stream_terminal_output_rejects_contradictory_completed_items() {
+        let item = json!({"type":"message","id":"done-item","role":"assistant",
+            "content":[{"type":"output_text","text":"actual completed item"}]});
+        let mut changed = item.clone();
+        changed["content"][0]["text"] = json!("conflicting terminal item");
+        for output in [json!([]), json!([changed]), Value::Null, json!({})] {
+            let response = [
+                json!({"type":"response.output_item.done","output_index":0,"item":item}),
+                json!({"type":"response.completed","response":{"id":"conflict","output":output}}),
+            ]
+            .iter()
+            .map(|value| format!("data: {value}\n\n"))
+            .collect::<String>();
+            let capture = fixture_capture(
+                "terminal-conflict",
+                "/v1/responses",
+                true,
+                RESPONSES_STREAM_REQUEST,
+                &response,
+            );
+            let interaction = model_interaction_from_capture(&capture).unwrap();
+            assert_eq!(interaction["response"]["raw"]["output"], output);
+            assert_eq!(interaction["integrity"]["raw_bytes_complete"], true);
+            assert_eq!(interaction["integrity"]["protocol_complete"], false);
+            assert!(
+                interaction["extensions"]["wire"]["malformed_sse_events"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            assert_eq!(
+                interaction["extensions"]["wire"]["sse_events"][0]["data"]["item"],
+                item
+            );
+        }
     }
 
     #[test]

@@ -182,10 +182,10 @@ function rpc(handle, externalFailure) {
   };
 }
 
-function sse(id, items) {
+function sse(id, items, streamedItems = items) {
   return [{ type: 'response.created', response: { id } },
-    ...items.map((item, output_index) => ({ type: 'response.output_item.done', output_index, item })),
-    { type: 'response.completed', response: { id,
+    ...streamedItems.map((item, output_index) => ({ type: 'response.output_item.done', output_index, item })),
+    { type: 'response.completed', response: { id, output: items,
       usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } } }]
     .map(value => `event: ${value.type}\ndata: ${JSON.stringify(value)}\n\n`).join('');
 }
@@ -336,6 +336,10 @@ function deterministicModel(image) {
       if (item.id === 'protocol-first-final') items.unshift({ type: 'message', role: 'assistant',
         id: 'protocol-first-commentary', phase: 'commentary',
         content: [{ type: 'output_text', text: 'FIRST_TURN_COMMENTARY' }] });
+      const streamedItems = [...items];
+      if (item.id === 'protocol-second-final') items.push({ type: 'message', role: 'assistant',
+        id: 'protocol-terminal-only-commentary', phase: 'commentary',
+        content: [{ type: 'output_text', text: 'SYNTHETIC_TERMINAL_ONLY_OUTPUT 中文 🧪' }] });
       const definitions = specs => specs.flatMap(spec => spec.type === 'namespace'
         ? definitions(spec.tools) : [spec]);
       const declarations = definitions([...(body.tools || []), ...body.input
@@ -349,9 +353,9 @@ function deterministicModel(image) {
       const responseId = `protocol-response-${observations.length + 1}`;
       observations.push({ turn_id: turnId, model: body.model, parallel_tool_calls: body.parallel_tool_calls,
         response_id: responseId, http_status: 200,
-        output_items: items, tool_calls: tools,
+        output_items: items, streamed_output_items: streamedItems.length, tool_calls: tools,
         input_sha256: sha256(JSON.stringify(body.input)), input_items: body.input.length });
-      return { status: 200, content_type: 'text/event-stream', body: sse(responseId, items) };
+      return { status: 200, content_type: 'text/event-stream', body: sse(responseId, items, streamedItems) };
     },
   };
 }
@@ -641,6 +645,11 @@ async function collectProtocol(t) {
         .some(reference => reference.capture_id === record.captureId));
       assert.ok(captured, 'every Canonical interaction must reference its actual Collector Wire');
       assert.equal(captured.responseStatus, observed.http_status);
+      if (observed.http_status === 200) {
+        const terminal = interaction.extensions.wire.sse_events.find(event => event.data?.type === 'response.completed');
+        assert.ok(isDeepStrictEqual(terminal?.data.response.output, observed.output_items),
+          'the actual terminal response must retain its complete output array (payload omitted)');
+      }
       if (observed.http_status === 503) {
         assert.ok(isDeepStrictEqual(interaction.response.raw, observed.error_response),
           'Canonical retry must preserve the actual HTTP error body (payload omitted)');
@@ -671,6 +680,9 @@ async function collectProtocol(t) {
     assert.equal(recovery.turn_id, retry.turn_id, 'retry must keep its actual native Turn identity');
     assert.equal(recovery.input_sha256, retry.input_sha256, 'retry must preserve the actual model input history');
     assert.equal(model.observations.filter(item => item.http_status === 503).length, 1);
+    const terminalOnlyItems = model.observations.filter(item => item.http_status === 200)
+      .reduce((count, item) => count + item.output_items.length - item.streamed_output_items, 0);
+    assert.equal(terminalOnlyItems, 1, 'collection must preserve an actual terminal-only output item');
     for (const turn of inspection.session.turns) {
       assert.equal(turn.model_interactions, wire.filter(item => item.turn_id === turn.turn_id).length,
         'each native Turn must include all actual HTTP attempts');
@@ -761,6 +773,7 @@ async function collectProtocol(t) {
       all_tool_results_in_raw_and_runtime: true, plan_turns_verified: true,
       tool_payloads_verified: true, tool_schemas_verified: true, process_outcomes_verified: true,
       all_model_items_in_canonical: true,
+      terminal_output_evidence: { complete_arrays_verified: true, terminal_only_items: terminalOnlyItems },
       model_output_items: model.observations.reduce((count, item) => count + item.output_items.length, 0),
       reasoning_evidence: { canonical_verified: true, resume_verified: true },
       model_profiles: [...new Map(model.observations.map(item => [item.model,
