@@ -142,6 +142,7 @@ ModelInteraction、RuntimeSpan 和 InteractionLink 证据。
 
 ```bash
 export CHIPTRACE_PLATFORM_TOKEN='<at-least-32-bytes>'
+export CHIPTRACE_PROJECT_ID='project-001'
 export CHIPTRACE_PLATFORM_ROOT=/srv/chiptrace/platform
 export CHIPTRACE_CAPTURE_ROOT=/srv/chiptrace/capture
 export CHIPTRACE_OBJECT_ROOT=/srv/chiptrace/objects
@@ -151,15 +152,24 @@ sudo install -d -o 10001 -g 10001 -m 0700 \
 docker compose -f deploy/cloud-platform.yml up -d --build
 ```
 
-OSS/S3 模式只替换后端环境变量，归档仍会在工作目录恢复后才进入验收：
+项目 ID、采集路径和存储命名空间由 root 下的 `NAMESPACE.json` 在首次启动时绑定。
+源配置变化会在加载任务和复用缓存前返回 `NAMESPACE_CONFLICT`；没有绑定的历史非空
+root 返回 `NAMESPACE_UNBOUND`，原数据保留。新版本需要显式项目 ID；历史状态或存储
+迁移须使用新的项目 root，先校验目标命名空间的权威 Raw，再重新提交恢复、检查和导出。
+不要补造绑定或复制旧任务/缓存来绕过检查。凭据轮换和资源限额变化可继续使用同一绑定。
+
+首次配置 OSS/S3 项目时，设置独立 root 和后端环境变量；归档仍会在工作目录恢复后才进入验收：
 
 ```bash
 export CHIPTRACE_BACKEND=oss                 # or s3
+export CHIPTRACE_PLATFORM_ROOT=/srv/chiptrace/platform-oss-project-001
 export CHIPTRACE_OBJECT_ENDPOINT='<endpoint>'
 export CHIPTRACE_OBJECT_BUCKET='<bucket>'
 export CHIPTRACE_OBJECT_PREFIX='datasets/chiptrace'
 export OSS_ACCESS_KEY_ID='<service-key>'
 export OSS_ACCESS_KEY_SECRET='<service-secret>'
+sudo install -d -o 10001 -g 10001 -m 0700 \
+  /srv/chiptrace/platform-oss-project-001
 ```
 
 CI 使用隔离 MinIO 验证 S3 协议、对象长度和 SHA-256；真实 Alibaba OSS 账号、区域 endpoint

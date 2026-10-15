@@ -116,6 +116,7 @@ async function createPlatformServer(options) {
 if (require.main === module) {
   createPlatformServer({
     root: process.env.CHIPTRACE_PLATFORM_ROOT || '/data/platform',
+    projectId: process.env.CHIPTRACE_PROJECT_ID,
     captureRoot: process.env.CHIPTRACE_CAPTURE_ROOT,
     binary: process.env.CHIPTRACE_BIN || 'chiptrace',
     backend: process.env.CHIPTRACE_BACKEND || 'fs',

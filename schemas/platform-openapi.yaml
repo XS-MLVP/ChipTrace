@@ -2,7 +2,11 @@ openapi: 3.1.0
 info:
   title: ChipTrace Cloud Platform Adapter
   version: 1.0.0
-  description: Internal service API. The host binds one instance to one authorized project and supplies storage credentials.
+  description: >-
+    Internal service API. The host supplies an explicit project identity and
+    storage credentials. A persisted namespace binding prevents the instance
+    from reusing another project or storage namespace's jobs and caches.
+    End-user authentication and tenant authorization remain the host's responsibility.
 servers:
   - url: http://127.0.0.1:18086
 security:

@@ -7,6 +7,26 @@ credentials are fixed by the host. Requests can choose an archive/session
 identifier, but cannot choose paths, credentials, storage options, or release
 quality gates.
 
+The host must supply `projectId` to `ChipTracePlugin`/`createPlatformServer`,
+or `CHIPTRACE_PROJECT_ID` to the standalone service. This is a stable ASCII
+project identifier assigned by the host, not a field accepted from API callers.
+Each root persists a private `NAMESPACE.json` before accepting jobs. Its SHA-256
+binds the project, capture path and effective storage namespace (backend,
+filesystem object root or endpoint/bucket/region, and prefix); it contains no
+credentials or conversation data. Source settings are fixed for the instance.
+Credential rotation and resource-limit changes do not change the binding.
+
+Startup rejects mismatched configuration with `NAMESPACE_CONFLICT` before
+loading jobs or reusing snapshots. Invalid bindings fail as `CORRUPT_STATE`.
+Existing jobs, work, usage or snapshots without a binding fail as
+`NAMESPACE_UNBOUND`; their bytes remain intact. For such historical state, keep
+the old root for evidence and start a new bound project root, verify the
+authoritative Raw in the intended storage namespace, then submit new restore,
+inspection and export jobs. Do not invent a binding or copy old cache/job files
+into a new namespace. Switching storage backends, project IDs or capture paths
+also requires a new root and verified migration. The binding guards accidental
+state reuse; host authentication and tenant authorization remain required.
+
 The plugin persists job acknowledgements before returning, uses the Rust
 engine's OS lock for a single writer, resumes queued/running jobs after a
 restart, and stores native Session/Turn records in a checksummed JSONL sidecar.
@@ -144,6 +164,7 @@ docker build --target platform \
 ```
 
 The minimal Compose example is [deploy/cloud-platform.yml](../../deploy/cloud-platform.yml).
+Set its required `CHIPTRACE_PROJECT_ID` alongside the service token and root.
 Mount `/data/platform` on durable local storage. In `fs` mode also mount the
 object root; in `oss`/`s3` mode it can be an empty scratch directory.
 

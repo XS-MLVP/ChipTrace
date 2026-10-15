@@ -296,7 +296,7 @@ jobs:
         with:
           name: native-context-report
           path: native-context.tap
-      - name: Verify cloud platform delivery gates, conflicting identities and signed OSS protocol
+      - name: Verify platform namespace binding, recovery, delivery gates and signed OSS protocol
         run: |
           set -euo pipefail
           node --test integrations/cloud-platform/platform.test.js integrations/cloud-platform/storage-oss.test.js 2>&1 | tee platform.tap
@@ -388,7 +388,7 @@ jobs:
           '
       - name: Build cloud platform image
         run: docker build --target platform --build-arg CHIPTRACE_REVISION="$GITHUB_SHA" -t chiptrace-platform:ci .
-      - name: Verify platform service and SDK in a container
+      - name: Verify platform namespace isolation, service and SDK in a container
         run: |
           docker run --rm --network none --read-only \
             --tmpfs /tmp:size=1g,mode=1777 \

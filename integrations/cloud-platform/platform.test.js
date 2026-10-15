@@ -67,7 +67,7 @@ test('inspection and paged Turns preserve unknown source records without claimin
   const segment = path.join(segmentsRoot, segments.at(-1));
   await fs.appendFile(segment, extra.map(value => JSON.stringify(value)).join('\n') + '\n');
   const bytes = await fs.readFile(segment);
-  const plugin = new ChipTracePlugin({ root: path.join(root, 'platform'), captureRoot: data.captureRoot,
+  const plugin = new ChipTracePlugin({ projectId: 'project-test', root: path.join(root, 'platform'), captureRoot: data.captureRoot,
     objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace' });
   const token = 'platform-test-token-with-at-least-32-bytes';
   app = await createPlatformServer({ plugin, token });
@@ -110,7 +110,7 @@ test('inspection and paged Turns preserve unknown source records without claimin
   legacy.result.delivery_ready = true;
   const reopen = async bytes => {
     await fs.writeFile(storedFile, bytes);
-    app = await createPlatformServer({ plugin: new ChipTracePlugin({ root: path.join(root, 'platform'),
+    app = await createPlatformServer({ plugin: new ChipTracePlugin({ projectId: 'project-test', root: path.join(root, 'platform'),
       captureRoot: data.captureRoot, objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace' }), token });
     await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
     return new ChipTraceClient({ baseUrl: `http://127.0.0.1:${app.server.address().port}`, token });
@@ -158,7 +158,7 @@ test('platform inspection and export reject conflicting duplicate native identit
   const segment = path.join(segmentsRoot, segments.at(-1));
   await fs.appendFile(segment, JSON.stringify(capture) + '\n');
   const bytes = await fs.readFile(segment);
-  const plugin = new ChipTracePlugin({ root: path.join(root, 'platform'), captureRoot: data.captureRoot,
+  const plugin = new ChipTracePlugin({ projectId: 'project-test', root: path.join(root, 'platform'), captureRoot: data.captureRoot,
     objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace' });
   const token = 'platform-test-token-with-at-least-32-bytes';
   app = await createPlatformServer({ plugin, token });
@@ -190,7 +190,7 @@ test('HTTP service and SDK run the real CLI archive/restore/inspect/export path'
   let app;
   t.after(async () => { if (app) await app.close(); await fs.rm(root, { recursive: true, force: true }); });
   const data = await fixture(root);
-  const plugin = new ChipTracePlugin({ root: path.join(root, 'platform'), captureRoot: data.captureRoot, objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace', concurrency: 2 });
+  const plugin = new ChipTracePlugin({ projectId: 'project-test', root: path.join(root, 'platform'), captureRoot: data.captureRoot, objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace', concurrency: 2 });
   const token = 'platform-test-token-with-at-least-32-bytes';
   app = await createPlatformServer({ plugin, token });
   await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
@@ -345,7 +345,7 @@ test('platform plugin persists failure and recovers queued work after restart', 
   t.after(async () => { if (recovered) await recovered.close(); if (plugin) await plugin.close(); await fs.rm(root, { recursive: true, force: true }); });
   const data = await fixture(root);
   const platformRoot = path.join(root, 'platform');
-  plugin = new ChipTracePlugin({ root: platformRoot, captureRoot: data.captureRoot, objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace', concurrency: 1 });
+  plugin = new ChipTracePlugin({ projectId: 'project-test', root: platformRoot, captureRoot: data.captureRoot, objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace', concurrency: 1 });
   await plugin.start();
   const failed = await plugin.submit({ id: 'missing-archive', kind: 'restore', archive_id: 'definitely-missing' });
   const failedJob = await waitFor(plugin, failed.request.id);
@@ -355,17 +355,227 @@ test('platform plugin persists failure and recovers queued work after restart', 
   await plugin.close();
   assert.equal(plugin.getJob('recovered-archive').status, 'queued');
 
-  recovered = new ChipTracePlugin({ root: platformRoot, captureRoot: data.captureRoot, objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace', concurrency: 1 });
+  recovered = new ChipTracePlugin({ projectId: 'project-test', root: platformRoot, captureRoot: data.captureRoot, objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace', concurrency: 1 });
   await recovered.start();
   assert.equal((await waitFor(recovered, 'recovered-archive')).status, 'completed');
   assert.equal(recovered.getJob('recovered-archive').attempt, 2);
   assert.equal(recovered.getJob('missing-archive').status, 'failed');
 });
 
+test('restart rejects a different storage namespace before exposing cached jobs or Raw', { timeout: 60000 }, async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-namespace-'));
+  const plugins = [];
+  t.after(async () => {
+    for (const plugin of plugins) await plugin.close();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+  const data = await fixture(root);
+  const options = { projectId: 'project-a', root: path.join(root, 'platform'), captureRoot: data.captureRoot,
+    objectRoot: data.objectRoot, binary, prefix: 'project-a', concurrency: 1 };
+  const first = new ChipTracePlugin(options);
+  plugins.push(first);
+  await first.submit({ id: 'archive-before', kind: 'archive', archive_id: 'shared-id' });
+  assert.equal((await waitFor(first, 'archive-before')).status, 'completed');
+  await first.submit({ id: 'restore-before', kind: 'restore', archive_id: 'shared-id' });
+  assert.equal((await waitFor(first, 'restore-before')).status, 'completed');
+  await first.close();
+  const snapshot = path.join(options.root, 'snapshots/shared-id/RAW_SOURCE.json');
+  const original = await fs.readFile(snapshot);
+  const missing = await run(binary, ['verify-raw-archive', '--backend', 'fs', '--root', data.objectRoot,
+    '--prefix', 'project-b', '--archive-id', 'shared-id']).then(() => 0, error => error.code);
+  assert.equal(missing, 1, 'the new namespace has no matching remote archive');
+  const second = new ChipTracePlugin({ ...options, prefix: 'project-b' });
+  plugins.push(second);
+  const outcome = await second.start().then(() => ({ status: 'fulfilled' }),
+    error => ({ status: 'rejected', error }));
+  if (outcome.status === 'fulfilled') {
+    const oldJob = second.getJob('restore-before');
+    await second.submit({ id: 'restore-after', kind: 'restore', archive_id: 'shared-id' });
+    const reused = await waitFor(second, 'restore-after');
+    t.diagnostic(JSON.stringify({ startup: outcome.status, old_job: oldJob.status,
+      new_namespace_archive_exit: missing, cached_restore: reused.status,
+      snapshot_unchanged: (await fs.readFile(snapshot)).equals(original) }));
+  }
+  assert.equal(outcome.status, 'rejected');
+  assert.equal(outcome.error.code, 'NAMESPACE_CONFLICT');
+  assert.equal(second.health().ok, false);
+  assert.equal(second.health().jobs, 0);
+  assert.deepEqual(await fs.readFile(snapshot), original);
+});
+
+test('platform requires an explicit host-controlled project identity', () => {
+  assert.throws(() => new ChipTracePlugin({ root: '/unused', binary }), /project_id/);
+  assert.throws(() => new ChipTracePlugin({ root: '/unused', binary, projectId: '../outside' }), /project_id/);
+});
+
+test('namespace binding survives credential rotation and rejects changes to project or data sources', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-binding-'));
+  const plugins = [];
+  t.after(async () => {
+    for (const plugin of plugins) await plugin.close();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+  for (const backend of ['fs', 'oss', 's3']) await t.test(backend, async t => {
+    const options = { root: path.join(root, backend), binary, backend,
+      projectId: 'private-project-a', captureRoot: path.join(root, 'private-captures-a'),
+      objectRoot: path.join(root, 'private-objects-a'), prefix: 'private-prefix-a',
+      endpoint: 'https://private-endpoint-a.invalid', bucket: 'private-bucket-a', region: 'region-a',
+      engineEnv: { OSS_ACCESS_KEY_SECRET: 'synthetic-private-secret-before' } };
+    const first = new ChipTracePlugin(options);
+    plugins.push(first);
+    await first.start();
+    assert.throws(() => { first.prefix = 'changed'; }, TypeError);
+    await first.close();
+    const bindingFile = path.join(options.root, 'NAMESPACE.json');
+    const binding = await fs.readFile(bindingFile);
+    assert.equal(JSON.parse(binding).schema_version, 'chiptrace.platform-namespace.v1');
+    assert.equal((await fs.stat(bindingFile)).mode & 0o777, 0o600);
+    assert.ok(!binding.toString().includes('private-'));
+    const rotated = new ChipTracePlugin({ ...options, prefix: '/private-prefix-a/', concurrency: 3,
+      engineEnv: { OSS_ACCESS_KEY_SECRET: 'synthetic-private-secret-after' } });
+    plugins.push(rotated);
+    await rotated.start();
+    assert.equal(rotated.health().ok, true);
+    await rotated.close();
+    assert.deepEqual(await fs.readFile(bindingFile), binding);
+    const changes = [
+      ['projectId', 'private-project-b'], ['captureRoot', path.join(root, 'private-captures-b')],
+      ['prefix', 'private-prefix-b'],
+      ...(backend === 'fs' ? [['objectRoot', path.join(root, 'private-objects-b')], ['backend', 'oss']]
+        : [['endpoint', 'https://private-endpoint-b.invalid'], ['bucket', 'private-bucket-b'], ['backend', 'fs']]),
+      ...(backend === 's3' ? [['region', 'region-b']] : []),
+    ];
+    for (const [field, value] of changes) await t.test(field, async () => {
+      const changed = new ChipTracePlugin({ ...options, [field]: value });
+      plugins.push(changed);
+      await assert.rejects(changed.start(), error => error.code === 'NAMESPACE_CONFLICT'
+        && !error.message.includes('private-'));
+      assert.equal(changed.health().ok, false);
+      assert.equal(changed.health().jobs, 0);
+      assert.equal(changed.health().failure.code, 'NAMESPACE_CONFLICT');
+      assert.deepEqual(await fs.readFile(bindingFile), binding);
+      await changed.close();
+    });
+  });
+});
+
+test('legacy platform state cannot acquire an invented namespace binding', async t => {
+  for (const directory of ['jobs', 'work', 'usage', 'snapshots']) await t.test(directory, async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-unbound-'));
+    const plugin = new ChipTracePlugin({ projectId: 'project-test', root, binary });
+    t.after(async () => { await plugin.close(); await fs.rm(root, { recursive: true, force: true }); });
+    await fs.mkdir(path.join(root, directory), { recursive: true });
+    const file = path.join(root, directory, 'legacy-private.json');
+    const original = Buffer.from('{"private":"synthetic-legacy-evidence"}\n');
+    await fs.writeFile(file, original);
+    await assert.rejects(plugin.start(), error => error.code === 'NAMESPACE_UNBOUND'
+      && !error.message.includes('synthetic-legacy-evidence'));
+    assert.equal(plugin.health().ok, false);
+    assert.equal(plugin.health().jobs, 0);
+    await assert.rejects(fs.stat(path.join(root, 'NAMESPACE.json')), { code: 'ENOENT' });
+    assert.deepEqual(await fs.readFile(file), original);
+  });
+});
+
+test('invalid namespace bindings stop recovery without exposing private stored state', async t => {
+  const cases = [
+    ['invalid JSON', async file => fs.writeFile(file, '{"private":"synthetic-private-state",')],
+    ['invalid schema', async file => fs.writeFile(file, JSON.stringify({ schema_version: 'unknown', configuration_sha256: 'a'.repeat(64) }))],
+    ['invalid digest', async file => fs.writeFile(file, JSON.stringify({ schema_version: 'chiptrace.platform-namespace.v1', configuration_sha256: 'invalid' }))],
+    ['oversized binding', async file => fs.writeFile(file, 'x'.repeat(4097))],
+    ['symbolic link', async file => { await fs.rename(file, `${file}.original`); await fs.symlink(`${file}.original`, file); }],
+    ['directory', async file => { await fs.rename(file, `${file}.original`); await fs.mkdir(file); }],
+  ];
+  for (const [name, corrupt] of cases) await t.test(name, async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-corrupt-binding-'));
+    const first = new ChipTracePlugin({ projectId: 'project-test', root, binary });
+    const second = new ChipTracePlugin({ projectId: 'project-test', root, binary });
+    t.after(async () => { await first.close(); await second.close(); await fs.rm(root, { recursive: true, force: true }); });
+    await first.start();
+    await first.close();
+    const bindingFile = path.join(root, 'NAMESPACE.json');
+    await corrupt(bindingFile);
+    const original = await fs.lstat(bindingFile);
+    const jobFile = path.join(root, 'jobs', 'legacy-private.json');
+    const jobBytes = Buffer.from('{"private":"synthetic-private-state",');
+    await fs.writeFile(jobFile, jobBytes);
+    await assert.rejects(second.start(), error => error.code === 'CORRUPT_STATE'
+      && !error.message.includes('synthetic-private-state'));
+    assert.equal(second.health().ok, false);
+    assert.equal(second.health().jobs, 0);
+    assert.deepEqual(await fs.readFile(jobFile), jobBytes);
+    const after = await fs.lstat(bindingFile);
+    assert.equal(after.ino, original.ino);
+    assert.equal(after.size, original.size);
+  });
+});
+
+test('namespace directory sync failure prevents readiness and allows evidence-preserving retry', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-binding-sync-'));
+  const first = new ChipTracePlugin({ projectId: 'project-test', root, binary });
+  const second = new ChipTracePlugin({ projectId: 'project-test', root, binary });
+  t.after(async () => { await first.close(); await second.close(); await fs.rm(root, { recursive: true, force: true }); });
+  const originalOpen = fs.open;
+  const mocked = t.mock.method(fs, 'open', async (file, ...args) => {
+    if (file === root) throw Object.assign(new Error('synthetic-private-sync-failure'), { code: 'EIO' });
+    return originalOpen(file, ...args);
+  });
+  await assert.rejects(first.start(), error => error.code === 'STORAGE_FAILURE'
+    && !error.message.includes('synthetic-private-sync-failure'));
+  assert.equal(first.health().ok, false);
+  assert.equal(first.health().jobs, 0);
+  await first.close();
+  mocked.mock.restore();
+  const bindingFile = path.join(root, 'NAMESPACE.json');
+  const binding = await fs.readFile(bindingFile);
+  await second.start();
+  assert.equal(second.health().ok, true);
+  assert.deepEqual(await fs.readFile(bindingFile), binding);
+});
+
+test('independent project services do not share jobs, usage or cached archives', { timeout: 60000 }, async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-projects-'));
+  const apps = [];
+  t.after(async () => {
+    for (const app of apps) await app.close();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+  const data = await fixture(root);
+  const clients = [];
+  for (const projectId of ['project-a', 'project-b']) {
+    const app = await createPlatformServer({ root: path.join(root, projectId), projectId, binary,
+      captureRoot: data.captureRoot, objectRoot: data.objectRoot, prefix: projectId,
+      token: `${projectId}-synthetic-service-token-at-least-32-bytes` });
+    apps.push(app);
+    await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
+    clients.push(new ChipTraceClient({ baseUrl: `http://127.0.0.1:${app.server.address().port}`,
+      token: `${projectId}-synthetic-service-token-at-least-32-bytes` }));
+  }
+  const [first, second] = clients;
+  await first.submit({ id: 'archive-a', kind: 'archive', archive_id: 'shared-id' });
+  assert.equal((await first.wait('archive-a')).status, 'completed');
+  await first.submit({ id: 'restore-a', kind: 'restore', archive_id: 'shared-id' });
+  assert.equal((await first.wait('restore-a')).status, 'completed');
+  await first.putUsageLog('usage-a', await fs.readFile(data.usage));
+  await assert.rejects(second.getJob('restore-a'), error => error.status === 404);
+  await assert.rejects(second.submit({ id: 'export-b', kind: 'export', archive_id: 'shared-id',
+    session_id: 'thread-self-test', release_id: 'release-b', usage_log_ids: ['usage-a'] }), error => error.status === 400);
+  await second.submit({ id: 'restore-b', kind: 'restore', archive_id: 'shared-id' });
+  const missing = await second.wait('restore-b');
+  assert.equal(missing.status, 'failed');
+  assert.equal(missing.error.exit_code, 1);
+  await assert.rejects(fs.stat(path.join(root, 'project-b/snapshots/shared-id')), { code: 'ENOENT' });
+  await second.submit({ id: 'archive-b', kind: 'archive', archive_id: 'shared-id' });
+  assert.equal((await second.wait('archive-b')).status, 'completed');
+  await second.submit({ id: 'restore-b-new', kind: 'restore', archive_id: 'shared-id' });
+  assert.equal((await second.wait('restore-b-new')).status, 'completed');
+  assert.equal(apps.every(app => app.plugin.health().ok), true);
+});
+
 test('writer lock excludes a second plugin and lock loss gates new jobs', async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-lock-'));
-  const first = new ChipTracePlugin({ root, binary });
-  const second = new ChipTracePlugin({ root, binary });
+  const first = new ChipTracePlugin({ projectId: 'project-test', root, binary });
+  const second = new ChipTracePlugin({ projectId: 'project-test', root, binary });
   t.after(async () => { await first.close(); await second.close(); await fs.rm(root, { recursive: true, force: true }); });
   await first.start();
   await assert.rejects(second.start(), error => error.code === 'WRITER_LOCK');
@@ -378,7 +588,7 @@ test('writer lock excludes a second plugin and lock loss gates new jobs', async 
 
 test('failed durable ACK degrades health and cannot expose completed work', async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-disk-failure-'));
-  const plugin = new ChipTracePlugin({ root, binary });
+  const plugin = new ChipTracePlugin({ projectId: 'project-test', root, binary });
   t.after(async () => { await plugin.close(); await fs.rm(root, { recursive: true, force: true }); });
   await plugin.start();
   await fs.rename(path.join(root, 'jobs'), path.join(root, 'saved-jobs'));
@@ -397,7 +607,7 @@ test('failed durable ACK degrades health and cannot expose completed work', asyn
 
 test('bounded history applies backpressure while identical job retries remain available', async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-capacity-'));
-  const plugin = new ChipTracePlugin({ root, binary, maxJobs: 1, maxQueuedJobs: 1 });
+  const plugin = new ChipTracePlugin({ projectId: 'project-test', root, binary, maxJobs: 1, maxQueuedJobs: 1 });
   t.after(async () => { await plugin.close(); await fs.rm(root, { recursive: true, force: true }); });
   const request = { id: 'first', kind: 'restore', archive_id: 'missing' };
   await plugin.submit(request);

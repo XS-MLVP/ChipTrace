@@ -134,12 +134,14 @@ class ChipTracePlugin {
   constructor(options = {}) {
     if (!options.root) throw new PlatformError('platform root is required');
     this.root = path.resolve(options.root);
+    this.projectId = component(options.projectId, 'project_id');
     this.captureRoot = path.resolve(options.captureRoot || path.join(this.root, 'captures'));
     this.binary = options.binary || 'chiptrace';
     this.backend = options.backend || 'fs';
     if (!['fs', 'oss', 's3'].includes(this.backend)) throw new PlatformError('unknown storage backend');
     this.objectRoot = path.resolve(options.objectRoot || path.join(this.root, 'objects'));
     this.prefix = options.prefix ?? 'chiptrace';
+    if (typeof this.prefix !== 'string') throw new PlatformError('object prefix must be a string');
     this.endpoint = options.endpoint;
     this.bucket = options.bucket;
     this.region = options.region;
@@ -152,6 +154,11 @@ class ChipTracePlugin {
     this.maxUsageBytes = integer(options.maxUsageBytes, 64 * 1024 * 1024, 1024, 1024 * 1024 * 1024);
     this.jobTimeoutMs = integer(options.jobTimeoutMs, 60 * 60 * 1000, 100, 24 * 60 * 60 * 1000);
     this.engineEnv = { ...process.env, RAYON_NUM_THREADS: '2', ...options.engineEnv };
+    // A running instance cannot switch the source of already cached evidence.
+    // Credentials and resource limits may change between instances independently.
+    for (const key of ['root', 'projectId', 'captureRoot', 'backend', 'objectRoot', 'prefix', 'endpoint', 'bucket', 'region']) {
+      Object.defineProperty(this, key, { writable: false, configurable: false });
+    }
     this.jobs = new Map();
     this.queue = [];
     this.running = new Set();
@@ -178,6 +185,7 @@ class ChipTracePlugin {
     for (const name of ['jobs', 'work', 'usage', 'snapshots']) await safeDirectory(path.join(this.root, name));
     try {
       await this.#acquireLock();
+      await this.#bindNamespace();
       const names = (await fsp.readdir(path.join(this.root, 'jobs'))).filter(name => name.endsWith('.json')).sort();
       if (names.length > this.maxJobs) throw new PlatformError('stored job capacity exceeded', 503, 'CAPACITY');
       for (const name of names) {
@@ -208,8 +216,62 @@ class ChipTracePlugin {
       this.#pump();
       return this.health();
     } catch (error) {
+      this.started = false;
       await this.#releaseLock();
       throw error;
+    }
+  }
+
+  async #bindNamespace() {
+    const identity = {
+      project_id: this.projectId,
+      capture_root: this.captureRoot,
+      backend: this.backend,
+      object_root: this.backend === 'fs' ? this.objectRoot : null,
+      endpoint: this.backend === 'fs' ? null : this.endpoint || null,
+      bucket: this.backend === 'fs' ? null : this.bucket || null,
+      region: this.backend === 's3' ? this.region || null : null,
+      prefix: this.prefix.replace(/^\/+|\/+$/g, ''),
+    };
+    // Persist only a digest: paths, project names, URLs and credentials do not
+    // belong in bootstrap diagnostics or the public health response.
+    const expected = { schema_version: 'chiptrace.platform-namespace.v1',
+      configuration_sha256: crypto.createHash('sha256').update(JSON.stringify(identity)).digest('hex') };
+    const file = path.join(this.root, 'NAMESPACE.json');
+    try {
+      const stat = await fsp.lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      if (stat) {
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4096) {
+          throw new PlatformError('platform namespace binding is invalid', 503, 'CORRUPT_STATE');
+        }
+        let stored;
+        try { stored = JSON.parse(decodeUtf8(await fsp.readFile(file))); }
+        catch { throw new PlatformError('platform namespace binding is invalid', 503, 'CORRUPT_STATE'); }
+        if (stored?.schema_version !== expected.schema_version
+            || typeof stored.configuration_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(stored.configuration_sha256)
+            || Object.keys(stored).length !== 2) {
+          throw new PlatformError('platform namespace binding is invalid', 503, 'CORRUPT_STATE');
+        }
+        if (stored.configuration_sha256 !== expected.configuration_sha256) {
+          throw new PlatformError('platform root belongs to a different project or storage namespace', 503, 'NAMESPACE_CONFLICT');
+        }
+        await syncDirectory(this.root);
+        return;
+      }
+      for (const name of ['jobs', 'work', 'usage', 'snapshots']) {
+        const directory = await fsp.opendir(path.join(this.root, name));
+        try {
+          if (await directory.read()) {
+            throw new PlatformError('existing platform state has no namespace binding; use a new root and verify Raw before migration', 503, 'NAMESPACE_UNBOUND');
+          }
+        } finally { await directory.close(); }
+      }
+      await durableWrite(file, expected, true);
+    } catch (error) {
+      const failure = error instanceof PlatformError ? error
+        : new PlatformError('platform namespace persistence failed', 503, 'STORAGE_FAILURE');
+      this.#degrade(failure.code, failure.message);
+      throw failure;
     }
   }
 
