@@ -9,6 +9,8 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const crypto = require('crypto');
+const { isUtf8 } = require('node:buffer');
+const { isDeepStrictEqual } = require('node:util');
 
 const CAPTURE_ID_RE = /^cap-[A-Za-z0-9._:-]+$/;
 const SENSITIVE_KEY_RE = /(^|[_-])(authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|password|passwd|secret|cookie|set-cookie)([_-]|$)/i;
@@ -283,11 +285,11 @@ function openCapturePaths(directory, captureId) {
   };
 }
 
-async function readOptionalFile(file) {
+async function readOptionalFile(file, missing = Buffer.alloc(0)) {
   try {
     return await fsp.readFile(file);
   } catch (error) {
-    if (error.code === 'ENOENT') return Buffer.alloc(0);
+    if (error.code === 'ENOENT') return missing;
     throw error;
   }
 }
@@ -305,8 +307,94 @@ async function syncOptionalFile(file) {
 }
 
 async function removeCaptureFiles(files) {
-  await Promise.all(Object.values(files).map((file) => fsp.rm(file, { force: true })));
+  // Metadata remains the recovery anchor until both body removals are durable.
+  await Promise.all([files.request, files.response].map(file => fsp.rm(file, { force: true })));
   await fsyncDirectory(path.dirname(files.metadata));
+  await fsp.rm(files.metadata, { force: true });
+  await fsyncDirectory(path.dirname(files.metadata));
+}
+
+function recoveryConflict(reason) {
+  const error = new Error(`open Capture recovery conflict: ${reason}`);
+  error.code = 'CAPTURE_ID_CONFLICT';
+  return error;
+}
+
+function openCaptureReceipt(metadata, request, response) {
+  for (const [side, bytes] of [['request', request], ['response', response]]) {
+    if (!isUtf8(bytes)) {
+      const error = new Error(`open Capture ${side} spool is not valid UTF-8; bytes retained`);
+      error.code = 'CAPTURE_BODY_ENCODING';
+      throw error;
+    }
+  }
+  const proof = bytes => ({ bytes: bytes.length, sha256: sha256(bytes) });
+  return { schema_version: 'chiptrace.open-capture-receipt.v1',
+    metadata: proof(metadata), request: proof(request), response: proof(response) };
+}
+
+function prepareOpenCaptureRecord(record, sanitize) {
+  const prepared = sanitizeCaptureRecord(record, sanitize);
+  prepared.captureTransaction = { ...prepared.captureTransaction, openReceipt: {
+    ...prepared.captureTransaction.openReceipt,
+    stored: Object.fromEntries(['request', 'response'].map(side => [side, {
+      bytes: prepared[`${side}BytesCaptured`], sha256: prepared[`${side}BodySha256`],
+    }])),
+  } };
+  return prepared;
+}
+
+function verifyOpenCaptureReceipt(record, base, metadata, request, response) {
+  const transaction = record?.captureTransaction;
+  const receipt = transaction?.openReceipt;
+  if (record?.captureId !== base.captureId || record.captureStage !== 'combined'
+    || !['finalized', 'recovered_incomplete'].includes(transaction?.state)
+    || !base.captureTransaction?.openedAt || transaction.openedAt !== base.captureTransaction.openedAt
+    || receipt?.schema_version !== 'chiptrace.open-capture-receipt.v1') {
+    throw recoveryConflict('stored record lacks a matching open receipt');
+  }
+  for (const field of ['recordType', 'sourceNamespace', 'method', 'inboundPath', 'proxiedPath', 'startedAt']) {
+    if (base[field] !== undefined && !isDeepStrictEqual(base[field], record[field])) {
+      throw recoveryConflict('stored ingress identity differs');
+    }
+  }
+  for (const [field, value] of Object.entries(base.traceContext || {})) {
+    if (!isDeepStrictEqual(value, record.traceContext?.[field])) {
+      throw recoveryConflict('stored trace identity differs');
+    }
+  }
+  const validProof = proof => proof && Number.isSafeInteger(proof.bytes) && proof.bytes >= 0
+    && typeof proof.sha256 === 'string' && /^[a-f0-9]{64}$/.test(proof.sha256);
+  if (!validProof(receipt.metadata) || receipt.metadata.bytes !== metadata.length
+    || receipt.metadata.sha256 !== sha256(metadata)) {
+    throw recoveryConflict('open metadata does not match the receipt');
+  }
+  for (const [side, bytes] of [['request', request], ['response', response]]) {
+    const proof = receipt[side];
+    if (!validProof(proof) || (bytes !== null
+      && (proof.bytes !== bytes.length || proof.sha256 !== sha256(bytes)))) {
+      throw recoveryConflict(`${side} spool does not match the receipt`);
+    }
+    const text = record[`${side}BodyText`];
+    const stored = receipt.stored?.[side];
+    if (typeof text !== 'string' || record[`${side}BytesCaptured`] !== Buffer.byteLength(text, 'utf8')
+      || record[`${side}BodySha256`] !== sha256(text) || !validProof(stored)
+      || stored.bytes !== record[`${side}BytesCaptured`] || stored.sha256 !== record[`${side}BodySha256`]) {
+      throw recoveryConflict(`stored ${side} body metadata is inconsistent`);
+    }
+    if (proof.bytes !== record[`${side}BytesCaptured`] || proof.sha256 !== record[`${side}BodySha256`]) {
+      // Explicit body redaction keeps the original hash. It cannot silently
+      // authorize arbitrary changed bytes under a matching Capture ID.
+      if (record.captureSanitization?.version !== 'chiptrace.capture-sanitization.v1'
+        || record.captureSanitization.bodyRedacted !== true
+        || record[`${side}BodyTextOriginalSha256`] !== proof.sha256) {
+        throw recoveryConflict(`stored ${side} body does not match the receipt`);
+      }
+      if (bytes !== null && sanitizeBodyText(bytes.toString('utf8'), new Set()).value !== text) {
+        throw recoveryConflict(`stored ${side} redaction does not match the spool`);
+      }
+    }
+  }
 }
 
 function sleep(ms) {
@@ -561,13 +649,14 @@ async function listRegularFiles(directory, suffix = '.json', includeErrorMarkers
     .sort();
 }
 
-async function listRegularFilesLimited(directory, suffix, limit) {
+async function listRegularFilesLimited(directory, suffix, limit, skip = () => false) {
   const files = [];
   let handle;
   try {
     handle = await fsp.opendir(directory);
     for await (const entry of handle) {
-      if (!entry.isFile() || entry.name.endsWith('.error.json') || !entry.name.endsWith(suffix)) continue;
+      if (!entry.isFile() || entry.name.endsWith('.error.json') || !entry.name.endsWith(suffix)
+        || skip(entry.name)) continue;
       files.push(path.join(directory, entry.name));
       if (files.length >= limit) break;
     }
@@ -603,7 +692,8 @@ class DurableCaptureTransaction {
     this.responseBytes = 0;
     this.requestTruncated = false;
     this.responseTruncated = false;
-    this.persistedBytes = metadataBytes;
+    this.metadataReceipt = { bytes: metadataBytes.length, sha256: sha256(metadataBytes) };
+    this.persistedBytes = metadataBytes.length;
     this.persistedFiles = 1;
     this.createdSpools = new Set();
     this.writeChain = Promise.resolve();
@@ -675,10 +765,17 @@ class DurableCaptureTransaction {
       syncOptionalFile(this.files.request),
       syncOptionalFile(this.files.response),
     ]);
-    const [requestBytes, responseBytes] = await Promise.all([
+    const [metadataBytes, requestBytes, responseBytes] = await Promise.all([
+      fsp.readFile(this.files.metadata),
       readOptionalFile(this.files.request),
       readOptionalFile(this.files.response),
     ]);
+    if (metadataBytes.length !== this.metadataReceipt.bytes
+      || sha256(metadataBytes) !== this.metadataReceipt.sha256) {
+      this.outbox.metrics.conflicts += 1;
+      throw recoveryConflict('open metadata changed before finalization');
+    }
+    const openReceipt = openCaptureReceipt(metadataBytes, requestBytes, responseBytes);
     const record = {
       ...this.baseRecord,
       ...fields,
@@ -696,9 +793,18 @@ class DurableCaptureTransaction {
         state: 'finalized',
         openedAt: this.baseRecord.captureTransaction.openedAt,
         finalizedAt: new Date().toISOString(),
+        openReceipt,
       },
     };
-    const ack = await this.outbox.enqueue(record, {
+    const prepared = prepareOpenCaptureRecord(record, this.outbox.sanitize);
+    try {
+      verifyOpenCaptureReceipt(prepared,
+        this.baseRecord, metadataBytes, requestBytes, responseBytes);
+    } catch (error) {
+      this.outbox.metrics.conflicts += 1;
+      throw error;
+    }
+    const ack = await this.outbox.enqueue(prepared, {
       creditBytes: this.persistedBytes,
       creditFiles: this.persistedFiles,
       schedule: false,
@@ -867,6 +973,7 @@ class DurableCaptureOutbox {
       await this.recoverOpenCaptures();
     } catch (error) {
       this.started = false;
+      this.recordError(error);
       throw error;
     }
     await this.refreshQueueStats();
@@ -919,7 +1026,12 @@ class DurableCaptureOutbox {
         response: path.join(this.openDir, `${stem}.response.bin`),
       };
       const metadataBytes = await fsp.readFile(metadataFile);
-      const baseRecord = JSON.parse(metadataBytes.toString('utf8'));
+      let baseRecord;
+      try { baseRecord = JSON.parse(metadataBytes.toString('utf8')); }
+      catch {
+        this.metrics.conflicts += 1;
+        throw recoveryConflict('open metadata is not valid JSON');
+      }
       const captureId = String(baseRecord.captureId || '');
       if (!validCaptureId(captureId)) throw new Error('open Capture has invalid captureId');
       const spoolStats = await Promise.all([files.request, files.response].map(async file => {
@@ -930,16 +1042,41 @@ class DurableCaptureOutbox {
       }));
       const openBytes = metadataBytes.length + spoolStats.reduce((sum, stat) => sum + (stat?.size || 0), 0);
       const openFiles = 1 + spoolStats.filter(Boolean).length;
-      const existing = await this.findExisting(captureId);
+      const [request, response] = await Promise.all([
+        readOptionalFile(files.request, null), readOptionalFile(files.response, null),
+      ]);
+      let existing = false;
+      let existingHash;
+      for (const file of await this.filesForCapture(captureId)) {
+        let bytes;
+        try { bytes = await fsp.readFile(file); } catch (error) {
+          if (error.code === 'ENOENT') continue;
+          throw error;
+        }
+        try {
+          let record;
+          try { record = JSON.parse(bytes.toString('utf8')); }
+          catch { throw recoveryConflict('stored record is not valid JSON'); }
+          verifyOpenCaptureReceipt(record, baseRecord, metadataBytes, request, response);
+          const digest = sha256(bytes);
+          if (existingHash && digest !== existingHash) {
+            throw recoveryConflict('stored queue versions differ');
+          }
+          existingHash = digest;
+          existing = true;
+        } catch (error) {
+          this.metrics.conflicts += 1;
+          throw error;
+        }
+      }
       if (existing) {
         await removeCaptureFiles(files);
         this.releaseOpenFiles(files, openBytes, openFiles);
         continue;
       }
-      const [requestBytes, responseBytes] = await Promise.all([
-        readOptionalFile(files.request),
-        readOptionalFile(files.response),
-      ]);
+      const requestBytes = request || Buffer.alloc(0);
+      const responseBytes = response || Buffer.alloc(0);
+      const openReceipt = openCaptureReceipt(metadataBytes, requestBytes, responseBytes);
       const recoveredAt = new Date().toISOString();
       const record = {
         ...baseRecord,
@@ -961,9 +1098,10 @@ class DurableCaptureOutbox {
           state: 'recovered_incomplete',
           openedAt: baseRecord.captureTransaction?.openedAt || null,
           recoveredAt,
+          openReceipt,
         },
       };
-      await this.enqueue(record, {
+      await this.enqueue(prepareOpenCaptureRecord(record, this.sanitize), {
         creditBytes: openBytes,
         creditFiles: openFiles,
         schedule: false,
@@ -1007,7 +1145,7 @@ class DurableCaptureOutbox {
     const releaseCapacity = this.reserveQueueCapacity(bytes.length, 1);
     try {
       await atomicWrite(files.metadata, bytes);
-      const transaction = new DurableCaptureTransaction(this, baseRecord, files, options, bytes.length);
+      const transaction = new DurableCaptureTransaction(this, baseRecord, files, options, bytes);
       this.openCaptures.set(captureId, transaction);
       this.openAtByName.set(path.basename(files.metadata), Date.parse(openedAt));
       this.metrics.openTransactions += 1;
@@ -1326,10 +1464,13 @@ class DurableCaptureOutbox {
     if (this.closed || this.draining || !this.relayUrl) return;
     this.drainPromise = (async () => {
       this.draining = true;
+      let idle = true;
       try {
-        const files = await listRegularFilesLimited(this.pendingDir, '.json', this.concurrency);
+        const cleanupPending = name => this.openAtByName.has(name.replace(/\.json$/, '.open.json'));
+        const files = await listRegularFilesLimited(this.pendingDir, '.json', this.concurrency, cleanupPending);
         const jobs = [];
         for (const file of files) {
+          if (cleanupPending(path.basename(file))) continue;
           if (jobs.length >= this.concurrency) break;
           let reservedBytes;
           try {
@@ -1372,11 +1513,14 @@ class DurableCaptureOutbox {
             });
           jobs.push(job);
         }
-        if (jobs.length) await Promise.all(jobs);
+        if (jobs.length) {
+          idle = false;
+          await Promise.all(jobs);
+        }
       } finally {
         this.draining = false;
         if (!this.closed && this.metrics.pending > 0) {
-          this.scheduleDrain(this.metrics.lastError ? this.retryBaseMs : 0);
+          this.scheduleDrain(this.metrics.lastError || idle ? this.retryBaseMs : 0);
         }
       }
     })();
@@ -1605,7 +1749,7 @@ class DurableCaptureOutbox {
       maxAttempts: this.maxAttempts,
       maxOpenAgeMs: this.maxOpenAgeMs,
       openWriteFailures,
-      openCaptureHealthy: openWriteFailures === 0 && this.metrics.staleOpenTransactions === 0
+      openCaptureHealthy: this.started && openWriteFailures === 0 && this.metrics.staleOpenTransactions === 0
         && this.openAtByName.size === this.metrics.openTransactions,
       timeoutMs: this.timeoutMs,
       sanitize: this.sanitize,

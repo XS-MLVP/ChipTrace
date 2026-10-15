@@ -271,7 +271,11 @@ test('gateway requires a real Relay byte receipt before removal and Collector pr
     await second.start();
     assert.equal(await second.flush(5000), true);
     assert.deepEqual(duplicateEvents, [{ captureId: 'cap-receipt-unversioned', duplicate: true }]);
-    await second.enqueue({ ...wire('cap-receipt-current-v2'), version: 'chiptrace.capture.v2' });
+    const streamingWire = { ...wire('cap-receipt-current-v2'), version: 'chiptrace.capture.v2' };
+    const transaction = await second.beginCapture(streamingWire);
+    await transaction.appendRequest(Buffer.from(streamingWire.requestBodyText));
+    await transaction.appendResponse(Buffer.from(streamingWire.responseBodyText));
+    await transaction.finalize({ responseStatus: streamingWire.responseStatus });
     assert.equal(await second.flush(5000), true);
     assert.equal(second.snapshot().durable, 2);
     assert.equal(second.snapshot().activeQueueBytes, 0);

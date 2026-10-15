@@ -30,6 +30,18 @@ pending。等待远端确认时仍可重扫并观察 processing；扫描不修�
 `finalize()` 拒绝，调用方还应持续检查健康状态。磁盘水位基于缓存的文件系统观察，不能
 阻止其他进程占满共享磁盘；实际 I/O 错误仍须保留和告警。
 
+流式最终化与 incomplete 恢复会生成 `chiptrace.open-capture-receipt.v1`，绑定 ingress
+元数据、原始 spool 和实际保存正文的长度与 SHA-256。重启时如果已有同 ID 记录，必须
+核对 pending/processing/failed 中的全部版本、原始身份和 receipt 后才能清理 open 原件；
+同 ID 本身不证明内容相同。旧记录缺少 receipt 或任一内容冲突时，启动返回
+`CAPTURE_ID_CONFLICT`，两份证据均保留，需按原始证据处理，不能直接删除或补造确认。
+
+清理先删除正文 spool 并同步目录，最后删除 ingress 元数据；若中途停止，匹配的
+receipt 支持继续清理已移除部分正文的事务。清理完成前该记录不进入远端投递，其他
+Capture 仍可投递。拆分在多个 chunk 中的 UTF-8 会按完整 spool 验证；最终 spool
+包含无效 UTF-8 时返回 `CAPTURE_BODY_ENCODING` 并保留原始字节，避免用替换字符改写 Wire。
+这份本地恢复确认与 Relay 的 input receipt 分别验证，均不代表 Session/Turn 已完整交付。
+
 ```js
 const {
   DurableCaptureOutbox,

@@ -162,6 +162,36 @@ function capture(id = 'cap-test-1') {
   };
 }
 
+async function interruptedFinalization(t, { partial = false, sanitize = false } = {}) {
+  const root = temporaryRoot();
+  const first = new DurableCaptureOutbox({ root, relayUrl: '', sanitize,
+    minFreeBytes: 0, minFreeFiles: 0 });
+  t.after(async () => {
+    await first.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const transaction = await first.beginCapture({ captureId: 'cap-interrupted-finalize',
+    sourceNamespace: 'synthetic-recovery', traceContext: { session_id: 'session-a', turn_id: 'turn-a' } });
+  const request = Buffer.from('{"input":"原文 🧪","api_key":"sk_synthetic_recovery_123456789012345"}');
+  const response = Buffer.from('event: response.completed\ndata: {"type":"response.completed","output":"原样响应"}\n\n');
+  const split = request.indexOf(Buffer.from('原')) + 1;
+  await transaction.appendRequest(request.subarray(0, split));
+  await transaction.appendRequest(request.subarray(split));
+  await transaction.appendResponse(response);
+  const originalRm = fsp.rm;
+  const intercepted = t.mock.method(fsp, 'rm', async (file, ...args) => {
+    if (Object.values(transaction.files).includes(file)
+      && (!partial || file === transaction.files.metadata)) {
+      throw Object.assign(new Error('synthetic interrupted spool cleanup'), { code: 'EIO' });
+    }
+    return originalRm(file, ...args);
+  });
+  try { await assert.rejects(transaction.finalize({ responseStatus: 200 }), { code: 'EIO' }); }
+  finally { intercepted.mock.restore(); await first.close(); }
+  const pending = path.join(root, 'pending', 'cap-interrupted-finalize.json');
+  return { root, first, transaction, pending, request, response };
+}
+
 test('body sanitization reconciles bytes and hashes while retaining the original hash', () => {
   const original = capture('cap-sanitize-contract');
   const sanitized = sanitizeCaptureRecord(original, true);
@@ -660,7 +690,7 @@ test('two-phase capture durably starts before streaming and finalizes exact Wire
   }
 });
 
-test('open streamed captures expose age and stale transaction count', async () => {
+test('open streamed captures expose age and stale transaction count', async t => {
   const root = temporaryRoot();
   const outbox = new DurableCaptureOutbox({ root, relayUrl: '', maxOpenAgeMs: 1000 });
   try {
@@ -671,10 +701,9 @@ test('open streamed captures expose age and stale transaction count', async () =
       method: 'POST',
       proxiedPath: '/v1/responses',
     });
-    const metadataPath = path.join(root, 'open', 'cap-stale-open.open.json');
-    const metadata = JSON.parse(await fsp.readFile(metadataPath, 'utf8'));
-    metadata.captureTransaction.openedAt = new Date(Date.now() - 5000).toISOString();
-    await fsp.writeFile(metadataPath, `${JSON.stringify(metadata)}\n`);
+    // Age the observation without changing the immutable ingress metadata.
+    const originalNow = Date.now;
+    t.mock.method(Date, 'now', () => originalNow() + 5000);
     await outbox.refreshQueueStats();
     const snapshot = outbox.snapshot();
     assert.equal(snapshot.openTransactions, 1);
@@ -696,6 +725,258 @@ test('open streamed captures expose age and stale transaction count', async () =
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('restart preserves open Wire when the same Capture ID has conflicting stored evidence', async t => {
+  for (const directory of ['pending', 'failed']) await t.test(directory, async t => {
+    const root = temporaryRoot();
+    const first = new DurableCaptureOutbox({ root, relayUrl: '', minFreeBytes: 0, minFreeFiles: 0 });
+    let second;
+    try {
+      const transaction = await first.beginCapture({ captureId: 'cap-recovery-conflict',
+        sourceNamespace: 'synthetic-original', traceContext: { session_id: 'session-a', turn_id: 'turn-a' } });
+      await transaction.appendRequest(Buffer.from('原始请求 🧪'));
+      await transaction.appendResponse(Buffer.from('原始响应 🧪'));
+      await first.close();
+      const existing = path.join(root, directory, 'cap-recovery-conflict.json');
+      await fsp.writeFile(existing, `${JSON.stringify({ ...capture('cap-recovery-conflict'),
+        sourceNamespace: 'synthetic-conflict', traceContext: { session_id: 'session-b', turn_id: 'turn-b' } })}\n`);
+      const originals = new Map(await Promise.all([...Object.values(transaction.files), existing]
+        .map(async file => [file, await fsp.readFile(file)])));
+      second = new DurableCaptureOutbox({ root, relayUrl: '', minFreeBytes: 0, minFreeFiles: 0 });
+      const outcome = await second.start().then(() => ({ status: 'fulfilled' }),
+        error => ({ status: 'rejected', error }));
+      const retained = await Promise.all([...originals.keys()].map(async file => {
+        try { return (await fsp.readFile(file)).equals(originals.get(file)); }
+        catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+      }));
+      t.diagnostic(JSON.stringify({ startup: outcome.status, unchanged_files: retained }));
+      assert.equal(outcome.status, 'rejected');
+      assert.equal(outcome.error.code, 'CAPTURE_ID_CONFLICT');
+      assert.ok(retained.every(Boolean), 'recovery must preserve both versions byte for byte');
+      assert.equal(second.started, false);
+      assert.equal(second.snapshot().conflicts, 1);
+    } finally {
+      await first.close();
+      if (second) await second.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test('restart verifies interrupted finalization before cleaning open spools', async t => {
+  const cases = [
+    ['complete spools', 'pending', false, false],
+    ['partly removed spools', 'pending', true, false],
+    ['explicit redaction', 'pending', true, true],
+    ['retained failed record', 'failed', false, false],
+    ['interrupted processing', 'processing', true, false],
+  ];
+  for (const [name, directory, partial, sanitize] of cases) await t.test(name, async t => {
+    const { root, transaction, pending, request, response } = await interruptedFinalization(t, { partial, sanitize });
+    const storedFile = path.join(root, directory, path.basename(pending));
+    if (storedFile !== pending) await fsp.rename(pending, storedFile);
+    const original = await fsp.readFile(storedFile);
+    const record = JSON.parse(original);
+    const receipt = record.captureTransaction.openReceipt;
+    assert.equal(receipt.schema_version, 'chiptrace.open-capture-receipt.v1');
+    const metadata = await fsp.readFile(transaction.files.metadata);
+    assert.deepEqual(receipt.metadata, { bytes: metadata.length, sha256: cryptoHash(metadata) });
+    assert.deepEqual(receipt.request, { bytes: request.length, sha256: cryptoHash(request) });
+    assert.deepEqual(receipt.response, { bytes: response.length, sha256: cryptoHash(response) });
+    if (partial) await assert.rejects(fsp.stat(transaction.files.request), { code: 'ENOENT' });
+    else assert.deepEqual(await fsp.readFile(transaction.files.request), request);
+    const second = new DurableCaptureOutbox({ root, relayUrl: '', minFreeBytes: 0, minFreeFiles: 0 });
+    try {
+      await second.start();
+      const finalFile = directory === 'processing' ? pending : storedFile;
+      assert.deepEqual(await fsp.readFile(finalFile), original);
+      assert.deepEqual(await fsp.readdir(second.openDir), []);
+      assert.equal(second.snapshot().openFiles, 0);
+      assert.equal(second.snapshot().openTransactions, 0);
+      assert.equal(second.snapshot().queueBytes, original.length);
+      assert.equal(second.snapshot().accepted, 0);
+      assert.equal(second.snapshot().conflicts, 0);
+      assert.equal(second.snapshot().pending, directory === 'failed' ? 0 : 1);
+      assert.equal(second.snapshot().failedFiles, directory === 'failed' ? 1 : 0);
+      assert.equal(second.snapshot().openCaptureHealthy, true);
+    } finally { await second.close(); }
+  });
+});
+
+test('restart rejects altered receipts, bodies and identities without changing either version', async t => {
+  const cases = [
+    ['stored body', async ({ pending }) => {
+      const record = JSON.parse(await fsp.readFile(pending));
+      record.requestBodyText = 'different body';
+      record.requestBytesCaptured = Buffer.byteLength(record.requestBodyText);
+      record.requestBodySha256 = cryptoHash(record.requestBodyText);
+      await fsp.writeFile(pending, `${JSON.stringify(record)}\n`);
+    }],
+    ['trace identity', async ({ pending }) => {
+      const record = JSON.parse(await fsp.readFile(pending));
+      record.traceContext.turn_id = 'conflicting-turn';
+      await fsp.writeFile(pending, `${JSON.stringify(record)}\n`);
+    }],
+    ['metadata digest', async ({ transaction }) => { await fsp.appendFile(transaction.files.metadata, ' '); }],
+    ['spool digest', async ({ transaction }) => { await fsp.appendFile(transaction.files.request, 'changed'); }],
+    ['invalid JSON', async ({ pending }) => {
+      await fsp.writeFile(pending, '{"private":"synthetic-private-marker",');
+    }],
+    ['invalid open JSON', async ({ transaction }) => {
+      await fsp.writeFile(transaction.files.metadata, '{"private":"synthetic-private-marker",');
+    }],
+    ['a second stored version', async ({ root, pending }) => {
+      const record = JSON.parse(await fsp.readFile(pending));
+      record.traceContext.session_id = 'conflicting-session';
+      await fsp.writeFile(path.join(root, 'failed', path.basename(pending)), `${JSON.stringify(record)}\n`);
+    }],
+  ];
+  for (const [name, corrupt] of cases) await t.test(name, async t => {
+    const scenario = await interruptedFinalization(t);
+    await corrupt(scenario);
+    const files = [...Object.values(scenario.transaction.files), scenario.pending];
+    const failed = path.join(scenario.root, 'failed', path.basename(scenario.pending));
+    if (fs.existsSync(failed)) files.push(failed);
+    const originals = await Promise.all(files.map(file => fsp.readFile(file)));
+    const second = new DurableCaptureOutbox({ root: scenario.root, relayUrl: '',
+      minFreeBytes: 0, minFreeFiles: 0 });
+    try {
+      await assert.rejects(second.start(), { code: 'CAPTURE_ID_CONFLICT' });
+      assert.equal(second.started, false);
+      assert.equal(second.snapshot().conflicts, 1);
+      assert.equal(second.snapshot().openCaptureHealthy, false);
+      assert.ok(!second.snapshot().lastError.includes('synthetic-private-marker'));
+      for (const [index, file] of files.entries()) {
+        assert.deepEqual(await fsp.readFile(file), originals[index]);
+      }
+    } finally { await second.close(); }
+  });
+});
+
+test('invalid UTF-8 spools remain intact through failed finalization and restart', async () => {
+  const root = temporaryRoot();
+  const first = new DurableCaptureOutbox({ root, relayUrl: '', minFreeBytes: 0, minFreeFiles: 0 });
+  let second;
+  try {
+    const transaction = await first.beginCapture({ captureId: 'cap-incomplete-utf8' });
+    const bytes = Buffer.from([0xe4, 0xb8]);
+    await transaction.appendRequest(bytes);
+    const metadata = await fsp.readFile(transaction.files.metadata);
+    await assert.rejects(transaction.finalize(), { code: 'CAPTURE_BODY_ENCODING' });
+    assert.equal(first.snapshot().openCaptureHealthy, false);
+    assert.equal(first.snapshot().openWriteFailures, 1);
+    await first.close();
+    second = new DurableCaptureOutbox({ root, relayUrl: '', minFreeBytes: 0, minFreeFiles: 0 });
+    await assert.rejects(second.start(), { code: 'CAPTURE_BODY_ENCODING' });
+    assert.deepEqual(await fsp.readFile(transaction.files.metadata), metadata);
+    assert.deepEqual(await fsp.readFile(transaction.files.request), bytes);
+    assert.deepEqual(await fsp.readdir(second.pendingDir), []);
+  } finally {
+    await first.close();
+    if (second) await second.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a redacted stored body cannot be replaced after its original spool was cleaned', async t => {
+  const scenario = await interruptedFinalization(t, { partial: true, sanitize: true });
+  const stored = JSON.parse(await fsp.readFile(scenario.pending));
+  stored.requestBodyText = 'altered after redaction';
+  stored.requestBytesCaptured = Buffer.byteLength(stored.requestBodyText);
+  stored.requestBodySha256 = cryptoHash(stored.requestBodyText);
+  const altered = Buffer.from(`${JSON.stringify(stored)}\n`);
+  await fsp.writeFile(scenario.pending, altered);
+  const metadata = await fsp.readFile(scenario.transaction.files.metadata);
+  const second = new DurableCaptureOutbox({ root: scenario.root, relayUrl: '',
+    minFreeBytes: 0, minFreeFiles: 0 });
+  try {
+    await assert.rejects(second.start(), { code: 'CAPTURE_ID_CONFLICT' });
+    assert.deepEqual(await fsp.readFile(scenario.pending), altered);
+    assert.deepEqual(await fsp.readFile(scenario.transaction.files.metadata), metadata);
+    await assert.rejects(fsp.stat(scenario.transaction.files.request), { code: 'ENOENT' });
+  } finally { await second.close(); }
+});
+
+test('finalization preserves externally changed open metadata as a conflict', async () => {
+  const root = temporaryRoot();
+  const outbox = new DurableCaptureOutbox({ root, relayUrl: '', minFreeBytes: 0, minFreeFiles: 0 });
+  try {
+    const transaction = await outbox.beginCapture({ captureId: 'cap-changed-open-metadata' });
+    const bytes = Buffer.from('原样证据');
+    await transaction.appendRequest(bytes);
+    await fsp.appendFile(transaction.files.metadata, ' ');
+    const metadata = await fsp.readFile(transaction.files.metadata);
+    await assert.rejects(transaction.finalize(), { code: 'CAPTURE_ID_CONFLICT' });
+    assert.deepEqual(await fsp.readFile(transaction.files.metadata), metadata);
+    assert.deepEqual(await fsp.readFile(transaction.files.request), bytes);
+    assert.deepEqual(await fsp.readdir(outbox.pendingDir), []);
+    assert.equal(outbox.snapshot().openCaptureHealthy, false);
+    assert.equal(outbox.snapshot().conflicts, 1);
+  } finally {
+    await outbox.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('delivery waits for spool cleanup while unrelated Captures remain deliverable',
+  { timeout: 10000 }, async t => {
+    const root = temporaryRoot();
+    const received = [];
+    const relay = await fakeRelay((req, res) => {
+      req.resume();
+      req.once('end', () => {
+        received.push(JSON.parse(req.rawTestBody).captureId);
+        res.end(JSON.stringify(syntheticReceipt(req.rawTestBody)));
+      });
+    });
+    const first = new DurableCaptureOutbox({ root, relayUrl: '', concurrency: 1,
+      minFreeBytes: 0, minFreeFiles: 0 });
+    let second;
+    let releaseCleanup;
+    const released = new Promise(resolve => { releaseCleanup = resolve; });
+    let enteredCleanup;
+    const entered = new Promise(resolve => { enteredCleanup = resolve; });
+    let finalization;
+    try {
+      const transaction = await first.beginCapture({ captureId: 'cap-blocked-cleanup' });
+      await transaction.appendRequest(Buffer.from('原样请求'));
+      const originalRm = fsp.rm;
+      t.mock.method(fsp, 'rm', async (file, ...args) => {
+        if (file === transaction.files.request || file === transaction.files.response) {
+          enteredCleanup();
+          await released;
+        }
+        return originalRm(file, ...args);
+      });
+      finalization = transaction.finalize({ responseStatus: 200 });
+      await entered;
+      await first.enqueue(capture('cap-unrelated-ready'), { schedule: false });
+      first.relayUrl = relay.url;
+      await first.drain();
+      // Visit the remaining candidate too, independent of filesystem order.
+      await first.drain();
+      assert.deepEqual(received, ['cap-unrelated-ready']);
+      assert.ok(fs.existsSync(path.join(first.pendingDir, 'cap-blocked-cleanup.json')));
+      await first.close();
+      releaseCleanup();
+      assert.equal((await finalization).durable, true);
+      second = new DurableCaptureOutbox({ root, relayUrl: relay.url, minFreeBytes: 0, minFreeFiles: 0 });
+      await second.start();
+      assert.equal(await second.flush(1000), true);
+      assert.deepEqual(received, ['cap-unrelated-ready', 'cap-blocked-cleanup']);
+    } finally {
+      releaseCleanup();
+      if (finalization) await finalization.catch(() => {});
+      await first.close();
+      if (first.drainPromise) await first.drainPromise;
+      if (second) {
+        await second.close();
+        if (second.drainPromise) await second.drainPromise;
+      }
+      await relay.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 
 test('restart converts an open streamed capture into explicit incomplete evidence', async () => {
   const root = temporaryRoot();
