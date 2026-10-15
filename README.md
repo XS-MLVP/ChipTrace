@@ -50,8 +50,9 @@ Wire、OTLP 和 Hook 使用 Stock Codex 自带的 Session、Turn、call ID 和 W
 原生 Session/Turn 的 HTTP 403，不能作为真实 Turn 的采集证据。OTLP/Hook 仍有流量，
 随后 Wire 超过 5 分钟未更新，runtime gate 真实退出 1。18084 保留 293 个历史失败文件
 （约 267 MB），trace exporter 未启用，
-watchdog 仍有错误；18086 没有监听。已核验基线 `c38c1c6` 的远端 CI 已确认 5/5 作业通过，覆盖
-原生 Hook 持久化确认、生产者缓存、固定 Go 工具链及流式 Manifest 下载；
+watchdog 仍有错误；18086 没有监听。已核验基线 `859d296` 的远端 CI 已确认 5/5 作业通过，覆盖
+原生 Hook 持久化确认、生产者缓存、流式下载及图片/计划/五类真实工具的双轮 resume 采集；
+新增原生协议采集使用带补丁生产者和合成模型，不替代线上验收。
 真实 OSS 账号及未修改客户端的 v2 多轮验收仍未完成，因此尚不能按生产就绪对外交付。
 
 接入排查还复现了系统默认 Provider 被用户配置覆盖、使 Wire 绕过采集的风险。

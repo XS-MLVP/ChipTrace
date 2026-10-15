@@ -14,7 +14,7 @@ const path = require('node:path');
 const readline = require('node:readline');
 const zlib = require('node:zlib');
 const { execFile, spawn } = require('node:child_process');
-const { promisify } = require('node:util');
+const { isDeepStrictEqual, promisify } = require('node:util');
 const test = require('node:test');
 const { DurableCaptureOutbox, codexTraceContextFromHeaders } = require('../openai-gateway/durable-outbox');
 const { prepareProducerSourceCache } = require('../../scripts/ci/producer-source-cache');
@@ -576,12 +576,13 @@ async function collectProtocol(t) {
       const interaction = interactions.find(item => item.response.id === `protocol-response-${index + 1}`);
       assert.ok(interaction, 'every actual model response must have a Canonical interaction');
       assert.equal(interaction.response.output_items.length, 1);
-      assert.deepEqual(interaction.response.output_items[0].raw, observed.output_item);
+      assert.ok(isDeepStrictEqual(interaction.response.output_items[0].raw, observed.output_item),
+        'Canonical model output must preserve the actual response item (payload omitted)');
       const captured = savedWire.find(record => interaction.raw_capture_refs
         .some(reference => reference.capture_id === record.captureId));
       assert.ok(captured, 'every Canonical interaction must reference its actual Collector Wire');
-      assert.deepEqual(interaction.request.raw, JSON.parse(captured.requestBody.raw),
-        'Canonical model input must preserve complete text, tools and multimodal history');
+      assert.ok(isDeepStrictEqual(interaction.request.raw, JSON.parse(captured.requestBody.raw)),
+        'Canonical model input must preserve complete text, tools and multimodal history (payload omitted)');
       assert.equal(interaction.trace_context.turn_id ?? interaction.trace_context.root_turn_id, observed.turn_id);
     }
     const imageResults = interactions.flatMap(item => item.tool_results_submitted)

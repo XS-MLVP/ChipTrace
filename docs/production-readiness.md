@@ -1,14 +1,15 @@
 # 生产就绪评估
 
-评估日期：2026-10-15。首次线上读取窗口为 10:53–10:59（Asia/Shanghai），最新线上只读快照为 21:22。
+评估日期：2026-10-16。最新线上只读快照为 00:56（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-21:22 的只读快照中，18084、3011、3012 均返回 200，Collector/Relay 仍为 `fe9fcf9`；
-累计投递与 Capture 均为 1,075,861，pending/failed 为 0、inflight 为 1，计数守恒；
-该瞬时在途项不表示持续积压。Wire 仍只有 1 条且已约 10.7 小时未更新，覆盖为
+00:56 的只读快照中，18084、3011、3012 均返回 200，Collector/Relay 仍为 `fe9fcf9`；
+累计投递与 Capture 均为 1,090,412，pending/inflight/failed 均为 0，计数守恒。
+这只是瞬时队列状态，不构成持续 SLO 或完整 Session 的证明。Wire 仍只有 1 条且已约
+14.2 小时未更新，覆盖为
 `degraded`；18086 连接拒绝，runtime gate 实际因 `stale_sources=wire` 退出 1。
-模型探针最后可用时间仍为 10 月 8 日。735 个 sealed Segment 共 84,952,380,937 bytes
+模型探针最后可用时间仍为 10 月 8 日。739 个 sealed Segment 共 86,479,405,705 bytes
 保存在共享 NFS；此观测不证明已提交目标 OSS。当前状态应区分为传输进程存活、完整
 业务链路未验收和在线交付入口不可用。
 
@@ -122,14 +123,14 @@ parts，2 Turn、8 模型交互、6 工具记录不变，Raw SHA-256 一致。
 | --- | --- | --- |
 | 18084、3011、3012 | HTTP 200 | 入口与采集进程存活 |
 | Collector/Relay | revision `fe9fcf924b226099202cb770b7cf0da29e0c2310` | 运行版本已固定；仓库新增修复尚未部署 |
-| 投递 | 21:22 同一快照已投递 1,075,861 条，pending/failed 为 0、inflight 为 1，计数守恒 | 持续传输；瞬时在途项不能当作持续积压，也不是完整 Session 数 |
-| Collector 磁盘 | 21:22 有 735 个 sealed Segment，84,952,380,937 bytes；活动段仍在增长 | 云端共享 NFS 上的 WAL 持续保存；不能证明 OSS 已提交 |
+| 投递 | 00:56 同一快照已投递 1,090,412 条，pending/inflight/failed 均为 0，计数守恒 | 该快照队列排空；不是持续 SLO 或完整 Session 数 |
+| Collector 磁盘 | 00:56 有 739 个 sealed Segment，86,479,405,705 bytes | 云端共享 NFS 上的 WAL 持续保存；不能证明 OSS 已提交 |
 | Wire | 新进程内仅 1 条；活动 WAL 中为无原生 Session/Turn 的 HTTP 403 | 无真实成功 Turn Wire 的证据 |
-| 来源新鲜度 | 21:22 OTLP/Hook 有流量，Wire 约 10.7 小时未更新；runtime gate 仍实际因 Wire 过期退出 1 | 当前采集覆盖降级 |
+| 来源新鲜度 | 00:56 OTLP/Hook 有流量，Wire 约 14.2 小时未更新；runtime gate 仍实际因 Wire 过期退出 1 | 当前采集覆盖降级 |
 | 历史失败 | 293 个文件，267,219,223 bytes | 保留失败取证，不能删除换取健康状态 |
 | 平台 18086 | 无法连接 | 当前无法交接在线管理、导出入口 |
 | 部署隔离 | Relay 要求 ingest token；Collector/Relay 绑定 loopback；两容器有重启策略 | 有内部入口保护；两容器尚无内存/CPU 上限或只读根文件系统 |
-| GitHub CI | 已核验基线 `c38c1c6`：[run 38741033586](https://github.com/XS-MLVP/ChipTrace/actions/runs/38741033586) 已确认成功；该轮 5/5 作业、16 份报告元数据均未过期、带 SHA-256 | 含流式 Manifest、Turn 和独立容器平台报告；未下载报告正文，后续分页变更须另验同 SHA CI |
+| GitHub CI | 已核验基线 `859d296`：[run 38772230195](https://github.com/XS-MLVP/ChipTrace/actions/runs/38772230195) 已确认成功；5/5 作业、16 份正大小报告元数据均未过期、带 SHA-256 | 包含新执行的图片、计划、五类真实工具、双轮 resume 及全模型输入/输出比较；使用带补丁生产者和合成模型，未下载报告正文，不能替代线上验收 |
 | GitHub 集成 | 远端 main 仍为 `514d4cf`；维护分支修复尚未合并 | 需完成评审、同 SHA 验证和受控发布；分支 CI 不等于部署 |
 
 11:26 复查时三个既有服务仍返回 HTTP 200，Relay 已投递 1,036,522 条，pending 为 1、
@@ -277,7 +278,7 @@ OSS 账号的生产验收；新版网关须在支持 input receipt 的 Relay 部
 | P1 | 企业数据治理 | 项目命名空间、主平台租户授权、访问审计、脱敏策略与下载确认后的保留/删除规则验收 |
 | P2 | 大数据量处理 | 为 Session/Turn 建持久索引；减少两遍 Raw 扫描及分页 sidecar 重扫，记录大归档内存/时间/磁盘指标 |
 
-未修改 Stock Codex 的当前多轮生产验收仍缺证据；已有五个 producer 补丁的隔离 Canary
+未修改 Stock Codex 的当前多轮生产验收仍缺证据；已有来源上下文补丁的隔离 Canary
 证明修复方向可行，但不能替代该条件。受管路由模板也尚未应用到系统配置。
 纯云端采集无法恢复客户端未发送成功的事件：运行中断网造成缺失时，应保留 partial 状态，
 按原生重试能力恢复，不能补造记录或承诺任意网络条件下绝不丢失。
