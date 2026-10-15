@@ -389,6 +389,16 @@ impl ExactTurnIndex {
         Ok(process)
     }
 
+    pub(crate) fn capture_has_unknown_session(&self, capture: &Value) -> Result<bool> {
+        let mut unknown = false;
+        visit_otlp(capture, |_, record, attributes| {
+            unknown |= self.record_sessions(record, &attributes)?.is_empty()
+                && self.source_scope(record, &attributes)? != Some(SourceScope::Process);
+            Ok(())
+        })?;
+        Ok(unknown)
+    }
+
     /// Diagnostic categories only: none of these establish a Turn identity.
     pub(crate) fn unresolved_reason(
         &self,

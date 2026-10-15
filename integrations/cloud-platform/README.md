@@ -107,6 +107,22 @@ coverage, closed Session/Turn boundaries and zero unscoped records.
 `unscoped_source_records` identifies which sources still lack an exact Turn
 join. Native logs can join through the Wire's W3C context and observed span
 ancestry; blank IDs and ambiguous shared traces never join by time or order.
+
+The inspection result's top-level `delivery_ready` and `validation_status`
+combine the scoped Session view, canonical protocol/runtime integrity and
+`source_context_audit`. Entire OTLP batches without an exact Session owner
+remain in the audit, even when their payloads are excluded from the selected
+canonical projection. They cannot be presumed unrelated. Inspection reuses one
+read snapshot for both projection and auditing; its audit disables ID samples.
+The full identity/parent index still grows with corpus size and is not yet a
+disk index.
+
+The Turns endpoint also returns this overall `delivery_ready` alongside the
+scoped `summary`. A true `summary.delivery_ready` or
+`integrity.delivery_ready` alone does not certify the complete inspection.
+Legacy stored inspections without a source audit return false for the page's
+overall flag; submit a new inspection job ID to recheck the original archive.
+
 Exports require `chiptrace.cloud-acceptance.v2`. Historical v1 manifests retain
 their original contract and must be reprocessed from original Raw to qualify
 for the current release.

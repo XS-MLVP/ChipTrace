@@ -37,6 +37,20 @@ function integer(value, fallback, minimum, maximum) {
   return number;
 }
 
+function sourceContextReady(audit, sessionId) {
+  if (audit?.schema_version !== 'chiptrace.source-context-audit.v2'
+      || audit.session_id !== sessionId || audit.unscoped_otlp_records !== 0) return false;
+  const fields = ['turn_assigned_records', 'session_level_records', 'process_level_records',
+    'unscoped_turn_records', 'other_session_records', 'unknown_session_records'];
+  return ['otlp_logs', 'otlp_traces'].every(source => {
+    const counts = audit.sources?.[source];
+    if (!counts || !['total_records', ...fields].every(field => Number.isSafeInteger(counts[field]) && counts[field] >= 0)) return false;
+    const total = fields.reduce((sum, field) => sum + counts[field], 0);
+    return Number.isSafeInteger(total) && total === counts.total_records
+      && counts.unscoped_turn_records === 0 && counts.unknown_session_records === 0;
+  });
+}
+
 async function syncDirectory(directory) {
   const handle = await fsp.open(directory, 'r');
   try { await handle.sync(); } finally { await handle.close(); }
@@ -466,11 +480,7 @@ class ChipTracePlugin {
       if (result.schema_version !== 'chiptrace.cloud-acceptance.v2'
           || result.session_view?.schema_version !== 'chiptrace.session-view.v2'
           || result.session_view?.delivery_ready !== true
-          || result.source_context_audit?.schema_version !== 'chiptrace.source-context-audit.v2'
-          || result.source_context_audit?.session_id !== request.session_id
-          || result.source_context_audit?.unscoped_otlp_records !== 0
-          || Object.values(result.source_context_audit?.sources || {}).some(counts =>
-            counts.unscoped_turn_records !== 0 || counts.unknown_session_records !== 0)
+          || !sourceContextReady(result.source_context_audit, request.session_id)
           || result.delivery_ready !== true || result.hard_gate_pass !== true || result.score < 90
           || result.archive_id !== request.archive_id || result.session_id !== request.session_id || result.release_id !== request.release_id) {
         throw new PlatformError('export does not match the requested accepted Session', 422, 'ACCEPTANCE_FAILED');
@@ -506,7 +516,11 @@ class ChipTracePlugin {
       'inspect-session', '--input', output, '--session-id', request.session_id,
       '--projection-output', projectionRoot,
     ]);
-    if (inspected.session?.session_id !== request.session_id || inspected.session.schema_version !== 'chiptrace.session-view.v2') {
+    if (inspected.session?.session_id !== request.session_id || inspected.session.schema_version !== 'chiptrace.session-view.v2'
+        || inspected.source_context_audit?.schema_version !== 'chiptrace.source-context-audit.v2'
+        || inspected.source_context_audit?.session_id !== request.session_id
+        || typeof inspected.delivery_ready !== 'boolean'
+        || (inspected.delivery_ready && !sourceContextReady(inspected.source_context_audit, request.session_id))) {
       throw new PlatformError('inspection does not match requested Session', 502, 'ENGINE_PROTOCOL');
     }
     const projection = inspected.projection;
@@ -610,7 +624,9 @@ class ChipTracePlugin {
     if (records !== job.turns.records || digest.digest('hex') !== job.turns.sha256) {
       throw new PlatformError('Turn evidence changed', 422, 'ARTIFACT_CHANGED');
     }
-    return { summary: session, total: records, offset, turns };
+    const deliveryReady = job.result.delivery_ready === true
+      && sourceContextReady(job.result.source_context_audit, job.request.session_id);
+    return { delivery_ready: deliveryReady, summary: session, total: records, offset, turns };
   }
 
   async openArtifact(id, file) {

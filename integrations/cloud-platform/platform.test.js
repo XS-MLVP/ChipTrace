@@ -39,6 +39,98 @@ function decodeProjectionJsonl(bytes) {
   return text.trim() ? text.trim().split('\n').map(line => JSON.parse(line)) : [];
 }
 
+test('inspection and paged Turns preserve unknown source records without claiming delivery', { timeout: 60000 }, async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-context-'));
+  let app;
+  t.after(async () => { if (app) await app.close(); await fs.rm(root, { recursive: true, force: true }); });
+  const data = await fixture(root);
+  const marker = 'private-unknown-session-content';
+  const batch = (endpoint, raw) => {
+    const rawJson = JSON.stringify(raw);
+    return { captureId: `cap-unknown-${endpoint}`, recordType: 'telemetry_batch', telemetryBatch: {
+      schema_version: 'chiptrace.telemetry-batch.v1', endpoint, raw_json: rawJson,
+      raw_bytes: Buffer.byteLength(rawJson), raw_sha256: crypto.createHash('sha256').update(rawJson).digest('hex'),
+      source_records: 1, derived_captures: 0, unknown_events: 0, conversion_errors: [],
+    } };
+  };
+  const extra = [
+    batch('otlp_logs', { resourceLogs: [{ scopeLogs: [{ logRecords: [{
+      body: { stringValue: marker }, attributes: [{ key: 'event.name', value: { stringValue: 'bootstrap' } }],
+    }] }] }] }),
+    batch('otlp_traces', { resourceSpans: [{ scopeSpans: [{ spans: [{
+      name: 'bootstrap', traceId: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', spanId: 'eeeeeeeeeeeeeeee',
+    }] }] }] }),
+  ];
+  const segmentsRoot = path.join(data.captureRoot, 'segments');
+  const segments = (await fs.readdir(segmentsRoot)).filter(name => name.endsWith('.sealed.ndjson')).sort();
+  assert.ok(segments.length > 0);
+  const segment = path.join(segmentsRoot, segments.at(-1));
+  await fs.appendFile(segment, extra.map(value => JSON.stringify(value)).join('\n') + '\n');
+  const bytes = await fs.readFile(segment);
+  const plugin = new ChipTracePlugin({ root: path.join(root, 'platform'), captureRoot: data.captureRoot,
+    objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace' });
+  const token = 'platform-test-token-with-at-least-32-bytes';
+  app = await createPlatformServer({ plugin, token });
+  await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
+  const client = new ChipTraceClient({ baseUrl: `http://127.0.0.1:${app.server.address().port}`, token });
+  await client.submit({ id: 'archive-unknown', kind: 'archive', archive_id: 'raw-unknown' });
+  assert.equal((await client.wait('archive-unknown')).status, 'completed');
+  await client.submit({ id: 'inspect-unknown', kind: 'inspect', archive_id: 'raw-unknown', session_id: 'thread-self-test' });
+  const inspected = await client.wait('inspect-unknown');
+  assert.equal(inspected.status, 'completed');
+  assert.equal(inspected.result.delivery_ready, false);
+  assert.equal(inspected.result.validation_status, 'not_ready');
+  assert.equal(inspected.result.session.delivery_ready, true);
+  assert.equal(inspected.result.integrity.delivery_ready, true);
+  const audit = inspected.result.source_context_audit;
+  assert.equal(audit.schema_version, 'chiptrace.source-context-audit.v2');
+  assert.equal(audit.session_id, 'thread-self-test');
+  assert.equal(audit.sources.otlp_logs.unknown_session_records, 1);
+  assert.equal(audit.sources.otlp_traces.unknown_session_records, 1);
+  assert.equal(audit.unscoped_otlp_records, 0);
+  assert.equal(audit.sample_limit, 0);
+  assert.deepEqual(audit.samples, []);
+  assert.equal(JSON.stringify(inspected.result).includes(marker), false);
+  const page = await client.getTurns('inspect-unknown', { offset: 0, limit: 1 });
+  assert.equal(page.delivery_ready, false);
+  assert.equal(page.summary.delivery_ready, true);
+  assert.equal(page.total, 5);
+  await client.putUsageLog('unknown-usage', await fs.readFile(data.usage));
+  await client.submit({ id: 'export-unknown', kind: 'export', archive_id: 'raw-unknown',
+    session_id: 'thread-self-test', release_id: 'release-unknown', usage_log_ids: ['unknown-usage'] });
+  const exported = await client.wait('export-unknown');
+  assert.equal(exported.status, 'failed');
+  assert.equal(exported.error.exit_code, 1);
+  assert.match(exported.error.message, /source context audit .* has unresolved records/);
+
+  await app.close();
+  app = null;
+  const storedFile = path.join(root, 'platform/jobs/inspect-unknown.json');
+  const legacy = JSON.parse(await fs.readFile(storedFile, 'utf8'));
+  legacy.result.delivery_ready = true;
+  const reopen = async bytes => {
+    await fs.writeFile(storedFile, bytes);
+    app = await createPlatformServer({ plugin: new ChipTracePlugin({ root: path.join(root, 'platform'),
+      captureRoot: data.captureRoot, objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace' }), token });
+    await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
+    return new ChipTraceClient({ baseUrl: `http://127.0.0.1:${app.server.address().port}`, token });
+  };
+  const inconsistentBytes = Buffer.from(JSON.stringify(legacy));
+  const inconsistentClient = await reopen(inconsistentBytes);
+  assert.equal((await inconsistentClient.getTurns('inspect-unknown')).delivery_ready, false);
+  assert.deepEqual(await fs.readFile(storedFile), inconsistentBytes);
+  await app.close();
+  app = null;
+  delete legacy.result.source_context_audit;
+  const legacyBytes = Buffer.from(JSON.stringify(legacy));
+  const restarted = await reopen(legacyBytes);
+  const legacyPage = await restarted.getTurns('inspect-unknown');
+  assert.equal(legacyPage.delivery_ready, false);
+  assert.equal(legacyPage.summary.delivery_ready, true);
+  assert.deepEqual(await fs.readFile(storedFile), legacyBytes);
+  assert.deepEqual(await fs.readFile(segment), bytes);
+});
+
 test('HTTP service and SDK run the real CLI archive/restore/inspect/export path', { timeout: 60000 }, async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-'));
   let app;
@@ -71,7 +163,14 @@ test('HTTP service and SDK run the real CLI archive/restore/inspect/export path'
   assert.equal((await client.wait(restored.request.id)).status, 'completed');
   const inspectedJob = await client.wait(inspected.request.id);
   assert.equal(inspectedJob.status, 'completed');
+  assert.equal(inspectedJob.result.delivery_ready, true);
+  assert.equal(inspectedJob.result.validation_status, 'delivery_ready');
+  assert.equal(inspectedJob.result.source_context_audit.schema_version, 'chiptrace.source-context-audit.v2');
+  assert.equal(inspectedJob.result.source_context_audit.session_id, 'thread-self-test');
+  assert.equal(inspectedJob.result.source_context_audit.sources.otlp_logs.unknown_session_records, 0);
+  assert.equal(inspectedJob.result.source_context_audit.sources.otlp_traces.unknown_session_records, 0);
   const page = await client.getTurns('inspect-job', { offset: 0, limit: 1 });
+  assert.equal(page.delivery_ready, true);
   assert.equal(page.total, page.summary.native_turns);
   assert.equal(page.total, 5);
   assert.equal(page.summary.schema_version, 'chiptrace.session-view.v2');

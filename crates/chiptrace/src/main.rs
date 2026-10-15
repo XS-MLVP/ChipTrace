@@ -9,7 +9,7 @@ use chiptrace::collector::{CollectorConfig, serve};
 use chiptrace::enrich::{EnrichConfig, enrich_captures, verify_enrichment};
 use chiptrace::jsonl::absolute_path;
 use chiptrace::model_interaction::{
-    InteractionProjectConfig, audit_session_context, project_interactions,
+    InteractionProjectConfig, audit_session_context, inspect_session, project_interactions,
     verify_interaction_projection,
 };
 use chiptrace::otlp_delivery::{OtlpDeliveryConfig, send_otlp};
@@ -838,22 +838,14 @@ async fn main() -> Result<()> {
                     .path()
                     .join("projection")
             });
-            let projection = project_interactions(InteractionProjectConfig {
+            serde_json::to_value(inspect_session(InteractionProjectConfig {
                 inputs: args.input,
                 output: projection_output,
                 task_session_id: None,
                 session_id: Some(args.session_id),
                 zstd_level: 1,
                 replace: args.projection_output.is_some(),
-            })?;
-            json!({
-                "delivery_ready":projection.session_view.as_ref().is_some_and(|view| view.delivery_ready),
-                "session":projection.session_view,
-                "source_coverage":projection.source_coverage,
-                "integrity":projection.integrity,
-                "validation_status":projection.validation_status,
-                "projection":projection,
-            })
+            })?)?
         }
         Command::AuditSessionContext(args) => serde_json::to_value(audit_session_context(
             &args.input,

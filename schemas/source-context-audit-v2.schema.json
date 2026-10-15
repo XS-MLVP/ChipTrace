@@ -7,7 +7,7 @@
   "properties": {
     "schema_version": {"const": "chiptrace.source-context-audit.v2"},
     "session_id": {"type": "string", "minLength": 1},
-    "selected_captures": {"$ref": "#/$defs/count"},
+    "selected_captures": {"$ref": "#/$defs/count", "description": "Captures included in the audit: selected Session, declared Process and batches with unknown Session owners. May exceed projection input_records."},
     "duplicate_captures_removed": {"$ref": "#/$defs/count"},
     "sources": {
       "type": "object", "additionalProperties": false,

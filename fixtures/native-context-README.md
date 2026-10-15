@@ -28,3 +28,10 @@ audit and Session checks reject this conflict; the real CLI must exit 1 with
 empty stdout, bounded diagnostics without body content, unchanged input bytes
 and no new files. These cases prevent Process declarations from hiding missing
 Turn identities; they are not observations of a real producer emitting them.
+
+Another CLI regression keeps wholly unowned batches in source accounting,
+resolves exact Process ancestry across separate batches, excludes an explicitly
+unrelated Session, and counts duplicate Captures once. The HTTP/SDK regression
+in `integrations/cloud-platform/platform.test.js` verifies that an otherwise
+complete synthetic Session with unowned logs/traces cannot claim overall
+delivery through inspection, paged Turns, or export.

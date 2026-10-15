@@ -154,6 +154,48 @@ test('source-declared Process scopes remain outside selected Session accounting'
   assert.deepEqual(await fs.readFile(data.file), data.bytes);
 });
 
+test('unowned batches remain in the audit while exact Process ancestry crosses batches', async t => {
+  const attr = (key, value) => ({ key, value: { stringValue: value } });
+  const processTrace = 'ffffffffffffffffffffffffffffffff';
+  const root = '1111111111111111';
+  const child = '2222222222222222';
+  const unknownLog = batch('otlp_logs', { resourceLogs: [{ scopeLogs: [{ logRecords: [{
+    body: { stringValue: 'private-unowned-batch-payload' },
+  }] }] }] }, 1);
+  unknownLog.captureId = 'cap-unowned-logs';
+  const traces = spans => ({ resourceSpans: [{ scopeSpans: [{ spans }] }] });
+  const captures = [
+    { captureId: 'cap-unowned-wire', recordType: 'api_snapshot', traceContext: { session_id: 'selected', turn_id: 'native-turn' } },
+    unknownLog,
+    batch('otlp_traces', traces([{ name: 'unowned', traceId: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', spanId: root }]), 1),
+    batch('otlp_traces', traces([{ name: 'process.bootstrap', traceId: processTrace, spanId: root,
+      attributes: [attr('codex.context_scope', 'process')] }]), 1),
+    batch('otlp_traces', traces([{ name: 'auth', traceId: processTrace, spanId: child, parentSpanId: root }]), 1),
+    batch('otlp_logs', { resourceLogs: [{ scopeLogs: [{ logRecords: [{ traceId: processTrace,
+      spanId: child, attributes: [attr('event.name', 'auth')] }] }] }] }, 1),
+    batch('otlp_logs', { resourceLogs: [{ scopeLogs: [{ logRecords: [{
+      attributes: [attr('conversation.id', 'other-session'), attr('event.name', 'codex.sse_event')],
+    }] }] }] }, 1),
+  ].map((capture, index) => index < 2 ? capture : { ...capture, captureId: `cap-unowned-extra-${index}` });
+  captures.push(unknownLog);
+  const data = await input(t, captures);
+  const result = await run(binary, ['audit-session-context', '--input', data.file, '--session-id', 'selected', '--sample-limit', '0']);
+  const audit = JSON.parse(result.stdout);
+  assert.equal(audit.selected_captures, 6);
+  assert.equal(audit.duplicate_captures_removed, 1);
+  assert.equal(audit.sources.otlp_logs.total_records, 2);
+  assert.equal(audit.sources.otlp_logs.unknown_session_records, 1);
+  assert.equal(audit.sources.otlp_logs.process_level_records, 1);
+  assert.equal(audit.sources.otlp_logs.other_session_records, 0);
+  assert.equal(audit.sources.otlp_traces.total_records, 3);
+  assert.equal(audit.sources.otlp_traces.unknown_session_records, 1);
+  assert.equal(audit.sources.otlp_traces.process_level_records, 2);
+  assert.equal(audit.unscoped_otlp_records, 0);
+  assert.ok(!result.stdout.includes('private-unowned-batch-payload'));
+  assert.deepEqual(await fs.readFile(data.file), data.bytes);
+  assert.deepEqual(await fs.readdir(data.root), ['input.ndjson']);
+});
+
 test('Turn business logs cannot be exempted by explicit or inherited Process scope', async t => {
   const attr = (key, value) => ({ key, value: { stringValue: value } });
   const traceId = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';

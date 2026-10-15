@@ -1,12 +1,14 @@
 //! Payload-free diagnostics for the exact Session/Turn OTLP join.
 //! Counts do not certify delivery or exempt unresolved records.
 
-use crate::session_view::{allowed_source_sessions, otlp_record_name, otlp_source_observation};
+#[cfg(test)]
+use crate::session_view::allowed_source_sessions;
+use crate::session_view::{otlp_record_name, otlp_source_observation};
 use crate::turn_identity::{ExactTurnIndex, hex_id, visit_otlp};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const SOURCE_CONTEXT_AUDIT_SCHEMA_VERSION: &str = "chiptrace.source-context-audit.v2";
 const MAX_GROUPS: usize = 128;
@@ -62,6 +64,55 @@ pub struct SourceContextAudit {
     pub omitted_samples: u64,
 }
 
+impl SourceContextCounts {
+    fn checked_total(&self) -> Result<u64> {
+        self.turn_assigned_records
+            .checked_add(self.session_level_records)
+            .and_then(|value| value.checked_add(self.process_level_records))
+            .and_then(|value| value.checked_add(self.unscoped_turn_records))
+            .and_then(|value| value.checked_add(self.other_session_records))
+            .and_then(|value| value.checked_add(self.unknown_session_records))
+            .context("source context audit count overflow")
+    }
+}
+
+impl SourceContextAudit {
+    /// Verify source identity and count invariants, without certifying other delivery gates.
+    pub fn verify_delivery_ready(&self, session_id: &str) -> Result<()> {
+        if self.schema_version != SOURCE_CONTEXT_AUDIT_SCHEMA_VERSION {
+            bail!("source context audit has an unsupported schema version");
+        }
+        if self.session_id != session_id {
+            bail!("source context audit Session does not match requested Session");
+        }
+        let mut unscoped = 0_u64;
+        for source in ["otlp_logs", "otlp_traces"] {
+            let counts = self
+                .sources
+                .get(source)
+                .with_context(|| format!("source context audit is missing {source}"))?;
+            if counts.checked_total()? != counts.total_records {
+                bail!("source context audit {source} counts do not conserve records");
+            }
+            if counts.unscoped_turn_records != 0 || counts.unknown_session_records != 0 {
+                bail!(
+                    "source context audit {source} has unresolved records: unscoped_turn_records={}, unknown_session_records={}",
+                    counts.unscoped_turn_records,
+                    counts.unknown_session_records
+                );
+            }
+            unscoped = unscoped
+                .checked_add(counts.unscoped_turn_records)
+                .context("source context audit unscoped count overflow")?;
+        }
+        if self.unscoped_otlp_records != unscoped {
+            bail!("source context audit unscoped count does not match source counts");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn audit_selected_source_context(
     captures: &[Value],
     session_id: &str,
@@ -77,13 +128,58 @@ pub(crate) fn audit_selected_source_context(
     for capture in captures {
         index.observe_capture(capture)?;
     }
-    let allowed = allowed_source_sessions(captures, session_id);
-    let mut sources: BTreeMap<String, SourceContextCounts> = BTreeMap::new();
-    let mut groups: BTreeMap<(String, String, String, String), u64> = BTreeMap::new();
-    let mut samples = Vec::new();
-    let mut omitted_gap_records = 0;
-    let mut gaps = 0;
+    let mut audit = SourceContextAuditBuilder::new(
+        session_id,
+        allowed_source_sessions(captures, session_id),
+        sample_limit,
+    )?;
     for capture in captures {
+        audit.observe_capture(capture, &index)?;
+    }
+    Ok(audit.finish(duplicates))
+}
+
+/// Accumulate bounded diagnostics while each Capture is already being read.
+pub(crate) struct SourceContextAuditBuilder {
+    session_id: String,
+    allowed: BTreeSet<String>,
+    sample_limit: usize,
+    selected_captures: u64,
+    sources: BTreeMap<String, SourceContextCounts>,
+    groups: BTreeMap<(String, String, String, String), u64>,
+    samples: Vec<ContextGapSample>,
+    omitted_gap_records: u64,
+    gaps: u64,
+}
+
+impl SourceContextAuditBuilder {
+    pub(crate) fn new(
+        session_id: &str,
+        allowed: BTreeSet<String>,
+        sample_limit: usize,
+    ) -> Result<Self> {
+        if sample_limit > MAX_CONTEXT_SAMPLES {
+            bail!("source context sample limit must be at most {MAX_CONTEXT_SAMPLES}");
+        }
+        Ok(Self {
+            session_id: session_id.to_owned(),
+            allowed,
+            sample_limit,
+            selected_captures: 0,
+            sources: BTreeMap::new(),
+            groups: BTreeMap::new(),
+            samples: Vec::new(),
+            omitted_gap_records: 0,
+            gaps: 0,
+        })
+    }
+
+    pub(crate) fn observe_capture(
+        &mut self,
+        capture: &Value,
+        index: &ExactTurnIndex,
+    ) -> Result<()> {
+        self.selected_captures += 1;
         let capture_id = capture
             .get("captureId")
             .and_then(Value::as_str)
@@ -92,18 +188,18 @@ pub(crate) fn audit_selected_source_context(
         visit_otlp(capture, |source, record, attributes| {
             let record_index = ordinal;
             ordinal += 1;
-            let observed = otlp_source_observation(source, record, &attributes, &index)?;
-            let counts = sources.entry(source.to_owned()).or_default();
+            let observed = otlp_source_observation(source, record, &attributes, index)?;
+            let counts = self.sources.entry(source.to_owned()).or_default();
             counts.total_records += 1;
             let in_session = observed
                 .session_id
                 .as_deref()
-                .is_some_and(|s| allowed.contains(s));
+                .is_some_and(|s| self.allowed.contains(s));
             let ambiguous_session = observed.session_id.is_none()
                 && observed
                     .related_sessions
                     .iter()
-                    .any(|s| allowed.contains(s));
+                    .any(|s| self.allowed.contains(s));
             if observed.process_scoped {
                 counts.process_level_records += 1;
                 return Ok(());
@@ -124,7 +220,7 @@ pub(crate) fn audit_selected_source_context(
                 counts.unknown_session_records += 1;
                 "unknown_session"
             };
-            gaps += 1;
+            self.gaps += 1;
             let reason = if ambiguous_session {
                 "ambiguous_session_context"
             } else {
@@ -141,15 +237,15 @@ pub(crate) fn audit_selected_source_context(
                 name.clone(),
                 reason.to_owned(),
             );
-            if let Some(count) = groups.get_mut(&key) {
+            if let Some(count) = self.groups.get_mut(&key) {
                 *count += 1;
-            } else if groups.len() < MAX_GROUPS {
-                groups.insert(key, 1);
+            } else if self.groups.len() < MAX_GROUPS {
+                self.groups.insert(key, 1);
             } else {
-                omitted_gap_records += 1;
+                self.omitted_gap_records += 1;
             }
-            if samples.len() < sample_limit {
-                samples.push(ContextGapSample {
+            if self.samples.len() < self.sample_limit {
+                self.samples.push(ContextGapSample {
                     capture_id: capture_id.to_owned(),
                     record_index,
                     source: source.to_owned(),
@@ -162,35 +258,37 @@ pub(crate) fn audit_selected_source_context(
                 });
             }
             Ok(())
-        })?;
+        })
     }
-    let unscoped_otlp_records = sources.values().map(|s| s.unscoped_turn_records).sum();
-    let omitted_samples = gaps - samples.len() as u64;
-    Ok(SourceContextAudit {
-        schema_version: SOURCE_CONTEXT_AUDIT_SCHEMA_VERSION.to_owned(),
-        session_id: session_id.to_owned(),
-        selected_captures: captures.len() as u64,
-        duplicate_captures_removed: duplicates,
-        sources,
-        unscoped_otlp_records,
-        group_limit: MAX_GROUPS,
-        gap_groups: groups
-            .into_iter()
-            .map(
-                |((source, disposition, record_name, reason), records)| ContextGapGroup {
-                    source,
-                    disposition,
-                    record_name,
-                    reason,
-                    records,
-                },
-            )
-            .collect(),
-        omitted_gap_records,
-        sample_limit,
-        samples,
-        omitted_samples,
-    })
+
+    pub(crate) fn finish(self, duplicates: u64) -> SourceContextAudit {
+        SourceContextAudit {
+            schema_version: SOURCE_CONTEXT_AUDIT_SCHEMA_VERSION.to_owned(),
+            session_id: self.session_id,
+            selected_captures: self.selected_captures,
+            duplicate_captures_removed: duplicates,
+            unscoped_otlp_records: self.sources.values().map(|s| s.unscoped_turn_records).sum(),
+            sources: self.sources,
+            group_limit: MAX_GROUPS,
+            gap_groups: self
+                .groups
+                .into_iter()
+                .map(
+                    |((source, disposition, record_name, reason), records)| ContextGapGroup {
+                        source,
+                        disposition,
+                        record_name,
+                        reason,
+                        records,
+                    },
+                )
+                .collect(),
+            omitted_gap_records: self.omitted_gap_records,
+            sample_limit: self.sample_limit,
+            omitted_samples: self.gaps - self.samples.len() as u64,
+            samples: self.samples,
+        }
+    }
 }
 
 #[cfg(test)]

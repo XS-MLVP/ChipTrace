@@ -17,7 +17,7 @@
 | 历史失败 | 293 个文件，267,219,223 bytes | 保留失败取证，不能删除换取健康状态 |
 | 平台 18086 | 无法连接 | 当前无法交接在线管理、导出入口 |
 | 部署隔离 | Relay 要求 ingest token；Collector/Relay 绑定 loopback；两容器有重启策略 | 有内部入口保护；两容器尚无内存/CPU 上限或只读根文件系统 |
-| GitHub CI | `1316488` 的 [run 38674424831](https://github.com/XS-MLVP/ChipTrace/actions/runs/38674424831) 已确认 5/5 作业成功 | 覆盖这一 SHA；不能代替后续提交或线上验收 |
+| GitHub CI | `9510758` 的 [run 38676531074](https://github.com/XS-MLVP/ChipTrace/actions/runs/38676531074) 已确认 5/5 作业成功 | 覆盖 Process 冲突修复这一 SHA；不能代替后续提交或线上验收 |
 
 11:26 复查时三个既有服务仍返回 HTTP 200，Relay 已投递 1,036,522 条，pending 为 1、
 inflight/failed 为 0、计数守恒。持续流量下瞬时 pending 不能单独判定积压故障。
@@ -38,6 +38,20 @@ sealed Archive 验收。全局四源门禁在该 403 到达后曾短暂通过；
 `make m0-test` 也实际退出 0：独立镜像 `chiptrace:m0-process-scope-canary` 在断网、只读
 根文件系统及非 root 用户下完成自测；构建标记为 `working-tree-process-scope-guard`，未替换线上镜像。
 这些隔离实现回归不改变上述线上、未修改生产者或真实 OSS 账号的验收状态。
+
+后续只读回放又确认检查入口的误报：历史样本存在 2 条日志和 84 个 span 的未知 Session
+身份，旧 `inspect-session` 顶层仍返回可交付。修复后检查入口复用同快照的来源审计，
+完整状态为 false；完全没有身份的独立 OTLP batch 也逐批计入审计，正文不因此留在
+Canonical 投影内存集合中。平台分页增加总交付状态，完整性不足的导出继续真实失败。
+原始 Raw 与合格 patched Canary 均保留，回放前后哈希不变。线上尚未加载这些修复。
+该检查修复的本地 `cloud-test` 已通过，包含 275 个 Rust 库测试、1 个 CLI 测试、
+7 个原生上下文 CLI 测试和 7 个平台/OSS 协议测试。独立镜像
+`chiptrace:m0-source-audit-canary` 的 `m0-test` 实际退出 0，构建标记为
+`working-tree-source-audit-inspection`。历史任务重启后的缺少审计和状态与审计冲突用例也通过，
+历史任务文件保持原样；这些实现回归不证明线上或真实 OSS 已验收。
+本地复跑还记录过一次 outbox 测试 18/19 通过、`make` 退出 2；随后独立 outbox 回归
+19/19 和完整 `cloud-test` 均通过，测试条件未放宽。原失败的断言细节未被当时的摘要
+保留，原因尚未定位，需继续跟踪；后续摘要已保留失败测试名称和完整断言块。
 
 ## 已有优势
 

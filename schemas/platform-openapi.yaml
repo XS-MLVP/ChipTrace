@@ -51,12 +51,17 @@ paths:
     parameters:
       - {$ref: '#/components/parameters/Id'}
     get:
-      description: Reads the verified Turn JSONL sidecar. Summary excludes full turns; total is the native Turn count.
+      description: >-
+        Reads the verified Turn JSONL sidecar. Top-level delivery_ready is the
+        overall inspection/acceptance status, including source context audit.
+        Summary is the scoped Session view and excludes full turns; total is
+        the native Turn count. Legacy inspections without a source audit return
+        false for the overall flag and require a new inspection job.
       parameters:
         - {$ref: '#/components/parameters/Offset'}
         - {$ref: '#/components/parameters/Limit'}
       responses:
-        '200': {description: 'Object containing summary, total, offset and turns (at most limit entries)'}
+        '200': {description: 'Object containing delivery_ready, summary, total, offset and turns (at most limit entries)'}
         '401': {$ref: '#/components/responses/Error'}
         '404': {$ref: '#/components/responses/Error'}
         '409': {$ref: '#/components/responses/Error'}

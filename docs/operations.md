@@ -228,6 +228,16 @@ Turn 业务事件不能以直接声明或精确父链继承的 Process scope 获
 `--sample-limit 0` 可关闭定位样本，分组和样本上限不会截断总计数。
 诊断报告保留 ID/名称元数据，按项目控制访问；完整交付结论仍来自云端验收。
 
+`inspect-session` 顶层 `delivery_ready` 还要求同快照的 `source_context_audit` 没有未知
+Session 或未归属业务记录，并通过 Canonical Runtime/协议与逐 Turn 来源检查。
+嵌套 Session 视图或 Runtime integrity 单项通过不代表顶层通过。完全无身份的独立 OTLP
+batch 逐批进入审计计数，不能在 Session 选择时静默遗漏；它们不会被猜测归属到当前 Turn。
+审计用的精确身份/父链索引仍占用随记录数增长的内存，大归档应测量峰值并安排磁盘索引。
+
+平台 `/v1/jobs/{id}/turns` 的顶层 `delivery_ready` 表示检查/验收总状态；`summary` 继续
+保留已精确归属的 Session 视图。历史检查结果若没有 `source_context_audit`，分页总状态
+为 false，需使用新 job ID 重新检查原始 Archive；不要改写历史任务结果。
+
 ## 回滚
 
 发布和回滚时同时更新部署环境文件中的 `CHIPTRACE_IMAGE`，使后续 Compose 重建使用

@@ -61,6 +61,14 @@ span 无法精确确定 Session 身份，以前的 Session 未归属计数没有
 `unknown_session_records`；只有来源端显式声明 `codex.context_scope=process` 时才能使用
 这一分类。旧 v1 报告没有该字段，不能作为当前 v2 门禁证据。
 
+审计也覆盖完全没有 Session 身份的独立 OTLP batch。全快照第一遍保留精确 Span 父链
+元数据，第二遍逐 Capture 累计计数；没有身份的 batch 正文不会因此加入 Canonical 投影
+或长期保留在投影的内存集合中。`selected_captures` 表示审计涉及的 Capture 数，包含已选
+Session、显式 Process 和身份未知的 batch，可能大于投影的 `input_records`。未知身份
+仍不归属当前 Session，但不能被假定为无关而从交付检查消失。明确属于其他 Session 且
+没有未知记录的 batch 继续排除，重复 Capture 只计一次。诊断分组和样本有上限，精确
+身份/父链索引仍随快照规模增长，尚未实现磁盘索引。
+
 `process` 声明也不能豁免 Turn 业务事件。`codex.sse_event`、`codex.tool_result`、
 `codex.tool_decision`、`codex.sandbox_outcome`、`codex.user_prompt`、`codex.turn_ttft`
 和 `codex.turn_cost` 若直接声明或沿精确父链继承 Process scope，审计和 Session 检查均拒绝，
@@ -203,6 +211,27 @@ process span 均保留。sealed Raw 在回放前后的 SHA-256 相同：
 Rust 和真实 CLI 的独立负例覆盖七类业务事件的直接/父链 Process 声明，共 14 种组合；
 CLI 均真实退出 1、stdout 为空、诊断不含正文、输入字节和目录不变。这些负例是协议回归，
 不表示 Stock Codex 在真实任务中已经发射了错误 Process 声明。
+
+## 检查入口的完整交付状态
+
+`inspect-session` 的顶层 `delivery_ready` 和 `validation_status` 现在合并逐 Turn 来源、
+原生边界、Canonical 协议/Runtime 完整性和来源身份审计。返回的 `source_context_audit`
+使用 `sample_limit=0`，与投影复用同一份读取快照；不额外重扫 Raw。来源审计和
+`cloud-acceptance` 复用同一计数守恒、未知 Session 和未归属 Turn 检查。
+嵌套 `session.delivery_ready` 是已精确选择的 Session/Turn 视图，
+`integrity.delivery_ready` 是 Canonical Runtime/协议视图，均不能单独替代顶层结果。
+
+2026-10-15 只读重放历史 Session `01a13bd7-c500-76c1-94c1-74370b1da588`：
+已归属的 Session 和 Runtime 检查均通过，但仍有 2 条日志、84 个 span 没有 Session
+身份。旧检查错误返回可交付；修复后顶层为 `delivery_ready=false`、
+`validation_status=not_ready`。原始 sealed Segment 的 SHA-256 保持
+`4682d03226ba984e8bd1cc1593026c215a2997a926f6d0999c1ed93d49b21039`。
+该失败样本和前述合格 patched 样本均保留，没有删除记录或改写原始身份。
+
+平台 HTTP/SDK 回归另向合成采集样本加入完全无身份的独立 logs/traces batch：检查任务
+成功返回诊断，总交付状态为 false；Turn 分页同样返回顶层 `delivery_ready=false`；
+导出任务保留引擎真实退出 1。CLI 回归覆盖跨 batch 的精确 Process 父链、重复 Capture、
+未知记录计数和正文不输出。这些合成负例不代替真实客户端验收。
 
 门禁还要求 `session_view.model_interactions` 和
 `session_view.tool_execution_records` 分别等于所有 Native Turn 对应字段的总和。聚合值

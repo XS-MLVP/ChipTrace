@@ -47,17 +47,9 @@ pub fn audit_session_context(
         bail!("no Capture JSONL inputs found");
     }
     discover_raw_sources(inputs, &discovered)?;
-    let (captures, duplicates, scopes) =
-        read_session_captures_with_scopes(&discovered, session_id)?;
-    let (mut captures, _, _) = select_projection_captures(captures, None, Some(session_id))?;
-    sort_captures(&mut captures);
-    crate::source_context::audit_selected_source_context(
-        &captures,
-        session_id,
-        &scopes,
-        duplicates,
-        sample_limit,
-    )
+    read_session_snapshot(&discovered, session_id, Some(sample_limit))?
+        .source_audit
+        .context("Session snapshot has no source context audit")
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +87,17 @@ pub struct InteractionProjectionManifest {
     pub raw_sources: Vec<RawSourceLineage>,
     pub parts: Vec<FileManifest>,
     pub validation_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionInspection {
+    pub delivery_ready: bool,
+    pub session: crate::session_view::SessionView,
+    pub source_coverage: CloudSourceCoverage,
+    pub integrity: DeliveryIntegrity,
+    pub validation_status: String,
+    pub source_context_audit: crate::source_context::SourceContextAudit,
+    pub projection: InteractionProjectionManifest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -291,6 +294,59 @@ pub(crate) fn summarize_raw_session(
 pub fn project_interactions(
     config: InteractionProjectConfig,
 ) -> Result<InteractionProjectionManifest> {
+    project_interactions_with_audit(config, false).map(|(projection, _)| projection)
+}
+
+/// Inspect the selected Session using one snapshot for projection and source auditing.
+pub fn inspect_session(config: InteractionProjectConfig) -> Result<SessionInspection> {
+    let session_id = config
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|session| !session.is_empty())
+        .context("Session inspection requires a native Session ID")?
+        .to_owned();
+    let (projection, source_context_audit) = project_interactions_with_audit(config, true)?;
+    let source_context_audit =
+        source_context_audit.context("Session inspection has no source context audit")?;
+    let session = projection
+        .session_view
+        .clone()
+        .context("Session inspection has no native Session/Turn view")?;
+    let delivery_ready = session.delivery_ready
+        && projection.source_coverage.complete
+        && projection.integrity.delivery_ready
+        && projection
+            .metrics
+            .pointer("/turn_interaction/complete")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && source_context_audit
+            .verify_delivery_ready(&session_id)
+            .is_ok();
+    Ok(SessionInspection {
+        delivery_ready,
+        session,
+        source_coverage: projection.source_coverage.clone(),
+        integrity: projection.integrity.clone(),
+        validation_status: if delivery_ready {
+            "delivery_ready"
+        } else {
+            "not_ready"
+        }
+        .to_owned(),
+        source_context_audit,
+        projection,
+    })
+}
+
+fn project_interactions_with_audit(
+    config: InteractionProjectConfig,
+    include_source_audit: bool,
+) -> Result<(
+    InteractionProjectionManifest,
+    Option<crate::source_context::SourceContextAudit>,
+)> {
     if config.inputs.is_empty() {
         bail!("at least one Capture input is required");
     }
@@ -311,20 +367,25 @@ pub fn project_interactions(
     if config.task_session_id.is_some() && config.session_id.is_some() {
         bail!("--task-session-id and --session-id cannot be used together");
     }
-    let (captures, duplicate_captures_removed, global_scopes) = if let Some(session) =
-        &config.session_id
-    {
-        let (captures, duplicates, scopes) = read_session_captures_with_scopes(&inputs, session)?;
-        (captures, duplicates, Some(scopes))
-    } else {
-        let (mut captures, duplicates) = read_captures(&inputs)?;
-        apply_exact_task_links(&mut captures)?;
-        let mut scopes = crate::turn_identity::ExactTurnIndex::default();
-        for capture in &captures {
-            scopes.observe_capture(capture)?;
-        }
-        (captures, duplicates, Some(scopes))
-    };
+    let (captures, duplicate_captures_removed, global_scopes, source_context_audit) =
+        if let Some(session) = &config.session_id {
+            let snapshot =
+                read_session_snapshot(&inputs, session, include_source_audit.then_some(0))?;
+            (
+                snapshot.captures,
+                snapshot.duplicates,
+                Some(snapshot.scopes),
+                snapshot.source_audit,
+            )
+        } else {
+            let (mut captures, duplicates) = read_captures(&inputs)?;
+            apply_exact_task_links(&mut captures)?;
+            let mut scopes = crate::turn_identity::ExactTurnIndex::default();
+            for capture in &captures {
+                scopes.observe_capture(capture)?;
+            }
+            (captures, duplicates, Some(scopes), None)
+        };
     let (mut captures, task_session_id, session_id) = select_projection_captures(
         captures,
         config.task_session_id.as_deref(),
@@ -464,7 +525,7 @@ pub fn project_interactions(
     fs::rename(&staging, &output)?;
     File::open(parent)?.sync_all()?;
     verify_interaction_artifacts(&output)?;
-    Ok(manifest)
+    Ok((manifest, source_context_audit))
 }
 
 fn build_canonical_records(captures: &[Value]) -> Result<CanonicalRecords> {
@@ -1121,6 +1182,22 @@ fn read_session_captures_with_scopes(
     inputs: &[PathBuf],
     session: &str,
 ) -> Result<(Vec<Value>, u64, crate::turn_identity::ExactTurnIndex)> {
+    let snapshot = read_session_snapshot(inputs, session, None)?;
+    Ok((snapshot.captures, snapshot.duplicates, snapshot.scopes))
+}
+
+struct SessionCaptureSnapshot {
+    captures: Vec<Value>,
+    duplicates: u64,
+    scopes: crate::turn_identity::ExactTurnIndex,
+    source_audit: Option<crate::source_context::SourceContextAudit>,
+}
+
+fn read_session_snapshot(
+    inputs: &[PathBuf],
+    session: &str,
+    audit_sample_limit: Option<usize>,
+) -> Result<SessionCaptureSnapshot> {
     let session = session.trim();
     if session.is_empty() {
         bail!("--session-id cannot be empty");
@@ -1129,7 +1206,11 @@ fn read_session_captures_with_scopes(
     let mut duplicates = 0_u64;
     let mut lineage = StockSessionLineage::default();
     let mut task_links = HashMap::new();
-    let mut turn_index = crate::turn_identity::ExactTurnIndex::default();
+    let mut turn_index = if audit_sample_limit.is_some() {
+        crate::turn_identity::ExactTurnIndex::for_turns()
+    } else {
+        crate::turn_identity::ExactTurnIndex::default()
+    };
     let mut found = false;
     // Inspect the entire corpus for duplicate conflicts, exact links and child
     // lineage before retaining payloads. Unrelated Sessions stay off the heap;
@@ -1156,6 +1237,15 @@ fn read_session_captures_with_scopes(
         bail!("session_id {session:?} was not found in Capture inputs");
     }
     let selection = lineage.selection(session)?;
+    let mut source_audit = audit_sample_limit
+        .map(|limit| {
+            crate::source_context::SourceContextAuditBuilder::new(
+                session,
+                selection.session_ids(),
+                limit,
+            )
+        })
+        .transpose()?;
     let mut captures = Vec::new();
     let mut visited = HashSet::new();
     let mut repeated = 0_u64;
@@ -1172,13 +1262,18 @@ fn read_session_captures_with_scopes(
         // Preserve ambiguity rejection even when the conflicting record belongs
         // to an unrelated session and will not be retained.
         apply_exact_task_link(&mut capture, &task_links)?;
-        if capture_matches_session(&capture, &selection)
+        let selected = capture_matches_session(&capture, &selection)
             || turn_index
                 .capture_sessions(&capture)?
                 .iter()
                 .any(|s| selection.allows_session_id(s))
-            || turn_index.capture_has_process_scope(&capture)?
+            || turn_index.capture_has_process_scope(&capture)?;
+        if let Some(audit) = &mut source_audit
+            && (selected || turn_index.capture_has_unknown_session(&capture)?)
         {
+            audit.observe_capture(&capture, &turn_index)?;
+        }
+        if selected {
             captures.push(capture);
         }
         Ok(())
@@ -1186,7 +1281,12 @@ fn read_session_captures_with_scopes(
     if visited.len() != seen.len() || repeated != duplicates {
         bail!("Capture inputs changed between Session selection scans");
     }
-    Ok((captures, duplicates, turn_index))
+    Ok(SessionCaptureSnapshot {
+        captures,
+        duplicates,
+        scopes: turn_index,
+        source_audit: source_audit.map(|audit| audit.finish(duplicates)),
+    })
 }
 
 fn select_projection_captures(

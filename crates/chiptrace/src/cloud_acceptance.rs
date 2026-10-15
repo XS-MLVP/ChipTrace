@@ -15,9 +15,7 @@ use crate::raw_archive::{
 use crate::release::{ReleaseConfig, build_release, verify_release};
 use crate::schema::{RAW_LINEAGE_SCHEMA_VERSION, RawSourceLineage};
 use crate::score::Profile;
-use crate::source_context::{
-    SOURCE_CONTEXT_AUDIT_SCHEMA_VERSION, SourceContextAudit, SourceContextCounts,
-};
+use crate::source_context::SourceContextAudit;
 use crate::telemetry::{OtlpExportConfig, export_otlp, verify_otlp_export};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -88,50 +86,6 @@ pub struct CloudAcceptanceManifest {
     pub raw_bytes: u64,
     pub artifacts: BTreeMap<String, AcceptanceArtifact>,
     pub validation_status: String,
-}
-
-fn checked_source_context_total(counts: &SourceContextCounts) -> Result<u64> {
-    counts
-        .turn_assigned_records
-        .checked_add(counts.session_level_records)
-        .and_then(|value| value.checked_add(counts.process_level_records))
-        .and_then(|value| value.checked_add(counts.unscoped_turn_records))
-        .and_then(|value| value.checked_add(counts.other_session_records))
-        .and_then(|value| value.checked_add(counts.unknown_session_records))
-        .context("source context audit count overflow")
-}
-
-fn verify_source_context_audit(audit: &SourceContextAudit, session_id: &str) -> Result<()> {
-    if audit.schema_version != SOURCE_CONTEXT_AUDIT_SCHEMA_VERSION {
-        bail!("source context audit has an unsupported schema version");
-    }
-    if audit.session_id != session_id {
-        bail!("source context audit Session does not match cloud acceptance");
-    }
-    let mut unscoped = 0_u64;
-    for source in ["otlp_logs", "otlp_traces"] {
-        let counts = audit
-            .sources
-            .get(source)
-            .with_context(|| format!("source context audit is missing {source}"))?;
-        if checked_source_context_total(counts)? != counts.total_records {
-            bail!("source context audit {source} counts do not conserve records");
-        }
-        if counts.unscoped_turn_records != 0 || counts.unknown_session_records != 0 {
-            bail!(
-                "source context audit {source} has unresolved records: unscoped_turn_records={}, unknown_session_records={}",
-                counts.unscoped_turn_records,
-                counts.unknown_session_records
-            );
-        }
-        unscoped = unscoped
-            .checked_add(counts.unscoped_turn_records)
-            .context("source context audit unscoped count overflow")?;
-    }
-    if audit.unscoped_otlp_records != unscoped {
-        bail!("source context audit unscoped count does not match source counts");
-    }
-    Ok(())
 }
 
 pub async fn run_cloud_acceptance(
@@ -217,7 +171,7 @@ async fn run_pipeline(
     }
     let source_context_audit =
         audit_session_context(std::slice::from_ref(&raw_root), &config.session_id, 0)?;
-    verify_source_context_audit(&source_context_audit, &config.session_id)?;
+    source_context_audit.verify_delivery_ready(&config.session_id)?;
 
     let enriched_root = output.join("enriched");
     let enrichment = enrich_captures(EnrichConfig {
@@ -544,7 +498,7 @@ pub fn verify_cloud_acceptance(root: &Path) -> Result<CloudAcceptanceManifest> {
         &manifest.session_id,
         0,
     )?;
-    verify_source_context_audit(&expected_source_context_audit, &manifest.session_id)?;
+    expected_source_context_audit.verify_delivery_ready(&manifest.session_id)?;
     if manifest.source_context_audit != expected_source_context_audit {
         bail!("cloud acceptance source context audit differs from committed Raw evidence");
     }

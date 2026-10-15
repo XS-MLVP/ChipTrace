@@ -124,6 +124,12 @@ impl StockSessionLineage {
 }
 
 impl StockSessionSelection {
+    pub(crate) fn session_ids(&self) -> BTreeSet<String> {
+        std::iter::once(self.root_session_id.clone())
+            .chain(self.members.keys().cloned())
+            .collect()
+    }
+
     pub(crate) fn allows_session_id(&self, session_id: &str) -> bool {
         session_id == self.root_session_id || self.members.contains_key(session_id)
     }
