@@ -231,7 +231,7 @@ v1 Schema 保持历史定义；旧产物只能按其冻结的旧验证器进行�
 只有场景标签的旧 Canary 报告须从 Raw 重生成；具体字段来源与组装命令见
 [原生 Turn 验收记录](native-turn-context.md#下一轮验收)。
 
-## 平台检查传输
+## 平台检查与验收传输
 
 默认 `inspect-session` 继续返回完整检查结果。显式使用 `--platform-report` 时必须同时
 指定 `--projection-output`；外层报告版本为 `chiptrace.platform-inspection.v1`，保留同快照的
@@ -245,8 +245,20 @@ v1 Schema 保持历史定义；旧产物只能按其冻结的旧验证器进行�
 记录数与 SHA-256，每次分页仍检查全文件；页外损坏也必须拒绝。原始 Raw 不因此改写。
 
 引擎 stdout 与 Turn 磁盘配额独立，默认均为 64 MiB；增加磁盘配额不能提高 JSON 输出上限。
-此传输格式没有放宽任何交付门禁，也不证明 Rust 投影内存、导出报告或逐页全文件扫描已
+此传输格式没有放宽任何交付门禁，也不证明 Rust 投影/验收内存或逐页全文件扫描已
 达到大规模处理要求。历史已完成任务继续按原描述读取；旧二进制不支持该格式时显式失败。
+
+`cloud-acceptance` 和 `verify-cloud-acceptance` 也支持显式 `--platform-report`，在完整验收
+或复验成功后返回 `chiptrace.platform-acceptance.v1`。`acceptance` 保留完整 v2 Manifest 的
+全部字段，只有 `session_view.turns` 改为独立的同级 `turns.jsonl`；该摘要不能作为完整
+`cloud-acceptance.v2` Schema 文件使用。报告另提供完整 Manifest 的 bytes/SHA-256 和 Turn
+文件的记录数、字节数及哈希，复用同一配额、原子持久化与冲突拒绝规则。
+
+平台在首次导出、重启恢复和下载前复验时均使用该格式。公开 job result 继续使用既有 v2
+摘要字段；完成任务前复验整个 sidecar，下载前再核对验收摘要、Turn 描述和采购包字节。
+精简输出不跳过七阶段复验，也不放宽分数、身份、来源、工具配对或 Raw 完整性门槛。
+默认 CLI 输出保持完整；默认 `verify-cloud-acceptance` 仍只读，只有显式平台报告模式会
+创建或复用验收目录同级的派生 Turn 文件。完整 Manifest、采购包和 Raw 不因摘要而改写。
 
 ## Tool Schema
 

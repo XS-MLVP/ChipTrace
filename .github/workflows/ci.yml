@@ -298,7 +298,7 @@ jobs:
         with:
           name: native-context-report
           path: native-context.tap
-      - name: Verify bounded Turn transport, native result quality, recovery and OSS protocol
+      - name: Verify bounded inspection/export transport, native result quality, recovery and OSS protocol
         run: |
           set -euo pipefail
           node --test integrations/cloud-platform/platform.test.js integrations/cloud-platform/storage-oss.test.js 2>&1 | tee platform.tap
@@ -407,7 +407,7 @@ jobs:
         with:
           name: container-ingest-receipt-report
           path: container-ingest-receipt.tap
-      - name: Verify bounded Turn transport, result quality and export refusal under container limits
+      - name: Verify inspection/export transport and delivery refusal under container limits
         run: |
           set -euo pipefail
           docker run --rm --network none --read-only \

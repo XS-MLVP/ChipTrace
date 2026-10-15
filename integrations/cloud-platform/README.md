@@ -39,6 +39,18 @@ default CLI inspection output retains its existing full format. The projection
 manifest is hashed in chunks during job setup. Use a matching plugin/CLI build;
 an older CLI that lacks this report fails explicitly.
 
+Export creation, restart recovery and every package download use
+`cloud-acceptance` / `verify-cloud-acceptance --platform-report`. These run the
+full acceptance verifier before returning `chiptrace.platform-acceptance.v1`:
+an `acceptance` summary, manifest checksum and the same durable Turn sidecar
+descriptor. The full `chiptrace.cloud-acceptance.v2` manifest and its complete
+Session view stay on disk. Public export jobs keep their existing v2 summary
+fields without the Turn array. The summary is not a standalone full acceptance
+Schema document. Downloads recheck the accepted summary, Turn descriptor and
+package bytes against the completed job. The default CLI commands retain their
+full output; default `verify-cloud-acceptance` is still read-only. Explicit
+`--platform-report` can create its derived sidecar beside the acceptance root.
+
 The engine JSON limit (`maxOutputBytes` / `CHIPTRACE_MAX_OUTPUT_BYTES`) and Turn
 disk limit (`maxTurnBytes` / `CHIPTRACE_MAX_TURN_BYTES`) are independent; both
 default to 64 MiB. A host can provision more Turn disk capacity without raising
@@ -49,7 +61,7 @@ written by the previous platform. Changed evidence and symlinks are preserved
 and refused. Completed legacy jobs remain readable through their recorded
 hashes.
 
-The `turns` endpoint reads that sidecar by page; completed inspection jobs keep
+The `turns` endpoint reads that sidecar by page; completed inspection and export jobs keep
 only the summary in their long-lived state. Inspection jobs also retain the verified canonical
 interaction projection; its manifest, ModelInteraction, RuntimeSpan and Link
 parts are available through the projection endpoint and are rechecked against
@@ -156,9 +168,9 @@ read snapshot for both projection and auditing; its audit disables ID samples.
 The full identity/parent index still grows with corpus size and is not yet a
 disk index.
 The Rust projection still holds the selected Session and Turn metadata in
-memory; this compact transport does not bound its RSS. Buyer export still
-returns its full engine report, and projection-manifest downloads currently
-parse the full manifest in Node. Turn pages still hash and count the whole
+memory; these compact reports do not bound Rust projection or acceptance RSS.
+Projection-manifest downloads currently parse the full manifest in Node.
+Turn pages still hash and count the whole
 sidecar, including records outside the requested page. These paths need
 separate scale measurements and a persistent index before capacity claims.
 One Turn can itself contain a large set of Raw references; a page's Turn count

@@ -13,6 +13,7 @@ use chiptrace::model_interaction::{
     verify_interaction_projection,
 };
 use chiptrace::otlp_delivery::{OtlpDeliveryConfig, send_otlp};
+use chiptrace::platform_acceptance::platform_acceptance_report;
 use chiptrace::platform_inspection::platform_inspection_report;
 use chiptrace::publish::{
     ArtifactKind, Backend, PublishConfig, PublishSource, VerifyPublishedConfig, publish,
@@ -626,12 +627,23 @@ struct CloudAcceptanceArgs {
     workers: usize,
     #[arg(long)]
     replace: bool,
+    /// 完整验收后返回平台摘要，并将完整 Turn JSONL 保存到输出目录同级。
+    #[arg(long)]
+    platform_report: bool,
+    /// 平台 Turn JSONL 的独立磁盘上限。
+    #[arg(long, requires = "platform_report")]
+    max_turn_bytes: Option<u64>,
 }
 
 #[derive(Debug, Args)]
 struct VerifyCloudAcceptanceArgs {
     #[arg(long)]
     acceptance: PathBuf,
+    /// 完整复验后返回平台摘要，并校验或创建输出目录同级的 Turn JSONL。
+    #[arg(long)]
+    platform_report: bool,
+    #[arg(long, requires = "platform_report")]
+    max_turn_bytes: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -786,32 +798,49 @@ async fn main() -> Result<()> {
             if !args.target_part_gib.is_finite() || args.target_part_gib <= 0.0 {
                 bail!("target_part_gib must be positive");
             }
-            serde_json::to_value(
-                run_cloud_acceptance(CloudAcceptanceConfig {
-                    archive_id: args.archive_id,
-                    backend: args.backend,
-                    root: args.root,
-                    endpoint: args.endpoint,
-                    bucket: args.bucket,
-                    region: args.region,
-                    prefix: args.prefix,
-                    usage_logs: args.usage_log,
-                    session_id: args.session_id,
-                    output: args.output,
-                    release_id: args.release_id,
-                    minimum_score: args.minimum_score,
-                    target_part_bytes: (args.target_part_gib * 1024.0 * 1024.0 * 1024.0) as u64,
-                    partitions: args.partitions,
-                    zstd_level: args.zstd_level,
-                    gzip_level: args.gzip_level,
-                    workers: args.workers,
-                    replace: args.replace,
-                })
-                .await?,
-            )?
+            let output = args.output.clone();
+            let acceptance = run_cloud_acceptance(CloudAcceptanceConfig {
+                archive_id: args.archive_id,
+                backend: args.backend,
+                root: args.root,
+                endpoint: args.endpoint,
+                bucket: args.bucket,
+                region: args.region,
+                prefix: args.prefix,
+                usage_logs: args.usage_log,
+                session_id: args.session_id,
+                output: args.output,
+                release_id: args.release_id,
+                minimum_score: args.minimum_score,
+                target_part_bytes: (args.target_part_gib * 1024.0 * 1024.0 * 1024.0) as u64,
+                partitions: args.partitions,
+                zstd_level: args.zstd_level,
+                gzip_level: args.gzip_level,
+                workers: args.workers,
+                replace: args.replace,
+            })
+            .await?;
+            if args.platform_report {
+                platform_acceptance_report(
+                    &acceptance,
+                    &output,
+                    args.max_turn_bytes.unwrap_or(64 * 1024 * 1024),
+                )?
+            } else {
+                serde_json::to_value(acceptance)?
+            }
         }
         Command::VerifyCloudAcceptance(args) => {
-            serde_json::to_value(verify_cloud_acceptance(&args.acceptance)?)?
+            let acceptance = verify_cloud_acceptance(&args.acceptance)?;
+            if args.platform_report {
+                platform_acceptance_report(
+                    &acceptance,
+                    &args.acceptance,
+                    args.max_turn_bytes.unwrap_or(64 * 1024 * 1024),
+                )?
+            } else {
+                serde_json::to_value(acceptance)?
+            }
         }
         Command::Assemble(args) => serde_json::to_value(assemble(AssembleConfig {
             inputs: args.input,

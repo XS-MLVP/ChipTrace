@@ -1,13 +1,13 @@
 # 生产就绪评估
 
-评估日期：2026-10-15。首次线上读取窗口为 10:53–10:59（Asia/Shanghai），本文记录的后续线上只读快照为 19:30。
+评估日期：2026-10-15。首次线上读取窗口为 10:53–10:59（Asia/Shanghai），本文记录的后续线上只读快照为 19:56。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-19:30 的只读快照中，18084、3011、3012 均返回 200，Collector/Relay 仍为 `fe9fcf9`；
-累计投递与 Capture 均为 1,067,946，pending/inflight/failed 为 0，计数守恒。
-Wire 仍只有 1 条且已约 8.8 小时未更新，覆盖为 `degraded`；18086 连接拒绝。
-模型探针最后可用时间仍为 10 月 8 日。733 个 sealed Segment 共 83,948,934,491 bytes
+19:56 的只读快照中，18084、3011、3012 均返回 200，Collector/Relay 仍为 `fe9fcf9`；
+累计投递与 Capture 均为 1,069,867，pending/inflight/failed 为 0，计数守恒。
+Wire 仍只有 1 条且已约 9.2 小时未更新，覆盖为 `degraded`；18086 连接拒绝。
+模型探针最后可用时间仍为 10 月 8 日。734 个 sealed Segment 共 84,485,411,394 bytes
 保存在共享 NFS；此观测不证明已提交目标 OSS。当前状态应区分为传输进程存活、完整
 业务链路未验收和在线交付入口不可用。
 
@@ -39,7 +39,7 @@ fixture 的资源限制回归，不是生产容量证明。
 stdout 与任务只保留摘要。隔离回归在 65,536 bytes JSON 上限下保留 447,426 bytes 的
 5 Turn 文件，任务 JSON 为 3,108 bytes；页外损坏仍拒绝，旧规范文件可原样复用。
 这是受控合成元数据回归，尚不是大归档容量测试或线上部署证明。Rust 的全 Session 投影、
-Buyer 完整报告和投影 Manifest 下载解析仍需单独优化，不能据此宣称整体内存已受限。
+投影 Manifest 下载解析和逐页全文件扫描仍需单独优化，不能据此宣称整体内存已受限。
 本地完整 `cloud-test` 实际退出 0，包含 296 个 Rust 库测试、1 个 CLI 测试和平台/OSS 协议
 56/56。真实 patched Canary 的同快照 Turn、审计、场景证据与 Canonical parts 均未变，
 原始 SHA-256 不变；精简报告为 6,118 bytes，完整 2 Turn 文件为 3,975 bytes。该证据仍
@@ -48,20 +48,36 @@ Buyer 完整报告和投影 Manifest 下载解析仍需单独优化，不能据�
 capabilities 和 no-new-privileges 下执行平台/OSS 协议测试，实际退出 0、56/56 通过。
 镜像 revision 标记为 `working-tree-platform-turn-report`，未作为生产镜像发布。
 
+后续导出负对照又复现相同的 stdout 瓶颈：合法合成 Session 在完整验收后因报告超过
+65,536 bytes 被平台终止，测试实际退出 1。新的 `chiptrace.platform-acceptance.v1` 在
+首次导出、重启恢复和每次下载前仍执行完整复验，将同一份完整 Turn 元数据持久化到
+sidecar，stdout 只返回验收摘要与校验描述。定向 HTTP/SDK 回归实际退出 0，保留
+5 Native Turn、10 个采购有效轮次、分数 100；完整验收 Manifest 为 474,462 bytes，
+Turn 文件为 447,426 bytes，报告为 4,099 bytes，任务 JSON 为 3,413 bytes。
+恢复复用原 Manifest 和 Turn inode，采购包下载的字节/哈希一致，损坏后真实拒绝。
+默认 CLI 输出和完整 v2 Manifest 保持原格式，精简报告不代替未修改生产者、真实 OSS
+账号或线上验收，也不证明 Rust 验收内存已受限。
+完整 `cloud-test` 随后实际退出 0：296 个 Rust 库测试、1 个 CLI 测试，平台/OSS 协议
+57/57；隔离 M0 镜像 `working-tree-platform-export-report` 的断网、只读、非 root 自测
+也实际退出 0。真实 patched Canary 只读回放仍保留原 Session、审计、场景和 Canonical
+parts，2 Turn、8 模型交互、6 工具记录不变，Raw SHA-256 一致。
+同一工作树的平台容器在前述 1 GiB/2 CPU/256 PID 限制下也实际退出 0，57/57 通过；
+这是隔离协议和故障回归，不能据此确认生产容量或线上已完成升级。
+
 ## 当前部署证据
 
 | 项目 | 实际观察 | 能证明的范围 |
 | --- | --- | --- |
 | 18084、3011、3012 | HTTP 200 | 入口与采集进程存活 |
 | Collector/Relay | revision `fe9fcf924b226099202cb770b7cf0da29e0c2310` | 运行版本已固定；仓库新增修复尚未部署 |
-| 投递 | 19:30 同一快照已投递 1,067,946 条，pending/inflight/failed 为 0，计数守恒 | 持续传输；不能当作并发压测结果或完整 Session 数 |
-| Collector 磁盘 | 19:30 有 733 个 sealed Segment，83,948,934,491 bytes；活动段仍在增长 | 云端共享 NFS 上的 WAL 持续保存；不能证明 OSS 已提交 |
+| 投递 | 19:56 同一快照已投递 1,069,867 条，pending/inflight/failed 为 0，计数守恒 | 持续传输；不能当作并发压测结果或完整 Session 数 |
+| Collector 磁盘 | 19:56 有 734 个 sealed Segment，84,485,411,394 bytes；活动段仍在增长 | 云端共享 NFS 上的 WAL 持续保存；不能证明 OSS 已提交 |
 | Wire | 新进程内仅 1 条；活动 WAL 中为无原生 Session/Turn 的 HTTP 403 | 无真实成功 Turn Wire 的证据 |
-| 来源新鲜度 | 19:30 OTLP/Hook 有流量，Wire 约 8.8 小时未更新；此前 runtime gate 已实际因 Wire 过期退出 1 | 当前采集覆盖降级 |
+| 来源新鲜度 | 19:56 OTLP/Hook 有流量，Wire 约 9.2 小时未更新；此前 runtime gate 已实际因 Wire 过期退出 1 | 当前采集覆盖降级 |
 | 历史失败 | 293 个文件，267,219,223 bytes | 保留失败取证，不能删除换取健康状态 |
 | 平台 18086 | 无法连接 | 当前无法交接在线管理、导出入口 |
 | 部署隔离 | Relay 要求 ingest token；Collector/Relay 绑定 loopback；两容器有重启策略 | 有内部入口保护；两容器尚无内存/CPU 上限或只读根文件系统 |
-| GitHub CI | 本轮平台传输变更前的 `ca54aba`：[run 38724285089](https://github.com/XS-MLVP/ChipTrace/actions/runs/38724285089) 已确认 5/5 作业成功，15 份报告元数据均未过期 | 含原生结果冲突、不完整观察及独立容器平台报告；不能代替本轮提交或线上验收 |
+| GitHub CI | 本轮平台导出变更前的 `838bd12`：[run 38728272786](https://github.com/XS-MLVP/ChipTrace/actions/runs/38728272786) 已确认 5/5 作业成功，15 份报告元数据均未过期 | 含精简检查传输、原生结果质量及独立容器平台报告；不能代替本轮提交或线上验收 |
 
 11:26 复查时三个既有服务仍返回 HTTP 200，Relay 已投递 1,036,522 条，pending 为 1、
 inflight/failed 为 0、计数守恒。持续流量下瞬时 pending 不能单独判定积压故障。

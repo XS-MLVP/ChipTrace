@@ -5,6 +5,7 @@ const fsp = fs.promises;
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
+const { isDeepStrictEqual } = require('node:util');
 const readline = require('node:readline');
 
 const PROJECTION_PARTS = Object.freeze({
@@ -120,6 +121,16 @@ async function fileDigest(file) {
     }
     return { bytes, sha256: digest.digest('hex') };
   } finally { await handle.close(); }
+}
+
+function engineTurnEvidence(session, evidence) {
+  if (session?.turns !== undefined || !evidence
+      || !Number.isSafeInteger(evidence.records) || evidence.records < 0 || evidence.records !== session?.native_turns
+      || !Number.isSafeInteger(evidence.bytes) || evidence.bytes < 0
+      || typeof evidence.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(evidence.sha256)) {
+    throw new PlatformError('invalid engine Turn evidence descriptor', 502, 'ENGINE_PROTOCOL');
+  }
+  return { records: evidence.records, bytes: evidence.bytes, sha256: evidence.sha256 };
 }
 
 function normalizeRequest(input) {
@@ -489,15 +500,9 @@ class ChipTracePlugin {
   async #persistTurns(job) {
     const session = job.result?.session || job.result?.session_view;
     if (!session) return;
-    if (job.result.schema_version === 'chiptrace.platform-inspection.v1') {
-      const evidence = job.result.turns;
-      if (session.turns !== undefined || !evidence
-          || !Number.isSafeInteger(evidence.records) || evidence.records < 0 || evidence.records !== session.native_turns
-          || !Number.isSafeInteger(evidence.bytes) || evidence.bytes < 0
-          || typeof evidence.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(evidence.sha256)) {
-        throw new PlatformError('invalid engine Turn evidence descriptor', 502, 'ENGINE_PROTOCOL');
-      }
-      job.turns = { records: evidence.records, bytes: evidence.bytes, sha256: evidence.sha256 };
+    if (job.result.schema_version === 'chiptrace.platform-inspection.v1'
+        || (job.request.kind === 'export' && job.result.schema_version === 'chiptrace.cloud-acceptance.v2')) {
+      job.turns = engineTurnEvidence(session, job.result.turns);
       delete job.result.turns;
       await this.#readTurnEvidence(job, 0, 0);
       return;
@@ -543,6 +548,27 @@ class ChipTracePlugin {
     return message;
   }
 
+  async #acceptanceSummary(report, request, output) {
+    const result = report?.acceptance;
+    if (report?.schema_version !== 'chiptrace.platform-acceptance.v1'
+        || result?.schema_version !== 'chiptrace.cloud-acceptance.v2'
+        || result.session_view?.schema_version !== 'chiptrace.session-view.v2'
+        || result.session_view.delivery_ready !== true
+        || !sourceContextReady(result.source_context_audit, request.session_id)
+        || result.delivery_ready !== true || result.hard_gate_pass !== true
+        || typeof result.score !== 'number' || !Number.isFinite(result.score) || result.score < 90
+        || result.archive_id !== request.archive_id || result.session_id !== request.session_id || result.release_id !== request.release_id) {
+      throw new PlatformError('export does not match the requested accepted Session', 422, 'ACCEPTANCE_FAILED');
+    }
+    engineTurnEvidence(result.session_view, report.turns);
+    const manifest = await fileDigest(path.join(output, 'manifest.json'));
+    if (report.manifest?.file !== 'manifest.json'
+        || report.manifest.bytes !== manifest.bytes || report.manifest.sha256 !== manifest.sha256) {
+      throw new PlatformError('acceptance manifest does not match engine report', 502, 'ENGINE_PROTOCOL');
+    }
+    return result;
+  }
+
   async #runJob(job) {
     const request = job.request;
     const work = path.join(this.root, 'work', request.id);
@@ -558,32 +584,30 @@ class ChipTracePlugin {
     if (request.kind === 'export') {
       const output = path.join(work, 'acceptance');
       await this.#phase(job, 'acceptance');
-      let result;
+      let report;
       const existingOutput = await fsp.lstat(output).catch(() => null);
       if (existingOutput && (!existingOutput.isDirectory() || existingOutput.isSymbolicLink())) {
         throw new PlatformError('stored acceptance output is not a directory', 503, 'CORRUPT_STATE');
       }
       if (existingOutput) {
-        result = await this.#engine(['verify-cloud-acceptance', '--acceptance', output]);
+        report = await this.#engine(['verify-cloud-acceptance', '--acceptance', output,
+          '--platform-report', '--max-turn-bytes', String(this.maxTurnBytes)]);
       } else {
         const usage = request.usage_log_ids.flatMap(id => ['--usage-log', path.join(this.root, 'usage', `${id}.jsonl`)]);
-        result = await this.#engine(['cloud-acceptance', '--archive-id', request.archive_id, ...this.storageArgs(),
+        report = await this.#engine(['cloud-acceptance', '--archive-id', request.archive_id, ...this.storageArgs(),
           '--session-id', request.session_id, '--release-id', request.release_id, '--output', output,
-          '--minimum-score', '90', '--workers', '1', '--partitions', '16', ...usage]);
+          '--minimum-score', '90', '--workers', '1', '--partitions', '16',
+          '--platform-report', '--max-turn-bytes', String(this.maxTurnBytes), ...usage]);
       }
-      if (result.schema_version !== 'chiptrace.cloud-acceptance.v2'
-          || result.session_view?.schema_version !== 'chiptrace.session-view.v2'
-          || result.session_view?.delivery_ready !== true
-          || !sourceContextReady(result.source_context_audit, request.session_id)
-          || result.delivery_ready !== true || result.hard_gate_pass !== true || result.score < 90
-          || result.archive_id !== request.archive_id || result.session_id !== request.session_id || result.release_id !== request.release_id) {
-        throw new PlatformError('export does not match the requested accepted Session', 422, 'ACCEPTANCE_FAILED');
-      }
+      const result = await this.#acceptanceSummary(report, request, output);
       const buyerPath = path.join(output, 'buyer-package', 'manifest.json');
       const buyerStat = await fsp.lstat(buyerPath);
       if (!buyerStat.isFile() || buyerStat.isSymbolicLink()) throw new PlatformError('stored buyer manifest is invalid', 503, 'CORRUPT_STATE');
       const buyer = JSON.parse(decodeUtf8(await fsp.readFile(buyerPath)));
       job.artifacts = buyer.packages.map(part => ({ file: path.basename(part.file), bytes: part.bytes, sha256: part.sha256 }));
+      // #persistTurns verifies this descriptor and removes it before the job
+      // is saved; the public result retains its existing v2 summary shape.
+      result.turns = report.turns;
       return result;
     }
     const output = path.join(this.root, 'snapshots', request.archive_id);
@@ -743,7 +767,13 @@ class ChipTracePlugin {
     const artifact = job.artifacts?.find(item => item.file === file);
     if (!artifact) throw new PlatformError('package not found', 404, 'NOT_FOUND');
     const output = path.join(this.root, 'work', job.request.id, 'acceptance');
-    await this.#engine(['verify-cloud-acceptance', '--acceptance', output]);
+    const report = await this.#engine(['verify-cloud-acceptance', '--acceptance', output,
+      '--platform-report', '--max-turn-bytes', String(this.maxTurnBytes)]);
+    const summary = await this.#acceptanceSummary(report, job.request, output);
+    if (!isDeepStrictEqual(summary, job.result)
+        || !isDeepStrictEqual(engineTurnEvidence(summary.session_view, report.turns), job.turns)) {
+      throw new PlatformError('accepted Session evidence changed', 422, 'ARTIFACT_CHANGED');
+    }
     const artifactPath = path.join(output, 'buyer-package', 'packages', file);
     const artifactStat = await fsp.lstat(artifactPath);
     if (!artifactStat.isFile() || artifactStat.isSymbolicLink()) throw new PlatformError('package file is invalid', 422, 'ARTIFACT_CHANGED');

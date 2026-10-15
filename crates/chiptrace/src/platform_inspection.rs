@@ -13,7 +13,7 @@ use std::path::Path;
 
 pub const PLATFORM_INSPECTION_SCHEMA_VERSION: &str = "chiptrace.platform-inspection.v1";
 
-struct SessionSummary<'a>(&'a SessionView);
+pub(crate) struct SessionSummary<'a>(pub(crate) &'a SessionView);
 
 impl Serialize for SessionSummary<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
@@ -59,23 +59,18 @@ fn existing_turns_match(path: &Path, bytes: u64, sha256: &str) -> Result<()> {
     Ok(())
 }
 
-/// Used only with a persistent projection. No Raw is modified, and an existing
-/// sidecar is reused only when its exact bytes match this inspected snapshot.
-pub fn platform_inspection_report(
-    inspection: &SessionInspection,
-    projection_output: &Path,
+pub(crate) fn persist_turn_evidence(
+    session: &SessionView,
+    artifact_output: &Path,
     max_turn_bytes: u64,
 ) -> Result<Value> {
     if max_turn_bytes == 0 {
         bail!("platform Turn evidence limit must be positive");
     }
-    if inspection.projection.session_view.as_ref() != Some(&inspection.session) {
-        bail!("platform projection does not match inspected Session");
-    }
-    let projection_output = crate::jsonl::absolute_path(projection_output)?;
-    let parent = projection_output
+    let artifact_output = crate::jsonl::absolute_path(artifact_output)?;
+    let parent = artifact_output
         .parent()
-        .context("platform projection has no parent")?;
+        .context("platform artifact has no parent")?;
     let target = parent.join("turns.jsonl");
     let temporary = tempfile::Builder::new()
         .prefix(".turns-")
@@ -84,7 +79,7 @@ pub fn platform_inspection_report(
     let mut bytes = 0_u64;
     {
         let mut writer = BufWriter::new(temporary.as_file());
-        for turn in &inspection.session.turns {
+        for turn in &session.turns {
             // Canonical key order also preserves sidecars written by the
             // previous platform from the CLI's JSON Value representation.
             let line = serde_json::to_vec(&serde_json::to_value(turn)?)?;
@@ -111,12 +106,31 @@ pub fn platform_inspection_report(
         Err(error) => return Err(error.error).context("persist platform Turn evidence"),
     }
     File::open(parent)?.sync_all()?;
-    let projection = &inspection.projection;
-    let manifest_path = projection_output.join("manifest.json");
+    Ok(json!({"records":session.turns.len(),"bytes":bytes,"sha256":sha256}))
+}
+
+pub(crate) fn manifest_descriptor(output: &Path) -> Result<Value> {
+    let manifest_path = output.join("manifest.json");
     let manifest_stat = fs::symlink_metadata(&manifest_path)?;
     if !manifest_stat.is_file() || manifest_stat.file_type().is_symlink() {
-        bail!("platform projection manifest is not a regular file");
+        bail!("platform artifact manifest is not a regular file");
     }
+    Ok(json!({"file":"manifest.json","bytes":manifest_stat.len(),
+        "sha256":crate::jsonl::sha256_file(&manifest_path)?}))
+}
+
+/// Used only with a persistent projection. No Raw is modified, and an existing
+/// sidecar is reused only when its exact bytes match this inspected snapshot.
+pub fn platform_inspection_report(
+    inspection: &SessionInspection,
+    projection_output: &Path,
+    max_turn_bytes: u64,
+) -> Result<Value> {
+    if inspection.projection.session_view.as_ref() != Some(&inspection.session) {
+        bail!("platform projection does not match inspected Session");
+    }
+    let turns = persist_turn_evidence(&inspection.session, projection_output, max_turn_bytes)?;
+    let projection = &inspection.projection;
     Ok(json!({
         "schema_version":PLATFORM_INSPECTION_SCHEMA_VERSION,
         "delivery_ready":inspection.delivery_ready,
@@ -126,13 +140,12 @@ pub fn platform_inspection_report(
         "validation_status":inspection.validation_status,
         "source_context_audit":inspection.source_context_audit,
         "scenario_evidence":inspection.scenario_evidence,
-        "turns":{"records":inspection.session.turns.len(),"bytes":bytes,"sha256":sha256},
+        "turns":turns,
         "interaction_projection":{
             "schema_version":projection.schema_version,"session_id":projection.session_id,
             "interactions":projection.interactions,"runtime_spans":projection.runtime_spans,
             "links":projection.links,"parts":projection.parts,
-            "manifest":{"file":"manifest.json","bytes":manifest_stat.len(),
-                "sha256":crate::jsonl::sha256_file(&manifest_path)?}
+            "manifest":manifest_descriptor(projection_output)?
         }
     }))
 }

@@ -34,6 +34,21 @@ async function fixture(root) {
   return { root: output, captureRoot: path.join(output, 'capture'), objectRoot: path.join(output, 'raw-object-store'), usage: path.join(output, 'sub2api-usage.jsonl') };
 }
 
+async function expandTurnEvidence(data) {
+  const segmentsRoot = path.join(data.captureRoot, 'segments');
+  const segments = (await fs.readdir(segmentsRoot)).filter(name => name.endsWith('.sealed.ndjson')).sort();
+  const records = [];
+  for (const name of segments) records.push(...(await fs.readFile(path.join(segmentsRoot, name), 'utf8'))
+    .trim().split('\n').filter(Boolean).map(line => JSON.parse(line)));
+  const batch = records.find(record => record.recordType === 'telemetry_batch' && record.telemetryBatch?.endpoint === 'otlp_logs');
+  assert.ok(batch, 'the fixture must contain exact native OTLP identities');
+  const extra = Array.from({ length: 400 }, (_, index) => ({ ...structuredClone(batch),
+    captureId: `cap-large-turn-${index}-${'x'.repeat(200)}` }));
+  const segment = path.join(segmentsRoot, segments.at(-1));
+  await fs.appendFile(segment, extra.map(record => JSON.stringify(record)).join('\n') + '\n');
+  return { segment, inputBytes: await fs.readFile(segment), extra };
+}
+
 function decodeProjectionJsonl(bytes) {
   const text = zlib.zstdDecompressSync(bytes).toString('utf8');
   return text.trim() ? text.trim().split('\n').map(line => JSON.parse(line)) : [];
@@ -309,18 +324,7 @@ test('large Turn evidence stays on disk while engine and job JSON remain bounded
   let app;
   t.after(async () => { if (app) await app.close(); await fs.rm(root, { recursive: true, force: true }); });
   const data = await fixture(root);
-  const segmentsRoot = path.join(data.captureRoot, 'segments');
-  const segments = (await fs.readdir(segmentsRoot)).filter(name => name.endsWith('.sealed.ndjson')).sort();
-  const records = [];
-  for (const name of segments) records.push(...(await fs.readFile(path.join(segmentsRoot, name), 'utf8'))
-    .trim().split('\n').filter(Boolean).map(line => JSON.parse(line)));
-  const batch = records.find(record => record.recordType === 'telemetry_batch' && record.telemetryBatch?.endpoint === 'otlp_logs');
-  assert.ok(batch, 'the fixture must contain exact native OTLP identities');
-  const extra = Array.from({ length: 400 }, (_, index) => ({ ...structuredClone(batch),
-    captureId: `cap-large-turn-${index}-${'x'.repeat(200)}` }));
-  const segment = path.join(segmentsRoot, segments.at(-1));
-  await fs.appendFile(segment, extra.map(record => JSON.stringify(record)).join('\n') + '\n');
-  const inputBytes = await fs.readFile(segment);
+  const { segment, inputBytes, extra } = await expandTurnEvidence(data);
   const maxOutputBytes = 64 * 1024;
   const maxTurnBytes = 4 * 1024 * 1024;
   const platformRoot = path.join(root, 'platform');
@@ -363,6 +367,109 @@ test('large Turn evidence stays on disk while engine and job JSON remain bounded
   await assert.rejects(client.getTurns('inspect-large', { offset: 0, limit: 1 }), error => error.status === 422 && error.code === 'ARTIFACT_CHANGED');
   await fs.writeFile(turnFile, persisted);
   assert.deepEqual(await fs.readFile(segment), inputBytes);
+});
+
+test('large accepted Session exports, recovers and downloads with compact engine reports', { timeout: 120000 }, async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-export-report-'));
+  let app;
+  t.after(async () => { if (app) await app.close(); await fs.rm(root, { recursive: true, force: true }); });
+  const data = await fixture(root);
+  const { segment, inputBytes, extra } = await expandTurnEvidence(data);
+  const maxOutputBytes = 64 * 1024;
+  const maxTurnBytes = 4 * 1024 * 1024;
+  const platformRoot = path.join(root, 'platform');
+  const token = 'platform-test-token-with-at-least-32-bytes';
+  const open = async () => {
+    app = await createPlatformServer({ plugin: new ChipTracePlugin({ projectId: 'project-test', root: platformRoot,
+      captureRoot: data.captureRoot, objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace', maxOutputBytes, maxTurnBytes }), token });
+    await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
+    return new ChipTraceClient({ baseUrl: `http://127.0.0.1:${app.server.address().port}`, token });
+  };
+  let client = await open();
+  await client.submit({ id: 'archive-large', kind: 'archive', archive_id: 'raw-large' });
+  assert.equal((await client.wait('archive-large')).status, 'completed');
+  await client.putUsageLog('large-usage', await fs.readFile(data.usage));
+  await client.submit({ id: 'export-large', kind: 'export', archive_id: 'raw-large', session_id: 'thread-self-test',
+    release_id: 'release-large', usage_log_ids: ['large-usage'] });
+  const exported = await client.wait('export-large');
+  assert.equal(exported.status, 'completed', JSON.stringify(exported.error));
+  assert.equal(exported.result.schema_version, 'chiptrace.cloud-acceptance.v2');
+  assert.equal(exported.result.delivery_ready, true);
+  assert.equal(exported.result.score, 100);
+  assert.equal(exported.result.effective_turns, 10);
+  assert.equal(exported.result.session_view.native_turns, 5);
+  assert.equal(exported.result.session_view.turns, undefined);
+  assert.ok(Buffer.byteLength(JSON.stringify(exported)) < maxOutputBytes);
+  assert.ok(exported.turns.bytes > maxOutputBytes);
+  const turns = [];
+  for (let offset = 0; offset < 5; offset += 2) {
+    const page = await client.getTurns('export-large', { offset, limit: 2 });
+    assert.equal(page.delivery_ready, true);
+    turns.push(...page.turns);
+  }
+  const references = new Set(turns.flatMap(turn => turn.raw_capture_refs));
+  for (const capture of extra) assert.ok(references.has(capture.captureId));
+  const work = path.join(platformRoot, 'work/export-large');
+  const acceptance = path.join(work, 'acceptance');
+  const manifestFile = path.join(acceptance, 'manifest.json');
+  const originalManifest = await fs.readFile(manifestFile);
+  const sidecar = path.join(work, 'turns.jsonl');
+  const originalTurns = await fs.readFile(sidecar);
+  const originalInode = (await fs.stat(sidecar)).ino;
+  const fullCommand = ['verify-cloud-acceptance', '--acceptance', acceptance];
+  const full = JSON.parse((await run(binary, fullCommand, { maxBuffer: 4 * 1024 * 1024 })).stdout);
+  assert.deepEqual(full.session_view.turns, turns);
+  const summary = structuredClone(full);
+  delete summary.session_view.turns;
+  assert.deepEqual(exported.result, summary);
+  const compactCommand = [...fullCommand, '--platform-report', '--max-turn-bytes', String(maxTurnBytes)];
+  const compact = await run(binary, compactCommand, { maxBuffer: maxOutputBytes });
+  const report = JSON.parse(compact.stdout);
+  assert.equal(report.schema_version, 'chiptrace.platform-acceptance.v1');
+  assert.deepEqual(report.acceptance, summary);
+  assert.equal(report.manifest.bytes, originalManifest.length);
+  assert.equal(report.manifest.sha256, crypto.createHash('sha256').update(originalManifest).digest('hex'));
+  assert.deepEqual(report.turns, exported.turns);
+  assert.equal((await fs.stat(sidecar)).ino, originalInode);
+  await assert.rejects(run(binary, [...fullCommand, '--platform-report', '--max-turn-bytes', '1']),
+    error => error.code === 1 && /platform Turn evidence exceeds disk limit/.test(error.stderr));
+  assert.deepEqual(await fs.readFile(sidecar), originalTurns);
+  assert.ok((await fs.readdir(work)).every(name => !name.startsWith('.turns-')));
+  const artifact = exported.artifacts[0];
+  const download = await client.download('export-large', artifact.file);
+  const packageBytes = Buffer.from(await download.arrayBuffer());
+  assert.equal(packageBytes.length, artifact.bytes);
+  assert.equal(crypto.createHash('sha256').update(packageBytes).digest('hex'), artifact.sha256);
+  await app.close();
+  app = null;
+  const jobFile = path.join(platformRoot, 'jobs/export-large.json');
+  const interrupted = JSON.parse(await fs.readFile(jobFile, 'utf8'));
+  interrupted.status = 'queued';
+  interrupted.phase = 'interrupted';
+  delete interrupted.result;
+  delete interrupted.turns;
+  delete interrupted.artifacts;
+  await fs.writeFile(jobFile, JSON.stringify(interrupted));
+  client = await open();
+  const recovered = await client.wait('export-large');
+  assert.equal(recovered.status, 'completed', JSON.stringify(recovered.error));
+  assert.equal(recovered.attempt, exported.attempt + 1);
+  assert.deepEqual(recovered.result, exported.result);
+  assert.deepEqual(recovered.turns, exported.turns);
+  assert.equal((await fs.stat(sidecar)).ino, originalInode);
+  assert.deepEqual(await fs.readFile(manifestFile), originalManifest);
+  const recoveredDownload = await client.download('export-large', artifact.file);
+  assert.deepEqual(Buffer.from(await recoveredDownload.arrayBuffer()), packageBytes);
+  const packagePath = path.join(acceptance, 'buyer-package/packages', artifact.file);
+  const corrupted = Buffer.from(packageBytes);
+  corrupted[corrupted.length - 1] ^= 1;
+  await fs.writeFile(packagePath, corrupted);
+  await assert.rejects(client.download('export-large', artifact.file), error => error.status === 422);
+  assert.deepEqual(await fs.readFile(segment), inputBytes);
+  assert.deepEqual(await fs.readFile(sidecar), originalTurns);
+  t.diagnostic(JSON.stringify({ max_output_bytes: maxOutputBytes, job_json_bytes: Buffer.byteLength(JSON.stringify(exported)),
+    compact_report_bytes: Buffer.byteLength(compact.stdout), acceptance_manifest_bytes: originalManifest.length,
+    turn_bytes: originalTurns.length, native_turns: turns.length, effective_turns: recovered.result.effective_turns }));
 });
 
 test('compact CLI report preserves inspection facts, reuses exact legacy sidecars and refuses changed evidence', { timeout: 60000 }, async t => {
