@@ -18,6 +18,23 @@ if ! (set -o noclobber; : > "$trace_log"); then
   printf '%s\n' 'producer check requires a new writable log file' >&2
   exit 2
 fi
+trace_interval=${CHIPTRACE_PRODUCER_RESOURCE_INTERVAL_SECONDS:-}
+trace_monitor_pid=
+if test -n "$trace_interval"; then
+  if ! [[ "$trace_interval" =~ ^[1-9][0-9]{0,3}$ ]] || test "$trace_interval" -gt 3600; then
+    printf '%s\n' 'invalid producer resource interval' >&2
+    exit 2
+  fi
+  node "$(dirname "$0")/producer-resources.js" "$trace_phase" "$trace_interval" &
+  trace_monitor_pid=$!
+fi
+trace_cleanup() {
+  if test -n "$trace_monitor_pid"; then
+    kill "$trace_monitor_pid" 2>/dev/null || true
+    wait "$trace_monitor_pid" 2>/dev/null || true
+  fi
+}
+trap trace_cleanup EXIT
 if "$@" 2>&1 | tee -a "$trace_log"; then
   trace_pipeline_status=("${PIPESTATUS[@]}")
 else

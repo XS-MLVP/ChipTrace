@@ -13,6 +13,8 @@ function command(t, source, options = {}) {
   const log = path.join(root, 'producer.log');
   if (options.existing) fs.writeFileSync(log, options.existing);
   const env = { ...process.env, GITHUB_ACTIONS: 'true' };
+  delete env.CHIPTRACE_PRODUCER_RESOURCE_INTERVAL_SECONDS;
+  if (options.resources) env.CHIPTRACE_PRODUCER_RESOURCE_INTERVAL_SECONDS = '1';
   if (options.brokenLogger) {
     const bin = path.join(root, 'bin');
     fs.mkdirSync(bin);
@@ -80,4 +82,30 @@ test('failed log writes cannot hide a producer failure or turn a successful chil
     assert.ok(result.stdout.includes('actual exit=' + (exit || 91)));
     assert.ok(result.stdout.includes('; command_exit=' + exit + '; log_exit=91'));
   }
+});
+
+test('live resource samples contain only bounded host metrics and the monitor is reaped after failure', t => {
+  const { result, bytes } = command(t,
+    'setTimeout(()=>{process.stdout.write("actual child failure\\n");process.exitCode=77},1250)', { resources: true });
+  assert.equal(result.status, 77, result.stderr);
+  assert.equal(bytes, 'actual child failure\n');
+  const prefix = '::notice title=Producer resources::';
+  const samples = result.stdout.split('\n').filter(line => line.startsWith(prefix))
+    .map(line => JSON.parse(line.slice(prefix.length)));
+  assert.ok(samples.length >= 2, result.stdout);
+  assert.ok(samples.at(-1).elapsed_seconds >= 1);
+  for (const value of samples) {
+    assert.equal(value.schema_version, 'chiptrace.producer-resources.v1');
+    assert.equal(value.phase, 'callbacks');
+    assert.equal(value.cpu_count, os.availableParallelism());
+    assert.ok(BigInt(value.memory_total_bytes) > 0n);
+    assert.ok(BigInt(value.memory_available_bytes) >= 0n);
+    assert.ok(BigInt(value.disk_available_bytes) >= 0n);
+    assert.ok(JSON.stringify(value).length < 1000);
+    assert.deepEqual(Object.keys(value).sort(), ['schema_version', 'observed_at', 'phase', 'monitor_pid',
+      'elapsed_seconds', 'cpu_count', 'load_average_1m', 'memory_total_bytes', 'memory_available_bytes',
+      'disk_available_bytes'].sort());
+  }
+  assert.equal(new Set(samples.map(value => value.monitor_pid)).size, 1);
+  assert.throws(() => process.kill(samples[0].monitor_pid, 0), { code: 'ESRCH' });
 });
