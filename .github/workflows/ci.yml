@@ -126,32 +126,67 @@ jobs:
             | tee "$RUNNER_TEMP/producer-cache-prepared.json"
           node -e 'console.log(JSON.stringify({exact_cache_hit: process.env.PRODUCER_CACHE_HIT === "true"}))' \
             | tee "$RUNNER_TEMP/producer-cache-observation.json"
-      - name: Compile and test detached callbacks and successful/failed/parallel stream terminals
+      - name: Compile the pinned core test executable before running regressions
         working-directory: .ci-codex-source/codex-rs
         run: |
-          cargo test -p codex-core --lib --locked creation_scope_ends \
-            2>&1 | tee "$RUNNER_TEMP/producer-callbacks.log"
-          cargo test -p codex-core --lib --locked parallel_response_terminals_keep_their_creation_spans \
-            2>&1 | tee "$RUNNER_TEMP/producer-parallel.log"
-          node "$GITHUB_WORKSPACE/scripts/ci/check-producer-regressions.js" \
-            "$RUNNER_TEMP/producer-callbacks.log" "$RUNNER_TEMP/producer-parallel.log" \
-            | tee "$RUNNER_TEMP/producer-regression-check.json"
-          cargo test -p codex-core --lib --locked client::tests \
-            2>&1 | tee "$RUNNER_TEMP/producer-client.log"
-          RUST_MIN_STACK=16777216 cargo test -p codex-app-server --lib --locked message_processor_tracing_tests \
-            2>&1 | tee "$RUNNER_TEMP/producer-session.log"
-          node "$GITHUB_WORKSPACE/scripts/ci/check-producer-regressions.js" \
-            "$RUNNER_TEMP/producer-callbacks.log" "$RUNNER_TEMP/producer-parallel.log" \
+          bash "$GITHUB_WORKSPACE/scripts/ci/run-producer-check.sh" core-test-build \
+            "$RUNNER_TEMP/producer-core-test-build.log" \
+            cargo test -p codex-core --lib --locked --no-run
+      - name: Test callbacks after their creation scope ends
+        working-directory: .ci-codex-source/codex-rs
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/ci/run-producer-check.sh" callbacks \
+            "$RUNNER_TEMP/producer-callbacks.log" \
+            cargo test -p codex-core --lib --locked creation_scope_ends
+      - name: Test parallel response terminals and verify all four context regressions executed
+        working-directory: .ci-codex-source/codex-rs
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/ci/run-producer-check.sh" parallel \
+            "$RUNNER_TEMP/producer-parallel.log" \
+            cargo test -p codex-core --lib --locked parallel_response_terminals_keep_their_creation_spans
+          bash "$GITHUB_WORKSPACE/scripts/ci/run-producer-check.sh" verify-callbacks \
+            "$RUNNER_TEMP/producer-regression-check.json" \
+            node "$GITHUB_WORKSPACE/scripts/ci/check-producer-regressions.js" \
+            "$RUNNER_TEMP/producer-callbacks.log" "$RUNNER_TEMP/producer-parallel.log"
+      - name: Test the pinned producer's complete HTTP and WebSocket client regressions
+        working-directory: .ci-codex-source/codex-rs
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/ci/run-producer-check.sh" client \
+            "$RUNNER_TEMP/producer-client.log" \
+            cargo test -p codex-core --lib --locked client::tests
+      - name: Compile the pinned App Server test executable before running Session regressions
+        working-directory: .ci-codex-source/codex-rs
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/ci/run-producer-check.sh" session-test-build \
+            "$RUNNER_TEMP/producer-session-test-build.log" \
+            cargo test -p codex-app-server --lib --locked --no-run
+      - name: Test Session and Turn scope propagation and verify both tests executed
+        working-directory: .ci-codex-source/codex-rs
+        env:
+          RUST_MIN_STACK: "16777216"
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/ci/run-producer-check.sh" session \
             "$RUNNER_TEMP/producer-session.log" \
-            | tee "$RUNNER_TEMP/producer-regression-check-with-session.json"
+            cargo test -p codex-app-server --lib --locked message_processor_tracing_tests
+          bash "$GITHUB_WORKSPACE/scripts/ci/run-producer-check.sh" verify-session \
+            "$RUNNER_TEMP/producer-regression-check-with-session.json" \
+            node "$GITHUB_WORKSPACE/scripts/ci/check-producer-regressions.js" \
+            "$RUNNER_TEMP/producer-callbacks.log" "$RUNNER_TEMP/producer-parallel.log" \
+            "$RUNNER_TEMP/producer-session.log"
       - name: Build the patched CLI and debug App Server from the exact producer source
         working-directory: .ci-codex-source/codex-rs
-        run: cargo build -p codex-cli --bin codex -p codex-app-server --bin codex-app-server --locked
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/ci/run-producer-check.sh" build \
+            "$RUNNER_TEMP/producer-build.log" \
+            cargo build -p codex-cli --bin codex -p codex-app-server --bin codex-app-server --locked
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.91.0"
       - name: Build the current Collector and Relay for newly executed protocol collection
-        run: cargo +1.91.0 build --locked --bin chiptrace
+        run: |
+          bash scripts/ci/run-producer-check.sh collector-build \
+            "$RUNNER_TEMP/producer-collector-build.log" \
+            cargo +1.91.0 build --locked --bin chiptrace
       - name: Collect two new native Turns with real tools, resume, failure and async results
         env:
           CHIPTRACE_PROTOCOL_PRODUCER: ${{ github.workspace }}/.ci-codex-source/codex-rs/target/debug/codex-app-server
@@ -177,11 +212,15 @@ jobs:
             ${{ runner.temp }}/producer-cache-identity.json
             ${{ runner.temp }}/producer-cache-prepared.json
             ${{ runner.temp }}/producer-cache-observation.json
+            ${{ runner.temp }}/producer-core-test-build.log
             ${{ runner.temp }}/producer-callbacks.log
             ${{ runner.temp }}/producer-parallel.log
             ${{ runner.temp }}/producer-regression-check.json
             ${{ runner.temp }}/producer-client.log
+            ${{ runner.temp }}/producer-session-test-build.log
             ${{ runner.temp }}/producer-session.log
+            ${{ runner.temp }}/producer-build.log
+            ${{ runner.temp }}/producer-collector-build.log
             ${{ runner.temp }}/producer-regression-check-with-session.json
             ${{ runner.temp }}/native-protocol-ci.json
             ${{ runner.temp }}/native-protocol-ci.tap
@@ -272,6 +311,7 @@ jobs:
       - name: Verify producer lock, regressions and actual Cargo cache invalidation
         run: |
           node --test scripts/ci/upstream-context.test.js scripts/ci/producer-source-cache.test.js \
+            scripts/ci/producer-command.test.js \
             | tee producer-ci-regressions.tap
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
