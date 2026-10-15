@@ -252,6 +252,10 @@ async fn health(State(state): State<AppState>) -> Response {
         status,
         json!({
             "ok": health.ok,
+            "build": {
+                "version": crate::VERSION,
+                "revision": crate::BUILD_REVISION,
+            },
             "collector": health,
             "http": {
                 "body_budget_capacity": state.body_budget.capacity(),

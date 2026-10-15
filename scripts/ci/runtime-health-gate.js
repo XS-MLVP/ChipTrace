@@ -36,6 +36,17 @@ function nonEmptyString(value, label) {
   return value;
 }
 
+function verifyBuildRevision(health, expectedRevision, label) {
+  if (expectedRevision === undefined) return null;
+  const build = object(health.build, `${label}.build`);
+  const revision = nonEmptyString(build.revision, `${label}.build.revision`);
+  if (revision !== expectedRevision) {
+    fail(`${label}.build.revision does not match expected revision `
+      + `(expected=${expectedRevision}, observed=${revision})`);
+  }
+  return revision;
+}
+
 function verifyGatewayHealth(health) {
   object(health, 'gateway health');
   if (health.status !== 'healthy') fail('gateway status must be healthy');
@@ -126,9 +137,10 @@ function verifyRelayHealth(health) {
   };
 }
 
-function verifyRuntimeHealth(gatewayHealth, relayHealth) {
+function verifyRuntimeHealth(gatewayHealth, relayHealth, { expectedRevision } = {}) {
   const gateway = verifyGatewayHealth(gatewayHealth);
   const relay = verifyRelayHealth(relayHealth);
+  const buildRevision = verifyBuildRevision(relayHealth, expectedRevision, 'relay health');
   if (gateway.delivered !== relay.delivered) {
     fail(
       'gateway and Relay delivered totals do not match '
@@ -137,6 +149,8 @@ function verifyRuntimeHealth(gatewayHealth, relayHealth) {
   }
   return {
     schema_version: 'chiptrace.runtime-health-gate.v1',
+    expected_revision: expectedRevision ?? null,
+    build_revision: buildRevision,
     gateway,
     relay,
   };
@@ -157,36 +171,43 @@ async function fetchJson(url, timeoutMs = DEFAULT_TIMEOUT_MS) {
   }
 }
 
-async function runRemoteHealthGate(gatewayUrl, relayUrl, timeoutMs = DEFAULT_TIMEOUT_MS) {
+async function runRemoteHealthGate(
+  gatewayUrl,
+  relayUrl,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  expectedRevision,
+) {
   if (!gatewayUrl || !relayUrl) fail('gateway and relay health URLs are required');
   const [gateway, relay] = await Promise.all([
     fetchJson(gatewayUrl, timeoutMs),
     fetchJson(relayUrl, timeoutMs),
   ]);
-  return verifyRuntimeHealth(gateway, relay);
+  return verifyRuntimeHealth(gateway, relay, { expectedRevision });
 }
 
 function parseArgs(argv) {
   let gateway;
   let relay;
   let timeout = DEFAULT_TIMEOUT_MS;
+  let expectedRevision;
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     const value = argv[index + 1];
     if (flag === '--gateway-url' && value) { gateway = value; index += 1; }
     else if (flag === '--relay-url' && value) { relay = value; index += 1; }
     else if (flag === '--timeout-ms' && value) { timeout = Number(value); index += 1; }
-    else fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL [--timeout-ms N]');
+    else if (flag === '--expected-revision' && value) { expectedRevision = value; index += 1; }
+    else fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL [--timeout-ms N] [--expected-revision REVISION]');
   }
   if (!gateway || !relay || !Number.isSafeInteger(timeout) || timeout < 100) {
-    fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL [--timeout-ms N]');
+    fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL [--timeout-ms N] [--expected-revision REVISION]');
   }
-  return { gateway, relay, timeout };
+  return { gateway, relay, timeout, expectedRevision };
 }
 
 if (require.main === module) {
   const args = parseArgs(process.argv.slice(2));
-  runRemoteHealthGate(args.gateway, args.relay, args.timeout)
+  runRemoteHealthGate(args.gateway, args.relay, args.timeout, args.expectedRevision)
     .then(result => process.stdout.write(`${JSON.stringify(result, null, 2)}\n`))
     .catch(error => {
       process.stderr.write(`${error.message || String(error)}\n`);

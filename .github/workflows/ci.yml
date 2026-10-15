@@ -200,7 +200,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t chiptrace:ci .
+      - run: docker build --build-arg CHIPTRACE_REVISION="$GITHUB_SHA" -t chiptrace:ci .
       - run: docker run --rm chiptrace:ci --help
       - name: Verify container JSONL delivery closure
         run: |
@@ -248,7 +248,7 @@ jobs:
           assert result["published_buyer_verify"]["ok"] is True
           '
       - name: Build cloud platform image
-        run: docker build --target platform -t chiptrace-platform:ci .
+        run: docker build --target platform --build-arg CHIPTRACE_REVISION="$GITHUB_SHA" -t chiptrace-platform:ci .
       - name: Verify platform service and SDK in a container
         run: |
           docker run --rm --network none --read-only \

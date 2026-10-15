@@ -2,6 +2,8 @@ ARG CHIPTRACE_PLATFORM_BASE=node:22-bookworm-slim
 FROM rust:1.91-bookworm AS builder
 
 WORKDIR /src
+ARG CHIPTRACE_REVISION=unknown
+ENV CHIPTRACE_BUILD_REVISION=${CHIPTRACE_REVISION}
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY schemas ./schemas

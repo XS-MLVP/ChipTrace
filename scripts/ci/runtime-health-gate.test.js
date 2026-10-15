@@ -36,6 +36,10 @@ function relay() {
   return {
     status: 'healthy',
     ok: true,
+    build: {
+      version: '0.6.0',
+      revision: 'f'.repeat(40),
+    },
     pending: 0,
     inflight: 0,
     failed: 0,
@@ -102,5 +106,22 @@ test('gateway and Relay delivery totals must agree', () => {
   assert.throws(
     () => verifyRuntimeHealth(gateway(), value),
     /gateway and Relay delivered totals do not match/,
+  );
+});
+
+test('deployment gate can require the running Relay revision', () => {
+  const expectedRevision = 'f'.repeat(40);
+  const result = verifyRuntimeHealth(gateway(), relay(), { expectedRevision });
+  assert.equal(result.expected_revision, expectedRevision);
+  assert.equal(result.build_revision, expectedRevision);
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), relay(), { expectedRevision: 'e'.repeat(40) }),
+    /relay health\.build\.revision does not match expected revision/,
+  );
+  const old = relay();
+  delete old.build;
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), old, { expectedRevision }),
+    /relay health\.build must be an object/,
   );
 });

@@ -29,3 +29,7 @@ mod turn_identity;
 pub mod wire_tools;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const BUILD_REVISION: &str = match option_env!("CHIPTRACE_BUILD_REVISION") {
+    Some(value) => value,
+    None => "unknown",
+};

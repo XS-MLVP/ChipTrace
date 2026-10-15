@@ -25,6 +25,14 @@ export CHIPTRACE_INGEST_TOKEN='<at-least-32-bytes>'
 docker compose -f deploy/collector-relay.yml up -d
 ```
 
+镜像必须用同一个 Git revision 构建并固定到部署环境；构建参数会写入 Collector/Relay
+健康响应，供升级后的 revision 门禁核对：
+
+```bash
+docker build --build-arg CHIPTRACE_REVISION="$(git rev-parse HEAD)" \
+  -t "chiptrace:$(git rev-parse HEAD)" .
+```
+
 18084 对外提供 Responses、`/models`、`/otel/v1/logs`、`/otel/v1/traces` 和
 `/hooks/codex`。Responses 与 `/models` 使用 Provider 业务鉴权，网关使用内部采集凭据读取
 Relay 目录；OTLP 与 Hook 使用独立采集凭据。Wire Capture 使用网关磁盘 outbox，其余采集
@@ -167,11 +175,13 @@ open 时间的事务存在时为 false。router_v2 宿主使用 `FULL_TRACE_CAPT
 ```bash
 node scripts/ci/runtime-health-gate.js \
   --gateway-url http://127.0.0.1:18084/health \
-  --relay-url http://127.0.0.1:3012/health
+  --relay-url http://127.0.0.1:3012/health \
+  --expected-revision <git-revision>
 ```
 
 该门禁同时要求网关 `openCaptureHealthy`、Relay `freshness_applicable`、四路来源新鲜、
-队列排空和 attempt 守恒。旧网关缺少 `openCaptureHealthy`，或旧 Relay 在 Runtime 有流量而
+队列排空、attempt 守恒，并在提供 `--expected-revision` 时确认 Relay 健康响应中的构建
+revision 与待发布镜像一致。旧网关缺少 `openCaptureHealthy`，或旧 Relay 在 Runtime 有流量而
 Wire 停止时返回 `freshness_applicable=false`，都会失败；历史失败文件仍保留为审计证据，
 不会被当作当前失败清理。
 重放失败证据时只能复制到 `pending`（不要移动或删除 `failed` 原件），确认 Relay durable

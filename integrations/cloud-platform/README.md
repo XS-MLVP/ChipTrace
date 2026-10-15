@@ -111,6 +111,7 @@ For a container image, build from the repository root:
 
 ```bash
 docker build --target platform \
+  --build-arg CHIPTRACE_REVISION=<git-revision> \
   -t chiptrace-platform:<git-revision> .
 ```
 

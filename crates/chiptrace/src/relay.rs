@@ -1846,6 +1846,13 @@ async fn relay_health(State(state): State<RelayAppState>) -> Response {
             let mut value = serde_json::to_value(health).unwrap_or_else(|_| json!({"ok":false}));
             if let Some(object) = value.as_object_mut() {
                 object.insert(
+                    "build".to_owned(),
+                    json!({
+                        "version": crate::VERSION,
+                        "revision": crate::BUILD_REVISION,
+                    }),
+                );
+                object.insert(
                     "body_budget_capacity".to_owned(),
                     json!(state.body_budget.capacity()),
                 );

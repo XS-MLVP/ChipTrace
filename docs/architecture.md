@@ -83,3 +83,5 @@ Wire、OTLP logs、OTLP traces 和 Hook 活动；当 Wire 持续活跃而任一 
 落后超过 5 分钟，也必须为 `degraded`，并把 `wire` 列入 `stale_sources`；Runtime 继续流入
 不能掩盖 Wire 断流。`complete` 只表示四路当前同步，不代表任何 Session 已通过 Buyer 验收。
 Session 是否可交付仍只由 `cloud-acceptance` 判定。
+Collector 和 Relay 的健康响应还包含 `build.version` 与 `build.revision`；部署门禁可以用
+固定 Git revision 拒绝旧镜像继续接收或交接数据。

@@ -153,6 +153,7 @@ test('production deployment templates require an immutable image revision', () =
   assert.match(platformCompose, /CHIPTRACE_PLATFORM_IMAGE/);
   assert.doesNotMatch(platformCompose, /chiptrace-platform:latest\b/);
   assert.match(dockerfile, /org\.opencontainers\.image\.revision="\$\{CHIPTRACE_REVISION\}"/);
+  assert.match(dockerfile, /ENV CHIPTRACE_BUILD_REVISION=\$\{CHIPTRACE_REVISION\}/);
 });
 
 test('separate native hook invocations survive while HTTP retries deduplicate', async () => {
