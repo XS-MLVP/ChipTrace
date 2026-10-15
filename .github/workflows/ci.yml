@@ -12,6 +12,30 @@ defaults:
     shell: bash
 
 jobs:
+  stock-managed-route:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install the pinned unmodified client in the runner temporary directory
+        run: |
+          npm install --prefix "$RUNNER_TEMP/chiptrace-stock-client" \
+            --no-audit --no-fund @openai/codex@0.163.0-alpha.11
+          docker pull node:22-bookworm-slim
+      - name: Verify managed Wire routing against real user and session overrides
+        run: |
+          set -euo pipefail
+          CHIPTRACE_STOCK_CODEX_MODULES="$RUNNER_TEMP/chiptrace-stock-client/node_modules" \
+            make managed-route-test | tee stock-managed-route.tap
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stock-managed-route-report
+          path: stock-managed-route.tap
+
   upstream-context:
     runs-on: ubuntu-latest
     timeout-minutes: 90

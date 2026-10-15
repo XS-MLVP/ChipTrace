@@ -1,5 +1,18 @@
 # Install as /etc/codex/requirements.toml.
+# Validated with Stock Codex 0.163.0-alpha.11.
 # SessionStart fails closed when cloud ingest is unavailable.
+# Exact requirements prevent user/profile/session overrides from bypassing Wire capture.
+model_provider = "OpenAI"
+
+[model_providers.OpenAI]
+name = "OpenAI-compatible Gateway"
+base_url = "http://172.28.11.121:18084/"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+request_max_retries = 25
+stream_max_retries = 25
+auth = { command = "printenv", args = ["CHIPTRACE_API_KEY"] }
 
 [features]
 hooks = true

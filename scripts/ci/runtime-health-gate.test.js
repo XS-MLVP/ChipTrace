@@ -1,6 +1,9 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const http = require('node:http');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
 const test = require('node:test');
 const { verifyRuntimeHealth } = require('./runtime-health-gate');
 
@@ -124,4 +127,29 @@ test('deployment gate can require the running Relay revision', () => {
     () => verifyRuntimeHealth(gateway(), old, { expectedRevision }),
     /relay health\.build must be an object/,
   );
+});
+
+test('runtime gate CLI preserves a real failure and diagnoses Wire missing from older health', async t => {
+  const current = relay();
+  current.ingest_coverage.status = 'degraded';
+  current.ingest_coverage.required_sources_observed = false;
+  current.ingest_coverage.required_sources_fresh = false;
+  current.ingest_coverage.wire = { requests: 0, source_records: 0, last_at: null };
+  current.ingest_coverage.stale_sources = ['wire', 'private-untrusted-source'];
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json', connection: 'close' });
+    res.end(JSON.stringify(req.url === '/gateway' ? gateway() : current));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  await assert.rejects(promisify(execFile)(process.execPath, [require.resolve('./runtime-health-gate'),
+    '--gateway-url', `${url}/gateway`, '--relay-url', `${url}/relay`,
+    '--expected-revision', current.build.revision], { timeout: 10000 }), error => {
+    assert.equal(error.code, 1);
+    assert.equal(error.stdout, '');
+    assert.match(error.stderr, /observed=degraded; missing_sources=wire; stale_sources=wire/);
+    assert.doesNotMatch(error.stderr, /private-untrusted-source/);
+    return true;
+  });
 });

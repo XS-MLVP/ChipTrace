@@ -53,6 +53,14 @@ Relay 快照，避免把“Runtime 仍在增长、Wire 已断流”误判为完�
 当前 Turn 分页的内存受页面约束，但每页会扫描并校验整份 sidecar；任务历史有上限，
 导出目录独立保留 Raw，因此上线前仍需安排磁盘容量和保留策略。
 
+2026-10-15 的接入复查发现系统配置和用户配置的同名 Provider 指向不同入口。现有 required
+Hook 只验证采集凭据和 Hook ACK，无法阻止 Responses 绕过采集网关。requirements 模板现已
+使用固定 Stock Codex 版本支持的 `model_provider` 和完整 `model_providers.OpenAI` exact
+约束；`stock-managed-route` CI 作业以未修改客户端、断网容器验证用户配置和命令行覆盖被
+约束，并保留旧模板确实可绕过的负对照。该配置回归不使用模型或业务凭据，不代表真实
+Turn 上下文、线上配置或 OSS 已验收。当前线上 Collector/Relay revision 为 `fe9fcf9`，
+runtime gate 因 Wire 缺失仍失败；受管配置模板还未应用到线上主机。
+
 ## 真实字段回归与当前缺口
 
 2026-10-14 从保留的 2026-09-05 Stock Codex 原始 sealed Canary 只读重放：

@@ -44,12 +44,17 @@ Wire、OTLP 和 Hook 使用 Stock Codex 自带的 Session、Turn、call ID 和 W
 `delivery_ready=true`。这是带生产者上下文补丁的隔离证据，不是未修改 Stock Codex 的发布
 证明；脱敏 fixture 只保存元数据，不包含 Raw 或对话正文。
 
-同日线上只读检查显示 18084、3011、3012 返回 200，Relay 已投递 1,021,950 条且
-`pending=0`、`failed=0`、`conservation_ok=true`，但 Collector/Relay 仍运行旧镜像
-`chiptrace:0.6.0-readiness-r2-20260905`。18084 报告有 3 个 open transaction、293 个
-历史失败文件（约 267 MB），旧 Relay 的 freshness 检查仍显示 `freshness_applicable=false`；
-18086 当前没有监听。因而传输闭环可用不等于每个 Session 已达到可交付标准，最新分支修复
-仍需先完成远端 CI、真实 OSS 账号验收和隔离 Canary 后再部署。
+同日复查确认 Collector/Relay 已运行 revision
+`fe9fcf924b226099202cb770b7cf0da29e0c2310`，18084、3011、3012 返回 200；传输队列排空且
+`conservation_ok=true`。但新 Relay 进程内 Wire 仍为 0，OTLP/Hook 有流量，runtime gate
+因来源不完整而失败。18084 保留 293 个历史失败文件（约 267 MB），trace exporter 未启用，
+watchdog 仍有错误；18086 没有监听。当前提交的远端 CI 因 GitHub 查询不可达而未确认，
+真实 OSS 账号及未修改客户端的 v2 多轮验收也未完成，因此尚不能按生产就绪对外交付。
+
+接入排查还复现了系统默认 Provider 被用户配置覆盖、使 Wire 绕过采集的风险。
+受管 requirements 模板现已强制 Provider 选择和完整网关定义，并增加固定版本未修改
+客户端的断网配置回归；部署方式和能力边界见 [Stock Codex 接入](integrations/codex/README.md)。
+这项模板修复尚未应用到线上主机，不能视为线上 Wire 已恢复。
 
 ## 构建
 

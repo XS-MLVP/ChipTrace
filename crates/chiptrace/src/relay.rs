@@ -1305,9 +1305,9 @@ impl IngestCoverageState {
         let wire_observed_long_enough = self.wire.first_observed_millis.is_some_and(|first| {
             now_millis.saturating_sub(first) > INGEST_COVERAGE_FRESHNESS_WINDOW_MS
         });
-        let missing_sources: Vec<&str> = required_routes
-            .iter()
-            .filter_map(|(name, route)| (route.requests == 0).then_some(*name))
+        let missing_sources: Vec<&str> = std::iter::once(("wire", &self.wire))
+            .chain(required_routes)
+            .filter_map(|(name, route)| (route.requests == 0).then_some(name))
             .collect();
         let mut stale_sources: Vec<&str> = self
             .wire
@@ -2169,6 +2169,50 @@ mod tests {
         assert_eq!(coverage["quality_errors"], 1);
         assert_eq!(coverage["buyer_eligibility_claimed"], false);
         relay.close().await.unwrap();
+    }
+
+    #[test]
+    fn ingest_coverage_lists_all_missing_sources_while_warming() {
+        let snapshot = IngestCoverageState::new().snapshot();
+        assert_eq!(snapshot["status"], "warming");
+        assert_eq!(snapshot["required_sources_observed"], false);
+        assert_eq!(
+            snapshot["missing_sources"],
+            json!(["wire", "otlp_logs", "otlp_traces", "hooks"])
+        );
+    }
+
+    #[test]
+    fn ingest_coverage_lists_wire_when_only_runtime_arrives() {
+        let mut coverage = IngestCoverageState::new();
+        for endpoint in [
+            CloudEndpoint::OtlpLogs,
+            CloudEndpoint::OtlpTraces,
+            CloudEndpoint::CodexHook,
+        ] {
+            coverage.observe_cloud(
+                endpoint,
+                &crate::cloud_ingest::CloudIngestSummary {
+                    endpoint: "test".to_owned(),
+                    source_records: 1,
+                    derived_captures: 1,
+                    unknown_events: 0,
+                    attributed_quality_errors: 0,
+                    conversion_errors: Vec::new(),
+                },
+                1,
+                0,
+                0,
+                0,
+            );
+        }
+        let snapshot = coverage.snapshot();
+        assert_eq!(snapshot["status"], "degraded");
+        assert_eq!(snapshot["required_sources_observed"], false);
+        assert_eq!(snapshot["required_sources_fresh"], false);
+        assert_eq!(snapshot["missing_sources"], json!(["wire"]));
+        assert_eq!(snapshot["stale_sources"], json!(["wire"]));
+        assert_eq!(snapshot["wire"]["requests"], 0);
     }
 
     #[test]

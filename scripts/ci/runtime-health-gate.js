@@ -108,7 +108,22 @@ function verifyRelayHealth(health) {
   nonNegativeInteger(health.delivered, 'relay.delivered');
 
   const coverage = object(health.ingest_coverage, 'relay.ingest_coverage');
-  if (coverage.status !== 'complete') fail('relay.ingest_coverage.status must be complete');
+  if (coverage.status !== 'complete') {
+    // Keep failure diagnostics bounded and free of arbitrary health response
+    // text. Older Relays omitted Wire from missing_sources even at count zero.
+    const status = ['warming', 'partial', 'degraded'].includes(coverage.status)
+      ? coverage.status : 'unknown';
+    const missing = REQUIRED_SOURCES.filter(source => (
+      coverage[source]?.requests === 0 || coverage[source]?.source_records === 0
+      || (Array.isArray(coverage.missing_sources) && coverage.missing_sources.includes(source))
+    ));
+    const stale = REQUIRED_SOURCES.filter(source => (
+      Array.isArray(coverage.stale_sources) && coverage.stale_sources.includes(source)
+    ));
+    fail('relay.ingest_coverage.status must be complete '
+      + `(observed=${status}; missing_sources=${missing.join(',') || 'none'}; `
+      + `stale_sources=${stale.join(',') || 'none'})`);
+  }
   requireTrue(coverage.required_sources_observed, 'relay.ingest_coverage.required_sources_observed');
   requireTrue(coverage.required_sources_fresh, 'relay.ingest_coverage.required_sources_fresh');
   // Runtime traffic without a recent Wire source must never pass as complete.

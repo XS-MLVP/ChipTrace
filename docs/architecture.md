@@ -82,6 +82,9 @@ Wire、OTLP logs、OTLP traces 和 Hook 活动；当 Wire 持续活跃而任一 
 和 `source_lag_ms`。如果 OTLP/Hook 在近 5 分钟仍有活动而 Wire 已停止或相对 Runtime
 落后超过 5 分钟，也必须为 `degraded`，并把 `wire` 列入 `stale_sources`；Runtime 继续流入
 不能掩盖 Wire 断流。`complete` 只表示四路当前同步，不代表任何 Session 已通过 Buyer 验收。
+`missing_sources` 包含所有尚未观察到的来源，包括 Wire；Wire 从未到达而 Runtime 持续
+流入时，会同时列入 `missing_sources` 和 `stale_sources`。runtime gate 的非零退出会附带
+有界的来源名称，兼容旧 Relay 在 Wire 为 0 时遗漏缺失列表的诊断。
 Session 是否可交付仍只由 `cloud-acceptance` 判定。
 Collector 和 Relay 的健康响应还包含 `build.version` 与 `build.revision`；部署门禁可以用
 固定 Git revision 拒绝旧镜像继续接收或交接数据。

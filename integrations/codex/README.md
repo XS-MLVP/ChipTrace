@@ -4,8 +4,15 @@
 
 | 模板 | 安装位置 | 作用 |
 | --- | --- | --- |
-| [config.toml.example](config.toml.example) | `/etc/codex/config.toml` | 固定 18084 Responses、OTLP 和 25 次网络重试 |
-| [requirements.toml.example](requirements.toml.example) | `/etc/codex/requirements.toml` | 固定 required 生命周期 Hook，并在 SessionStart 执行前置检查 |
+| [config.toml.example](config.toml.example) | `/etc/codex/config.toml` | 默认 18084 Responses、OTLP 和 25 次网络重试 |
+| [requirements.toml.example](requirements.toml.example) | `/etc/codex/requirements.toml` | 强制 Provider 选择及完整定义、required 生命周期 Hook，并在 SessionStart 执行前置检查 |
+
+系统 `config.toml` 提供默认值，用户配置和会话参数可以覆盖它。仅安装该文件不能证明
+Responses 经过 18084：OTLP/Hook 可以仍发往云端，而同名 Provider 已被用户改到另一个入口。
+`requirements.toml` 因此显式设置 `model_provider` 和完整的 `model_providers.OpenAI`，
+使原生客户端强制使用采集网关和 command auth；修改目标网关时必须同时更新两个文件。
+目前原生 requirements 没有对应的 OTLP 强制字段；OTLP 仍是默认配置，必须在真实 Canary
+中逐 Turn 验证，不能把 Provider 约束当作四路来源已经完整。
 
 业务凭据和采集凭据由主机管理系统注入环境，不写入配置或 Trace：
 
@@ -31,9 +38,21 @@ Release。
 Provider 使用 command auth，确保 Stock Codex 会刷新该目录。Tool Schema 只取模型实际收到的
 Responses Wire；模型身份以 Wire 与 Sub2API 精确路由为准。
 
-受管主机要求 Stock Codex 0.150 或更高版本，并使用 `--strict-config`。`otel.tool_result.max_bytes`
-固定为 256 MiB；低版本不识别该字段时必须在首个 Turn 前失败，不能以默认 2 KiB 截断结果后
-继续产生不可交付的 Session。云端仍以每条事件实际报告的 `output_truncated=false` 为准。
+当前 Provider 约束已使用未修改的 Stock Codex `0.163.0-alpha.11` 在断网、只读根文件系统的
+容器中验证。其他版本需要重新运行配置回归和真实 Canary，不能仅凭版本号较新或
+`--strict-config` 未报错认定约束生效。`otel.tool_result.max_bytes` 固定为 256 MiB；
+客户端必须支持该字段，云端仍以每条事件实际报告的 `output_truncated=false` 为准。
+
+配置回归不需要 Provider 凭据，不启动 Turn，不调用模型，也不读取宿主用户配置：
+
+```bash
+CHIPTRACE_STOCK_CODEX_MODULES=/path/to/pinned-install/node_modules make managed-route-test
+```
+
+它先验证旧的 Hook-only requirements 会让用户 Provider 绕过系统默认路由，再通过实际
+`config/read` 和 `configRequirements/read` 验证新模板能抵御用户选择、同名 Provider 定义和
+命令行覆盖，并移除用户注入的鉴权/HTTP header 设置。GitHub CI 单独安装固定版本客户端，
+保留 `stock-managed-route-report`；这项离线检查不替代未修改客户端的真实多轮数据验收。
 
 ## 无管理员权限的测试
 

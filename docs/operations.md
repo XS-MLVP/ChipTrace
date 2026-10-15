@@ -39,16 +39,22 @@ Relay 目录；OTLP 与 Hook 使用独立采集凭据。Wire Capture 使用网�
 请求获得 Rust Relay 的 durable ACK。格式错误返回 400，认证失败返回 401，ID 冲突返回
 409，只有暂时故障返回可重试 5xx。
 
-2026-10-15 的只读检查显示，18084、3011、3012 均返回 HTTP 200；Collector/Relay 已
-投递 1,021,950 条，`pending=0`、`failed=0`、`conservation_ok=true`。当前运行镜像仍是
-`chiptrace:0.6.0-readiness-r2-20260905`，不是本分支最新修复。18084 还有 3 个 open
-transaction、293 个历史失败文件（约 267 MB），watchdog 配置存在但
-`watchdog.running=false`；3012 的旧 Relay 报告 `wire_age_ms=162514459` 且
-`freshness_applicable=false`，所以其 `status=complete` 不能作为最新 freshness 门禁已
-部署的证据。18086 当前没有监听，平台插件尚未作为在线服务运行。
+2026-10-15 复查确认，18084、3011、3012 均返回 HTTP 200；Collector/Relay 已运行
+revision `fe9fcf924b226099202cb770b7cf0da29e0c2310`，`pending=0`、`failed=0`、
+`conservation_ok=true`。18084 的 open transaction 已为 0，293 个历史失败文件
+（267,219,223 bytes）仍保留。新 Relay 进程收到 OTLP logs/traces 和 Hook，但 Wire 为 0，
+`required_sources_fresh=false`，带预期 revision 的 runtime gate 真实退出 1。
+trace exporter 未启用，watchdog 最近报告重试失败；18086 没有监听。
 
-隔离 patched Canary 已通过当前仓库门禁，但线上镜像尚未切换。生产发布仍需先完成远端
-CI、目标 OSS 账号验收和未修改 Stock Codex 的真实 Canary，再灰度升级并复查重启/回滚。
+读取到的系统和用户配置存在同名 Provider 的不同 `base_url`。离线原生客户端回归确认，
+系统 `config.toml` 的默认路由可以被用户配置覆盖；仅有 OTLP/Hook 流量不能证明 Wire
+经过 18084。新 requirements 模板通过原生 exact Provider 约束修复这个接入风险，但本次
+没有改动线上 `/etc/codex` 或用户配置。更新受管配置后必须从新客户端进程获取真实 Wire，
+再复验 runtime gate 和目标 Session 的四源关联；不能用合成 Capture 把线上计数补成通过。
+
+隔离 patched Canary 已通过仓库门禁，但不证明线上未修改客户端已经通过。当前提交远端
+CI 尚未取得可查询的结果，生产交接仍需完成远端 CI、目标 OSS 账号验收、未修改 Stock Codex
+的真实 Canary，以及重启/回滚复验。
 历史失败文件和 open transaction 是审计证据，不能为了让健康计数变绿而删除。
 
 ## Stock Codex
@@ -61,7 +67,9 @@ codex
 ```
 
 `SessionStart` 会同步检查采集入口；配置无效、认证失败或入口不可用时，在首个 Turn 前
-停止。任务期间发生缺失时不阻断业务，但该 Session 不能交付。
+停止。它不检查有效 Provider 或 OTLP 路由，不能替代 requirements 的 Provider 约束和真实
+来源验收。其他版本部署前须通过 `make managed-route-test`，确认 exact 约束确实生效。
+任务期间发生缺失时不阻断业务，但该 Session 不能交付。
 
 ## 云端验收
 
