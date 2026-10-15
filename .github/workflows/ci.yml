@@ -239,7 +239,7 @@ jobs:
         with:
           name: runtime-health-gate-report
           path: runtime-health-gate.tap
-      - name: Emit the patched multi-turn Canary gate artifact
+      - name: Verify real scenario witnesses and emit the patched multi-turn Canary artifact
         run: |
           set -euo pipefail
           node scripts/ci/native-canary-gate.js \
@@ -249,6 +249,8 @@ jobs:
           python3 -c '
           import json
           result = json.load(open("native-canary-gate.json", encoding="utf-8"))
+          assert result["schema_version"] == "chiptrace.native-canary-gate.v2"
+          assert result["scenario_evidence_verified"] is True
           assert result["real_upstream"] is True
           assert result["stock_version"] == "0.163.0-alpha.11"
           assert result["producer_mode"] == "patched_stock"

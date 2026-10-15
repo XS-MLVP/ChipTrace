@@ -6,6 +6,27 @@ const { verifyNativeCanaryReport } = require('./native-canary-gate');
 
 const coverage = () => ({ wire: 1, otlp_logs: 2, otlp_traces: 3, hooks: 1, missing_sources: [], complete: true });
 
+function scenarioEvidence() {
+  const witness = (id, tool, seq, outcome) => ({
+    capture_id: id, call_id: id, session_id: 'session-1', turn_id: 'turn-1', tool,
+    runtime_namespace: 'functions', source_event_name: 'codex.tool_result',
+    tool_result_seq: seq, output_truncated: false,
+    process_outcome: { kind: 'process', provenance: 'stock_codex.unified_exec.log_output.header', ...outcome },
+    requested_session_id: tool === 'write_stdin' ? 4242 : null,
+  });
+  return {
+    schema_version: 'chiptrace.native-canary-scenarios.v1', source: 'exact_capture_snapshot',
+    session_id: 'session-1', complete: true, missing_scenarios: [],
+    second_turn: { turn_ids: ['turn-1', 'turn-2'] },
+    resume: { capture_id: 'cap-resume', source_event_name: 'SessionStart', source: 'resume' },
+    failed_tool_process: witness('cap-failed', 'exec_command', 1, { state: 'exited', exit_code: 7, success: false }),
+    delayed_write_stdin: {
+      launch: witness('cap-launch', 'exec_command', 2, { state: 'running', session_id: 4242, success: null }),
+      terminal: witness('cap-poll', 'write_stdin', 3, { state: 'exited', exit_code: 0, success: true }),
+    },
+  };
+}
+
 function report() {
   return {
     real_upstream: true,
@@ -18,6 +39,7 @@ function report() {
       patch_set: ['test-context.patch'],
     },
     scenario_coverage: ['second_turn', 'resume', 'failed_tool_process', 'delayed_write_stdin'],
+    scenario_evidence: scenarioEvidence(),
     source_coverage: { wire: 2, otlp_logs: 2, otlp_traces: 2, hooks: 2, missing_sources: [], complete: true },
     native_exit: { code: 0, signal: null },
     delivery_ready: true,
@@ -39,13 +61,13 @@ function report() {
       native_turns: 2,
       closed_turns: 2,
       model_interactions: 2,
-      tool_execution_records: 2,
+      tool_execution_records: 4,
       turns: [
         {
           session_id: 'session-1', turn_id: 'turn-1', status: 'closed', state_conflict: false,
           started_at: 'redacted', finished_at: 'redacted', terminal_events: 1,
-          raw_capture_refs: ['capture-1'],
-          model_interactions: 1, tool_execution_records: 1, source_coverage: coverage(),
+          raw_capture_refs: ['capture-1', 'cap-failed', 'cap-launch', 'cap-poll'],
+          model_interactions: 1, tool_execution_records: 3, source_coverage: coverage(),
         },
         {
           session_id: 'session-1', turn_id: 'turn-2', status: 'cancelled', state_conflict: false,
@@ -80,7 +102,7 @@ function audit() {
 
 test('native canary gate requires a complete multi-turn four-source bundle', () => {
   assert.deepEqual(verifyNativeCanaryReport(report(), audit()), {
-    schema_version: 'chiptrace.native-canary-gate.v1',
+    schema_version: 'chiptrace.native-canary-gate.v2',
     real_upstream: true,
     stock_version: '0.163.0-alpha.11',
     producer_mode: 'patched_stock',
@@ -89,13 +111,62 @@ test('native canary gate requires a complete multi-turn four-source bundle', () 
     unmodified_stock: false,
     production_ready: false,
     scenario_coverage: ['delayed_write_stdin', 'failed_tool_process', 'resume', 'second_turn'],
+    scenario_evidence_verified: true,
     source_coverage: { wire: 2, otlp_logs: 2, otlp_traces: 2, hooks: 2, missing_sources: [], complete: true },
     native_turns: 2,
     model_interactions: 2,
-    tool_execution_records: 2,
+    tool_execution_records: 4,
     selected_audit_records: 10,
     delivery_ready: true,
   });
+});
+
+test('scenario labels cannot certify a missing resume or missing process observations', () => {
+  const declarations = report();
+  delete declarations.scenario_evidence;
+  declarations.provenance.producer_mode = 'unmodified_stock';
+  declarations.provenance.patch_set = [];
+  declarations.session_view.session_epochs = 1;
+  declarations.session_view.closed_session_epochs = 1;
+  declarations.session_view.tool_execution_records = 0;
+  for (const turn of declarations.session_view.turns) turn.tool_execution_records = 0;
+  assert.throws(
+    () => verifyNativeCanaryReport(declarations, audit(), { requireUnmodifiedStock: true }),
+    /scenario evidence|resume|process observations/,
+  );
+});
+
+test('scenario witnesses must retain native identity, source, failure and asynchronous linkage', () => {
+  const cases = [
+    ['missing', r => { delete r.scenario_evidence; }, /scenario evidence/],
+    ['foreign Session', r => { r.scenario_evidence.session_id = 'other'; }, /another Session/],
+    ['one epoch', r => {
+      r.session_view.session_epochs = 1; r.session_view.closed_session_epochs = 1;
+    }, /resume needs/],
+    ['compact', r => { r.scenario_evidence.resume.source = 'compact'; }, /resume needs/],
+    ['same Turn', r => { r.scenario_evidence.second_turn.turn_ids = ['turn-1', 'turn-1']; }, /two distinct/],
+    ['missing Raw', r => { r.scenario_evidence.failed_tool_process.capture_id = 'absent'; }, /Raw membership/],
+    ['ambiguous Raw', r => { r.session_view.turns[1].raw_capture_refs.push('cap-failed'); }, /Raw membership/],
+    ['reused Capture', r => {
+      r.scenario_evidence.delayed_write_stdin.launch.capture_id = 'cap-failed';
+    }, /contradictory/],
+    ['external tool', r => { r.scenario_evidence.failed_tool_process.runtime_namespace = 'client'; }, /builtin tool/],
+    ['truncated', r => { r.scenario_evidence.delayed_write_stdin.launch.output_truncated = true; }, /untruncated/],
+    ['no failure', r => {
+      r.scenario_evidence.failed_tool_process.process_outcome.exit_code = 0;
+      r.scenario_evidence.failed_tool_process.process_outcome.success = true;
+    }, /nonzero process exit/],
+    ['wrong process ID', r => { r.scenario_evidence.delayed_write_stdin.terminal.requested_session_id = 999; }, /actual running Session ID/],
+    ['poll before launch', r => { r.scenario_evidence.delayed_write_stdin.terminal.tool_result_seq = 1; }, /contradictory|later terminal/],
+    ['unknown sequence', r => { delete r.scenario_evidence.delayed_write_stdin.launch.tool_result_seq; }, /positive tool_result_seq/],
+    ['too few tools', r => {
+      r.session_view.turns[0].tool_execution_records = 2; r.session_view.tool_execution_records = 3;
+    }, /exceed native Turn tool records/],
+  ];
+  for (const [name, mutate, expected] of cases) {
+    const value = report(); mutate(value);
+    assert.throws(() => verifyNativeCanaryReport(value, audit()), expected, name);
+  }
 });
 
 test('integrity.ready cannot bypass an unscoped Turn record', () => {

@@ -1,5 +1,6 @@
 pub mod assemble;
 pub mod buyer;
+mod canary_scenarios;
 pub mod capture;
 pub mod cloud_acceptance;
 pub mod cloud_ingest;

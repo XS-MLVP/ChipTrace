@@ -38,6 +38,8 @@ test('redacted real patched Canary passes the complete delivery gate', () => {
   const report = read('native-canary-multiturn-0163-success-report.json');
   const audit = read('native-canary-multiturn-0163-success-audit.json');
   const result = verifyNativeCanaryReport(report, audit);
+  assert.equal(result.schema_version, 'chiptrace.native-canary-gate.v2');
+  assert.equal(result.scenario_evidence_verified, true);
   assert.equal(result.native_turns, 2);
   assert.equal(result.producer_mode, 'patched_stock');
   assert.equal(result.unmodified_stock, false);
@@ -51,4 +53,11 @@ test('redacted real patched Canary passes the complete delivery gate', () => {
     'second_turn',
   ]);
   assert.deepEqual(result.source_coverage, report.source_coverage);
+});
+
+test('historical declaration-only success needs fresh engine witnesses', () => {
+  const report = read('native-canary-multiturn-0163-success-report.json');
+  const audit = read('native-canary-multiturn-0163-success-audit.json');
+  delete report.scenario_evidence;
+  assert.throws(() => verifyNativeCanaryReport(report, audit), /scenario evidence/);
 });

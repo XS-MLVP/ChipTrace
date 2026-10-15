@@ -12,11 +12,85 @@
       "upstream-session-scope-extension.patch",
       "upstream-session-scope-process.patch"
     ],
-    "transform": "Native identifiers, timestamps, payloads, paths and credentials were replaced or removed; this is metadata only."
+    "transform": "Native identifiers, timestamps, payloads, paths and credentials were replaced or removed; this is metadata only. Scenario witnesses were regenerated from the retained sealed Raw by inspect-session; identifiers were consistently replaced, preserving observed sequence, state and exit values. Raw references retain only a metadata subset."
   },
   "real_upstream": true,
   "stock_version": "0.163.0-alpha.11",
   "scenario_coverage": ["delayed_write_stdin", "failed_tool_process", "resume", "second_turn"],
+  "scenario_evidence": {
+    "schema_version": "chiptrace.native-canary-scenarios.v1",
+    "source": "exact_capture_snapshot",
+    "session_id": "00000000-0000-7000-8000-000000000201",
+    "complete": true,
+    "missing_scenarios": [],
+    "second_turn": {
+      "turn_ids": ["00000000-0000-7000-8000-000000000202", "00000000-0000-7000-8000-000000000203"]
+    },
+    "resume": {
+      "capture_id": "capture-resume",
+      "source_event_name": "SessionStart",
+      "source": "resume"
+    },
+    "failed_tool_process": {
+      "capture_id": "capture-failed",
+      "session_id": "00000000-0000-7000-8000-000000000201",
+      "turn_id": "00000000-0000-7000-8000-000000000202",
+      "call_id": "call-failed",
+      "tool": "exec_command",
+      "runtime_namespace": "functions",
+      "source_event_name": "codex.tool_result",
+      "tool_result_seq": 2,
+      "output_truncated": false,
+      "requested_session_id": null,
+      "process_outcome": {
+        "kind": "process",
+        "state": "exited",
+        "exit_code": 7,
+        "success": false,
+        "provenance": "stock_codex.unified_exec.log_output.header"
+      }
+    },
+    "delayed_write_stdin": {
+      "launch": {
+        "capture_id": "capture-launch",
+        "session_id": "00000000-0000-7000-8000-000000000201",
+        "turn_id": "00000000-0000-7000-8000-000000000202",
+        "call_id": "call-launch",
+        "tool": "exec_command",
+        "runtime_namespace": "functions",
+        "source_event_name": "codex.tool_result",
+        "tool_result_seq": 3,
+        "output_truncated": false,
+        "requested_session_id": null,
+        "process_outcome": {
+          "kind": "process",
+          "state": "running",
+          "session_id": 4242,
+          "success": null,
+          "provenance": "stock_codex.unified_exec.log_output.header"
+        }
+      },
+      "terminal": {
+        "capture_id": "capture-poll",
+        "session_id": "00000000-0000-7000-8000-000000000201",
+        "turn_id": "00000000-0000-7000-8000-000000000202",
+        "call_id": "call-poll",
+        "tool": "write_stdin",
+        "runtime_namespace": "functions",
+        "source_event_name": "codex.tool_result",
+        "tool_result_seq": 4,
+        "output_truncated": false,
+        "requested_session_id": 4242,
+        "process_outcome": {
+          "kind": "process",
+          "state": "exited",
+          "exit_code": 0,
+          "success": true,
+          "provenance": "stock_codex.unified_exec.log_output.header"
+        }
+      }
+    }
+  },
   "source_coverage": {
     "wire": 8,
     "otlp_logs": 15,
@@ -55,7 +129,7 @@
         "started_at": "redacted",
         "finished_at": "redacted",
         "terminal_events": 1,
-        "raw_capture_refs": ["capture-1"],
+        "raw_capture_refs": ["capture-1", "capture-failed", "capture-launch", "capture-poll"],
         "model_interactions": 5,
         "tool_execution_records": 4,
         "source_coverage": {"wire": 5, "otlp_logs": 359, "otlp_traces": 1341, "hooks": 2, "missing_sources": [], "complete": true}

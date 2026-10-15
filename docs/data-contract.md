@@ -210,6 +210,13 @@ Runtime integrity 或 Session 级计数宣称交付完整。
 v1 Schema 保持历史定义；旧产物只能按其冻结的旧验证器进行历史复验。升级必须从同一份
 原始 Raw 重新运行全部验收，不能仅改版本字段、补写 Session 统计或沿用旧的通过标志。
 
+`inspect-session.scenario_evidence` 使用 `chiptrace.native-canary-scenarios.v1`，从同一
+精确身份快照提取第二轮、resume、非零进程退出和异步 `write_stdin` 的有界元数据证据。
+该字段用于 Canary 门禁 v2；普通 Session 不需要执行所有 Canary 场景。
+它不进入投影 metrics 或代替 Manifest 校验，缺失场景以 null 和 `missing_scenarios` 保留。
+只有场景标签的旧 Canary 报告须从 Raw 重生成；具体字段来源与组装命令见
+[原生 Turn 验收记录](native-turn-context.md#下一轮验收)。
+
 ## Tool Schema
 
 采购工具定义只取自模型实际收到的 Responses Wire。每个被调用工具必须包含明确

@@ -193,12 +193,13 @@ Session 记录，Wire、OTLP logs、OTLP traces、Hook 四路来源均有正数�
 
 ```json
 {
-  "schema_version": "chiptrace.native-canary-gate.v1",
+  "schema_version": "chiptrace.native-canary-gate.v2",
   "real_upstream": true,
   "stock_version": "0.163.0-alpha.11",
   "producer_mode": "patched_stock",
   "unmodified_stock": false,
   "production_ready": false,
+  "scenario_evidence_verified": true,
   "native_turns": 2,
   "selected_audit_records": 3621,
   "delivery_ready": true
@@ -254,6 +255,21 @@ CI 现在在固定源码 clean clone 中复验五个补丁的 `apply --check`、
 
 ## 下一轮验收
 
+Canary 门禁 v2 不再把 `scenario_coverage` 标签视为场景已执行的证明。
+`inspect-session` 顶层新增 `scenario_evidence`，与 Session 视图及来源审计来自同一次
+Capture 快照，不写入 Canonical 投影 metrics，也不放宽投影 Manifest 的重算校验。
+其中只保留有模型交互的两个原生 Turn、真实 `SessionStart(source=resume)`、非零进程退出，
+以及同一 Turn 内 running exec 与较晚 terminal `write_stdin` 的调用、序号和进程 ID。
+工具证据必须来自未截断的 builtin `codex.tool_result`；进程 ID 重用或调用证据冲突不能
+用来拼接异步过程。摘要不含对话正文、完整工具参数或输出。
+
+2026-10-15 以新的检查入口只读回放前述合格 patched Raw，仍得到 2 个 Turn、8 个模型
+交互、6 条工具记录、3621 条审计记录；真实失败退出为 7，异步 launch/poll 序号为 3/4。
+脱敏 fixture 保留这些实际状态及序号，并一致替换身份。Raw SHA-256 保持上文值不变。
+只有标签、没有 `scenario_evidence` 的历史报告现在会拒绝，须从保留的 Raw 重新检查。
+普通完整 Session 不要求执行 Canary 的四项特殊场景，因此场景缺失本身不降低
+`inspect-session.delivery_ready`；Canary 门禁单独要求它们齐全。
+
 真实 Canary 的报告和 `audit-session-context` 必须经过仓库内的同一门禁，不能只看
 `integrity.delivery_ready` 或 CLI 退出码。门禁要求真实上游客户端至少两个 Native Turn，
 每个 Turn 的 Wire、OTLP logs、OTLP traces、required Hook 均有记录，Session/Turn 均闭合，
@@ -261,9 +277,29 @@ CI 现在在固定源码 clean clone 中复验五个补丁的 `apply --check`、
 
 ```bash
 chiptrace inspect-session --input <sealed-raw-or-restored-directory> \
-  --session-id <stock-codex-session-id> > report.json
-chiptrace audit-session-context --input <sealed-raw-or-restored-directory> \
-  --session-id <stock-codex-session-id> --sample-limit 0 > source-context-audit.json
+  --session-id <stock-codex-session-id> > inspection.json
+```
+
+Canary 启动器另保留真实上游观察、客户端版本/源码/补丁来源和进程退出结果，写入
+`producer-run.json` 的 `real_upstream`、`stock_version`、`provenance`、`native_exit`；
+这些运行事实不能从检查结果或场景标签推断。将它与同快照的引擎结果组装后执行门禁：
+
+```bash
+node - <<'NODE'
+const fs = require('node:fs');
+const inspection = JSON.parse(fs.readFileSync('inspection.json', 'utf8'));
+const run = JSON.parse(fs.readFileSync('producer-run.json', 'utf8'));
+const report = {
+  real_upstream: run.real_upstream, stock_version: run.stock_version,
+  provenance: run.provenance, native_exit: run.native_exit,
+  delivery_ready: inspection.delivery_ready, integrity: inspection.integrity,
+  session: inspection.session, source_coverage: inspection.source_coverage,
+  scenario_coverage: ['second_turn', 'resume', 'failed_tool_process', 'delayed_write_stdin'],
+  scenario_evidence: inspection.scenario_evidence,
+};
+fs.writeFileSync('report.json', JSON.stringify(report, null, 2));
+fs.writeFileSync('source-context-audit.json', JSON.stringify(inspection.source_context_audit, null, 2));
+NODE
 node scripts/ci/native-canary-gate.js \
   --report report.json --audit source-context-audit.json --minimum-turns 2
 ```
@@ -283,6 +319,8 @@ node scripts/ci/native-canary-gate.js \
 该门禁只输出计数和状态摘要，不读取或打印对话正文、工具参数、鉴权值或文件路径。
 失败结果必须保留 Raw 和审计报告，不能通过删除未归属记录、改写状态或降低轮次门槛来
 获得通过。
+门禁校验这些摘要之间的一致性，不认证任意手写 JSON 的真实性，也不替代 Raw/Manifest
+哈希复验、生产者来源确认、真实 OSS 或线上交付验收；发布时应从已验证 Raw 新生成检查结果。
 
 1. 保留业务请求的原生 Session、Turn、request/response 和 W3C 上下文，验证 SSE 回调离开
    原始异步任务后仍能精确关联；同 Trace 多 Turn 不允许依赖全局“当前 Turn”。

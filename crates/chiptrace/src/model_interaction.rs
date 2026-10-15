@@ -97,7 +97,14 @@ pub struct SessionInspection {
     pub integrity: DeliveryIntegrity,
     pub validation_status: String,
     pub source_context_audit: crate::source_context::SourceContextAudit,
+    pub scenario_evidence: Value,
     pub projection: InteractionProjectionManifest,
+}
+
+struct ProjectionSnapshot {
+    projection: InteractionProjectionManifest,
+    source_context_audit: Option<crate::source_context::SourceContextAudit>,
+    scenario_evidence: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,7 +301,7 @@ pub(crate) fn summarize_raw_session(
 pub fn project_interactions(
     config: InteractionProjectConfig,
 ) -> Result<InteractionProjectionManifest> {
-    project_interactions_with_audit(config, false).map(|(projection, _)| projection)
+    project_interactions_with_audit(config, false).map(|snapshot| snapshot.projection)
 }
 
 /// Inspect the selected Session using one snapshot for projection and source auditing.
@@ -306,9 +313,15 @@ pub fn inspect_session(config: InteractionProjectConfig) -> Result<SessionInspec
         .filter(|session| !session.is_empty())
         .context("Session inspection requires a native Session ID")?
         .to_owned();
-    let (projection, source_context_audit) = project_interactions_with_audit(config, true)?;
+    let ProjectionSnapshot {
+        projection,
+        source_context_audit,
+        scenario_evidence,
+    } = project_interactions_with_audit(config, true)?;
     let source_context_audit =
         source_context_audit.context("Session inspection has no source context audit")?;
+    let scenario_evidence =
+        scenario_evidence.context("Session inspection has no scenario evidence")?;
     let session = projection
         .session_view
         .clone()
@@ -336,6 +349,7 @@ pub fn inspect_session(config: InteractionProjectConfig) -> Result<SessionInspec
         }
         .to_owned(),
         source_context_audit,
+        scenario_evidence,
         projection,
     })
 }
@@ -343,10 +357,7 @@ pub fn inspect_session(config: InteractionProjectConfig) -> Result<SessionInspec
 fn project_interactions_with_audit(
     config: InteractionProjectConfig,
     include_source_audit: bool,
-) -> Result<(
-    InteractionProjectionManifest,
-    Option<crate::source_context::SourceContextAudit>,
-)> {
+) -> Result<ProjectionSnapshot> {
     if config.inputs.is_empty() {
         bail!("at least one Capture input is required");
     }
@@ -402,6 +413,13 @@ fn project_interactions_with_audit(
             )
         })
         .transpose()?;
+    let scenario_evidence = if include_source_audit {
+        session_view
+            .as_ref()
+            .map(|view| crate::canary_scenarios::summarize(&captures, view))
+    } else {
+        None
+    };
     let capture_records = captures.len() as u64;
     let source_coverage = cloud_source_coverage(&captures);
 
@@ -525,7 +543,11 @@ fn project_interactions_with_audit(
     fs::rename(&staging, &output)?;
     File::open(parent)?.sync_all()?;
     verify_interaction_artifacts(&output)?;
-    Ok((manifest, source_context_audit))
+    Ok(ProjectionSnapshot {
+        projection: manifest,
+        source_context_audit,
+        scenario_evidence,
+    })
 }
 
 fn build_canonical_records(captures: &[Value]) -> Result<CanonicalRecords> {

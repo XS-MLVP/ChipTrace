@@ -223,6 +223,14 @@ test('HTTP service and SDK run the real CLI archive/restore/inspect/export path'
   assert.equal(inspectedJob.result.source_context_audit.session_id, 'thread-self-test');
   assert.equal(inspectedJob.result.source_context_audit.sources.otlp_logs.unknown_session_records, 0);
   assert.equal(inspectedJob.result.source_context_audit.sources.otlp_traces.unknown_session_records, 0);
+  const scenarios = inspectedJob.result.scenario_evidence;
+  assert.equal(scenarios.schema_version, 'chiptrace.native-canary-scenarios.v1');
+  assert.equal(scenarios.session_id, 'thread-self-test');
+  assert.equal(scenarios.source, 'exact_capture_snapshot');
+  // A complete ordinary Session need not execute the Canary's resume scenario.
+  assert.equal(scenarios.complete, false);
+  assert.ok(scenarios.missing_scenarios.includes('resume'));
+  assert.equal(scenarios.resume, null);
   const page = await client.getTurns('inspect-job', { offset: 0, limit: 1 });
   assert.equal(page.delivery_ready, true);
   assert.equal(page.total, page.summary.native_turns);
