@@ -70,10 +70,17 @@ ChipTrace 程序或服务，用户仍直接运行：
 codex
 ```
 
-`SessionStart` 会同步检查采集入口；配置无效、认证失败或入口不可用时，在首个 Turn 前
-停止。它不检查有效 Provider 或 OTLP 路由，不能替代 requirements 的 Provider 约束和真实
-来源验收。其他版本部署前须通过 `make managed-route-test`，确认 exact 约束确实生效。
+`SessionStart` 会同步检查采集入口和 Relay 持久化确认；配置无效、认证失败、入口不可用，
+或仅返回 HTTP 200 而没有合法确认时，在首个 Turn 前停止。它不检查有效 Provider 或 OTLP
+路由，不能替代 requirements 的 Provider 约束和真实来源验收。其他版本部署前须通过
+`make managed-route-test`，确认 exact 约束确实生效。
 任务期间发生缺失时不阻断业务，但该 Session 不能交付。
+
+ACK-only 备用服务不保存 Trace，不能作为采集健康或交付证据。open21 若曾启用
+`codex-open21-chiptrace-ack-sink.service`，真实网关恢复后应先确认 `/health` 的
+`fullTraceCapture.enabled=true` 且传输健康，再停用其开机启动并将 unit 归档，随后执行
+用户级 `daemon-reload`；历史日志保留。不能让备用 ACK 代替 required Hook 的持久化确认。
+更新原生命令后须重新部署 requirements；用户级 Hook 还需在最终路径重新审核 trust hash。
 
 ## 云端验收
 

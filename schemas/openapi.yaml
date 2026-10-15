@@ -97,7 +97,12 @@ paths:
               type: object
               required: [hook_event_name, session_id]
       responses:
-        "200": {description: Hook Raw 与生命周期事实已持久化}
+        "200":
+          description: Relay WAL 已确认 Hook Raw 与派生事实；不表示 Collector 或 OSS 交付完成。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HookReceipt"
         "400": {description: Hook JSON 无效}
         "401": {description: Token 缺失或无效}
         "503": {description: 背压或存储不可用}
@@ -124,6 +129,35 @@ paths:
         "503": {description: 封存失败}
 components:
   schemas:
+    HookReceipt:
+      type: object
+      required: [partialSuccess, chiptrace]
+      properties:
+        partialSuccess:
+          type: object
+          required: [rejectedLogRecords, rejectedSpans, errorMessage]
+          properties:
+            rejectedLogRecords: {type: integer, const: 0}
+            rejectedSpans: {type: integer, const: 0}
+            errorMessage: {type: "null"}
+        chiptrace:
+          type: object
+          required: [ok, durable, captures, duplicates, summary]
+          properties:
+            ok: {type: boolean, const: true}
+            durable: {type: boolean, const: true}
+            captures: {type: integer, const: 2}
+            duplicates: {type: integer, minimum: 0, maximum: 2}
+            summary:
+              type: object
+              required: [endpoint, source_records, derived_captures, unknown_events, attributed_quality_errors, conversion_errors]
+              properties:
+                endpoint: {type: string, const: codex_hook}
+                source_records: {type: integer, const: 1}
+                derived_captures: {type: integer, const: 1}
+                unknown_events: {type: integer, const: 0}
+                attributed_quality_errors: {type: integer, const: 0}
+                conversion_errors: {type: array, maxItems: 0}
     WireCapture:
       allOf:
         - $ref: ./capture-v2.schema.json

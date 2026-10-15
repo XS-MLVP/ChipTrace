@@ -19,7 +19,8 @@ gateway-host-test:
 	node --test integrations/openai-gateway/host-health.test.js
 
 codex-config-test:
-	node --test integrations/codex/config-contract.test.js
+	cargo build --locked --bin chiptrace
+	node --test integrations/codex/config-contract.test.js integrations/codex/hook-ack.test.js
 	node --test scripts/ci/upstream-context.test.js
 
 managed-route-test:

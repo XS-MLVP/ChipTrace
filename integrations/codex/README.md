@@ -28,11 +28,21 @@ export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer%20${CHIPTRACE_INGEST_TOK
 codex --strict-config
 ```
 
-此后用户仍直接运行 `codex`。`SessionStart` 会验证三项环境配置和 18084 Hook 入口；缺失、
-认证失败或入口不可用时，在首个 Turn 前停止。Responses Wire 记录模型事实，
+此后用户仍直接运行 `codex`。`SessionStart` 会验证三项环境配置和 18084 Hook 入口的
+真实持久化确认；缺失、认证失败、入口不可用或确认无效时，在首个 Turn 前停止。
+Responses Wire 记录模型事实，
 `codex.tool_result` OTLP 记录真实工具执行，required Hook 只记录 Session、Turn、压缩和子代理
 生命周期，且不覆盖用户已有 Hook。三类事实缺失或冲突时，云端保留 Raw，但拒绝进入采购
 Release。
+
+九类 Hook 都要求 HTTP 200，以及 `chiptrace.ok=true`、`durable=true`、正确的
+`codex_hook` 来源和零质量错误。单次生命周期事件应确认一个原始批次和一个派生事件，
+共两条 Capture；重复数可以是 0、1 或 2，同一次重试的事件字节保持不变。
+`HTTP 200 {}`、ACK-only 备用入口、重定向和部分拒绝均不能作为持久化证据。
+其他 Hook 的确认失败返回非零退出码，云端继续保留收到的事实并拒绝不完整 Session。
+单次 Hook 确认只证明 Relay WAL 接收，逐 Turn 的四源完整性和 OSS 交付仍需独立验收。
+开发回归 `make codex-config-test` 会构建 CLI，执行错误确认负例和隔离 Relay/Collector
+实测；CI 保存精简的 `native-hook-ack-report`，不采集真实业务正文。
 
 云端 `/models` 必须先验证真实 Provider 凭据，再为真实模型返回 `direct` function 工具目录。
 Provider 使用 command auth，确保 Stock Codex 会刷新该目录。Tool Schema 只取模型实际收到的
@@ -72,6 +82,8 @@ Stock Codex 0.153.4 的 `exec --json` 被 SessionStart Hook 前置拦截时，�
 
 原生 Hook 命令依赖 `/usr/bin/python3` 和 `/usr/bin/curl`。命令在每次 Hook 调用时保留原生
 JSON 字段，并为缺少身份的事件补充独立 `event_id` 与 `occurred_at`，然后把同一份 JSON
-交给 curl 重试。Stock Codex 恢复会话后可能再次发送内容完全相同的 `SessionEnd`；单纯按
-请求体哈希去重会丢掉第二次闭合。独立调用必须有不同 ID，同一次 HTTP 重试必须保持 ID
+交给 curl，最多执行两次、每次不超过一秒。每次响应独立读取，传输中断时丢弃该次确认
+残片，再验证下一次完整响应；不会把多次响应拼接成 JSON。Stock Codex 恢复会话后可能
+再次发送内容完全相同的 `SessionEnd`；单纯按请求体哈希去重会丢掉第二次闭合。
+独立调用必须有不同 ID，同一次 HTTP 重试必须保持 ID
 不变。更新用户级命令后，需要在最终路径重新审核并记录 Hook trust hash。

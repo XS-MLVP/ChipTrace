@@ -136,7 +136,17 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked
       - run: node --test integrations/openai-gateway/durable-outbox.test.js
-      - run: node --test integrations/codex/config-contract.test.js
+      - name: Build the CLI used by native Hook and platform regressions
+        run: cargo build --locked --bin chiptrace
+      - name: Verify native Hook configuration and durable acknowledgements
+        run: |
+          set -euo pipefail
+          node --test integrations/codex/config-contract.test.js integrations/codex/hook-ack.test.js | tee native-hook-ack.tap
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-hook-ack-report
+          path: native-hook-ack.tap
       - run: node --test scripts/ci/upstream-context.test.js
       - run: node --test scripts/ci/native-canary-gate.test.js
       - run: node --test scripts/ci/native-canary-evidence.test.js
@@ -197,8 +207,6 @@ jobs:
           name: native-canary-gate-report
           path: native-canary-gate.json
       - run: cargo run --locked --bin chiptrace -- self-test
-      - name: Build the CLI used by the platform integration path
-        run: cargo build --locked --bin chiptrace
       - name: Verify native context gaps, unowned batches and read-only diagnostics
         run: node --test integrations/codex/native-context.test.js | tee native-context.tap
       - uses: actions/upload-artifact@v4

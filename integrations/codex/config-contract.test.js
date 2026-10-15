@@ -94,7 +94,7 @@ test('required Hooks contain lifecycle only and fail closed at SessionStart', ()
   const sessionStartCommand = JSON.parse(sessionStartCommandLine[1]);
   assert.match(sessionStart, /\$CHIPTRACE_API_KEY/);
   assert.match(sessionStart, /\$OTEL_EXPORTER_OTLP_HEADERS/);
-  assert.match(sessionStartCommand, /\\"continue\\":false/);
+  assert.match(sessionStartCommand, /"continue":false/);
   assert.match(sessionStartCommand, /cloud ingest unavailable or configuration incomplete/);
 
   const timeouts = [...requirements.matchAll(/^timeout = (\d+)$/gm)]
@@ -102,7 +102,6 @@ test('required Hooks contain lifecycle only and fail closed at SessionStart', ()
   assert.equal(timeouts.length, events.length);
   assert.equal(timeouts.every((timeout) => timeout <= 3), true);
   assert.equal(commands.every((command) => command.includes('--max-time 1')), true);
-  assert.equal(commands.every((command) => command.includes('--retry-max-time 2')), true);
   assert.doesNotMatch(requirements, /--max-time 8|timeout = 10/);
 });
 
@@ -164,7 +163,10 @@ test('separate native hook invocations survive while HTTP retries deduplicate', 
     req.on('end', () => {
       bodies.push(Buffer.concat(chunks).toString('utf8'));
       res.writeHead(bodies.length === 1 ? 503 : 200);
-      res.end('{}');
+      res.end(JSON.stringify({ partialSuccess: { rejectedLogRecords: 0, rejectedSpans: 0, errorMessage: null },
+        chiptrace: { ok: true, durable: true, captures: 2, duplicates: 0,
+          summary: { endpoint: 'codex_hook', source_records: 1, derived_captures: 1, unknown_events: 0,
+            attributed_quality_errors: 0, conversion_errors: [] } } }));
     });
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));

@@ -17,7 +17,7 @@
 | 历史失败 | 293 个文件，267,219,223 bytes | 保留失败取证，不能删除换取健康状态 |
 | 平台 18086 | 无法连接 | 当前无法交接在线管理、导出入口 |
 | 部署隔离 | Relay 要求 ingest token；Collector/Relay 绑定 loopback；两容器有重启策略 | 有内部入口保护；两容器尚无内存/CPU 上限或只读根文件系统 |
-| GitHub CI | `31f9e16` 的 [run 38679669015](https://github.com/XS-MLVP/ChipTrace/actions/runs/38679669015) 已确认 5/5 作业成功 | 覆盖未归属 batch 审计与交付状态修复；不能代替后续提交或线上验收 |
+| GitHub CI | `8a0a381` 的 [run 38681058681](https://github.com/XS-MLVP/ChipTrace/actions/runs/38681058681) 已确认 5/5 作业成功 | 覆盖独立审计内存修复；不能代替后续提交或线上验收 |
 
 11:26 复查时三个既有服务仍返回 HTTP 200，Relay 已投递 1,036,522 条，pending 为 1、
 inflight/failed 为 0、计数守恒。持续流量下瞬时 pending 不能单独判定积压故障。
@@ -78,6 +78,23 @@ Canonical 投影内存集合中。平台分页增加总交付状态，完整性�
 隔离镜像 `chiptrace:m0-audit-memory-canary` 的 `m0-test` 也实际退出 0，构建标记为
 `working-tree-audit-payload-retention`；它在断网、只读根文件系统和非 root 用户下运行，
 没有替换线上 Collector/Relay。
+
+后续运维复查发现 ACK-only 备用用户服务仍被启用，累计重启 810,067 次，最近退出码 1，
+日志为 723,461,901 bytes，末尾仍有 `Address already in use`。真实 18084 网关当时返回
+200、`fullTraceCapture.enabled=true` 且传输健康。已停用备用服务、归档 unit 并重新加载
+用户 systemd，复查为 `LoadState=not-found`、`ActiveState=inactive`、`MainPID=0`。
+归档 unit 的 SHA-256 与原件相同，历史日志未删除；完整采集门禁仍因 Wire 过期退出 1。
+
+同一轮真实执行模板负对照：`SessionStart` 收到 ACK-only 的 `HTTP 200 {}` 后退出 0，
+没有返回停止结果。模板现已为九类 Hook 增加持久化确认校验，拒绝无效 JSON、非持久化、
+错误来源、质量错误、计数冲突、超大响应、重定向和 HTTP 失败。定向配置与 Hook 回归
+26/26 通过；隔离真实 Relay/Collector 保存九个生命周期事件的 18 条记录，重复的
+SessionEnd 获得幂等确认且没有增加记录。未修改 Stock Codex 的断网受管配置回归也通过。
+中断确认测试还复现过 curl 内部重试拼接残片、使后续有效确认误失败的问题；命令现已
+按次独立读取确认，最多执行两次，同一原生事件字节不变。新的网络中断回归和最终
+`make cloud-test` 均实际退出 0；完整测试日志保留，失败细节不会仅由摘要替代。
+主机 `/etc/codex` 两个文件仍为 root 所有、当前用户不可写，新的 Hook 和 Provider 约束
+尚需管理员部署。该回归不证明未修改客户端的真实多轮、线上 Wire 或目标 OSS 已验收。
 
 ## 已有优势
 
