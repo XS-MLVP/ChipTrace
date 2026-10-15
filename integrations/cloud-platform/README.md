@@ -11,8 +11,11 @@ The plugin persists job acknowledgements before returning, uses the Rust
 engine's OS lock for a single writer, resumes queued/running jobs after a
 restart, and stores native Session/Turn records in a checksummed JSONL sidecar.
 The `turns` endpoint reads that sidecar by page, so a large Session does not
-remain in the service's heap. Export artifacts are re-verified before every
-download.
+remain in the service's heap. Inspection jobs also retain the verified canonical
+interaction projection; its manifest, ModelInteraction, RuntimeSpan and Link
+parts are available through the projection endpoint and are rechecked against
+their recorded SHA-256 before every download. This keeps the paged Turn summary
+small without dropping the full interaction evidence.
 
 Restores and inspections reuse one verified disk snapshot per archive ID.
 Jobs for the same archive are serialized; distinct archives can run up to the
@@ -32,6 +35,7 @@ POST /v1/jobs
 GET  /v1/jobs?offset=0&limit=50
 GET  /v1/jobs/{id}
 GET  /v1/jobs/{id}/turns?offset=0&limit=50
+GET  /v1/jobs/{id}/projection/{part}
 PUT  /v1/usage/{id}
 GET  /v1/jobs/{id}/packages/{file}
 ```
@@ -106,6 +110,14 @@ ancestry; blank IDs and ambiguous shared traces never join by time or order.
 Exports require `chiptrace.cloud-acceptance.v2`. Historical v1 manifests retain
 their original contract and must be reprocessed from original Raw to qualify
 for the current release.
+
+`projection/{part}` is available for completed inspection jobs with `part` set
+to `manifest`, `interactions`, `runtime`, or `links`. The compressed JSONL
+parts retain every canonical ModelInteraction, RuntimeSpan and InteractionLink;
+the manifest records their counts and checksums. The Turn sidecar remains the
+bounded index containing each Turn's explicit identity, source coverage and Raw
+capture references. Consumers should use those identities and the projection
+parts together rather than treating Session-level counts as Turn evidence.
 
 For a container image, build from the repository root:
 

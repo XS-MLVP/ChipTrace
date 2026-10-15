@@ -15,7 +15,8 @@ HTTP transport：原先 FS 自测可通过，而 OSS/S3 在发送前返回 Confi
 - Rust 1.91：264 个 workspace 测试和 1 个 CLI 测试通过；fmt、Clippy `-D warnings` 通过。
 - Stock Codex 配置、网关 durable outbox：26 个 Node 测试通过。
 - 平台 HTTP/SDK：真实 CLI 四源采集 fixture，归档、恢复、分页 Turn、逐 Turn 四源覆盖、
-  usage 注册、Buyer 导出与下载哈希通过。fixture 中 5 个原生 Turn、10 个采购有效轮次、分数 100。
+  canonical interaction projection 下载与篡改拒绝、usage 注册、Buyer 导出与下载哈希通过。
+  fixture 中 5 个原生 Turn、10 个采购有效轮次、分数 100。
 - 故障测试覆盖非零引擎退出、重启重排队、ID 冲突、UTF-8、请求上限、单写者锁、
   锁丢失、任务 ACK 写盘失败、历史容量限制和 Turn 文件篡改。
 - OSS 使用带 V1 签名检查的 HTTP 协议 fixture，校验不可覆盖写入、Checkpoint 最后提交、

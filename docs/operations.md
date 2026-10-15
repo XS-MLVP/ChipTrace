@@ -108,9 +108,11 @@ chiptrace verify-cloud-acceptance \
 需要把收集与验收能力嵌入已有云平台时，使用
 [integrations/cloud-platform](../integrations/cloud-platform/README.md) 的服务端插件。
 它把每个实例绑定到一个项目命名空间，任务确认、队列、Raw 恢复目录、Session/Turn 分页
-sidecar 和交付包都落在 `CHIPTRACE_PLATFORM_ROOT`；客户端只能提交已授权的 ID，不能传入
-路径、OSS 凭据或降低 Buyer v7 门槛。服务令牌只用于平台后端之间的调用，外层仍应接入
-平台自己的用户鉴权和租户授权。
+sidecar、canonical interaction projection 和交付包都落在 `CHIPTRACE_PLATFORM_ROOT`；
+客户端只能提交已授权的 ID，不能传入路径、OSS 凭据或降低 Buyer v7 门槛。服务令牌只用于
+平台后端之间的调用，外层仍应接入平台自己的用户鉴权和租户授权。检查任务的 `/turns`
+接口提供有界的 Turn 索引，`/projection/{part}` 提供经过 SHA-256 复核的完整
+ModelInteraction、RuntimeSpan 和 InteractionLink 证据。
 
 本地磁盘模式可直接运行：
 

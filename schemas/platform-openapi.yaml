@@ -62,6 +62,35 @@ paths:
         '409': {$ref: '#/components/responses/Error'}
         '422': {$ref: '#/components/responses/Error'}
         '503': {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}/projection/{part}:
+    parameters:
+      - {$ref: '#/components/parameters/Id'}
+      - name: part
+        in: path
+        required: true
+        schema:
+          type: string
+          enum: [manifest, interactions, runtime, links]
+    get:
+      description: Streams a reverified canonical interaction projection part for a completed inspection job.
+      responses:
+        '200':
+          description: Manifest JSON or compressed canonical JSONL projection
+          headers:
+            X-Content-SHA256:
+              schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+            ETag:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {type: object}
+            application/zstd:
+              schema: {type: string, format: binary}
+        '401': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
   /v1/usage/{id}:
     parameters:
       - {$ref: '#/components/parameters/Id'}

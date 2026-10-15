@@ -63,6 +63,15 @@ function createPlatformHandler(plugin, token) {
         const result = await plugin.putUsageLog(decodeURIComponent(usage[1]), await readBody(req, plugin.maxUsageBytes));
         return json(res, result.duplicate ? 200 : 201, result);
       }
+      const projection = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/projection\/([^/]+)$/);
+      if (projection && req.method === 'GET') {
+        const artifact = await plugin.openProjection(decodeURIComponent(projection[1]), decodeURIComponent(projection[2]));
+        res.writeHead(200, { 'content-type': artifact.contentType, 'content-length': artifact.bytes,
+          'content-disposition': `attachment; filename="${artifact.file.split('/').pop()}"`, etag: `"${artifact.sha256}"`,
+          'x-content-sha256': artifact.sha256 });
+        await pipeline(artifact.stream, res);
+        return;
+      }
       const jobPath = url.pathname.match(/^\/v1\/jobs\/([^/]+)(?:\/(turns|packages\/([^/]+)))?$/);
       if (jobPath && req.method === 'GET') {
         const id = decodeURIComponent(jobPath[1]);

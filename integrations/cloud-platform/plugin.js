@@ -7,6 +7,13 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const readline = require('node:readline');
 
+const PROJECTION_PARTS = Object.freeze({
+  manifest: { file: 'manifest.json', contentType: 'application/json; charset=utf-8' },
+  interactions: { file: 'interactions/model-interactions.jsonl.zst', contentType: 'application/zstd' },
+  runtime: { file: 'runtime/runtime-spans.jsonl.zst', contentType: 'application/zstd' },
+  links: { file: 'links/interaction-links.jsonl.zst', contentType: 'application/zstd' },
+});
+
 class PlatformError extends Error {
   constructor(message, status = 400, code = 'INVALID_REQUEST') {
     super(message);
@@ -58,6 +65,29 @@ async function safeDirectory(directory) {
 function decodeUtf8(bytes) {
   try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
   catch { throw new PlatformError('body must be valid UTF-8'); }
+}
+
+function projectionMetadata(value, manifest = null) {
+  if (!value || typeof value !== 'object' || !Array.isArray(value.parts)) return null;
+  const parts = value.parts.map(part => ({
+    file: part.file,
+    bytes: part.bytes,
+    records: part.records ?? null,
+    sha256: part.sha256,
+    uncompressed_bytes: part.uncompressed_bytes ?? null,
+  }));
+  if (parts.some(part => typeof part.file !== 'string' || !Number.isSafeInteger(part.bytes)
+      || typeof part.sha256 !== 'string')) return null;
+  const metadata = {
+    schema_version: value.schema_version,
+    session_id: value.session_id ?? null,
+    interactions: value.interactions,
+    runtime_spans: value.runtime_spans,
+    links: value.links,
+    parts,
+  };
+  if (manifest) metadata.manifest = manifest;
+  return metadata;
 }
 
 function normalizeRequest(input) {
@@ -467,10 +497,34 @@ class ChipTracePlugin {
     }
     if (request.kind === 'restore') return result;
     await this.#phase(job, 'inspecting');
-    const inspected = await this.#engine(['inspect-session', '--input', output, '--session-id', request.session_id]);
+    const projectionRoot = path.join(work, 'projection');
+    const projectionStat = await fsp.lstat(projectionRoot).catch(() => null);
+    if (projectionStat && (!projectionStat.isDirectory() || projectionStat.isSymbolicLink())) {
+      throw new PlatformError('stored interaction projection is invalid', 503, 'CORRUPT_STATE');
+    }
+    const inspected = await this.#engine([
+      'inspect-session', '--input', output, '--session-id', request.session_id,
+      '--projection-output', projectionRoot,
+    ]);
     if (inspected.session?.session_id !== request.session_id || inspected.session.schema_version !== 'chiptrace.session-view.v2') {
       throw new PlatformError('inspection does not match requested Session', 502, 'ENGINE_PROTOCOL');
     }
+    const projection = inspected.projection;
+    const manifestPath = path.join(projectionRoot, 'manifest.json');
+    const manifestBytes = await fsp.readFile(manifestPath);
+    const metadata = projectionMetadata(projection, {
+      file: 'manifest.json',
+      bytes: manifestBytes.length,
+      sha256: crypto.createHash('sha256').update(manifestBytes).digest('hex'),
+    });
+    if (!metadata || metadata.schema_version !== 'chiptrace.interaction-projection.v1'
+        || metadata.session_id !== request.session_id
+        || projection.session_view?.schema_version !== 'chiptrace.session-view.v2'
+        || JSON.stringify(projection.session_view) !== JSON.stringify(inspected.session)) {
+      throw new PlatformError('interaction projection does not match inspected Session', 502, 'ENGINE_PROTOCOL');
+    }
+    delete inspected.projection;
+    inspected.interaction_projection = metadata;
     return inspected;
   }
 
@@ -595,6 +649,79 @@ class ChipTracePlugin {
         throw new PlatformError('package checksum mismatch', 422, 'ARTIFACT_CHANGED');
       }
       return { ...artifact, stream: handle.createReadStream({ start: 0, autoClose: true }) };
+    } catch (error) { await handle.close(); throw error; }
+  }
+
+  async openProjection(id, part) {
+    const release = this.#acquireRead();
+    try {
+      const artifact = await this.#openProjection(id, part);
+      artifact.stream.once('close', release);
+      return artifact;
+    } catch (error) { release(); throw error; }
+  }
+
+  async #openProjection(id, part) {
+    const job = this.getJob(id);
+    if (job.status !== 'completed' || !job.result?.interaction_projection) {
+      throw new PlatformError('interaction projection is not ready', 409, 'JOB_NOT_READY');
+    }
+    const descriptor = PROJECTION_PARTS[part];
+    if (!descriptor) throw new PlatformError('projection part not found', 404, 'NOT_FOUND');
+    const expected = job.result.interaction_projection;
+    if (!expected || !Array.isArray(expected.parts)) {
+      throw new PlatformError('interaction projection metadata is invalid', 503, 'CORRUPT_STATE');
+    }
+    const expectedManifest = expected.manifest;
+    if (!expectedManifest || expectedManifest.file !== 'manifest.json'
+        || !Number.isSafeInteger(expectedManifest.bytes) || typeof expectedManifest.sha256 !== 'string') {
+      throw new PlatformError('interaction projection metadata is invalid', 503, 'CORRUPT_STATE');
+    }
+    const root = path.join(this.root, 'work', component(id, 'job_id'), 'projection');
+    const rootStat = await fsp.lstat(root).catch(() => null);
+    if (!rootStat?.isDirectory() || rootStat.isSymbolicLink()) {
+      throw new PlatformError('interaction projection is missing', 422, 'ARTIFACT_CHANGED');
+    }
+    const manifestPath = path.join(root, 'manifest.json');
+    const manifestStat = await fsp.lstat(manifestPath).catch(() => null);
+    if (!manifestStat?.isFile() || manifestStat.isSymbolicLink() || manifestStat.size !== expectedManifest.bytes) {
+      throw new PlatformError('interaction projection manifest changed', 422, 'ARTIFACT_CHANGED');
+    }
+    const manifestBytes = await fsp.readFile(manifestPath);
+    if (crypto.createHash('sha256').update(manifestBytes).digest('hex') !== expectedManifest.sha256) {
+      throw new PlatformError('interaction projection manifest changed', 422, 'ARTIFACT_CHANGED');
+    }
+    let manifest;
+    try { manifest = JSON.parse(decodeUtf8(manifestBytes)); }
+    catch { throw new PlatformError('interaction projection manifest is invalid', 422, 'ARTIFACT_CHANGED'); }
+    if (JSON.stringify(projectionMetadata(manifest, expected.manifest)) !== JSON.stringify(expected)) {
+      throw new PlatformError('interaction projection metadata changed', 422, 'ARTIFACT_CHANGED');
+    }
+    const expectedPart = descriptor.file === 'manifest.json'
+      ? expectedManifest
+      : expected.parts.find(item => item.file === descriptor.file);
+    if (!expectedPart) throw new PlatformError('projection part is not recorded', 422, 'ARTIFACT_CHANGED');
+    const file = path.join(root, descriptor.file);
+    const stat = await fsp.lstat(file).catch(() => null);
+    if (!stat?.isFile() || stat.isSymbolicLink() || stat.size !== expectedPart.bytes) {
+      throw new PlatformError('interaction projection part changed', 422, 'ARTIFACT_CHANGED');
+    }
+    const handle = await fsp.open(file, 'r');
+    try {
+      const digest = crypto.createHash('sha256');
+      const buffer = Buffer.alloc(1024 * 1024);
+      let position = 0;
+      for (;;) {
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+        if (!bytesRead) break;
+        digest.update(buffer.subarray(0, bytesRead));
+        position += bytesRead;
+      }
+      if (position !== expectedPart.bytes || digest.digest('hex') !== expectedPart.sha256) {
+        throw new PlatformError('interaction projection part checksum mismatch', 422, 'ARTIFACT_CHANGED');
+      }
+      return { file: descriptor.file, bytes: expectedPart.bytes, sha256: expectedPart.sha256,
+        contentType: descriptor.contentType, stream: handle.createReadStream({ start: 0, autoClose: true }) };
     } catch (error) { await handle.close(); throw error; }
   }
 

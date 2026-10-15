@@ -280,6 +280,9 @@ struct InspectSessionArgs {
     input: Vec<PathBuf>,
     #[arg(long)]
     session_id: String,
+    /// 将 canonical interaction projection 持久化到指定目录；省略时使用临时目录。
+    #[arg(long)]
+    projection_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -823,14 +826,25 @@ async fn main() -> Result<()> {
             })?)?
         }
         Command::InspectSession(args) => {
-            let temporary = tempfile::tempdir()?;
+            let temporary = if args.projection_output.is_none() {
+                Some(tempfile::tempdir()?)
+            } else {
+                None
+            };
+            let projection_output = args.projection_output.clone().unwrap_or_else(|| {
+                temporary
+                    .as_ref()
+                    .expect("inspect-session temporary projection directory")
+                    .path()
+                    .join("projection")
+            });
             let projection = project_interactions(InteractionProjectConfig {
                 inputs: args.input,
-                output: temporary.path().join("projection"),
+                output: projection_output,
                 task_session_id: None,
                 session_id: Some(args.session_id),
                 zstd_level: 1,
-                replace: false,
+                replace: args.projection_output.is_some(),
             })?;
             json!({
                 "delivery_ready":projection.session_view.as_ref().is_some_and(|view| view.delivery_ready),
@@ -838,6 +852,7 @@ async fn main() -> Result<()> {
                 "source_coverage":projection.source_coverage,
                 "integrity":projection.integrity,
                 "validation_status":projection.validation_status,
+                "projection":projection,
             })
         }
         Command::AuditSessionContext(args) => serde_json::to_value(audit_session_context(

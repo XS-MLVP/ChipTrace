@@ -76,6 +76,44 @@ test('HTTP service and SDK run the real CLI archive/restore/inspect/export path'
   assert.ok(page.summary.turns === undefined);
   assert.equal(page.turns.length, Math.min(1, page.total));
   assert.equal(Object.prototype.hasOwnProperty.call(page.summary, 'turns'), false);
+  assert.equal(page.turns[0].raw_capture_refs.length > 0, true);
+  const allTurns = await client.getTurns('inspect-job', { offset: 0, limit: 100 });
+  assert.equal(allTurns.turns.length, page.total);
+  assert.equal(allTurns.turns.reduce((sum, turn) => sum + turn.model_interactions, 0), page.summary.model_interactions);
+  assert.equal(allTurns.turns.reduce((sum, turn) => sum + turn.tool_execution_records, 0), page.summary.tool_execution_records);
+
+  const inspectedProjection = inspectedJob.result.interaction_projection;
+  assert.equal(inspectedProjection.schema_version, 'chiptrace.interaction-projection.v1');
+  assert.equal(inspectedProjection.session_id, 'thread-self-test');
+  assert.equal(inspectedProjection.interactions, page.summary.model_interactions);
+  assert.ok(inspectedProjection.runtime_spans > 0);
+  assert.ok(inspectedProjection.links > 0);
+  const projectionManifestResponse = await client.downloadProjection('inspect-job', 'manifest');
+  assert.equal(projectionManifestResponse.headers.get('content-type'), 'application/json; charset=utf-8');
+  const projectionManifest = await projectionManifestResponse.json();
+  assert.equal(projectionManifest.schema_version, inspectedProjection.schema_version);
+  assert.deepEqual(projectionManifest.parts, inspectedProjection.parts);
+  for (const [part, file] of Object.entries({
+    interactions: 'interactions/model-interactions.jsonl.zst',
+    runtime: 'runtime/runtime-spans.jsonl.zst',
+    links: 'links/interaction-links.jsonl.zst',
+  })) {
+    const response = await client.downloadProjection('inspect-job', part);
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const metadata = inspectedProjection.parts.find(item => item.file === file);
+    assert.ok(metadata);
+    assert.equal(bytes.length, metadata.bytes);
+    assert.equal(crypto.createHash('sha256').update(bytes).digest('hex'), metadata.sha256);
+    assert.equal(response.headers.get('x-content-sha256'), metadata.sha256);
+  }
+  await assert.rejects(client.downloadProjection('inspect-job', 'unknown'), error => error.status === 404);
+  const projectionPartPath = path.join(root, 'platform/work/inspect-job/projection/interactions/model-interactions.jsonl.zst');
+  const originalProjectionPart = await fs.readFile(projectionPartPath);
+  const tamperedProjectionPart = Buffer.from(originalProjectionPart);
+  tamperedProjectionPart[0] ^= 1;
+  await fs.writeFile(projectionPartPath, tamperedProjectionPart);
+  await assert.rejects(client.downloadProjection('inspect-job', 'interactions'), error => error.status === 422 && error.code === 'ARTIFACT_CHANGED');
+  await fs.writeFile(projectionPartPath, originalProjectionPart);
 
   const usage = await fs.readFile(data.usage);
   assert.equal((await client.putUsageLog('usage-1', usage)).duplicate, false);
