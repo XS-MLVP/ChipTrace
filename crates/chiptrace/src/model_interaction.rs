@@ -5259,6 +5259,19 @@ fn build_tool_runtime_spans(
                     && model_names.is_disjoint(&authoritative_names))
         });
         let native_result_consistency = native_tool_result_payload_consistency(&captures);
+        // Every native result is a source fact. A later complete observation
+        // cannot erase an earlier truncated result or an unknown completeness
+        // flag. Hook payloads remain independent representations.
+        let result_content_captured = native_result_consistency.incomplete_observations == 0
+            && execution
+                .get("result_content_captured")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+        let output_truncated = if native_result_consistency.observations > 0 {
+            native_result_consistency.output_truncated
+        } else {
+            execution.get("output_truncated").and_then(Value::as_bool)
+        };
         let conflict = authoritative_statuses.len() > 1
             || process_outcomes.len() > 1
             || authoritative_names.len() > 1
@@ -5301,9 +5314,8 @@ fn build_tool_runtime_spans(
                 "buyer_schema_eligible":execution.get("schema").is_some_and(|schema| !schema.is_null())
                     && execution.pointer("/schema/schema_provenance/source_complete")
                         .and_then(Value::as_bool) != Some(false),
-                "result_content_captured":execution.get("result_content_captured")
-                    .and_then(Value::as_bool).unwrap_or(true),
-                "output_truncated":execution.get("output_truncated"),
+                "result_content_captured":result_content_captured,
+                "output_truncated":output_truncated,
                 "lifecycle_terminal":lifecycle_terminal,
                 "semantic_status":semantic_status,
                 "semantic_status_provenance":semantic_status_provenance,
@@ -5333,6 +5345,8 @@ struct NativeToolResultPayloadConsistency {
     observations: usize,
     arguments_conflict: bool,
     result_conflict: bool,
+    incomplete_observations: usize,
+    output_truncated: Option<bool>,
 }
 
 fn native_tool_result_payload_consistency(
@@ -5344,6 +5358,25 @@ fn native_tool_result_payload_consistency(
         let execution = &capture["toolExecution"];
         if string_field(execution, "source_event_name") != Some("codex.tool_result") {
             continue;
+        }
+        let output_truncated = execution.get("output_truncated").and_then(Value::as_bool);
+        consistency.output_truncated = match (
+            consistency.observations,
+            consistency.output_truncated,
+            output_truncated,
+        ) {
+            (0, _, flag) => flag,
+            (_, Some(true), _) | (_, _, Some(true)) => Some(true),
+            (_, Some(false), Some(false)) => Some(false),
+            _ => None,
+        };
+        if output_truncated != Some(false)
+            || execution
+                .get("result_content_captured")
+                .and_then(Value::as_bool)
+                == Some(false)
+        {
+            consistency.incomplete_observations += 1;
         }
         consistency.observations += 1;
         if let Some(first) = first {
@@ -7250,24 +7283,35 @@ mod tests {
     }
 
     fn native_payload_observation(arguments: &str, output: &str) -> Value {
+        native_payload_observation_with_completeness(arguments, output, Some(false))
+    }
+
+    fn native_payload_observation_with_completeness(
+        arguments: &str,
+        output: &str,
+        output_truncated: Option<bool>,
+    ) -> Value {
         use crate::cloud_ingest::{CloudEndpoint, prepare_cloud_ingest};
 
         let attr = |key: &str, value: Value| json!({"key":key,"value":value});
+        let mut attributes = vec![
+            attr("event.name", json!({"stringValue":"codex.tool_result"})),
+            attr("conversation.id", json!({"stringValue":"payload-session"})),
+            attr("turn.id", json!({"stringValue":"payload-turn"})),
+            attr("call_id", json!({"stringValue":"payload-call"})),
+            attr("tool_name", json!({"stringValue":"read_workspace"})),
+            attr("tool_namespace", json!({"stringValue":"functions"})),
+            attr("arguments", json!({"stringValue":arguments})),
+            attr("output", json!({"stringValue":output})),
+            attr("success", json!({"boolValue":true})),
+        ];
+        if let Some(truncated) = output_truncated {
+            attributes.push(attr("output_truncated", json!({"boolValue":truncated})));
+        }
         let raw = serde_json::to_vec(&json!({
             "resourceLogs":[{"scopeLogs":[{"logRecords":[{
                 "timeUnixNano":"1788307201000000000",
-                "attributes":[
-                    attr("event.name", json!({"stringValue":"codex.tool_result"})),
-                    attr("conversation.id", json!({"stringValue":"payload-session"})),
-                    attr("turn.id", json!({"stringValue":"payload-turn"})),
-                    attr("call_id", json!({"stringValue":"payload-call"})),
-                    attr("tool_name", json!({"stringValue":"read_workspace"})),
-                    attr("tool_namespace", json!({"stringValue":"functions"})),
-                    attr("arguments", json!({"stringValue":arguments})),
-                    attr("output", json!({"stringValue":output})),
-                    attr("success", json!({"boolValue":true})),
-                    attr("output_truncated", json!({"boolValue":false}))
-                ]
+                "attributes":attributes
             }]}]}]
         }))
         .unwrap();
@@ -7306,6 +7350,37 @@ mod tests {
     }
 
     #[test]
+    fn native_result_incompleteness_survives_later_complete_observations() {
+        let mut observed = Vec::new();
+        for incomplete_flag in [Some(true), None] {
+            let complete = native_payload_observation("{}", "same captured output");
+            let incomplete = native_payload_observation_with_completeness(
+                "{}",
+                "same captured output",
+                incomplete_flag,
+            );
+            for captures in [
+                [incomplete.clone(), complete.clone()],
+                [complete.clone(), incomplete.clone()],
+            ] {
+                let spans = build_runtime_spans(&captures, &[]).unwrap();
+                let span = spans
+                    .iter()
+                    .find(|span| span["call_id"] == "payload-call")
+                    .unwrap();
+                assert_eq!(span["extensions"]["state_conflict"], false);
+                assert_eq!(span["raw_capture_refs"].as_array().unwrap().len(), 2);
+                observed.push(span["extensions"]["result_content_captured"].clone());
+            }
+        }
+        assert_eq!(
+            observed,
+            vec![json!(false); 4],
+            "truncated and unknown native results must block in either arrival order"
+        );
+    }
+
+    #[test]
     fn equivalent_native_payloads_and_hook_views_do_not_conflict() {
         let first = native_payload_observation(r#"{"target":"original","limit":1}"#, "same result");
         let repeated =
@@ -7316,6 +7391,8 @@ mod tests {
         hook["toolExecution"]["status"] = json!("unknown");
         hook["toolExecution"]["arguments"] = json!({"hook_view":"different representation"});
         hook["toolExecution"]["result"] = json!({"hook_view":"different representation"});
+        hook["toolExecution"]["result_content_captured"] = json!(false);
+        hook["toolExecution"]["output_truncated"] = json!(true);
         let captures = [first, repeated, hook];
         let spans = build_runtime_spans(&captures, &[]).unwrap();
         let span = spans
@@ -7325,9 +7402,14 @@ mod tests {
         assert_eq!(span["extensions"]["state_conflict"], false);
         assert_eq!(span["raw_capture_refs"].as_array().unwrap().len(), 3);
         assert_eq!(span["result"], "same result");
+        assert_eq!(span["extensions"]["result_content_captured"], true);
+        assert_eq!(span["extensions"]["output_truncated"], false);
         assert_eq!(
             span["extensions"]["native_result_consistency"],
-            json!({"observations":2,"arguments_conflict":false,"result_conflict":false})
+            json!({
+                "observations":2,"arguments_conflict":false,"result_conflict":false,
+                "incomplete_observations":0,"output_truncated":false
+            })
         );
     }
 

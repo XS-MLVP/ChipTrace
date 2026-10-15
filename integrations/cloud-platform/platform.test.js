@@ -243,6 +243,67 @@ test('conflicting native tool payloads prevent delivery and Buyer export while p
   });
 });
 
+test('native result incompleteness blocks delivery in either arrival order', { timeout: 180000 }, async t => {
+  for (const completeness of ['truncated', 'unknown']) for (const order of ['incomplete-first', 'incomplete-last']) {
+    await t.test(`${completeness}/${order}`, async t => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-native-completeness-'));
+      let app;
+      t.after(async () => { if (app) await app.close(); await fs.rm(root, { recursive: true, force: true }); });
+      const data = await fixture(root);
+      const segmentsRoot = path.join(data.captureRoot, 'segments');
+      const segments = (await fs.readdir(segmentsRoot)).filter(name => name.endsWith('.sealed.ndjson')).sort();
+      const records = [];
+      for (const name of segments) records.push(...(await fs.readFile(path.join(segmentsRoot, name), 'utf8'))
+        .trim().split('\n').filter(Boolean).map(line => JSON.parse(line)));
+      const original = records.find(record => record.toolExecution?.source_event_name === 'codex.tool_result'
+        && record.toolExecution.call_id === 'call-2');
+      assert.ok(original, 'the fixture must include a native OTLP result');
+      const complete = structuredClone(original);
+      complete.captureId = 'cap-native-completeness-complete';
+      const incomplete = structuredClone(original);
+      incomplete.captureId = 'cap-native-completeness-incomplete';
+      incomplete.toolExecution.output_truncated = completeness === 'truncated' ? true : null;
+      incomplete.toolExecution.result_content_captured = false;
+      const extra = order === 'incomplete-first' ? [incomplete, complete] : [complete, incomplete];
+      const segment = path.join(segmentsRoot, segments.at(-1));
+      await fs.appendFile(segment, extra.map(record => JSON.stringify(record)).join('\n') + '\n');
+      const bytes = await fs.readFile(segment);
+      const token = 'platform-test-token-with-at-least-32-bytes';
+      app = await createPlatformServer({ plugin: new ChipTracePlugin({ projectId: 'project-test', root: path.join(root, 'platform'),
+        captureRoot: data.captureRoot, objectRoot: data.objectRoot, binary, prefix: 'datasets/chiptrace' }), token });
+      await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
+      const client = new ChipTraceClient({ baseUrl: `http://127.0.0.1:${app.server.address().port}`, token });
+      await client.submit({ id: 'archive-incomplete', kind: 'archive', archive_id: 'raw-incomplete' });
+      assert.equal((await client.wait('archive-incomplete')).status, 'completed');
+      await client.submit({ id: 'inspect-incomplete', kind: 'inspect', archive_id: 'raw-incomplete', session_id: 'thread-self-test' });
+      const inspected = await client.wait('inspect-incomplete');
+      assert.equal(inspected.status, 'completed');
+      assert.equal(inspected.result.delivery_ready, false);
+      assert.equal(inspected.result.session.delivery_ready, true);
+      assert.equal(inspected.result.integrity.runtime_complete, false);
+      assert.equal((await client.getTurns('inspect-incomplete')).delivery_ready, false);
+      const response = await client.downloadProjection('inspect-incomplete', 'runtime');
+      const spans = decodeProjectionJsonl(Buffer.from(await response.arrayBuffer()));
+      const tool = spans.find(span => span.span_kind === 'tool_execution' && span.call_id === 'call-2');
+      assert.equal(tool.extensions.state_conflict, false);
+      assert.equal(tool.extensions.result_content_captured, false);
+      assert.equal(tool.extensions.output_truncated, completeness === 'truncated' ? true : null);
+      assert.equal(tool.extensions.native_result_consistency.observations, 3);
+      assert.equal(tool.extensions.native_result_consistency.incomplete_observations, 1);
+      for (const capture of [original, complete, incomplete]) assert.ok(tool.raw_capture_refs.includes(capture.captureId));
+      await client.putUsageLog('incomplete-usage', await fs.readFile(data.usage));
+      await client.submit({ id: 'export-incomplete', kind: 'export', archive_id: 'raw-incomplete',
+        session_id: 'thread-self-test', release_id: 'release-incomplete', usage_log_ids: ['incomplete-usage'] });
+      const exported = await client.wait('export-incomplete');
+      assert.equal(exported.status, 'failed');
+      assert.equal(exported.error.exit_code, 1);
+      assert.match(exported.error.message, /interaction projection is not delivery ready; failed gates: runtime_complete/);
+      await assert.rejects(client.download('export-incomplete', 'buyer-package.tar.gz'), error => error.status === 409);
+      assert.deepEqual(await fs.readFile(segment), bytes);
+    });
+  }
+});
+
 test('HTTP service and SDK run the real CLI archive/restore/inspect/export path', { timeout: 60000 }, async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-platform-'));
   let app;

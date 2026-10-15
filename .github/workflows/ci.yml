@@ -298,7 +298,7 @@ jobs:
         with:
           name: native-context-report
           path: native-context.tap
-      - name: Verify platform recovery, native tool payload conflicts, delivery gates and OSS protocol
+      - name: Verify platform native result quality, recovery, delivery gates and OSS protocol
         run: |
           set -euo pipefail
           node --test integrations/cloud-platform/platform.test.js integrations/cloud-platform/storage-oss.test.js 2>&1 | tee platform.tap
@@ -407,10 +407,12 @@ jobs:
         with:
           name: container-ingest-receipt-report
           path: container-ingest-receipt.tap
-      - name: Verify platform isolation, native tool payload conflicts and export refusal in a container
+      - name: Verify platform result quality and export refusal under container limits
         run: |
           set -euo pipefail
           docker run --rm --network none --read-only \
+            --memory 1g --cpus 2 --pids-limit 256 \
+            --cap-drop ALL --security-opt no-new-privileges \
             --tmpfs /tmp:size=1g,mode=1777 \
             -v "$PWD/integrations/cloud-platform:/tests:ro" \
             chiptrace-platform:ci --test /tests/platform.test.js /tests/storage-oss.test.js \
