@@ -35,6 +35,50 @@ pub struct CaptureRecord {
     pub legacy_raw_sha256: Option<String>,
     pub received_at: Option<String>,
     pub model: Option<String>,
+    // Derived from the already parsed envelope; never added to persisted bytes.
+    pub(crate) wire_evidence: WireCaptureEvidence,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WireCaptureEvidence {
+    pub turn_scoped: bool,
+    pub http_success: bool,
+    pub identity_conflict: bool,
+}
+
+impl WireCaptureEvidence {
+    fn from_capture(value: &Value) -> Self {
+        if value.get("recordType").and_then(Value::as_str) != Some("api_snapshot") {
+            return Self::default();
+        }
+        let present = |path| {
+            value
+                .pointer(path)
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
+        };
+        let session =
+            present("/traceContext/source_session_id") || present("/traceContext/session_id");
+        let turn = present("/traceContext/turn_id") || present("/traceContext/root_turn_id");
+        let identity_conflict = value
+            .get("fieldEvidenceConflicts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|item| {
+                item.get("field")
+                    .and_then(Value::as_str)
+                    .is_some_and(|field| field.starts_with("traceContext."))
+            });
+        Self {
+            turn_scoped: session && turn && !identity_conflict,
+            http_success: value
+                .get("responseStatus")
+                .and_then(Value::as_u64)
+                .is_some_and(|status| (200..300).contains(&status)),
+            identity_conflict,
+        }
+    }
 }
 
 impl CaptureRecord {
@@ -234,6 +278,7 @@ pub(crate) fn normalize_capture_with_policy(
         .and_then(|body| body.get("model"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let wire_evidence = WireCaptureEvidence::from_capture(&value);
     let canonical = serde_json::to_vec(&value)?;
     if canonical.len() > max_bytes {
         bail!("normalized capture envelope exceeds {max_bytes} bytes");
@@ -246,6 +291,7 @@ pub(crate) fn normalize_capture_with_policy(
         legacy_raw_sha256,
         received_at,
         model,
+        wire_evidence,
     })
 }
 
@@ -298,7 +344,9 @@ pub fn validate_stored_capture(raw: &[u8]) -> Result<CaptureRecord> {
     let value: Value = serde_json::from_slice(raw)?;
     // Run the current structural validator, but retain the exact historical
     // bytes. WAL locators and hashes must never change during migration.
-    let _ = normalize_capture_with_policy(raw, raw.len().saturating_add(1024 * 1024), false)?;
+    let wire_evidence =
+        normalize_capture_with_policy(raw, raw.len().saturating_add(1024 * 1024), false)?
+            .wire_evidence;
     let capture_id = value
         .get("captureId")
         .and_then(Value::as_str)
@@ -325,6 +373,7 @@ pub fn validate_stored_capture(raw: &[u8]) -> Result<CaptureRecord> {
         legacy_raw_sha256: None,
         received_at,
         model,
+        wire_evidence,
     })
 }
 
@@ -1846,6 +1895,70 @@ fn validate_trace_context(object: &Map<String, Value>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_health_evidence_requires_native_session_turn_and_http_success() {
+        for (status, trace, scoped, success) in [
+            (403, json!({}), false, false),
+            (200, json!({"session_id":"s"}), false, true),
+            (200, json!({"session_id":" ","turn_id":"t"}), false, true),
+            (
+                200,
+                json!({"task_session_id":"s","turn_id":"t"}),
+                false,
+                true,
+            ),
+            (429, json!({"session_id":"s","turn_id":"t"}), true, false),
+            (201, json!({"session_id":"s","turn_id":"t"}), true, true),
+            (
+                299,
+                json!({"source_session_id":"s","root_turn_id":"t"}),
+                true,
+                true,
+            ),
+            (300, json!({"session_id":"s","turn_id":"t"}), true, false),
+        ] {
+            let value = json!({
+                "captureId":"cap-wire-health-evidence",
+                "recordType":"api_snapshot",
+                "sourceNamespace":"test",
+                "traceContext":trace,
+                "responseStatus":status,
+                "requestBodyText":"{}",
+                "responseBodyText":"{}"
+            });
+            let record =
+                normalize_wire_capture(&serde_json::to_vec(&value).unwrap(), 16384).unwrap();
+            assert_eq!(record.wire_evidence.turn_scoped, scoped, "{value}");
+            assert_eq!(record.wire_evidence.http_success, success, "{value}");
+            assert!(!record.wire_evidence.identity_conflict);
+            let persisted: Value = serde_json::from_slice(&record.canonical).unwrap();
+            assert!(persisted.get("wire_evidence").is_none());
+        }
+    }
+
+    #[test]
+    fn wire_health_rejects_conflicting_context_without_changing_stored_bytes() {
+        for field in ["session_id", "turn_id", "root_turn_id"] {
+            let mut value = json!({
+                "captureId":"cap-wire-conflicting-health",
+                "recordType":"api_snapshot",
+                "sourceNamespace":"test",
+                "traceContext":{"session_id":"s","turn_id":"t","root_turn_id":"root"},
+                "requestBody":{"client_metadata":{}},
+                "responseStatus":200
+            });
+            value["requestBody"]["client_metadata"][field] = json!("conflicting-id");
+            let raw = serde_json::to_vec_pretty(&value).unwrap();
+            let normalized = normalize_wire_capture(&raw, 16384).unwrap();
+            assert!(normalized.wire_evidence.identity_conflict, "{field}");
+            assert!(!normalized.wire_evidence.turn_scoped, "{field}");
+            let stored = validate_stored_capture(&raw).unwrap();
+            assert_eq!(stored.wire_evidence, normalized.wire_evidence);
+            assert_eq!(stored.canonical, raw);
+            assert_eq!(stored.sha256, hex::encode(Sha256::digest(&raw)));
+        }
+    }
 
     #[test]
     fn normalizes_legacy_text_body_and_redacts_credentials() {

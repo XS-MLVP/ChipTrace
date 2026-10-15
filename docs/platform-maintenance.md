@@ -44,7 +44,11 @@ MinIO 公共容器标签的远端拉取已返回 access denied；CI 因此从固
 
 升级完成后还要运行 `node scripts/ci/runtime-health-gate.js` 检查网关和 Relay 的实时门禁。
 它会拒绝旧版本缺少 `openCaptureHealthy` 的响应，以及 `freshness_applicable=false` 的
-Relay 快照，避免把“Runtime 仍在增长、Wire 已断流”误判为完整采集。
+Relay 快照，避免把“Runtime 仍在增长、Wire 已断流”误判为完整采集。runtime gate v2
+还独立校验 `wire_turn_coverage`：明确 Session/Turn、无上下文冲突的 HTTP 2xx Capture
+必须近期获得新的 durable ACK；403、无身份请求和 duplicate 不刷新该证据。统计只包含
+真实成功 ACK，批量冲突和失败项被排除；CI 保存 `runtime-health-gate-report` TAP artifact。
+HTTP 2xx 不证明协议终态，门禁始终输出 `session_delivery_claimed=false`。
 门禁还会比较网关和 Relay 的 `delivered` 总数；两端计数不一致时必须先定位投递账本或
 健康快照延迟，不能继续交接数据。
 
@@ -59,7 +63,8 @@ Hook 只验证采集凭据和 Hook ACK，无法阻止 Responses 绕过采集网�
 约束；`stock-managed-route` CI 作业以未修改客户端、断网容器验证用户配置和命令行覆盖被
 约束，并保留旧模板确实可绕过的负对照。该配置回归不使用模型或业务凭据，不代表真实
 Turn 上下文、线上配置或 OSS 已验收。当前线上 Collector/Relay revision 为 `fe9fcf9`，
-runtime gate 因 Wire 缺失仍失败；受管配置模板还未应用到线上主机。
+新进程唯一 Wire 是没有原生 Session/Turn 的 HTTP 403，随后 runtime gate 因 Wire 过期
+失败；受管配置模板和新的 Turn Wire 统计还未应用到线上主机。
 
 ## 真实字段回归与当前缺口
 

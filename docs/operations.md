@@ -42,7 +42,9 @@ Relay 目录；OTLP 与 Hook 使用独立采集凭据。Wire Capture 使用网�
 2026-10-15 复查确认，18084、3011、3012 均返回 HTTP 200；Collector/Relay 已运行
 revision `fe9fcf924b226099202cb770b7cf0da29e0c2310`，`pending=0`、`failed=0`、
 `conservation_ok=true`。18084 的 open transaction 已为 0，293 个历史失败文件
-（267,219,223 bytes）仍保留。新 Relay 进程收到 OTLP logs/traces 和 Hook，但 Wire 为 0，
+（267,219,223 bytes）仍保留。新 Relay 进程收到 OTLP logs/traces 和 Hook，Wire 只有 1 条；
+活动 WAL 的固定长度只读快照确认它是没有原生 Session/Turn 的 HTTP 403。全局四源门禁
+曾短暂通过，但这不证明业务 Turn 采集成功。随后 Wire 超过 5 分钟未更新，
 `required_sources_fresh=false`，带预期 revision 的 runtime gate 真实退出 1。
 trace exporter 未启用，watchdog 最近报告重试失败；18086 没有监听。
 
@@ -164,6 +166,8 @@ CI 使用隔离 MinIO 验证 S3 协议、对象长度和 SHA-256；真实 Alibab
   应按 `missing_sources`、`stale_sources`、`source_lag_ms`、`runtime_age_ms` 和 `wire_lag_ms`
   检查 Stock Codex 受管配置；不能用 Runtime 来源的增长把 Wire 断流解释为 complete。
 - Relay `pending`、`inflight`、最老队列时间、磁盘空间和 attempt 守恒。
+- `ingest_coverage.wire_turn_coverage` 的成功 Turn Wire 数及新鲜度。无身份、上下文冲突、
+  非 2xx 请求和重复投递均不能刷新 `last_successful_at`；它们仍计入各自真实 ACK 统计。
 - `output_truncated=true`、未知 OTLP 事件、转换错误和身份冲突。
 - Session start/end、模型调用/结果/执行、内部父引用的完整率；以及每个 Turn 的 Wire、
   OTLP logs、OTLP traces、required Hook 覆盖和 `incomplete_turns`。
@@ -171,7 +175,8 @@ CI 使用隔离 MinIO 验证 S3 协议、对象长度和 SHA-256；真实 Alibab
 
 网关 `/health` 的 `fullTraceCapture.currentDeliveryHealthy=true`、`outbox.pending=0`、
 `outbox.processing=0`、`outbox.recentFailureCount=0` 且 `rustRelay.conservationOk=true`
-才表示当前 Wire 投递闭环可交接。`historicalFailures` 是启动前保留的审计证据，不应因
+才表示当前传输闭环健康；它们不证明收到过有归属的成功 Turn Wire。
+`historicalFailures` 是启动前保留的审计证据，不应因
 数量非零而清理或把服务标成故障。旧版本在正文脱敏后可能留下过期的 body 长度/哈希；当前
 outbox 会在新写入和发送历史副本前按实际 UTF-8 正文幂等重算元数据，并保留已有的原文哈希。
 `outbox.openTransactions`、`outbox.oldestOpenAgeMs` 和 `outbox.staleOpenTransactions` 也必须
@@ -191,7 +196,13 @@ node scripts/ci/runtime-health-gate.js \
 
 该门禁同时要求网关 `openCaptureHealthy`、Relay `freshness_applicable`、四路来源新鲜、
 队列排空、attempt 守恒，并在提供 `--expected-revision` 时确认 Relay 健康响应中的构建
-revision 与待发布镜像一致。旧网关缺少 `openCaptureHealthy`，或旧 Relay 在 Runtime 有流量而
+revision 与待发布镜像一致。v2 还要求 `wire_turn_coverage` 有明确原生 Session/Turn、无
+上下文冲突的 HTTP 2xx Capture，且最近一次新 durable Capture 在五分钟窗口内；旧 Relay
+缺少新统计时失败。统计按真实 durable ACK 逐条累加，包含 duplicate，批量冲突或失败项
+不计入；duplicate 不刷新成功证据的时间。HTTP 2xx 仅指 HTTP 状态，不证明 SSE 模型终态、
+客户端交付或整个 Session 完整。输出固定 `session_delivery_claimed=false`，逐 Session
+交付仍必须通过 `cloud-acceptance`。
+旧网关缺少 `openCaptureHealthy`，或旧 Relay 在 Runtime 有流量而
 Wire 停止时返回 `freshness_applicable=false`，都会失败；历史失败文件仍保留为审计证据，
 不会被当作当前失败清理。
 重放失败证据时只能复制到 `pending`（不要移动或删除 `failed` 原件），确认 Relay durable

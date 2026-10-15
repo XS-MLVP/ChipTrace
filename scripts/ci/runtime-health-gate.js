@@ -97,6 +97,46 @@ function verifyCoverageRoute(route, source) {
   nonEmptyString(value.last_at, `relay.ingest_coverage.${source}.last_at`);
 }
 
+function verifyWireTurnCoverage(coverage) {
+  const label = 'relay.ingest_coverage.wire_turn_coverage';
+  const turns = object(coverage.wire_turn_coverage, label);
+  if (turns.success_definition !== 'http_2xx') fail(`${label}.success_definition must be http_2xx`);
+  if (turns.freshness_definition !== 'new_durable_capture') {
+    fail(`${label}.freshness_definition must be new_durable_capture`);
+  }
+  const scoped = nonNegativeInteger(turns.turn_scoped_captures, `${label}.turn_scoped_captures`);
+  const successful = nonNegativeInteger(
+    turns.successful_turn_scoped_captures, `${label}.successful_turn_scoped_captures`,
+  );
+  const unscoped = nonNegativeInteger(turns.unscoped_captures, `${label}.unscoped_captures`);
+  const conflicts = nonNegativeInteger(
+    turns.identity_conflict_captures, `${label}.identity_conflict_captures`,
+  );
+  const durable = nonNegativeInteger(
+    coverage.wire.durable_captures, 'relay.ingest_coverage.wire.durable_captures',
+  );
+  if (scoped + unscoped !== durable || successful > scoped || conflicts > unscoped) {
+    fail(`${label} counts are inconsistent with durable Wire captures`);
+  }
+  if (successful === 0) fail(`${label}.successful_turn_scoped_captures must be positive`);
+  nonEmptyString(turns.last_successful_at, `${label}.last_successful_at`);
+  const age = nonNegativeInteger(turns.last_successful_age_ms, `${label}.last_successful_age_ms`);
+  if (coverage.freshness_window_ms === 0 || age > coverage.freshness_window_ms) {
+    fail(`${label}.last_successful_age_ms exceeds the positive freshness window`);
+  }
+  requireTrue(turns.successful_turn_scoped_fresh, `${label}.successful_turn_scoped_fresh`);
+  return {
+    success_definition: turns.success_definition,
+    freshness_definition: turns.freshness_definition,
+    turn_scoped_captures: scoped,
+    successful_turn_scoped_captures: successful,
+    unscoped_captures: unscoped,
+    identity_conflict_captures: conflicts,
+    last_successful_at: turns.last_successful_at,
+    last_successful_age_ms: age,
+  };
+}
+
 function verifyRelayHealth(health) {
   object(health, 'relay health');
   if (health.status !== 'healthy') fail('relay status must be healthy');
@@ -137,6 +177,7 @@ function verifyRelayHealth(health) {
   nonNegativeInteger(coverage.freshness_window_ms, 'relay.ingest_coverage.freshness_window_ms');
   nonNegativeInteger(coverage.wire_age_ms, 'relay.ingest_coverage.wire_age_ms');
   for (const source of REQUIRED_SOURCES) verifyCoverageRoute(coverage[source], source);
+  const wireTurnCoverage = verifyWireTurnCoverage(coverage);
 
   return {
     status: health.status,
@@ -145,6 +186,7 @@ function verifyRelayHealth(health) {
     coverage_status: coverage.status,
     freshness_applicable: coverage.freshness_applicable,
     required_sources_fresh: coverage.required_sources_fresh,
+    wire_turn_coverage: wireTurnCoverage,
     sources: REQUIRED_SOURCES.reduce((result, source) => {
       result[source] = coverage[source].source_records;
       return result;
@@ -163,7 +205,9 @@ function verifyRuntimeHealth(gatewayHealth, relayHealth, { expectedRevision } = 
     );
   }
   return {
-    schema_version: 'chiptrace.runtime-health-gate.v1',
+    schema_version: 'chiptrace.runtime-health-gate.v2',
+    // This process-wide health gate cannot prove any Session's full delivery.
+    session_delivery_claimed: false,
     expected_revision: expectedRevision ?? null,
     build_revision: buildRevision,
     gateway,

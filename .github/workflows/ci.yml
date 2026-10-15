@@ -140,7 +140,15 @@ jobs:
       - run: node --test scripts/ci/upstream-context.test.js
       - run: node --test scripts/ci/native-canary-gate.test.js
       - run: node --test scripts/ci/native-canary-evidence.test.js
-      - run: node --test scripts/ci/runtime-health-gate.test.js
+      - name: Verify runtime delivery and Turn Wire evidence fails closed
+        run: |
+          set -euo pipefail
+          node --test scripts/ci/runtime-health-gate.test.js | tee runtime-health-gate.tap
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runtime-health-gate-report
+          path: runtime-health-gate.tap
       - name: Emit the patched multi-turn Canary gate artifact
         run: |
           set -euo pipefail

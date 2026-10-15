@@ -122,8 +122,11 @@ Native Turn 和 2 个 Session epoch，覆盖第二轮、resume、失败工具进
 `unscoped_otlp_records=0`；仓库门禁输出 `selected_audit_records=3621`、
 `delivery_ready=true`。该结果只证明 producer 补丁链路在隔离环境满足 v2 门禁。
 
-Collector/Relay 已部署 revision `fe9fcf924b226099202cb770b7cf0da29e0c2310`，但新进程缺少
-Wire，runtime gate 仍失败。未修改 Stock Codex 的同等两轮证据、真实 Alibaba OSS 账户和
+Collector/Relay 已部署 revision `fe9fcf924b226099202cb770b7cf0da29e0c2310`。新进程只有
+1 条没有原生 Session/Turn 的 HTTP 403 Wire；全局四源门禁曾短暂通过，随后因 Wire 过期
+真实退出 1。这个通过窗口不构成 Native Turn 的业务采集证据。runtime gate v2 新增成功
+Turn Wire 与独立新鲜度要求，并保留 `session_delivery_claimed=false`；该修复尚未部署。
+未修改 Stock Codex 的同等两轮证据、真实 Alibaba OSS 账户和
 18086 平台服务仍未完成验收。18084/Collector/Relay 的传输健康和 `pending=0` 不能替代逐 Session 的
 Turn 来源覆盖；历史通过的 v1 长任务也必须从原始 Raw 按当前 v2 门槛重验。GitHub CI 会把
 门禁摘要作为 `native-canary-gate-report` artifact 保存，方便审查者核对这一区分。

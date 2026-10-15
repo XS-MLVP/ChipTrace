@@ -1,5 +1,6 @@
 use crate::capture::{
-    CaptureRecord, normalize_capture, normalize_wire_capture, normalize_wire_capture_batch,
+    CaptureRecord, WireCaptureEvidence, normalize_capture, normalize_wire_capture,
+    normalize_wire_capture_batch,
 };
 use crate::cloud_ingest::{CloudEndpoint, CloudIngestBatch, prepare_cloud_ingest};
 use crate::ingest::{BodyReadError, InflightBodyBudget};
@@ -1195,10 +1196,21 @@ struct RouteCoverage {
     last_observed_millis: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct WireTurnCoverage {
+    turn_scoped_captures: u64,
+    successful_turn_scoped_captures: u64,
+    unscoped_captures: u64,
+    identity_conflict_captures: u64,
+    last_successful_at: Option<String>,
+    last_successful_observed_millis: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 struct IngestCoverageState {
     started_at: String,
     wire: RouteCoverage,
+    wire_turn_coverage: WireTurnCoverage,
     otlp_logs: RouteCoverage,
     otlp_traces: RouteCoverage,
     hooks: RouteCoverage,
@@ -1212,6 +1224,7 @@ impl IngestCoverageState {
         Self {
             started_at: utc_now(),
             wire: RouteCoverage::default(),
+            wire_turn_coverage: WireTurnCoverage::default(),
             otlp_logs: RouteCoverage::default(),
             otlp_traces: RouteCoverage::default(),
             hooks: RouteCoverage::default(),
@@ -1221,11 +1234,17 @@ impl IngestCoverageState {
         }
     }
 
-    fn observe_wire(&mut self, durable: u64, duplicates: u64) {
-        if durable == 0 {
+    fn observe_wire(&mut self, acknowledged: &[(WireCaptureEvidence, bool)]) {
+        if acknowledged.is_empty() {
             return;
         }
+        let durable = acknowledged.len() as u64;
+        let duplicates = acknowledged
+            .iter()
+            .filter(|(_, duplicate)| *duplicate)
+            .count() as u64;
         let observed_millis = unix_millis();
+        let observed_at = utc_now();
         self.wire.requests = self.wire.requests.saturating_add(1);
         self.wire.source_records = self.wire.source_records.saturating_add(durable);
         self.wire.durable_captures = self.wire.durable_captures.saturating_add(durable);
@@ -1234,7 +1253,29 @@ impl IngestCoverageState {
             .first_observed_millis
             .get_or_insert(observed_millis);
         self.wire.last_observed_millis = Some(observed_millis);
-        self.wire.last_at = Some(utc_now());
+        self.wire.last_at = Some(observed_at.clone());
+        let turns = &mut self.wire_turn_coverage;
+        for (evidence, duplicate) in acknowledged {
+            if evidence.turn_scoped {
+                turns.turn_scoped_captures = turns.turn_scoped_captures.saturating_add(1);
+                if evidence.http_success {
+                    turns.successful_turn_scoped_captures =
+                        turns.successful_turn_scoped_captures.saturating_add(1);
+                    // Retrying an already durable capture cannot keep business
+                    // evidence fresh indefinitely.
+                    if !duplicate {
+                        turns.last_successful_at = Some(observed_at.clone());
+                        turns.last_successful_observed_millis = Some(observed_millis);
+                    }
+                }
+            } else {
+                turns.unscoped_captures = turns.unscoped_captures.saturating_add(1);
+            }
+            if evidence.identity_conflict {
+                turns.identity_conflict_captures =
+                    turns.identity_conflict_captures.saturating_add(1);
+            }
+        }
     }
 
     fn observe_cloud(
@@ -1272,6 +1313,10 @@ impl IngestCoverageState {
     }
 
     fn snapshot_at(&self, now_millis: u64) -> Value {
+        let turns = &self.wire_turn_coverage;
+        let successful_turn_scoped_age_ms = turns
+            .last_successful_observed_millis
+            .map(|last| now_millis.saturating_sub(last));
         let sources_observed = self.wire.requests > 0
             && self.otlp_logs.requests > 0
             && self.otlp_traces.requests > 0
@@ -1364,7 +1409,20 @@ impl IngestCoverageState {
                 "hooks":source_lag_ms(&self.wire, &self.hooks),
             },
             "buyer_eligibility_claimed":false,
+            "session_delivery_claimed":false,
             "wire":route_coverage_value(&self.wire),
+            "wire_turn_coverage":{
+                "success_definition":"http_2xx",
+                "freshness_definition":"new_durable_capture",
+                "turn_scoped_captures":turns.turn_scoped_captures,
+                "successful_turn_scoped_captures":turns.successful_turn_scoped_captures,
+                "unscoped_captures":turns.unscoped_captures,
+                "identity_conflict_captures":turns.identity_conflict_captures,
+                "last_successful_at":turns.last_successful_at,
+                "last_successful_age_ms":successful_turn_scoped_age_ms,
+                "successful_turn_scoped_fresh":successful_turn_scoped_age_ms
+                    .is_some_and(|age| age <= INGEST_COVERAGE_FRESHNESS_WINDOW_MS),
+            },
             "otlp_logs":route_coverage_value(&self.otlp_logs),
             "otlp_traces":route_coverage_value(&self.otlp_traces),
             "hooks":route_coverage_value(&self.hooks),
@@ -1659,9 +1717,9 @@ async fn relay_captures(State(state): State<RelayAppState>, request: Request) ->
 }
 
 async fn relay_enqueue_batch(state: &RelayAppState, records: Vec<CaptureRecord>) -> Response {
-    let capture_ids: Vec<String> = records
+    let capture_metadata: Vec<(String, WireCaptureEvidence)> = records
         .iter()
-        .map(|record| record.capture_id.clone())
+        .map(|record| (record.capture_id.clone(), record.wire_evidence))
         .collect();
     let results = match state.relay.enqueue_batch(records).await {
         Ok(results) => results,
@@ -1676,13 +1734,15 @@ async fn relay_enqueue_batch(state: &RelayAppState, records: Vec<CaptureRecord>)
     let mut duplicates = 0_u64;
     let mut conflicts = 0_u64;
     let mut unavailable = 0_u64;
-    let outcomes: Vec<Value> = capture_ids
+    let mut acknowledged = Vec::new();
+    let outcomes: Vec<Value> = capture_metadata
         .into_iter()
         .zip(results)
-        .map(|(capture_id, result)| match result {
+        .map(|((capture_id, evidence), result)| match result {
             Ok(ack) => {
                 durable += 1;
                 duplicates += u64::from(ack.duplicate);
+                acknowledged.push((evidence, ack.duplicate));
                 json!({
                     "capture_id": capture_id,
                     "ok": true,
@@ -1721,7 +1781,7 @@ async fn relay_enqueue_batch(state: &RelayAppState, records: Vec<CaptureRecord>)
         .ingest_coverage
         .lock()
         .expect("ingest coverage poisoned")
-        .observe_wire(durable, duplicates);
+        .observe_wire(&acknowledged);
     relay_response(
         if durable == total {
             if duplicates == total {
@@ -1769,13 +1829,14 @@ async fn relay_capture(State(state): State<RelayAppState>, request: Request) -> 
                 );
             }
         };
+    let evidence = record.wire_evidence;
     match state.relay.enqueue_record(record).await {
         Ok(ack) => {
             state
                 .ingest_coverage
                 .lock()
                 .expect("ingest coverage poisoned")
-                .observe_wire(1, u64::from(ack.duplicate));
+                .observe_wire(&[(evidence, ack.duplicate)]);
             relay_response(
                 if ack.duplicate {
                     StatusCode::OK
@@ -1977,10 +2038,8 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn cloud_auth_and_invalid_payload_fail_before_retry_queue() {
-        let temporary = tempfile::tempdir().unwrap();
-        let config = RelayConfig {
+    fn test_config(temporary: &tempfile::TempDir) -> RelayConfig {
+        RelayConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             store: StoreConfig {
                 root: temporary.path().join("outbox"),
@@ -2010,8 +2069,13 @@ mod tests {
             max_inflight_body_bytes: 4 * 1024 * 1024,
             max_batch_records: 64,
             ingest_bearer_token: Some("test-cloud-token-at-least-32-bytes".to_owned()),
-        };
-        let relay = DurableRelay::open(config).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cloud_auth_and_invalid_payload_fail_before_retry_queue() {
+        let temporary = tempfile::tempdir().unwrap();
+        let relay = DurableRelay::open(test_config(&temporary)).await.unwrap();
         let state = RelayAppState {
             relay: relay.clone(),
             body_budget: InflightBodyBudget::new(4 * 1024 * 1024, 1024 * 1024).unwrap(),
@@ -2171,6 +2235,201 @@ mod tests {
         relay.close().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn wire_turn_coverage_counts_only_durable_single_and_partial_batch_acks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let relay = DurableRelay::open(test_config(&temporary)).await.unwrap();
+        let state = RelayAppState {
+            relay: relay.clone(),
+            body_budget: InflightBodyBudget::new(4 * 1024 * 1024, 1024 * 1024).unwrap(),
+            max_batch_records: 64,
+            ingest_coverage: Arc::new(Mutex::new(IngestCoverageState::new())),
+        };
+        let wire = |id, status, trace| {
+            json!({
+                "captureId":id,"recordType":"api_snapshot","sourceNamespace":"test",
+                "requestBodyText":"{}","responseBodyText":"{}",
+                "responseStatus":status,"traceContext":trace
+            })
+        };
+        let request = |body: String, content_type| {
+            Request::builder()
+                .header("content-type", content_type)
+                .header(AUTHORIZATION, "Bearer test-cloud-token-at-least-32-bytes")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let unscoped = wire("cap-unscoped-403", 403, json!({}));
+        for status in [StatusCode::ACCEPTED, StatusCode::OK] {
+            assert_eq!(
+                relay_capture(
+                    State(state.clone()),
+                    request(unscoped.to_string(), "application/json")
+                )
+                .await
+                .status(),
+                status
+            );
+        }
+        let snapshot = state.ingest_coverage.lock().unwrap().snapshot();
+        assert_eq!(snapshot["wire"]["durable_captures"], 2);
+        assert_eq!(snapshot["wire_turn_coverage"]["unscoped_captures"], 2);
+        assert_eq!(
+            snapshot["wire_turn_coverage"]["successful_turn_scoped_fresh"],
+            false
+        );
+
+        let scoped = json!({"session_id":"s","turn_id":"t"});
+        let success = wire("cap-single-success", 200, scoped.clone());
+        assert_eq!(
+            relay_capture(
+                State(state.clone()),
+                request(success.to_string(), "application/json")
+            )
+            .await
+            .status(),
+            StatusCode::ACCEPTED
+        );
+        let conflict = wire(
+            "cap-single-success",
+            200,
+            json!({"session_id":"s","turn_id":"other"}),
+        );
+        assert_eq!(
+            relay_capture(
+                State(state.clone()),
+                request(conflict.to_string(), "application/json")
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        let mut identity_conflict = wire("cap-identity-conflict", 200, scoped.clone());
+        identity_conflict["requestBodyText"] =
+            json!("{\"client_metadata\":{\"session_id\":\"other\"}}");
+        let batch = [
+            wire("cap-unscoped-403", 200, scoped.clone()), // Conflicts with durable 403.
+            wire("cap-batch-403", 403, json!({})),
+            wire("cap-batch-429", 429, scoped.clone()),
+            identity_conflict,
+            wire("cap-batch-201", 201, scoped),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        let response = relay_captures(
+            State(state.clone()),
+            request(batch.clone(), "application/x-ndjson"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::MULTI_STATUS);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(body["counts"]["durable"], 4);
+        assert_eq!(body["counts"]["conflicts"], 1);
+        let response = relay_health(State(state.clone())).await;
+        let health: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        let coverage = &health["ingest_coverage"];
+        assert_eq!(coverage["wire"]["durable_captures"], 7);
+        assert_eq!(coverage["wire"]["duplicates"], 1);
+        let turns = &coverage["wire_turn_coverage"];
+        assert_eq!(turns["turn_scoped_captures"], 3);
+        assert_eq!(turns["successful_turn_scoped_captures"], 2);
+        assert_eq!(turns["unscoped_captures"], 4);
+        assert_eq!(turns["identity_conflict_captures"], 1);
+        assert_eq!(turns["successful_turn_scoped_fresh"], true);
+        assert_eq!(coverage["session_delivery_claimed"], false);
+
+        let retry =
+            relay_captures(State(state.clone()), request(batch, "application/x-ndjson")).await;
+        assert_eq!(retry.status(), StatusCode::MULTI_STATUS);
+        let after_retry = state.ingest_coverage.lock().unwrap().snapshot();
+        assert_eq!(after_retry["wire"]["durable_captures"], 11);
+        assert_eq!(after_retry["wire"]["duplicates"], 5);
+        assert_eq!(
+            after_retry["wire_turn_coverage"]["last_successful_at"],
+            turns["last_successful_at"]
+        );
+        relay.close().await.unwrap();
+
+        let closed_wire = wire(
+            "cap-closed-single",
+            200,
+            json!({"session_id":"s","turn_id":"t"}),
+        );
+        assert_eq!(
+            relay_capture(
+                State(state.clone()),
+                request(closed_wire.to_string(), "application/json")
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let closed_batch = wire(
+            "cap-closed-batch",
+            200,
+            json!({"session_id":"s","turn_id":"t"}),
+        );
+        let response = relay_captures(
+            State(state.clone()),
+            request(closed_batch.to_string(), "application/x-ndjson"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::MULTI_STATUS);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(body["counts"]["durable"], 0);
+        assert_eq!(body["counts"]["unavailable"], 1);
+        let after_unavailable = state.ingest_coverage.lock().unwrap().snapshot();
+        assert_eq!(after_unavailable["wire"], after_retry["wire"]);
+        assert_eq!(
+            after_unavailable["wire_turn_coverage"]["successful_turn_scoped_captures"],
+            after_retry["wire_turn_coverage"]["successful_turn_scoped_captures"]
+        );
+        assert_eq!(
+            after_unavailable["wire_turn_coverage"]["last_successful_at"],
+            after_retry["wire_turn_coverage"]["last_successful_at"]
+        );
+    }
+
+    #[test]
+    fn unscoped_failed_and_duplicate_wire_cannot_refresh_successful_turn_evidence() {
+        let mut coverage = IngestCoverageState::new();
+        let success = WireCaptureEvidence {
+            turn_scoped: true,
+            http_success: true,
+            identity_conflict: false,
+        };
+        coverage.observe_wire(&[(success, false)]);
+        let before = coverage.wire_turn_coverage.last_successful_at.clone();
+        coverage.wire_turn_coverage.last_successful_observed_millis = Some(1_000);
+        coverage.observe_wire(&[
+            (WireCaptureEvidence::default(), false),
+            (
+                WireCaptureEvidence {
+                    http_success: false,
+                    ..success
+                },
+                false,
+            ),
+            (success, true),
+        ]);
+        let snapshot = coverage.snapshot();
+        assert!(snapshot["wire_age_ms"].as_u64().unwrap() <= INGEST_COVERAGE_FRESHNESS_WINDOW_MS);
+        assert_eq!(
+            snapshot["wire_turn_coverage"]["successful_turn_scoped_fresh"],
+            false
+        );
+        assert_eq!(coverage.wire_turn_coverage.last_successful_at, before);
+        assert_eq!(
+            coverage.wire_turn_coverage.last_successful_observed_millis,
+            Some(1_000)
+        );
+    }
+
     #[test]
     fn ingest_coverage_lists_all_missing_sources_while_warming() {
         let snapshot = IngestCoverageState::new().snapshot();
@@ -2218,7 +2477,7 @@ mod tests {
     #[test]
     fn ingest_coverage_separates_source_observation_from_buyer_eligibility() {
         let mut coverage = IngestCoverageState::new();
-        coverage.observe_wire(2, 0);
+        coverage.observe_wire(&[(WireCaptureEvidence::default(), false); 2]);
         for endpoint in [
             CloudEndpoint::OtlpLogs,
             CloudEndpoint::OtlpTraces,
@@ -2255,7 +2514,7 @@ mod tests {
     #[test]
     fn ingest_coverage_degrades_when_runtime_sources_lag_active_wire() {
         let mut coverage = IngestCoverageState::new();
-        coverage.observe_wire(1, 0);
+        coverage.observe_wire(&[(WireCaptureEvidence::default(), false)]);
         for endpoint in [
             CloudEndpoint::OtlpLogs,
             CloudEndpoint::OtlpTraces,
@@ -2303,7 +2562,7 @@ mod tests {
     #[test]
     fn ingest_coverage_degrades_when_active_wire_never_gets_runtime_sources() {
         let mut coverage = IngestCoverageState::new();
-        coverage.observe_wire(1, 0);
+        coverage.observe_wire(&[(WireCaptureEvidence::default(), false)]);
         let first_wire = coverage.wire.first_observed_millis.unwrap();
         let latest_wire = first_wire + INGEST_COVERAGE_FRESHNESS_WINDOW_MS + 1;
         coverage.wire.last_observed_millis = Some(latest_wire);
@@ -2323,7 +2582,7 @@ mod tests {
     #[test]
     fn ingest_coverage_degrades_when_runtime_is_active_without_recent_wire() {
         let mut coverage = IngestCoverageState::new();
-        coverage.observe_wire(1, 0);
+        coverage.observe_wire(&[(WireCaptureEvidence::default(), false)]);
         for endpoint in [
             CloudEndpoint::OtlpLogs,
             CloudEndpoint::OtlpTraces,

@@ -46,8 +46,10 @@ Wire、OTLP 和 Hook 使用 Stock Codex 自带的 Session、Turn、call ID 和 W
 
 同日复查确认 Collector/Relay 已运行 revision
 `fe9fcf924b226099202cb770b7cf0da29e0c2310`，18084、3011、3012 返回 200；传输队列排空且
-`conservation_ok=true`。但新 Relay 进程内 Wire 仍为 0，OTLP/Hook 有流量，runtime gate
-因来源不完整而失败。18084 保留 293 个历史失败文件（约 267 MB），trace exporter 未启用，
+`conservation_ok=true`。新 Relay 进程内仅有 1 条 Wire；只读活动 WAL 快照确认它是没有
+原生 Session/Turn 的 HTTP 403，不能作为真实 Turn 的采集证据。OTLP/Hook 仍有流量，
+随后 Wire 超过 5 分钟未更新，runtime gate 真实退出 1。18084 保留 293 个历史失败文件
+（约 267 MB），trace exporter 未启用，
 watchdog 仍有错误；18086 没有监听。当前提交的远端 CI 因 GitHub 查询不可达而未确认，
 真实 OSS 账号及未修改客户端的 v2 多轮验收也未完成，因此尚不能按生产就绪对外交付。
 
@@ -55,6 +57,9 @@ watchdog 仍有错误；18086 没有监听。当前提交的远端 CI 因 GitHub
 受管 requirements 模板现已强制 Provider 选择和完整网关定义，并增加固定版本未修改
 客户端的断网配置回归；部署方式和能力边界见 [Stock Codex 接入](integrations/codex/README.md)。
 这项模板修复尚未应用到线上主机，不能视为线上 Wire 已恢复。
+仓库 runtime gate v2 另要求近期有明确 Session/Turn、无上下文冲突的 HTTP 2xx Wire，
+并拒绝缺少该统计的旧 Relay；重复投递不能刷新这类证据。完整评估和发布条件见
+[生产就绪评估](docs/production-readiness.md)。该门禁修复尚未部署到上述线上 revision。
 
 ## 构建
 
@@ -96,6 +101,7 @@ OTLP 单根且内部父引用全部可解析。
 - [部署与运维](docs/operations.md)
 - [数据契约](docs/data-contract.md)
 - [验收矩阵](docs/acceptance-matrix.md)
+- [生产就绪评估](docs/production-readiness.md)
 - [交付格式](docs/delivery.md)
 - [OpenAPI](schemas/openapi.yaml)
 - [云平台嵌入插件](integrations/cloud-platform/README.md)

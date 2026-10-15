@@ -103,7 +103,13 @@ paths:
         "503": {description: 背压或存储不可用}
   /health:
     get:
-      summary: WAL、队列、投递守恒与当前进程四路采集覆盖及五分钟新鲜度
+      summary: WAL、队列、投递守恒、四路覆盖与成功 Turn Wire 的独立新鲜度
+      description: >-
+        传输健康不代表 Session 完整。Relay ingest_coverage.wire_turn_coverage
+        按 durable ACK 统计有原生 Session/Turn 且无上下文冲突的 Wire、其中 HTTP 2xx
+        的数量及无归属/冲突数量；只有非重复的有归属 HTTP 2xx Capture 刷新成功证据时间。
+        HTTP 2xx 不证明 SSE 终态。runtime health gate v2 要求该证据近期有效，
+        并固定声明 session_delivery_claimed=false。
       responses:
         "200": {description: 就绪}
         "503": {description: 未就绪}

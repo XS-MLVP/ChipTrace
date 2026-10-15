@@ -35,7 +35,9 @@ function gateway() {
 }
 
 function relay() {
-  const route = source_records => ({ requests: 1, source_records, last_at: '2026-10-15T00:00:00Z' });
+  const route = source_records => ({
+    requests: 1, source_records, durable_captures: source_records, last_at: '2026-10-15T00:00:00Z',
+  });
   return {
     status: 'healthy',
     ok: true,
@@ -58,6 +60,17 @@ function relay() {
       missing_sources: [],
       stale_sources: [],
       wire: route(8),
+      wire_turn_coverage: {
+        success_definition: 'http_2xx',
+        freshness_definition: 'new_durable_capture',
+        turn_scoped_captures: 6,
+        successful_turn_scoped_captures: 5,
+        unscoped_captures: 2,
+        identity_conflict_captures: 1,
+        last_successful_at: '2026-10-15T00:00:00Z',
+        last_successful_age_ms: 0,
+        successful_turn_scoped_fresh: true,
+      },
       otlp_logs: route(15),
       otlp_traces: route(9),
       hooks: route(8),
@@ -65,12 +78,54 @@ function relay() {
   };
 }
 
-test('runtime health gate accepts a fresh four-source delivery closure', () => {
+test('runtime health gate requires fresh scoped HTTP success without claiming Session delivery', () => {
   const result = verifyRuntimeHealth(gateway(), relay());
-  assert.equal(result.schema_version, 'chiptrace.runtime-health-gate.v1');
+  assert.equal(result.schema_version, 'chiptrace.runtime-health-gate.v2');
+  assert.equal(result.session_delivery_claimed, false);
   assert.equal(result.gateway.open_capture_healthy, true);
   assert.equal(result.relay.freshness_applicable, true);
   assert.deepEqual(result.relay.sources, { wire: 8, otlp_logs: 15, otlp_traces: 9, hooks: 8 });
+  assert.equal(result.relay.wire_turn_coverage.successful_turn_scoped_captures, 5);
+});
+
+test('older health with only global Wire traffic fails closed', () => {
+  const value = relay();
+  delete value.ingest_coverage.wire_turn_coverage;
+  assert.throws(() => verifyRuntimeHealth(gateway(), value), /wire_turn_coverage must be an object/);
+});
+
+test('unscoped 403 traffic and scoped non-2xx responses cannot satisfy the runtime gate', () => {
+  for (const scoped of [0, 8]) {
+    const value = relay();
+    Object.assign(value.ingest_coverage.wire_turn_coverage, {
+      turn_scoped_captures: scoped,
+      successful_turn_scoped_captures: 0,
+      unscoped_captures: 8 - scoped,
+      identity_conflict_captures: 0,
+      last_successful_at: null,
+      last_successful_age_ms: null,
+      successful_turn_scoped_fresh: false,
+    });
+    assert.throws(() => verifyRuntimeHealth(gateway(), value),
+      /successful_turn_scoped_captures must be positive/);
+  }
+});
+
+test('fresh global Wire cannot hide stale successful Turn evidence or inconsistent counters', () => {
+  for (const changes of [
+    { last_successful_age_ms: 300001 },
+    { successful_turn_scoped_fresh: false },
+    { last_successful_age_ms: null },
+    { successful_turn_scoped_captures: 7 },
+    { unscoped_captures: 3 },
+    { identity_conflict_captures: 3 },
+    { success_definition: 'http_or_sse_success' },
+    { freshness_definition: 'any_retry' },
+  ]) {
+    const value = relay();
+    Object.assign(value.ingest_coverage.wire_turn_coverage, changes);
+    assert.throws(() => verifyRuntimeHealth(gateway(), value), /wire_turn_coverage/);
+  }
 });
 
 test('old gateway health without openCaptureHealthy fails closed', () => {
@@ -150,6 +205,33 @@ test('runtime gate CLI preserves a real failure and diagnoses Wire missing from 
     assert.equal(error.stdout, '');
     assert.match(error.stderr, /observed=degraded; missing_sources=wire; stale_sources=wire/);
     assert.doesNotMatch(error.stderr, /private-untrusted-source/);
+    return true;
+  });
+});
+
+test('runtime gate CLI returns nonzero for an unscoped 403 despite fresh four-source health', async t => {
+  const current = relay();
+  Object.assign(current.ingest_coverage.wire_turn_coverage, {
+    turn_scoped_captures: 0,
+    successful_turn_scoped_captures: 0,
+    unscoped_captures: 8,
+    identity_conflict_captures: 0,
+    last_successful_at: null,
+    last_successful_age_ms: null,
+    successful_turn_scoped_fresh: false,
+  });
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json', connection: 'close' });
+    res.end(JSON.stringify(req.url === '/gateway' ? gateway() : current));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  await assert.rejects(promisify(execFile)(process.execPath, [require.resolve('./runtime-health-gate'),
+    '--gateway-url', `${url}/gateway`, '--relay-url', `${url}/relay`], { timeout: 10000 }), error => {
+    assert.equal(error.code, 1);
+    assert.equal(error.stdout, '');
+    assert.match(error.stderr, /successful_turn_scoped_captures must be positive/);
     return true;
   });
 });
