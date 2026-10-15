@@ -1,6 +1,6 @@
 # 生产就绪评估
 
-评估日期：2026-10-15。首次线上读取窗口为 10:53–10:59（Asia/Shanghai），11:26、12:17、12:55、13:17 再次只读复查。
+评估日期：2026-10-15。首次线上读取窗口为 10:53–10:59（Asia/Shanghai），最新线上只读复查为 13:49。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
@@ -10,14 +10,14 @@
 | --- | --- | --- |
 | 18084、3011、3012 | HTTP 200 | 入口与采集进程存活 |
 | Collector/Relay | revision `fe9fcf924b226099202cb770b7cf0da29e0c2310` | 运行版本已固定；仓库新增修复尚未部署 |
-| 投递 | 12:17 同一快照已投递 1,039,543 条，pending/inflight/failed 为 0，计数守恒 | 累计传输闭环；不能当作并发压测结果 |
-| Collector 磁盘 | 12:17 有 726 个 sealed Segment，80,540,839,951 bytes；活动段仍在增长 | 云端本地 WAL 持续保存；不能证明 OSS 已提交 |
+| 投递 | 13:49 同一快照已投递 1,045,024 条，pending/inflight/failed 为 0，计数守恒 | 累计传输闭环；不能当作并发压测结果或完整 Session 数 |
+| Collector 磁盘 | 13:49 有 727 个 sealed Segment，81,065,877,360 bytes；活动段仍在增长 | 云端共享 NFS 上的 WAL 持续保存；不能证明 OSS 已提交 |
 | Wire | 新进程内仅 1 条；活动 WAL 中为无原生 Session/Turn 的 HTTP 403 | 无真实成功 Turn Wire 的证据 |
-| 来源新鲜度 | OTLP/Hook 有流量，Wire 超过五分钟未更新；runtime gate 实际退出 1 | 当前采集覆盖降级 |
+| 来源新鲜度 | 13:49 OTLP/Hook 有流量，Wire 约 186 分钟未更新；runtime gate 实际退出 1 | 当前采集覆盖降级 |
 | 历史失败 | 293 个文件，267,219,223 bytes | 保留失败取证，不能删除换取健康状态 |
 | 平台 18086 | 无法连接 | 当前无法交接在线管理、导出入口 |
 | 部署隔离 | Relay 要求 ingest token；Collector/Relay 绑定 loopback；两容器有重启策略 | 有内部入口保护；两容器尚无内存/CPU 上限或只读根文件系统 |
-| GitHub CI | `eb70405` 的 [run 38683383719](https://github.com/XS-MLVP/ChipTrace/actions/runs/38683383719) 已确认 5/5 作业成功 | 覆盖原生 Hook 持久化确认修复；不能代替后续提交或线上验收 |
+| GitHub CI | `91bcd79` 的 [run 38687168540](https://github.com/XS-MLVP/ChipTrace/actions/runs/38687168540) 已确认 5/5 作业成功 | 覆盖持久化确认、生产者缓存与固定 Go 工具链；不能代替后续提交或线上验收 |
 
 11:26 复查时三个既有服务仍返回 HTTP 200，Relay 已投递 1,036,522 条，pending 为 1、
 inflight/failed 为 0、计数守恒。持续流量下瞬时 pending 不能单独判定积压故障。
@@ -96,12 +96,30 @@ SessionEnd 获得幂等确认且没有增加记录。未修改 Stock Codex 的�
 主机 `/etc/codex` 两个文件仍为 root 所有、当前用户不可写，新的 Hook 和 Provider 约束
 尚需管理员部署。该回归不证明未修改客户端的真实多轮、线上 Wire 或目标 OSS 已验收。
 
-12:55 的 runtime gate 再次实际退出 1，诊断为 `stale_sources=wire`。13:17 只读复查时，
+12:55 的 runtime gate 再次实际退出 1，诊断为 `stale_sources=wire`。13:49 只读复查时，
 18084、3011、3012 仍返回 HTTP 200，Collector/Relay 仍是 `fe9fcf9`；同一窗口已投递
-1,043,285 条，pending/inflight/failed 为 0，计数守恒。Wire 仍只有 1 条，约 154 分钟
-未更新；18086 仍为 `ECONNREFUSED`。两个 root 所有的受管配置文件仍为九月的修改时间；
+1,045,024 条，pending/inflight/failed 为 0，计数守恒。Wire 仍只有 1 条，约 186 分钟
+未更新，runtime gate 真实退出 1；18086 仍为 `ECONNREFUSED`。
+同一轮容器瞬时内存为 Relay 1.726 GiB、Collector 113.5 MiB；容器未设置内存或 CPU
+上限。该瞬时观测不是峰值容量或泄漏诊断。共享 NFS 使用率为 57%，没有因此证明项目
+配额、保留策略或真实 OSS 归档已生效。两个 root 所有的受管配置文件仍为九月的修改时间；
 已退役的 ACK-only unit 仍为 not-found/inactive。维护分支已有后续修复，但远端 main
 仍为 `514d4cf`。这些结果表明代码、线上部署和可交付能力尚未闭合。
+
+## 业务鉴权与客户端环境
+
+同日后续接入排查进一步核对了业务鉴权边界：同一份已配置的 Codex 凭据用于共享
+Provider 目录时返回 HTTP 200，用于 18084 `/models` 时返回 HTTP 401。18084 源码将
+业务鉴权交给当前 Sub2API 上游验证；仅有另一个 Provider 的可用凭据，无法据此完成
+这个入口的真实 Wire Canary。该检查只读取模型目录，未调用模型、未输出密钥或正文。
+维护进程未设置 `CHIPTRACE_API_KEY`、`CHIPTRACE_INGEST_TOKEN` 和
+`OTEL_EXPORTER_OTLP_HEADERS`；其他已运行进程的 OTLP/Hook 流量不能证明新进程已有
+这些环境变量。当前唯一安装和 npm alpha 均仍是 `0.163.0-alpha.11`，状态与更新检查
+均退出 0；没有已发现的新发行版本可以替代当前原生上下文缺口的验收。
+
+管理员部署受管配置前，还需向目标新进程注入 18084 对应的授权业务凭据及采集凭据。
+业务和采集凭据从本项目授权 Secret 或主机管理系统注入；共享 Provider 按主机策略
+维护。真实 Alibaba OSS 和主平台身份接入的验收条件继续保留。
 
 ## 已有优势
 
@@ -120,7 +138,7 @@ SessionEnd 获得幂等确认且没有增加记录。未修改 Stock Codex 的�
 
 | 优先级 | 工作 | 完成证据 |
 | --- | --- | --- |
-| P0 | 应用受管 Provider 路由约束，恢复真实 Wire | 新客户端普通任务经 18084；Wire 含原生 Session/Turn；新 runtime gate 通过 |
+| P0 | 注入目标业务与采集凭据，应用受管 Provider 路由约束，恢复真实 Wire | 新客户端普通任务经 18084；Wire 含原生 Session/Turn；新 runtime gate 通过 |
 | P0 | 获得符合 v2 上下文契约的未修改生产者版本 | 真实第二轮、resume、失败工具及延迟 `write_stdin`；`unscoped=0`；`--require-unmodified-stock` 通过 |
 | P0 | 在目标 OSS 账号验收存储、恢复与交付 | 连续 sealed Archive 上传、Checkpoint、逐对象校验、恢复、损坏拒绝、Buyer 包下载复验 |
 | P0 | 发布平台服务 | 18086/API 可访问；通过主平台身份鉴权完成一次真实采集到导出下载 |

@@ -22,6 +22,14 @@ export CHIPTRACE_INGEST_TOKEN='<ingest-token>'
 export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer%20${CHIPTRACE_INGEST_TOKEN}"
 ```
 
+`CHIPTRACE_API_KEY` 必须是目标 18084 上游业务系统授权的凭据。当前 router_v2 部署由
+Sub2API 验证业务鉴权；另一个 Provider 接受的凭据不能据此视为可在 18084 使用。
+2026-10-15 使用同一份现有 Codex 凭据做只读目录检查，共享 Provider 返回 HTTP 200，
+18084 `/models` 返回 HTTP 401；没有发送模型请求，也没有输出凭据或响应正文。
+管理员应先在目标新客户端进程注入三项环境变量，并用该部署授权的业务凭据验证目录
+访问，再下发受管配置和运行真实 Canary。目录访问成功只证明该次目录请求被接受，
+模型生成、逐 Turn 四源和远端持久化仍需分别验收。
+
 安装文件后保持权限为 `0600`，并用严格配置启动：
 
 ```bash

@@ -129,6 +129,7 @@ setup-node 7.1.0、upload-artifact 7.0.2 固定到 SHA；三者原生使用 Node
 | 原先仅缓存依赖 | `eb70405` / [38683383719](https://github.com/XS-MLVP/ChipTrace/actions/runs/38683383719) | 9 分 51 秒 |
 | 工作区缓存首次填充 | `fd5fd0f` / [38684659151](https://github.com/XS-MLVP/ChipTrace/actions/runs/38684659151) | 19 分 44 秒 |
 | 工作区缓存实际命中 | `dd3de61` / [38686561355](https://github.com/XS-MLVP/ChipTrace/actions/runs/38686561355) | 2 分 04 秒 |
+| 固定 Go 工具链后的再次命中 | `91bcd79` / [38687168540](https://github.com/XS-MLVP/ChipTrace/actions/runs/38687168540) | 1 分 55 秒 |
 
 命中轮的步骤实际返回 `exact cache hit: true`，随后生产者测试和 CLI 构建分别执行 7 秒和
 13 秒，均成功。新缓存为 2,562,094,057 bytes，源码身份与隔离 clean checkout 的完整
@@ -138,8 +139,10 @@ setup-node 7.1.0、upload-artifact 7.0.2 固定到 SHA；三者原生使用 Node
 测试。只读 HEAD 复查确认 tag API 可用，但 v6 对应提交与稳定 v7.0.0 的 codeload
 归档均返回 HTTP 404。工作流改由 runner 预装 Go 的原生 `GOTOOLCHAIN=go1.24.2`
 机制选择工具链，构建前检查真实 `go env GOVERSION`；MinIO 源码仍固定同一 commit。
-工具链日志和完整构建日志另随 S3 报告保留。该路径必须由后续实际 CI 构建与 S3 测试
-验收，不能用原作业的初始化失败或本地 YAML 检查推断通过。
+工具链日志和完整构建日志另随 S3 报告保留。`91bcd79` 的上述 Actions run 已真实完成
+工具链检查、MinIO 编译和 S3 测试，五个作业均成功；生产者作业再次实际命中缓存，仍执行
+全部测试及 CLI 构建。该结果不替代后续提交的 CI，也不证明线上部署或真实 Alibaba OSS
+账号已验收。
 
 宿主网关还须使用 `openCaptureHealthy` 门禁。独立部署 smoke：
 
