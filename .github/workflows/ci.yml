@@ -174,6 +174,15 @@ jobs:
       - run: node --test integrations/openai-gateway/durable-outbox.test.js
       - name: Build the CLI used by native Hook and platform regressions
         run: cargo build --locked --bin chiptrace
+      - name: Verify gateway removal requires real Relay and Collector receipts
+        run: |
+          set -euo pipefail
+          node --test integrations/openai-gateway/relay-receipt.test.js 2>&1 | tee gateway-receipt.tap
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: gateway-receipt-report
+          path: gateway-receipt.tap
       - name: Verify native Hook configuration and durable acknowledgements
         run: |
           set -euo pipefail

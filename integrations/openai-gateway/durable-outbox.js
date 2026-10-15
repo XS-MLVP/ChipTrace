@@ -324,6 +324,31 @@ function isRetryableStatus(status) {
   return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
+function relayReceiptError(payload, captureId, inputBytes, inputSha256) {
+  if (payload?.ok !== true || payload.durable !== true || payload.local_durable !== true) {
+    return 'Relay did not confirm local durability';
+  }
+  const input = payload.input_receipt;
+  if (input?.schema_version !== 'chiptrace.capture-input-receipt.v1'
+    || input.bytes !== inputBytes || input.sha256 !== inputSha256) {
+    return 'Relay receipt does not match the transmitted bytes';
+  }
+  const capture = payload.capture;
+  if (capture?.capture_id !== captureId || capture.durable !== true
+    || typeof payload.duplicate !== 'boolean' || capture.duplicate !== payload.duplicate
+    || capture.state !== (payload.duplicate ? 'duplicate' : 'accepted')) {
+    return 'Relay Capture receipt identity or state is inconsistent';
+  }
+  if (typeof capture.raw_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(capture.raw_sha256)
+    || !Number.isSafeInteger(capture.length) || capture.length <= 0
+    || !Number.isSafeInteger(capture.segment_id) || capture.segment_id <= 0
+    || !Number.isSafeInteger(capture.offset) || capture.offset < 0
+    || !Number.isSafeInteger(capture.offset + capture.length)) {
+    return 'Relay Capture receipt hash or WAL locator is invalid';
+  }
+  return null;
+}
+
 function redactText(text, redactedFields) {
   let value = String(text ?? '');
   const before = value;
@@ -1314,6 +1339,7 @@ class DurableCaptureOutbox {
       return;
     }
 
+    const inputSha256 = sha256(bytes);
     let lastError = null;
     const currentAttempt = this.attemptsByFile.get(file) || 0;
     for (let offset = 1; offset <= this.maxAttempts; offset += 1) {
@@ -1339,7 +1365,8 @@ class DurableCaptureOutbox {
         } catch {
           payload = {};
         }
-        if (response.ok && payload.ok === true && payload.durable === true) {
+        const receiptError = relayReceiptError(payload, captureId, bytes.length, inputSha256);
+        if (response.ok && receiptError === null) {
           await fsp.rm(file, { force: false });
           await fsyncDirectory(this.processingDir);
           this.metrics.durable += 1;
@@ -1358,12 +1385,14 @@ class DurableCaptureOutbox {
           this.onDurable?.({ captureId, duplicate: payload.duplicate === true });
           return;
         }
-        const error = new Error(`Rust Relay returned HTTP ${response.status} without durable acknowledgement`);
+        const error = new Error(response.ok
+          ? `Invalid Rust Relay acknowledgement: ${receiptError}`
+          : `Rust Relay returned HTTP ${response.status} without durable acknowledgement`);
         error.status = response.status;
-        error.retryable = isRetryableStatus(response.status);
+        error.retryable = response.ok || isRetryableStatus(response.status);
         lastError = error;
         if (!error.retryable) {
-          if (response.status === 409 || payload.reason === 'capture_id_conflict') {
+          if (response.status === 409 || payload?.reason === 'capture_id_conflict') {
             this.metrics.conflicts += 1;
             this.onFailure?.({ captureId, reason: 'capture_id_conflict', error });
             await this.moveFailed(file, 'capture_id_conflict', storedBytesLength);

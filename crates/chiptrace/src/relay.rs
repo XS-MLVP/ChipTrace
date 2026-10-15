@@ -1917,6 +1917,11 @@ async fn relay_capture(State(state): State<RelayAppState>, request: Request) -> 
                     "durable":true,
                     "local_durable":true,
                     "duplicate":ack.duplicate,
+                    "input_receipt": {
+                        "schema_version": "chiptrace.capture-input-receipt.v1",
+                        "bytes": body.bytes.len(),
+                        "sha256": crate::jsonl::sha256_bytes(&body.bytes),
+                    },
                     "capture":ack,
                 }),
             )
@@ -2199,6 +2204,67 @@ mod tests {
                 .await
                 .unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn delivery_receipt_wire_input_binds_current_request_to_canonical_wal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let relay = DurableRelay::open(test_config(&temporary)).await.unwrap();
+        let state = RelayAppState {
+            relay: relay.clone(),
+            body_budget: InflightBodyBudget::new(4 * 1024 * 1024, 1024 * 1024).unwrap(),
+            max_batch_records: 64,
+            ingest_coverage: Arc::new(Mutex::new(IngestCoverageState::new())),
+        };
+        let wire = json!({
+            "captureId": "cap-wire-input-receipt", "recordType": "api_snapshot",
+            "sourceNamespace": "synthetic-input-receipt", "responseStatus": 200,
+            "requestBodyText": "{\"input\":\"中文 request\"}",
+            "responseBodyText": "{\"output\":\"保留 response\"}"
+        });
+        let mut stored_hash = None;
+        for (body, expected_status) in [
+            (format!(" \n{wire}\n"), StatusCode::ACCEPTED),
+            (format!(" \n{wire}\n"), StatusCode::OK),
+            (wire.to_string(), StatusCode::OK),
+        ] {
+            let request = Request::builder()
+                .header("content-type", "application/json")
+                .header(AUTHORIZATION, "Bearer test-cloud-token-at-least-32-bytes")
+                .body(Body::from(body.clone()))
+                .unwrap();
+            let response = relay_capture(State(state.clone()), request).await;
+            assert_eq!(response.status(), expected_status);
+            let payload: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap())
+                    .unwrap();
+            assert_eq!(
+                payload["input_receipt"],
+                json!({
+                    "schema_version": "chiptrace.capture-input-receipt.v1",
+                    "bytes": body.len(),
+                    "sha256": crate::jsonl::sha256_bytes(body.as_bytes()),
+                })
+            );
+            let stored = relay
+                .inner
+                .store
+                .read_capture("cap-wire-input-receipt")
+                .await
+                .unwrap();
+            assert_eq!(
+                payload["capture"]["raw_sha256"],
+                crate::jsonl::sha256_bytes(&stored)
+            );
+            assert_eq!(payload["capture"]["length"], stored.len() as u64 + 1);
+            if let Some(hash) = &stored_hash {
+                assert_eq!(&payload["capture"]["raw_sha256"], hash);
+            } else {
+                stored_hash = Some(payload["capture"]["raw_sha256"].clone());
+            }
+        }
+        assert_eq!(relay.inner.store.health().captures, 1);
+        relay.close().await.unwrap();
     }
 
     #[tokio::test]

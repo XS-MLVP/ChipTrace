@@ -31,6 +31,25 @@ Relay 的 `/capture` 和 `/captures` 只接收 `recordType=api_snapshot` 且来�
 出现在这两个入口时整条或整批返回 400，不能绕过对应的权威来源。历史字段仅由离线读取器
 验证原始字节和哈希，不属于在线采集契约。
 
+## 网关输入与持久化确认
+
+Relay 的 Wire `/capture` 成功响应包含 `input_receipt`，使用
+`chiptrace.capture-input-receipt.v1` 确认当前 HTTP 请求的完整字节数和 SHA-256，包括请求
+实际携带的尾部换行。`capture` 则确认规范化后的 WAL 记录；两种字节口径必须分开：
+
+| 字段 | 字节口径 |
+| --- | --- |
+| `input_receipt.bytes` | 当前 HTTP 请求正文 |
+| `input_receipt.sha256` | 当前 HTTP 请求正文的 SHA-256 |
+| `capture.raw_sha256` | 规范化后的 WAL JSON，不包含行尾换行 |
+| `capture.length` | 规范化后的 WAL JSON 加一个行尾换行 |
+
+网关 outbox 删除待投递文件前，必须核对 input receipt 与本次实际发送的字节完全一致，
+并检查 Capture ID、两层 durable、local_durable、幂等状态和有效 WAL locator。历史正文
+元数据修复仍只作用于发送副本，确认应绑定修复后的发送字节，不能使用审计原件的哈希。
+无效成功响应按退避重试，耗尽本轮尝试后仍保留 pending，不能删除文件或伪造 durable 计数。
+幂等重试的 input receipt 绑定本次请求，规范化后的 Capture 身份与哈希保持不变。
+
 ## Collector 持久化确认
 
 Relay 只有在下游 HTTP 成功且收到绑定当前 Capture 的持久化确认后，才能把投递账本

@@ -8,6 +8,13 @@
 原子落盘，后台获得 Rust Relay 的 durable ACK 后才删除待投递文件。进程重启时会恢复
 `pending` 和 `processing`，相同 `captureId` 保持幂等，不同内容使用相同 ID 时直接冲突。
 
+远端确认必须包含 `chiptrace.capture-input-receipt.v1`，其字节数和 SHA-256 精确匹配本次
+实际发送的请求正文，同时返回当前 Capture 的有效 WAL 明细。仅有 `ok/durable`、错误
+身份、矛盾状态或无效 JSON 都继续重试，文件保留在 pending。Relay 会规范化输入 JSON，
+因此输入哈希和规范化 WAL 哈希分别确认，不能互相替代。
+发布时先更新 Relay，再更新网关模块；旧 Relay 缺少 input receipt 时，新模块会保留积压。
+必须用同一发布候选的真实进程验证确认链路，并检查积压和完整性门禁。
+
 ```js
 const {
   DurableCaptureOutbox,
@@ -55,6 +62,8 @@ await outbox.enqueue(capture);
 
 ```bash
 node --test integrations/openai-gateway/durable-outbox.test.js
+# 隔离启动真实 Relay/Collector，验证确认丢失、重启、幂等与两份 WAL 的字节和哈希：
+make gateway-receipt-test
 # 部署前对实际宿主网关执行，脚本必须加载本版本 outbox 并接入上述健康门禁：
 CHIPTRACE_GATEWAY_SCRIPT=/absolute/path/to/server.js make gateway-host-test
 ```

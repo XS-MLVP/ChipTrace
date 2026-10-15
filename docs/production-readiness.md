@@ -121,6 +121,23 @@ Provider 目录时返回 HTTP 200，用于 18084 `/models` 时返回 HTTP 401。
 业务和采集凭据从本项目授权 Secret 或主机管理系统注入；共享 Provider 按主机策略
 维护。真实 Alibaba OSS 和主平台身份接入的验收条件继续保留。
 
+## 确认链路的隔离回归
+
+后续检查定位到两层错误确认风险：Relay 对 Collector 的部分确认只检查 `ok/durable`，
+网关也会仅凭这两个标志删除待投递文件。隔离负对照真实复现前者将无 Capture 明细的
+确认记为 delivered（两项 Rust 测试失败、退出 101），后者错误排空队列（Node 退出 1）。
+修复后 Collector 确认绑定 Capture ID、SHA-256、字节长度和状态；网关另验证当前请求的
+input receipt，避免混淆输入 JSON 与规范化 WAL 的字节口径。无效确认保留 pending。
+
+Rust 1.91 与 Node 22 的最终 `cloud-test` 实际退出 0，包含 281 个 Rust 库测试、33 个
+网关测试及真实网关 outbox → Relay → Collector 联测。联测覆盖确认丢失、网关重启、
+幂等重放、JSON/SSE 的 UTF-8 正文、两份 WAL 的字节与哈希一致及服务重启后恢复。
+独立宿主网关健康检查也通过。联测首轮因断言使用网关字段名而失败，按实际 WAL 的
+`requestBody.raw` 等字段修正后通过，失败日志与最终日志均保留。CI 新增
+`rust-tests-report`、`gateway-receipt-report`，包括失败时的完整测试输出。
+这些隔离回归没有升级线上进程、重新认证历史 delivered 账本或替代未修改客户端及真实
+OSS 账号的生产验收；新版网关须在支持 input receipt 的 Relay 部署后启用。
+
 ## 已有优势
 
 - Wire、OTLP logs、OTLP traces 和 Hook 按原生身份精确关联，覆盖请求、工具定义、

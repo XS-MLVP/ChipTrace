@@ -22,6 +22,20 @@ function cryptoHash(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
+// Contract fixtures only. The separate gateway receipt integration test uses
+// the real Relay and Collector and verifies the committed WAL bytes.
+function syntheticReceipt(bytes, duplicate = false) {
+  const record = JSON.parse(bytes.toString('utf8'));
+  return {
+    ok: true, durable: true, local_durable: true, duplicate,
+    input_receipt: { schema_version: 'chiptrace.capture-input-receipt.v1',
+      bytes: bytes.length, sha256: cryptoHash(bytes) },
+    capture: { capture_id: record.captureId, state: duplicate ? 'duplicate' : 'accepted',
+      durable: true, duplicate, raw_sha256: cryptoHash(bytes), length: bytes.length,
+      segment_id: 1, offset: 0 },
+  };
+}
+
 test('Responses SSE boundary requires a complete terminal event', () => {
   const tracker = new ResponsesSseBoundaryTracker();
   let state = tracker.observe(Buffer.from(
@@ -202,7 +216,7 @@ test('historical records with stale body metadata are repaired only in the repla
       assert.equal(body.responseBodySha256, cryptoHash(body.responseBodyText));
       res.statusCode = 202;
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ ok: true, durable: true, duplicate: false }));
+      res.end(JSON.stringify(syntheticReceipt(req.rawTestBody)));
     });
   });
   const outbox = new DurableCaptureOutbox({
@@ -231,6 +245,9 @@ test('historical records with stale body metadata are repaired only in the repla
 
 async function fakeRelay(handler) {
   const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.once('end', () => { req.rawTestBody = Buffer.concat(chunks); });
     res.setHeader('connection', 'close');
     handler(req, res);
   });
@@ -240,6 +257,56 @@ async function fakeRelay(handler) {
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }
+
+test('outbox retains exact pending bytes when Relay returns an unproven durable ACK', async t => {
+  const cases = [
+    ['ACK-only', () => ({ ok: true, durable: true, duplicate: false })],
+    ['missing input receipt', r => { delete r.input_receipt; return r; }],
+    ['wrong input hash', r => { r.input_receipt.sha256 = '0'.repeat(64); return r; }],
+    ['wrong input length', r => { r.input_receipt.bytes++; return r; }],
+    ['wrong input schema', r => { r.input_receipt.schema_version = 'unknown'; return r; }],
+    ['wrong Capture ID', r => { r.capture.capture_id = 'cap-unrelated'; return r; }],
+    ['not locally durable', r => { r.local_durable = false; return r; }],
+    ['not durably stored', r => { r.capture.durable = false; return r; }],
+    ['conflicting duplicate state', r => { r.capture.duplicate = true; return r; }],
+    ['pending Capture state', r => { r.capture.state = 'pending'; return r; }],
+    ['invalid stored hash', r => { r.capture.raw_sha256 = 'not-a-sha256'; return r; }],
+    ['invalid WAL locator', r => { r.capture.offset = -1; return r; }],
+    ['invalid JSON', () => '{'],
+  ];
+  for (const [name, transform] of cases) await t.test(name, async () => {
+    const relay = await fakeRelay((req, res) => {
+      req.resume();
+      req.once('end', () => {
+        const response = transform(syntheticReceipt(req.rawTestBody));
+        res.writeHead(202, { 'content-type': 'application/json' });
+        res.end(typeof response === 'string' ? response : JSON.stringify(response));
+      });
+    });
+    const root = temporaryRoot();
+    const outbox = new DurableCaptureOutbox({
+      root, relayUrl: '', maxAttempts: 1,
+      retryBaseMs: 1, retryMaxMs: 1, retryJitterPercent: 0,
+    });
+    try {
+      await outbox.enqueue(capture('cap-unproven-receipt'), { schedule: false });
+      const file = path.join(root, 'pending', 'cap-unproven-receipt.json');
+      const original = await fsp.readFile(file);
+      outbox.relayUrl = relay.url;
+      assert.equal(await outbox.flush(100), false);
+      await outbox.close();
+      if (outbox.drainPromise) await outbox.drainPromise;
+      assert.deepEqual(await fsp.readFile(file), original);
+      assert.equal(outbox.snapshot().durable, 0);
+      assert.equal(outbox.snapshot().failedFiles, 0);
+    } finally {
+      await outbox.close();
+      if (outbox.drainPromise) await outbox.drainPromise;
+      await relay.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 test('outbox preserves Wire bodies, strips credentials, retries, and removes after durable ACK', async () => {
   let attempts = 0;
@@ -255,7 +322,7 @@ test('outbox preserves Wire bodies, strips credentials, retries, and removes aft
         res.end(JSON.stringify({ ok: false, reason: 'temporary' }));
       } else {
         res.statusCode = 202;
-        res.end(JSON.stringify({ ok: true, durable: true, duplicate: false }));
+        res.end(JSON.stringify(syntheticReceipt(req.rawTestBody)));
       }
     });
   });
@@ -310,7 +377,7 @@ test('processing files are recovered and replayed after a restart', async () => 
     req.once('end', () => {
       res.statusCode = 202;
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ ok: true, durable: true, duplicate: false }));
+      res.end(JSON.stringify(syntheticReceipt(req.rawTestBody)));
     });
   });
   const second = new DurableCaptureOutbox({
@@ -487,7 +554,7 @@ test('complete temporary writes are recovered while corrupt tails are quarantine
     req.once('end', () => {
       res.statusCode = 202;
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ ok: true, durable: true, duplicate: false }));
+      res.end(JSON.stringify(syntheticReceipt(req.rawTestBody)));
     });
   });
   const outbox = new DurableCaptureOutbox({
@@ -674,7 +741,7 @@ test('historical failed evidence is reported without poisoning fresh health', as
     req.once('end', () => {
       res.statusCode = 202;
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ ok: true, durable: true, duplicate: false }));
+      res.end(JSON.stringify(syntheticReceipt(req.rawTestBody)));
     });
   });
   const outbox = new DurableCaptureOutbox({
