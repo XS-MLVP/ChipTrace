@@ -14,8 +14,16 @@
 
 `CHIPTRACE_PROTOCOL_MODE=unmodified_stock` 使共享 fixture 通过系统 Bubblewrap 启动
 普通 `codex --strict-config app-server`，不传 debug-only 启动参数。根文件系统只读，
-本次临时目录可写，私有 `/etc` 仅绑定必要的公开 OS 文件和本次 config/requirements，
+本次临时目录可写，私有 `/tmp` 仅映射到该目录下新建的沙箱工作目录；私有 `/etc`
+仅绑定必要的公开 OS 文件和本次 config/requirements，
 最后重新挂为只读；宿主没有 `/etc/codex` 也能运行，不读取或改写宿主 Provider 配置。
+
+远端首次运行在第一个 shell 工具失败，实际错误为构建 Bubblewrap 命令时遇到只读
+文件系统。上游 `codex-uds` 在 `/tmp/codex-daemon-<uid>` 准备受保护的 socket 目录，
+不使用 TMPDIR；本机此前已有目录，空白 CI 主机没有。将 `/tmp` 隔离为空白只读目录后
+本地也复现同一失败；fixture 现提供私有可写 `/tmp`，保留原生工具沙箱和所有断言，
+也不再暴露宿主已有 daemon 目录。失败运行和诊断保留，不以预创建宿主目录或关闭沙箱
+换取通过。
 
 ```bash
 CHIPTRACE_PROTOCOL_PRODUCER=/absolute/path/to/official/codex \

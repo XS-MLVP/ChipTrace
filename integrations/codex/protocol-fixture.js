@@ -264,6 +264,8 @@ async function protocolFixture(t, prefix) {
       const managed = path.join(root, 'managed');
       await fs.mkdir(home, { mode: 0o700 });
       await fs.mkdir(managed, { mode: 0o700 });
+      const sandboxTmp = path.join(root, 'sandbox-tmp');
+      if (unmodifiedStock) await fs.mkdir(sandboxTmp, { mode: 0o700 });
       const substitute = value => value.replaceAll('http://172.28.11.121:18084', endpoint)
         .replaceAll('CHIPTRACE_API_KEY', 'CHIPTRACE_PROTOCOL_API_KEY');
       const config = substitute(await fs.readFile(path.join(__dirname, 'config.toml.example'), 'utf8'))
@@ -286,7 +288,11 @@ async function protocolFixture(t, prefix) {
         const args = unmodifiedStock ? [
           '--unshare-user', '--unshare-pid', '--die-with-parent',
           '--ro-bind', '/', '/', '--proc', '/proc', '--dev', '/dev',
-          '--bind', root, root, '--tmpfs', '/etc',
+          // The released sandbox prepares /tmp/codex-daemon-<uid> even for
+          // read-only tools. Do not depend on or expose a host's existing socket
+          // directory. This writable /tmp maps only to the private fixture.
+          '--bind', sandboxTmp, '/tmp', '--bind', root, root,
+          '--ro-bind', producer, producer, '--tmpfs', '/etc',
           ...publicEtc.flatMap(name => ['--ro-bind-try', `/etc/${name}`, `/etc/${name}`]),
           '--ro-bind', path.join(home, 'config.toml'), '/etc/codex/config.toml',
           '--ro-bind', path.join(managed, 'requirements.toml'), '/etc/codex/requirements.toml',
