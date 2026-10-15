@@ -154,6 +154,40 @@ test('source-declared Process scopes remain outside selected Session accounting'
   assert.deepEqual(await fs.readFile(data.file), data.bytes);
 });
 
+test('Turn business logs cannot be exempted by explicit or inherited Process scope', async t => {
+  const attr = (key, value) => ({ key, value: { stringValue: value } });
+  const traceId = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const spanId = '5555555555555555';
+  const marker = 'private-process-scope-business-payload';
+  for (const name of ['codex.sse_event', 'codex.tool_result', 'codex.tool_decision',
+    'codex.sandbox_outcome', 'codex.user_prompt', 'codex.turn_ttft', 'codex.turn_cost']) {
+    for (const inherited of [false, true]) {
+      const log = { body: { stringValue: marker }, attributes: [attr('event.name', name)] };
+      if (inherited) Object.assign(log, { traceId, spanId });
+      else log.attributes.push(attr('codex.context_scope', 'process'));
+      const spans = [{ traceId, spanId, name: 'process.bootstrap',
+        attributes: [attr('codex.context_scope', 'process')] }];
+      const data = await input(t, [
+        { captureId: 'cap-business-process-wire', recordType: 'api_snapshot', traceContext: {
+          session_id: 'selected-session', turn_id: 'native-turn',
+        } },
+        batch('otlp_traces', { resourceSpans: [{ scopeSpans: [{ spans }] }] }, 1),
+        batch('otlp_logs', { resourceLogs: [{ scopeLogs: [{ logRecords: [log] }] }] }, 1),
+      ]);
+      await assert.rejects(run(binary, ['audit-session-context', '--input', data.file,
+        '--session-id', 'selected-session']), error => {
+        assert.equal(error.code, 1);
+        assert.equal(error.stdout, '');
+        assert.match(error.stderr, /Turn-level business event conflicts with Process scope/);
+        assert.ok(!error.stderr.includes(marker));
+        return true;
+      }, `${name}, inherited=${inherited}`);
+      assert.deepEqual(await fs.readFile(data.file), data.bytes);
+      assert.deepEqual(await fs.readdir(data.root), ['input.ndjson']);
+    }
+  }
+});
+
 test('corrupt Raw, conflicting captures and oversized diagnostic limits retain real nonzero exits', { timeout: 30000 }, async t => {
   const raw = { resourceLogs: [] };
   const bad = batch('otlp_logs', raw, 0);

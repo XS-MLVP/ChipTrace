@@ -21,3 +21,10 @@ Rust checks the join, unchanged Session gates, bounded diagnostics and schema.
 Node runs the real CLI with reconstructed Capture envelopes, verifies input
 bytes remain unchanged and asserts actual nonzero exits for corrupt/conflicting
 inputs. CI also runs the CLI path in a container with a read-only root filesystem.
+
+Separate synthetic negative cases cover seven Turn business event names with
+explicit or exact-parent-inherited Process scope (14 combinations). The Rust
+audit and Session checks reject this conflict; the real CLI must exit 1 with
+empty stdout, bounded diagnostics without body content, unchanged input bytes
+and no new files. These cases prevent Process declarations from hiding missing
+Turn identities; they are not observations of a real producer emitting them.

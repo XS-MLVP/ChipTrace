@@ -54,9 +54,11 @@ trace exporter 未启用，watchdog 最近报告重试失败；18086 没有监�
 没有改动线上 `/etc/codex` 或用户配置。更新受管配置后必须从新客户端进程获取真实 Wire，
 再复验 runtime gate 和目标 Session 的四源关联；不能用合成 Capture 把线上计数补成通过。
 
-隔离 patched Canary 已通过仓库门禁，但不证明线上未修改客户端已经通过。当前提交远端
-CI 尚未取得可查询的结果，生产交接仍需完成远端 CI、目标 OSS 账号验收、未修改 Stock Codex
-的真实 Canary，以及重启/回滚复验。
+隔离 patched Canary 已通过仓库门禁，但不证明线上未修改客户端已经通过。提交
+`13164883972a33634e4c420d532e612c666edfad` 的
+[远端 CI](https://github.com/XS-MLVP/ChipTrace/actions/runs/38674424831)
+已确认 5/5 作业成功；该结果只覆盖这一 SHA。生产交接仍需待发布 SHA 的远端 CI、
+目标 OSS 账号验收、未修改 Stock Codex 的真实 Canary，以及重启/回滚复验。
 历史失败文件和 open transaction 是审计证据，不能为了让健康计数变绿而删除。
 
 ## Stock Codex
@@ -220,6 +222,9 @@ Canonical Runtime/协议检查通过，不能覆盖原生 Turn 的缺失、未�
 记录保留分类总数；`unknown_session_records` 不会被默认为当前 Session。
 来源端显式声明 `codex.context_scope=process` 的后台记录计入 `process_level_records`，
 不会参与 Turn 覆盖；缺少该声明的进程级记录仍按未知 Session 处理。
+Turn 业务事件不能以直接声明或精确父链继承的 Process scope 获得豁免；出现冲突时，
+审计和 Session 检查真实失败，Raw 保留。七类事件名单及回归证据见
+[原生上下文约束](native-turn-context.md)。
 `--sample-limit 0` 可关闭定位样本，分组和样本上限不会截断总计数。
 诊断报告保留 ID/名称元数据，按项目控制访问；完整交付结论仍来自云端验收。
 

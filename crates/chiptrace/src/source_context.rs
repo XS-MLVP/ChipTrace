@@ -301,6 +301,62 @@ mod tests {
     }
 
     #[test]
+    fn turn_business_events_cannot_be_exempted_by_process_scope() {
+        let trace = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let root = "5555555555555555";
+        for name in [
+            "codex.sse_event",
+            "codex.tool_result",
+            "codex.tool_decision",
+            "codex.sandbox_outcome",
+            "codex.user_prompt",
+            "codex.turn_ttft",
+            "codex.turn_cost",
+        ] {
+            for inherited in [false, true] {
+                let mut log =
+                    json!({"attributes":[{"key":"event.name","value":{"stringValue":name}}]});
+                if inherited {
+                    log["traceId"] = json!(trace);
+                    log["spanId"] = json!(root);
+                } else {
+                    log["attributes"].as_array_mut().unwrap().push(json!({
+                        "key":"codex.context_scope","value":{"stringValue":"process"}
+                    }));
+                }
+                let captures = vec![
+                    json!({"recordType":"api_snapshot","captureId":"wire","traceContext":{
+                        "session_id":"s","turn_id":"t"
+                    }}),
+                    batch(
+                        "otlp_traces",
+                        json!({"resourceSpans":[{"scopeSpans":[{"spans":[{
+                            "traceId":trace,"spanId":root,"name":"process.bootstrap",
+                            "attributes":[{"key":"codex.context_scope","value":{"stringValue":"process"}}]
+                        }]}]}]}),
+                    ),
+                    batch(
+                        "otlp_logs",
+                        json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[log]}]}]}),
+                    ),
+                ];
+                let mut global = ExactTurnIndex::default();
+                for capture in &captures {
+                    global.observe_capture(capture).unwrap();
+                }
+                let error =
+                    audit_selected_source_context(&captures, "s", &global, 0, 0).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Turn-level business event conflicts with Process scope")
+                );
+                assert!(summarize_session(&captures, "s").is_err());
+            }
+        }
+    }
+
+    #[test]
     fn current_native_fields_preserve_all_context_gaps_and_count_unknown_sessions() {
         let (fixture, captures) = native_fixture();
         let session = fixture["session_id"].as_str().unwrap();

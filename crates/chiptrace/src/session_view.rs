@@ -4,7 +4,7 @@ use crate::lifecycle::LifecycleState;
 use crate::turn_identity::{
     ExactTurnIndex, SourceScope, session_attribute, turn_attribute, visit_otlp,
 };
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -304,7 +304,7 @@ pub(crate) fn otlp_source_observation(
             (related_sessions.len() == 1).then(|| related_sessions.first().unwrap().clone())
         });
     let turn_id = identity.map(|(_, t)| t).or(turn_attribute(attributes)?);
-    let requires_turn = matches!(
+    let turn_business_event = matches!(
         event_name.as_deref(),
         Some(
             "codex.sse_event"
@@ -315,12 +315,17 @@ pub(crate) fn otlp_source_observation(
                 | "codex.turn_ttft"
                 | "codex.turn_cost"
         )
-    ) || match &source_scope {
-        Some(SourceScope::Session(Some(_))) => false,
-        Some(SourceScope::Session(None) | SourceScope::Turn) => true,
-        Some(SourceScope::Process) => false,
-        None => !exempt,
-    };
+    );
+    if process_scoped && turn_business_event {
+        bail!("OTLP Turn-level business event conflicts with Process scope");
+    }
+    let requires_turn = turn_business_event
+        || match &source_scope {
+            Some(SourceScope::Session(Some(_))) => false,
+            Some(SourceScope::Session(None) | SourceScope::Turn) => true,
+            Some(SourceScope::Process) => false,
+            None => !exempt,
+        };
     Ok(SourceObservation {
         source,
         session_id,

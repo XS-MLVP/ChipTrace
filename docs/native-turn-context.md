@@ -61,6 +61,12 @@ span 无法精确确定 Session 身份，以前的 Session 未归属计数没有
 `unknown_session_records`；只有来源端显式声明 `codex.context_scope=process` 时才能使用
 这一分类。旧 v1 报告没有该字段，不能作为当前 v2 门禁证据。
 
+`process` 声明也不能豁免 Turn 业务事件。`codex.sse_event`、`codex.tool_result`、
+`codex.tool_decision`、`codex.sandbox_outcome`、`codex.user_prompt`、`codex.turn_ttft`
+和 `codex.turn_cost` 若直接声明或沿精确父链继承 Process scope，审计和 Session 检查均拒绝，
+诊断为 `OTLP Turn-level business event conflicts with Process scope`。合法进程后台记录
+仍按原始声明分类；冲突输入和 Raw 保留，不改写 scope 或删除业务记录。
+
 [精简回归 fixture](../fixtures/native-context-README.md) 只保留实际字段和父链，用一致
 别名替换身份。CI 验证缺口、跨 Session 歧义、正文不输出、计数守恒和真实非零退出；
 它不替代完整 Raw 或新的真实客户端 Canary。
@@ -188,6 +194,15 @@ Session 记录，Wire、OTLP logs、OTLP traces、Hook 四路来源均有正数�
 线上镜像或真实 Alibaba OSS 账户已经验收。门禁输出 `producer_mode=patched_stock`，生产
 交接命令还必须添加 `--require-unmodified-stock`；正向 fixture 也不替代 Raw、鉴权审计或
 采购包。
+
+2026-10-15 加入上述 Process 冲突保护后，再次只读回放这份真实两轮 patched Canary：
+`audit-session-context --sample-limit 0` 和 `inspect-session` 均退出 0，仍为 2 个原生 Turn、
+`delivery_ready=true` 和 3621 条分类守恒的 OTLP 记录。合法的 2 条 process 日志和 114 个
+process span 均保留。sealed Raw 在回放前后的 SHA-256 相同：
+`fb39af7a9bae56dd17455f7840b51248a57e4fe64725705339de04d43f6fd3ef`。
+Rust 和真实 CLI 的独立负例覆盖七类业务事件的直接/父链 Process 声明，共 14 种组合；
+CLI 均真实退出 1、stdout 为空、诊断不含正文、输入字节和目录不变。这些负例是协议回归，
+不表示 Stock Codex 在真实任务中已经发射了错误 Process 声明。
 
 门禁还要求 `session_view.model_interactions` 和
 `session_view.tool_execution_records` 分别等于所有 Native Turn 对应字段的总和。聚合值
