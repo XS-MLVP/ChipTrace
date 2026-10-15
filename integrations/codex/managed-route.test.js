@@ -4,6 +4,7 @@
 // request, credential, host Codex configuration, or production volume is used.
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
+const { createReadStream } = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -13,7 +14,9 @@ const { promisify } = require('node:util');
 const test = require('node:test');
 
 const run = promisify(execFile);
-const stockVersion = '0.163.0-alpha.11';
+const stockRelease = require('./stock-release.json');
+const stockVersion = stockRelease.version;
+const stockBinary = '@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex';
 const image = process.env.CHIPTRACE_CONFIG_TEST_IMAGE || 'node:22-bookworm-slim';
 const gatewayUrl = 'http://172.28.11.121:18084/';
 const userConfig = `model_provider = "Bypass"
@@ -50,7 +53,7 @@ async function readConfiguration(t, root, modules, requirements, flags = []) {
     '-v', `${modules}:/stock/node_modules:ro`, '-v', `${work}:/work`,
     '-v', `${path.join(__dirname, 'config.toml.example')}:/etc/codex/config.toml:ro`,
     '-v', `${requirementsPath}:/etc/codex/requirements.toml:ro`,
-    '--entrypoint', '/stock/node_modules/.bin/codex', image,
+    '--entrypoint', `/stock/node_modules/${stockBinary}`, image,
     '--strict-config', ...flags, 'app-server'], { stdio: ['pipe', 'pipe', 'pipe'] });
   const pending = new Map();
   let nextId = 0;
@@ -119,6 +122,10 @@ test('Stock Codex cannot bypass the managed Wire route through local configurati
   const modules = await fs.realpath(configuredModules);
   const metadata = JSON.parse(await fs.readFile(path.join(modules, '@openai/codex/package.json'), 'utf8'));
   assert.equal(metadata.version, stockVersion);
+  const digest = crypto.createHash('sha256');
+  for await (const bytes of createReadStream(path.join(modules, stockBinary))) digest.update(bytes);
+  assert.equal(digest.digest('hex'), stockRelease.linux_x64_binary_sha256,
+    'managed routing must use the same official ELF as source-context qualification');
   const requirements = await fs.readFile(path.join(__dirname, 'requirements.toml.example'), 'utf8');
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-managed-route-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));

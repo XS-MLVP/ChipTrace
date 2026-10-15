@@ -21,8 +21,10 @@ const run = promisify(execFile);
 const producerMode = process.env.CHIPTRACE_PROTOCOL_MODE || 'patched_stock_debug_app_server';
 assert.ok(['patched_stock_debug_app_server', 'unmodified_stock'].includes(producerMode), 'unsupported protocol producer mode');
 const unmodifiedStock = producerMode === 'unmodified_stock';
-const version = unmodifiedStock ? stockRelease.version : '0.163.0-alpha.11';
-const upstream = unmodifiedStock ? stockRelease.upstream_commit : '5425d3e625daa58eea3ad1de27c087eb3b2ffbd3';
+// Compare the official release and its context repair on the same upstream
+// source. Patch provenance still distinguishes the repaired producer.
+const version = stockRelease.version;
+const upstream = stockRelease.upstream_commit;
 const patches = unmodifiedStock ? [] : ['upstream-sse-context.patch', 'upstream-sse-context-test.patch',
   'upstream-session-scope.patch', 'upstream-session-scope-extension.patch',
   'upstream-session-scope-process.patch', 'upstream-config-read-scope.patch'];

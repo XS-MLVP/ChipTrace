@@ -23,8 +23,9 @@ jobs:
           package-manager-cache: false
       - name: Install the pinned unmodified client in the runner temporary directory
         run: |
+          stock_spec=$(node -p 'require("./integrations/codex/stock-release.json").npm_spec')
           npm install --prefix "$RUNNER_TEMP/chiptrace-stock-client" \
-            --no-audit --no-fund @openai/codex@0.163.0-alpha.11
+            --ignore-scripts --no-audit --no-fund "$stock_spec"
           docker pull node:22-bookworm-slim
       - name: Verify managed Wire routing against real user and session overrides
         run: |
@@ -115,17 +116,18 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Check out the pinned Stock Codex source
+      - name: Check out the stable source shared with official release qualification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: openai/codex
-          ref: 5425d3e625daa58eea3ad1de27c087eb3b2ffbd3
+          ref: 83086188ae0614bd882818ff1aa23f3194962012
           path: .ci-codex-source
           fetch-depth: 1
       - name: Verify the producer context patches still match the pinned source
         run: |
           set -euo pipefail
-          test "$(git -C .ci-codex-source rev-parse HEAD)" = "5425d3e625daa58eea3ad1de27c087eb3b2ffbd3"
+          expected_upstream=$(node -p 'require("./integrations/codex/stock-release.json").upstream_commit')
+          test "$(git -C .ci-codex-source rev-parse HEAD)" = "$expected_upstream"
           git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-sse-context.patch"
           git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-sse-context.patch"
           git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-sse-context-test.patch"
@@ -170,10 +172,11 @@ jobs:
       - name: Reconcile only the pinned tag's local package release versions
         working-directory: .ci-codex-source/codex-rs
         run: |
+          producer_version=$(node -p 'require(process.env.GITHUB_WORKSPACE + "/integrations/codex/stock-release.json").version')
           cargo metadata --format-version 1 --no-deps > "$RUNNER_TEMP/producer-metadata.json"
           node "$GITHUB_WORKSPACE/scripts/ci/check-producer-lock.js" --prepare \
             "$GITHUB_WORKSPACE/.ci-codex-source" "$RUNNER_TEMP/producer-metadata.json" \
-            0.163.0-alpha.11 | tee "$RUNNER_TEMP/producer-lock-check.json"
+            "$producer_version" | tee "$RUNNER_TEMP/producer-lock-check.json"
       - name: Identify the complete patched producer source before restoring artifacts
         id: producer-source
         run: |

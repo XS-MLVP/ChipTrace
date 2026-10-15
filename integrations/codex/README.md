@@ -56,7 +56,7 @@ Release。
 Provider 使用 command auth，确保 Stock Codex 会刷新该目录。Tool Schema 只取模型实际收到的
 Responses Wire；模型身份以 Wire 与 Sub2API 精确路由为准。
 
-当前 Provider 约束已使用未修改的 Stock Codex `0.163.0-alpha.11` 在断网、只读根文件系统的
+当前 Provider 约束已使用未修改的 Stock Codex `0.163.0` 在断网、只读根文件系统的
 容器中验证。其他版本需要重新运行配置回归和真实 Canary，不能仅凭版本号较新或
 `--strict-config` 未报错认定约束生效。`otel.tool_result.max_bytes` 固定为 256 MiB；
 客户端必须支持该字段，云端仍以每条事件实际报告的 `output_truncated=false` 为准。
@@ -64,6 +64,8 @@ Responses Wire；模型身份以 Wire 与 Sub2API 精确路由为准。
 正式版 `0.163.0` 已独立执行合成模型双轮采集，仍因来源上下文缺口拒绝交付。
 `stock-release-context` CI 保存该已知拒绝的精简诊断，不声明生产版本支持；命令、固定
 身份和验收边界见[原生 Turn 记录](../../docs/native-turn-context.md)。
+修复生产者的五项协议联测已迁移到同一正式版源码及完整六补丁；其来源仍为
+`patched_stock_debug_app_server`，不表示官方二进制已经包含修复。
 
 配置回归不需要 Provider 凭据，不启动 Turn，不调用模型，也不读取宿主用户配置：
 

@@ -15,10 +15,10 @@ const {
   sessionTests,
 } = require('./check-producer-regressions');
 
-const version = '0.163.0-alpha.11';
+const { version } = require('../../integrations/codex/stock-release.json');
 const metadata = {
-  workspace_members: ['path+file:///source/core#codex-core@0.163.0-alpha.11'],
-  packages: [{ id: 'path+file:///source/core#codex-core@0.163.0-alpha.11',
+  workspace_members: [`path+file:///source/core#codex-core@${version}`],
+  packages: [{ id: `path+file:///source/core#codex-core@${version}`,
     name: 'codex-core', version, source: null }],
 };
 const original = `version = 4

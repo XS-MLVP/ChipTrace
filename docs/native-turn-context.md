@@ -54,6 +54,14 @@ Session/Turn 不上传。正向的 patched 五场景仍独立执行，原有所�
 
 ## 每次 CI 新执行的协议采集
 
+当前修复生产者与官方原版诊断统一固定
+[`stock-release.json`](../integrations/codex/stock-release.json) 的正式版 `0.163.0`，
+upstream commit 为 `83086188ae0614bd882818ff1aa23f3194962012`。
+`upstream-context` 在该源码应用完整六补丁并构建；`stock-release-context` 使用同一
+源码对应的官方未修改 ELF。修复版的来源报告仍明确保留补丁列表和源码摘要，不能通过
+未修改客户端门禁。受管路由配置回归也使用同一正式版；下文 alpha Canary 是历史证据。
+源码、外部依赖和 API 行为均须重新验证，不能从旧 alpha 的通过结果推导正式版通过。
+
 `upstream-context` 除生产者单元测试和 CLI 构建外，还构建固定源码的 debug App Server，
 运行 [protocol-collection.test.js](../integrations/codex/protocol-collection.test.js)。它使用临时
 受管配置、本地确定性 Responses 服务、真实工具、当前 Relay/Collector 和原生 OTLP/Hook；

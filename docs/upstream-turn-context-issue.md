@@ -1,6 +1,36 @@
-# Draft: OTLP SSE logs lack request/Turn context in 0.163.0-alpha.11
+# Draft: OTLP SSE logs lack request/Turn context in 0.163.0
 
 This is a draft for upstream review. It has not been posted as an issue or PR.
+
+## Current stable release reproduction
+
+The official unmodified Linux x64 `0.163.0` binary (release commit
+`83086188ae0614bd882818ff1aa23f3194962012`) reproduces the context gap in new
+native collection. The maintained `stock-release-context` CI job installs that
+exact release and verifies its complete source digest and ELF SHA-256 before
+executing two Turns with resume, real tools, HTTP retry and asynchronous
+process polling against a local deterministic Responses endpoint. Model bytes
+and usage in this reproduction are synthetic; native tools and telemetry are
+actually executed.
+
+A local execution retained 2 closed Turns, 2 closed Session epochs, 12 HTTP
+attempts and 10 actual native tool results. Its 82 logs included 47 unresolved
+Turn records; 1,992 spans included 375 unresolved Turn records and 153 records
+without an exact Session owner. All source categories conserved their totals;
+these counts vary with initialization and are not pinned as universal values.
+The full collection assertion returned actual exit 1. CI accepts the known-gap
+diagnostic only after complete protocol/Raw/Runtime witnesses and the missing
+source context are verified; it always reports production readiness false.
+
+In the stable source, `ApiTelemetry` still has no captured request Span, and
+[`on_sse_poll`](https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/core/src/client.rs#L3020)
+directly calls `log_sse_event`. The creation-scope and response-terminal patch
+and its regression patch apply to this stable commit. The separate Session,
+process and configuration scope repairs also apply. Current maintained CI now
+builds those repairs from the stable commit; passing the earlier alpha
+experiment does not by itself qualify this new source or the official ELF.
+
+## Earlier real-provider reproduction
 
 An unmodified Codex `0.163.0-alpha.11` CLI completed a real Responses-provider
 session with native OTLP HTTP JSON logs, traces and lifecycle hooks enabled.
