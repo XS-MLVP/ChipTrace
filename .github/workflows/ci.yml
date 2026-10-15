@@ -130,6 +130,8 @@ jobs:
           assert result["real_upstream"] is True
           assert result["stock_version"] == "0.163.0-alpha.11"
           assert result["native_turns"] == 2
+          assert result["model_interactions"] == 8
+          assert result["tool_execution_records"] == 6
           assert result["selected_audit_records"] == 3621
           assert result["scenario_coverage"] == [
               "delayed_write_stdin", "failed_tool_process", "resume", "second_turn"

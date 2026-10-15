@@ -18,6 +18,9 @@ function report() {
     session_view: {
       schema_version: 'chiptrace.session-view.v2',
       session_id: 'session-1',
+      session_epochs: 2,
+      closed_session_epochs: 2,
+      invalid_session_boundaries: 0,
       delivery_ready: true,
       latest_epoch_closed: true,
       turn_source_coverage_complete: true,
@@ -27,9 +30,22 @@ function report() {
       unscoped_turn_records: 0,
       unscoped_source_records: {},
       native_turns: 2,
+      closed_turns: 2,
+      model_interactions: 2,
+      tool_execution_records: 2,
       turns: [
-        { session_id: 'session-1', turn_id: 'turn-1', status: 'closed', state_conflict: false, source_coverage: coverage() },
-        { session_id: 'session-1', turn_id: 'turn-2', status: 'cancelled', state_conflict: false, source_coverage: coverage() },
+        {
+          session_id: 'session-1', turn_id: 'turn-1', status: 'closed', state_conflict: false,
+          started_at: 'redacted', finished_at: 'redacted', terminal_events: 1,
+          raw_capture_refs: ['capture-1'],
+          model_interactions: 1, tool_execution_records: 1, source_coverage: coverage(),
+        },
+        {
+          session_id: 'session-1', turn_id: 'turn-2', status: 'cancelled', state_conflict: false,
+          started_at: 'redacted', finished_at: 'redacted', terminal_events: 1,
+          raw_capture_refs: ['capture-2'],
+          model_interactions: 1, tool_execution_records: 1, source_coverage: coverage(),
+        },
       ],
     },
   };
@@ -63,6 +79,8 @@ test('native canary gate requires a complete multi-turn four-source bundle', () 
     scenario_coverage: ['delayed_write_stdin', 'failed_tool_process', 'resume', 'second_turn'],
     source_coverage: { wire: 2, otlp_logs: 2, otlp_traces: 2, hooks: 2, missing_sources: [], complete: true },
     native_turns: 2,
+    model_interactions: 2,
+    tool_execution_records: 2,
     selected_audit_records: 10,
     delivery_ready: true,
   });
@@ -142,6 +160,33 @@ test('per-Turn OTLP totals must match the source audit', () => {
     () => verifyNativeCanaryReport(report(), broken),
     /turn otlp_logs records do not match source_context_audit/,
   );
+});
+
+test('Session interaction totals must equal the native Turn totals', () => {
+  const broken = report();
+  broken.session_view.model_interactions += 1;
+  assert.throws(
+    () => verifyNativeCanaryReport(broken, audit()),
+    /session_view\.model_interactions does not equal the sum of native Turn/,
+  );
+  const missing = report();
+  delete missing.session_view.turns[0].tool_execution_records;
+  assert.throws(
+    () => verifyNativeCanaryReport(missing, audit()),
+    /session_view\.turns\[0\]\.tool_execution_records must be a non-negative integer/,
+  );
+});
+
+test('closed Turns must retain terminal boundaries and Raw references', () => {
+  const missingTerminal = report();
+  missingTerminal.session_view.turns[0].terminal_events = 0;
+  assert.throws(() => verifyNativeCanaryReport(missingTerminal, audit()), /has no terminal event/);
+  const missingRaw = report();
+  missingRaw.session_view.turns[0].raw_capture_refs = [];
+  assert.throws(() => verifyNativeCanaryReport(missingRaw, audit()), /raw_capture_refs must be non-empty/);
+  const mismatchedEpochs = report();
+  mismatchedEpochs.session_view.closed_session_epochs = 1;
+  assert.throws(() => verifyNativeCanaryReport(mismatchedEpochs, audit()), /session epochs are not fully closed/);
 });
 
 test('explicit process-level records are conserved without becoming Session evidence', () => {

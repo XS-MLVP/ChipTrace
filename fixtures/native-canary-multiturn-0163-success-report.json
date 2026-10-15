@@ -35,12 +35,20 @@
     "unscoped_turn_records": 0,
     "unscoped_source_records": {},
     "delivery_ready": true,
+    "model_interactions": 8,
+    "tool_execution_records": 6,
     "turns": [
       {
         "session_id": "00000000-0000-7000-8000-000000000201",
         "turn_id": "00000000-0000-7000-8000-000000000202",
         "status": "closed",
         "state_conflict": false,
+        "started_at": "redacted",
+        "finished_at": "redacted",
+        "terminal_events": 1,
+        "raw_capture_refs": ["capture-1"],
+        "model_interactions": 5,
+        "tool_execution_records": 4,
         "source_coverage": {"wire": 5, "otlp_logs": 359, "otlp_traces": 1341, "hooks": 2, "missing_sources": [], "complete": true}
       },
       {
@@ -48,6 +56,12 @@
         "turn_id": "00000000-0000-7000-8000-000000000203",
         "status": "closed",
         "state_conflict": false,
+        "started_at": "redacted",
+        "finished_at": "redacted",
+        "terminal_events": 1,
+        "raw_capture_refs": ["capture-2"],
+        "model_interactions": 3,
+        "tool_execution_records": 2,
         "source_coverage": {"wire": 3, "otlp_logs": 214, "otlp_traces": 849, "hooks": 2, "missing_sources": [], "complete": true}
       }
     ]

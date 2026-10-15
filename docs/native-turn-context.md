@@ -184,6 +184,11 @@ Session 记录，Wire、OTLP logs、OTLP traces、Hook 四路来源均有正数�
 分类。该结果证明补丁后的隔离生产者路径可以满足门禁，不证明未修改发行版、线上镜像或
 真实 Alibaba OSS 账户已经验收；正向 fixture 也不替代 Raw、鉴权审计或采购包。
 
+门禁还要求 `session_view.model_interactions` 和
+`session_view.tool_execution_records` 分别等于所有 Native Turn 对应字段的总和。聚合值
+缺失、被篡改或存在未归属交互时，Canary 会失败；这两个字段不能用 Runtime integrity
+结果代替。
+
 CI 现在在固定源码 clean clone 中复验五个补丁的 `apply --check`、顺序应用和
 `git diff --check`，其中进程级后台任务的补丁单独保存为
 [`upstream-session-scope-process.patch`](upstream-session-scope-process.patch)。

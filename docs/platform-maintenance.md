@@ -44,6 +44,8 @@ MinIO 公共容器标签的远端拉取已返回 access denied；CI 因此从固
 升级完成后还要运行 `node scripts/ci/runtime-health-gate.js` 检查网关和 Relay 的实时门禁。
 它会拒绝旧版本缺少 `openCaptureHealthy` 的响应，以及 `freshness_applicable=false` 的
 Relay 快照，避免把“Runtime 仍在增长、Wire 已断流”误判为完整采集。
+门禁还会比较网关和 Relay 的 `delivered` 总数；两端计数不一致时必须先定位投递账本或
+健康快照延迟，不能继续交接数据。
 
 后续优先迭代：基于 Session/Turn 索引减少两遍全量扫描；按项目设置磁盘配额和确认后的保留周期；
 在主平台完成多租户授权、计费与审计；扩大到真实并发与较大 Archive 的压力测试。

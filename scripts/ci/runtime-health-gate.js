@@ -127,10 +127,18 @@ function verifyRelayHealth(health) {
 }
 
 function verifyRuntimeHealth(gatewayHealth, relayHealth) {
+  const gateway = verifyGatewayHealth(gatewayHealth);
+  const relay = verifyRelayHealth(relayHealth);
+  if (gateway.delivered !== relay.delivered) {
+    fail(
+      'gateway and Relay delivered totals do not match '
+      + `(gateway=${gateway.delivered}, relay=${relay.delivered})`,
+    );
+  }
   return {
     schema_version: 'chiptrace.runtime-health-gate.v1',
-    gateway: verifyGatewayHealth(gatewayHealth),
-    relay: verifyRelayHealth(relayHealth),
+    gateway,
+    relay,
   };
 }
 

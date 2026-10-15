@@ -140,6 +140,21 @@ function verifyNativeCanaryReport(report, audit, { minimumTurns = DEFAULT_MINIMU
   const sessionId = nonEmptyString(session.session_id, 'session_view.session_id');
   requireTrue(session.delivery_ready, 'session_view.delivery_ready');
   requireTrue(session.latest_epoch_closed, 'session_view.latest_epoch_closed');
+  const sessionEpochs = nonNegativeInteger(session.session_epochs, 'session_view.session_epochs');
+  const closedSessionEpochs = nonNegativeInteger(
+    session.closed_session_epochs,
+    'session_view.closed_session_epochs',
+  );
+  requireZero(
+    nonNegativeInteger(session.invalid_session_boundaries, 'session_view.invalid_session_boundaries'),
+    'session_view.invalid_session_boundaries',
+  );
+  if (sessionEpochs === 0 || closedSessionEpochs !== sessionEpochs) {
+    fail(
+      'session_view session epochs are not fully closed '
+      + `(epochs=${sessionEpochs}, closed=${closedSessionEpochs})`,
+    );
+  }
   requireTrue(session.turn_source_coverage_complete, 'session_view.turn_source_coverage_complete');
   requireZero(session.open_turns, 'session_view.open_turns');
   requireZero(session.conflicted_turns, 'session_view.conflicted_turns');
@@ -156,8 +171,16 @@ function verifyNativeCanaryReport(report, audit, { minimumTurns = DEFAULT_MINIMU
   if (!Array.isArray(session.turns) || session.turns.length !== session.native_turns) {
     fail('session_view.turns does not match native_turns');
   }
+  const closedTurns = nonNegativeInteger(session.closed_turns, 'session_view.closed_turns');
+  if (closedTurns !== session.native_turns) {
+    fail(`session_view.closed_turns must equal native_turns (closed=${closedTurns}, turns=${session.native_turns})`);
+  }
   const turnIdentities = new Set();
   const turnAssignedRecords = Object.fromEntries(AUDIT_SOURCES.map(source => [source, 0]));
+  const turnInteractionTotals = {
+    model_interactions: 0,
+    tool_execution_records: 0,
+  };
   for (const [index, turn] of session.turns.entries()) {
     object(turn, `session_view.turns[${index}]`);
     if (nonEmptyString(turn.session_id, `session_view.turns[${index}].session_id`) !== sessionId) {
@@ -171,6 +194,28 @@ function verifyNativeCanaryReport(report, audit, { minimumTurns = DEFAULT_MINIMU
       fail(`session_view.turns[${index}].status must be closed or cancelled`);
     }
     requireTrue(turn.state_conflict === false, `session_view.turns[${index}].state_conflict`);
+    if (nonNegativeInteger(turn.terminal_events, `session_view.turns[${index}].terminal_events`) === 0) {
+      fail(`session_view.turns[${index}] has no terminal event`);
+    }
+    nonEmptyString(turn.started_at, `session_view.turns[${index}].started_at`);
+    nonEmptyString(turn.finished_at, `session_view.turns[${index}].finished_at`);
+    if (!Array.isArray(turn.raw_capture_refs) || turn.raw_capture_refs.length === 0) {
+      fail(`session_view.turns[${index}].raw_capture_refs must be non-empty`);
+    }
+    const captureRefs = new Set(turn.raw_capture_refs.map((captureId, refIndex) => (
+      nonEmptyString(captureId, `session_view.turns[${index}].raw_capture_refs[${refIndex}]`)
+    )));
+    if (captureRefs.size !== turn.raw_capture_refs.length) {
+      fail(`session_view.turns[${index}].raw_capture_refs must be unique`);
+    }
+    turnInteractionTotals.model_interactions += nonNegativeInteger(
+      turn.model_interactions,
+      `session_view.turns[${index}].model_interactions`,
+    );
+    turnInteractionTotals.tool_execution_records += nonNegativeInteger(
+      turn.tool_execution_records,
+      `session_view.turns[${index}].tool_execution_records`,
+    );
     const coverage = object(turn.source_coverage, `session_view.turns[${index}].source_coverage`);
     requireTrue(coverage.complete, `session_view.turns[${index}].source_coverage.complete`);
     if (!Array.isArray(coverage.missing_sources) || coverage.missing_sources.length !== 0) {
@@ -185,6 +230,26 @@ function verifyNativeCanaryReport(report, audit, { minimumTurns = DEFAULT_MINIMU
       }
       if (AUDIT_SOURCES.includes(source)) turnAssignedRecords[source] += count;
     }
+  }
+  const sessionModelInteractions = nonNegativeInteger(
+    session.model_interactions,
+    'session_view.model_interactions',
+  );
+  const sessionToolExecutionRecords = nonNegativeInteger(
+    session.tool_execution_records,
+    'session_view.tool_execution_records',
+  );
+  if (sessionModelInteractions !== turnInteractionTotals.model_interactions) {
+    fail(
+      'session_view.model_interactions does not equal the sum of native Turn model_interactions '
+      + `(session=${sessionModelInteractions}, turns=${turnInteractionTotals.model_interactions})`,
+    );
+  }
+  if (sessionToolExecutionRecords !== turnInteractionTotals.tool_execution_records) {
+    fail(
+      'session_view.tool_execution_records does not equal the sum of native Turn '
+      + `tool_execution_records (session=${sessionToolExecutionRecords}, turns=${turnInteractionTotals.tool_execution_records})`,
+    );
   }
   const auditSummary = verifyAudit(audit, sessionId);
   for (const source of AUDIT_SOURCES) {
@@ -202,6 +267,8 @@ function verifyNativeCanaryReport(report, audit, { minimumTurns = DEFAULT_MINIMU
     scenario_coverage: scenarios,
     source_coverage: sourceCoverage,
     native_turns: session.native_turns,
+    model_interactions: sessionModelInteractions,
+    tool_execution_records: sessionToolExecutionRecords,
     selected_audit_records: auditSummary.selected_records,
     delivery_ready: true,
   };

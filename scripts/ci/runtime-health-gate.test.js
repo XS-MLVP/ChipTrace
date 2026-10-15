@@ -95,3 +95,12 @@ test('queue failures and non-conservation fail closed', () => {
   value.conservation_ok = false;
   assert.throws(() => verifyRuntimeHealth(gateway(), value), /conservation_ok must be true/);
 });
+
+test('gateway and Relay delivery totals must agree', () => {
+  const value = relay();
+  value.delivered -= 1;
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), value),
+    /gateway and Relay delivered totals do not match/,
+  );
+});
