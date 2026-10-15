@@ -19,6 +19,17 @@
 最终化、投递和恢复发生在扫描期间时会重读，避免漏计新文件或把已确认记录重新计为
 pending。等待远端确认时仍可重扫并观察 processing；扫描不修改 Capture 正文或历史失败。
 
+`beginCapture()`、流式追加和 `enqueue()` 共用字节与文件数预留；预留在磁盘操作前完成，
+一直保留到计数更新或写入失败，避免并发请求同时通过容量检查。流式追加也检查文件数、
+剩余空间和 inode 水位。最终化可抵扣旧 spool 的逻辑队列用量，但物理空间和 inode 必须
+足够容纳新的完整 JSON，旧 spool 在新记录持久化后才释放；重启恢复逐条释放已转换用量。
+
+写入或最终化失败会立即令 `openCaptureHealthy=false`，`openWriteFailures` 返回本进程中
+受影响的 open Capture 数。已写入的字节继续保留；`finalize()` 返回真实错误，重启后按
+`recovered_incomplete` 恢复，不能当作完整交付。追加方法仍通过写入链保存错误并在
+`finalize()` 拒绝，调用方还应持续检查健康状态。磁盘水位基于缓存的文件系统观察，不能
+阻止其他进程占满共享磁盘；实际 I/O 错误仍须保留和告警。
+
 ```js
 const {
   DurableCaptureOutbox,
@@ -53,8 +64,8 @@ await outbox.enqueue(capture);
   OTLP/Hook 证据提供。无法关联的记录保留为 Wire-only，不能进入合格 Release。
 - 业务响应不等待远端 Relay。磁盘写入失败、队列上限或 inode/空间水位必须出现在健康指标。
 - 健康检查必须要求 `outbox.snapshot().openCaptureHealthy === true`，并结合 Relay、积压、
-  当前失败与截断指标。open 事务超过 `maxOpenAgeMs`（默认 30 分钟）或缺少可验证打开时间
-  时，该值为 false；pending/processing 为零不能掩盖未最终化的 Capture。
+  当前失败与截断指标。open 事务写入/最终化失败、超过 `maxOpenAgeMs`（默认 30 分钟）或
+  缺少可验证打开时间时，该值为 false；pending/processing 为零不能掩盖未最终化的 Capture。
 
 历史失败 Capture 的正文如果曾经被脱敏，旧记录可能把脱敏前的 `requestBytesCaptured`/
 `responseBytesCaptured` 或 SHA-256 留在元数据中。发送前 outbox 会按当前 UTF-8 正文修复这

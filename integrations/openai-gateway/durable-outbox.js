@@ -632,23 +632,26 @@ class DurableCaptureTransaction {
     const file = this.files[side];
     this.writeChain = this.writeChain.then(() => this.outbox.withQueueMutation(async () => {
       if (this.writeError) return;
-      if (this.outbox.metrics.queueBytes + retained.length > this.outbox.maxBytes) {
-        const error = new Error('capture outbox byte cap is full');
-        error.code = 'OUTBOX_FULL';
-        throw error;
-      }
+      await this.outbox.refreshFilesystemStats(false);
       const firstWrite = !this.createdSpools.has(side);
-      await fsp.appendFile(file, retained, { mode: 0o600, flag: 'a' });
-      if (firstWrite) {
-        this.createdSpools.add(side);
-        this.persistedFiles += 1;
-        this.outbox.metrics.openFiles += 1;
+      const releaseCapacity = this.outbox.reserveQueueCapacity(retained.length, Number(firstWrite));
+      try {
+        await fsp.appendFile(file, retained, { mode: 0o600, flag: 'a' });
+        if (firstWrite) {
+          this.createdSpools.add(side);
+          this.persistedFiles += 1;
+          this.outbox.metrics.openFiles += 1;
+        }
+        this.persistedBytes += retained.length;
+        this.outbox.metrics.openBytes += retained.length;
+        this.outbox.metrics.queueBytes += retained.length;
+        this.outbox.accountFilesystemAllocation(retained.length, Number(firstWrite));
+      } finally {
+        releaseCapacity();
       }
-      this.persistedBytes += retained.length;
-      this.outbox.metrics.openBytes += retained.length;
-      this.outbox.metrics.queueBytes += retained.length;
     })).catch((error) => {
       this.writeError ||= error;
+      this.outbox.recordError(error);
     });
     return this.writeChain;
   }
@@ -656,9 +659,15 @@ class DurableCaptureTransaction {
   async finalize(fields = {}) {
     if (this.closed) throw new Error('capture transaction is closed');
     this.closed = true;
-    await this.writeChain;
-    if (this.writeError) throw this.writeError;
-    return this.outbox.withQueueMutation(() => this.finalizeRecord(fields));
+    try {
+      await this.writeChain;
+      if (this.writeError) throw this.writeError;
+      return await this.outbox.withQueueMutation(() => this.finalizeRecord(fields));
+    } catch (error) {
+      this.writeError ||= error;
+      this.outbox.recordError(error);
+      throw error;
+    }
   }
 
   async finalizeRecord(fields) {
@@ -913,9 +922,18 @@ class DurableCaptureOutbox {
       const baseRecord = JSON.parse(metadataBytes.toString('utf8'));
       const captureId = String(baseRecord.captureId || '');
       if (!validCaptureId(captureId)) throw new Error('open Capture has invalid captureId');
+      const spoolStats = await Promise.all([files.request, files.response].map(async file => {
+        try { return await fsp.stat(file); } catch (error) {
+          if (error.code === 'ENOENT') return null;
+          throw error;
+        }
+      }));
+      const openBytes = metadataBytes.length + spoolStats.reduce((sum, stat) => sum + (stat?.size || 0), 0);
+      const openFiles = 1 + spoolStats.filter(Boolean).length;
       const existing = await this.findExisting(captureId);
       if (existing) {
         await removeCaptureFiles(files);
+        this.releaseOpenFiles(files, openBytes, openFiles);
         continue;
       }
       const [requestBytes, responseBytes] = await Promise.all([
@@ -945,14 +963,13 @@ class DurableCaptureOutbox {
           recoveredAt,
         },
       };
-      const openBytes = metadataBytes.length + requestBytes.length + responseBytes.length;
-      const openFiles = 1 + Number(requestBytes.length > 0) + Number(responseBytes.length > 0);
       await this.enqueue(record, {
         creditBytes: openBytes,
         creditFiles: openFiles,
         schedule: false,
       });
       await removeCaptureFiles(files);
+      this.releaseOpenFiles(files, openBytes, openFiles);
     }
   }
 
@@ -987,48 +1004,42 @@ class DurableCaptureOutbox {
     delete baseRecord.responseBodyText;
     const bytes = Buffer.from(`${JSON.stringify(baseRecord)}\n`, 'utf8');
     await this.refreshFilesystemStats(false);
-    if (this.metrics.queueBytes + this.reservedBytes + bytes.length > this.maxBytes) {
-      const error = new Error('capture outbox byte cap is full');
-      error.code = 'OUTBOX_FULL';
+    const releaseCapacity = this.reserveQueueCapacity(bytes.length, 1);
+    try {
+      await atomicWrite(files.metadata, bytes);
+      const transaction = new DurableCaptureTransaction(this, baseRecord, files, options, bytes.length);
+      this.openCaptures.set(captureId, transaction);
+      this.openAtByName.set(path.basename(files.metadata), Date.parse(openedAt));
+      this.metrics.openTransactions += 1;
+      this.metrics.openFiles += 1;
+      this.metrics.openBytes += bytes.length;
+      this.metrics.queueBytes += bytes.length;
+      this.accountFilesystemAllocation(bytes.length, 1);
+      return transaction;
+    } catch (error) {
+      this.metrics.rejected += 1;
+      this.recordError(error);
       throw error;
+    } finally {
+      releaseCapacity();
     }
-    if (this.metrics.filesystemFreeBytes !== null
-      && this.metrics.filesystemFreeBytes - this.reservedBytes - bytes.length < this.minFreeBytes) {
-      const error = new Error('capture outbox filesystem free-space cutoff reached');
-      error.code = 'OUTBOX_DISK_PRESSURE';
-      throw error;
-    }
-    if (this.metrics.pending
-      + this.metrics.processing
-      + this.metrics.failedFiles
-      + this.metrics.auxiliaryFiles
-      + this.metrics.openFiles
-      + this.metrics.stalledFiles
-      + this.reservedFiles >= this.maxFiles) {
-      const error = new Error('capture outbox file cap is full');
-      error.code = 'OUTBOX_FULL';
-      throw error;
-    }
-    await atomicWrite(files.metadata, bytes);
-    const transaction = new DurableCaptureTransaction(this, baseRecord, files, options, bytes.length);
-    this.openCaptures.set(captureId, transaction);
-    this.openAtByName.set(path.basename(files.metadata), Date.parse(openedAt));
-    this.metrics.openTransactions += 1;
-    this.metrics.openFiles += 1;
-    this.metrics.openBytes += bytes.length;
-    this.metrics.queueBytes += bytes.length;
-    return transaction;
   }
 
   releaseOpenCapture(transaction, bytes, files) {
     if (this.openCaptures.get(transaction.captureId) === transaction) {
       this.openCaptures.delete(transaction.captureId);
     }
-    this.openAtByName.delete(path.basename(transaction.files.metadata));
+    this.releaseOpenFiles(transaction.files, bytes, files);
+  }
+
+  releaseOpenFiles(paths, bytes, files) {
+    this.openAtByName.delete(path.basename(paths.metadata));
     this.metrics.openTransactions = Math.max(0, this.metrics.openTransactions - 1);
     this.metrics.openFiles = Math.max(0, this.metrics.openFiles - files);
     this.metrics.openBytes = Math.max(0, this.metrics.openBytes - bytes);
     this.metrics.queueBytes = Math.max(0, this.metrics.queueBytes - bytes);
+    if (this.metrics.filesystemFreeBytes !== null) this.metrics.filesystemFreeBytes += bytes;
+    if (this.metrics.filesystemFreeFiles !== null) this.metrics.filesystemFreeFiles += files;
   }
 
   async close() {
@@ -1192,6 +1203,52 @@ class DurableCaptureOutbox {
     return this.withQueueMutation(() => this.enqueueRecord(record, options));
   }
 
+  reserveQueueCapacity(bytes, files, { creditBytes = 0, creditFiles = 0 } = {}) {
+    const reject = (message, code) => {
+      this.metrics.rejected += 1;
+      const error = new Error(message);
+      error.code = code;
+      this.recordError(error);
+      throw error;
+    };
+    // Finalization's logical queue credit does not free physical space yet:
+    // the old spools must survive until the combined record is durable.
+    if (this.metrics.filesystemFreeBytes !== null
+      && this.metrics.filesystemFreeBytes - this.reservedBytes - bytes < this.minFreeBytes) {
+      reject('capture outbox filesystem free-space cutoff reached', 'OUTBOX_DISK_PRESSURE');
+    }
+    if (this.metrics.filesystemFreeFiles !== null
+      && this.metrics.filesystemFreeFiles - this.reservedFiles - files < this.minFreeFiles) {
+      reject('capture outbox filesystem inode cutoff reached', 'OUTBOX_INODE_PRESSURE');
+    }
+    if (Math.max(0, this.metrics.queueBytes - creditBytes)
+      + this.reservedBytes + bytes > this.maxBytes) {
+      reject('capture outbox byte cap is full', 'OUTBOX_FULL');
+    }
+    if (this.metrics.pending + this.metrics.processing + this.metrics.failedFiles
+      + this.metrics.auxiliaryFiles + this.metrics.openFiles + this.metrics.stalledFiles
+      + this.reservedFiles - creditFiles + files > this.maxFiles) {
+      reject('capture outbox file cap is full', 'OUTBOX_FULL');
+    }
+    // There must be no await between checking the shared limits and reserving
+    // them. Opens, appends and regular enqueue all use this same accounting.
+    this.reservedBytes += bytes;
+    this.reservedFiles += files;
+    return () => {
+      this.reservedBytes -= bytes;
+      this.reservedFiles -= files;
+    };
+  }
+
+  accountFilesystemAllocation(bytes, files) {
+    if (this.metrics.filesystemFreeBytes !== null) {
+      this.metrics.filesystemFreeBytes = Math.max(0, this.metrics.filesystemFreeBytes - bytes);
+    }
+    if (this.metrics.filesystemFreeFiles !== null) {
+      this.metrics.filesystemFreeFiles = Math.max(0, this.metrics.filesystemFreeFiles - files);
+    }
+  }
+
   async enqueueRecord(record, options) {
     const captureId = String(record?.captureId || '');
     if (!validCaptureId(captureId)) {
@@ -1217,40 +1274,6 @@ class DurableCaptureOutbox {
       return { durable: true, duplicate: true, captureId, bytes: existing.bytes.length };
     }
     await this.refreshFilesystemStats(false);
-    const additionalBytes = Math.max(0, bytes.length - creditBytes);
-    if (this.metrics.filesystemFreeBytes !== null
-      && this.metrics.filesystemFreeBytes - this.reservedBytes - additionalBytes < this.minFreeBytes) {
-      this.metrics.rejected += 1;
-      const error = new Error('capture outbox filesystem free-space cutoff reached');
-      error.code = 'OUTBOX_DISK_PRESSURE';
-      throw error;
-    }
-    if (this.metrics.filesystemFreeFiles !== null
-      && this.metrics.filesystemFreeFiles - this.reservedFiles - Math.max(0, 1 - creditFiles) < this.minFreeFiles) {
-      this.metrics.rejected += 1;
-      const error = new Error('capture outbox filesystem inode cutoff reached');
-      error.code = 'OUTBOX_INODE_PRESSURE';
-      throw error;
-    }
-    if (Math.max(0, this.metrics.queueBytes - creditBytes)
-      + this.reservedBytes + bytes.length > this.maxBytes) {
-      this.metrics.rejected += 1;
-      const error = new Error('capture outbox byte cap is full');
-      error.code = 'OUTBOX_FULL';
-      throw error;
-    }
-    if (this.metrics.pending
-      + this.metrics.processing
-      + this.metrics.failedFiles
-      + this.metrics.auxiliaryFiles
-      + this.metrics.openFiles
-      + this.metrics.stalledFiles
-      + this.reservedFiles - creditFiles >= this.maxFiles) {
-      this.metrics.rejected += 1;
-      const error = new Error('capture outbox file cap is full');
-      error.code = 'OUTBOX_FULL';
-      throw error;
-    }
     if (bytes.length > this.maxInflightBytes) {
       this.metrics.rejected += 1;
       const error = new Error('capture exceeds outbox in-flight byte budget');
@@ -1258,8 +1281,7 @@ class DurableCaptureOutbox {
       throw error;
     }
     const target = path.join(this.pendingDir, captureFileName(captureId));
-    this.reservedBytes += bytes.length;
-    this.reservedFiles += 1;
+    const releaseCapacity = this.reserveQueueCapacity(bytes.length, 1, { creditBytes, creditFiles });
     try {
       await atomicWrite(target, bytes);
     } catch (error) {
@@ -1278,20 +1300,14 @@ class DurableCaptureOutbox {
       this.recordError(error);
       throw error;
     } finally {
-      this.reservedBytes = Math.max(0, this.reservedBytes - bytes.length);
-      this.reservedFiles = Math.max(0, this.reservedFiles - 1);
+      releaseCapacity();
     }
     this.metrics.accepted += 1;
     this.metrics.pending += 1;
     this.metrics.queueBytes += bytes.length;
     this.metrics.activeQueueBytes += bytes.length;
     this.queuedAtByName.set(path.basename(target), Date.now());
-    if (this.metrics.filesystemFreeBytes !== null) {
-      this.metrics.filesystemFreeBytes = Math.max(0, this.metrics.filesystemFreeBytes - bytes.length);
-    }
-    if (this.metrics.filesystemFreeFiles !== null) {
-      this.metrics.filesystemFreeFiles = Math.max(0, this.metrics.filesystemFreeFiles - 1);
-    }
+    this.accountFilesystemAllocation(bytes.length, 1);
     this.metrics.lastAcceptedAt = new Date().toISOString();
     if (options.schedule !== false) this.scheduleDrain(0);
     return { durable: true, duplicate: false, captureId, bytes: bytes.length };
@@ -1567,6 +1583,10 @@ class DurableCaptureOutbox {
 
   snapshot() {
     this.refreshOpenAgeMetrics();
+    let openWriteFailures = 0;
+    for (const transaction of this.openCaptures.values()) {
+      if (transaction.writeError) openWriteFailures += 1;
+    }
     let oldestQueuedAtMs = null;
     for (const queuedAtMs of this.queuedAtByName.values()) {
       if (oldestQueuedAtMs === null || queuedAtMs < oldestQueuedAtMs) {
@@ -1584,7 +1604,8 @@ class DurableCaptureOutbox {
       maxInflightBytes: this.maxInflightBytes,
       maxAttempts: this.maxAttempts,
       maxOpenAgeMs: this.maxOpenAgeMs,
-      openCaptureHealthy: this.metrics.staleOpenTransactions === 0
+      openWriteFailures,
+      openCaptureHealthy: openWriteFailures === 0 && this.metrics.staleOpenTransactions === 0
         && this.openAtByName.size === this.metrics.openTransactions,
       timeoutMs: this.timeoutMs,
       sanitize: this.sanitize,

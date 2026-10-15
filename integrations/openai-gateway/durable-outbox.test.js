@@ -830,6 +830,280 @@ test('concurrent different bytes for one capture ID cannot overwrite each other'
   }
 });
 
+test('streaming admission reserves capacity before concurrent writes', { timeout: 10000 }, async t => {
+  for (const quota of ['files', 'bytes']) {
+    for (const follower of ['open', 'enqueue']) await t.test(`${quota}: open then ${follower}`, async t => {
+      const root = temporaryRoot();
+      const outbox = new DurableCaptureOutbox({ root, relayUrl: '', maxBytes: 1024 * 1024,
+        maxFiles: quota === 'files' ? 1 : 100, minFreeBytes: 0, minFreeFiles: 0 });
+      let releaseWrite;
+      const released = new Promise(resolve => { releaseWrite = resolve; });
+      let enteredWrite;
+      const entered = new Promise(resolve => { enteredWrite = resolve; });
+      let first;
+      try {
+        await outbox.start();
+        const originalLink = fsp.link;
+        const target = path.join(root, 'open', 'cap-reserved-open.open.json');
+        t.mock.method(fsp, 'link', async (source, destination, ...args) => {
+          if (destination === target) {
+            enteredWrite();
+            await released;
+          }
+          return originalLink(source, destination, ...args);
+        });
+        const record = id => ({ captureId: id, sourceNamespace: 'synthetic-capacity',
+          padding: quota === 'bytes' ? 'x'.repeat(600 * 1024) : '' });
+        first = outbox.beginCapture(record('cap-reserved-open'));
+        await entered;
+        const [second] = await Promise.allSettled([follower === 'open'
+          ? outbox.beginCapture(record('cap-reserved-following'))
+          : outbox.enqueue(record('cap-reserved-following'), { schedule: false })]);
+        assert.equal(second.status, 'rejected', 'the in-progress metadata write must occupy capacity');
+        assert.equal(second.reason.code, 'OUTBOX_FULL');
+        releaseWrite();
+        const transaction = await first;
+        const original = await fsp.readFile(transaction.files.metadata);
+        assert.deepEqual(await fsp.readdir(outbox.openDir), ['cap-reserved-open.open.json']);
+        assert.deepEqual(await fsp.readdir(outbox.pendingDir), []);
+        assert.equal(outbox.snapshot().openTransactions, 1);
+        assert.equal(outbox.snapshot().queueBytes, original.length);
+        assert.equal(outbox.reservedBytes, 0);
+        assert.equal(outbox.reservedFiles, 0);
+      } finally {
+        releaseWrite();
+        if (first) await first.catch(() => {});
+        await outbox.close();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test('concurrent stream appends keep the byte cap and recover the accepted prefix',
+  { timeout: 10000 }, async t => {
+    const root = temporaryRoot();
+    const outbox = new DurableCaptureOutbox({ root, relayUrl: '', maxBytes: 1024 * 1024,
+      minFreeBytes: 0, minFreeFiles: 0 });
+    let recovered;
+    let releaseWrite;
+    const released = new Promise(resolve => { releaseWrite = resolve; });
+    let enteredWrite;
+    const entered = new Promise(resolve => { enteredWrite = resolve; });
+    let firstWrite;
+    try {
+      const first = await outbox.beginCapture({ captureId: 'cap-capacity-first' });
+      const second = await outbox.beginCapture({ captureId: 'cap-capacity-second' });
+      const prefix = Buffer.from('保留的前缀 🧪');
+      const payload = Buffer.from('原样'.repeat(100000));
+      await second.appendRequest(prefix);
+      const originalAppend = fsp.appendFile;
+      t.mock.method(fsp, 'appendFile', async (file, ...args) => {
+        if (file === first.files.request) {
+          enteredWrite();
+          await released;
+        }
+        return originalAppend(file, ...args);
+      });
+      firstWrite = first.appendRequest(payload);
+      await entered;
+      await second.appendRequest(payload);
+      assert.equal(second.writeError?.code, 'OUTBOX_FULL');
+      assert.equal(outbox.snapshot().openCaptureHealthy, false);
+      assert.equal(outbox.snapshot().openWriteFailures, 1);
+      releaseWrite();
+      await firstWrite;
+      assert.equal(first.writeError, null);
+      assert.deepEqual(await fsp.readFile(first.files.request), payload);
+      assert.deepEqual(await fsp.readFile(second.files.request), prefix);
+      assert.ok(outbox.snapshot().queueBytes <= outbox.maxBytes);
+      assert.equal(outbox.reservedBytes, 0);
+      assert.equal(outbox.reservedFiles, 0);
+      await assert.rejects(second.finalize({ responseStatus: 200 }), { code: 'OUTBOX_FULL' });
+      await outbox.close();
+
+      recovered = new DurableCaptureOutbox({ root, relayUrl: '', maxBytes: 1024 * 1024,
+        minFreeBytes: 0, minFreeFiles: 0 });
+      await recovered.start();
+      assert.equal(recovered.snapshot().openTransactions, 0);
+      assert.equal(recovered.snapshot().pending, 2);
+      assert.equal(recovered.snapshot().openWriteFailures, 0);
+      for (const [id, bytes] of [['cap-capacity-first', payload], ['cap-capacity-second', prefix]]) {
+        const stored = JSON.parse(await fsp.readFile(path.join(root, 'pending', `${id}.json`)));
+        assert.equal(stored.requestBodyText, bytes.toString('utf8'));
+        assert.equal(stored.requestBytesCaptured, bytes.length);
+        assert.equal(stored.requestBodySha256, cryptoHash(bytes));
+        assert.equal(stored.captureTransaction.state, 'recovered_incomplete');
+        assert.equal(stored.requestTruncated, true);
+        assert.equal(stored.upstreamResponseCompleted, false);
+        assert.equal(stored.clientResponseFinished, false);
+      }
+    } finally {
+      releaseWrite();
+      if (firstWrite) await firstWrite;
+      await outbox.close();
+      if (recovered) await recovered.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+test('stream writes respect file and filesystem cutoffs while preserving earlier bytes', async t => {
+  const cases = [
+    ['file cap', outbox => { outbox.maxFiles = 2; }, 'OUTBOX_FULL'],
+    ['free space', outbox => { outbox.minFreeBytes = Number.MAX_SAFE_INTEGER; }, 'OUTBOX_DISK_PRESSURE'],
+    ['inodes', outbox => { outbox.minFreeFiles = Number.MAX_SAFE_INTEGER; }, 'OUTBOX_INODE_PRESSURE'],
+  ];
+  for (const [name, applyPressure, code] of cases) await t.test(name, async () => {
+    const root = temporaryRoot();
+    const outbox = new DurableCaptureOutbox({ root, relayUrl: '', minFreeBytes: 0, minFreeFiles: 0 });
+    try {
+      const transaction = await outbox.beginCapture({ captureId: 'cap-stream-pressure' });
+      const prefix = Buffer.from('已收集的请求 🧪');
+      await transaction.appendRequest(prefix);
+      const metadata = await fsp.readFile(transaction.files.metadata);
+      // Raising the configured watermarks safely exercises pressure without
+      // filling the host disk or allocating millions of real inodes.
+      applyPressure(outbox);
+      await transaction.appendResponse(Buffer.from('must not enter the spool'));
+      assert.equal(transaction.writeError?.code, code);
+      assert.equal(outbox.snapshot().openWriteFailures, 1);
+      assert.equal(outbox.snapshot().openCaptureHealthy, false);
+      await assert.rejects(transaction.finalize({ responseStatus: 200 }), { code });
+      assert.deepEqual(await fsp.readFile(transaction.files.metadata), metadata);
+      assert.deepEqual(await fsp.readFile(transaction.files.request), prefix);
+      await assert.rejects(fsp.stat(transaction.files.response), { code: 'ENOENT' });
+      assert.equal(outbox.snapshot().pending, 0);
+      assert.equal(outbox.reservedBytes, 0);
+      assert.equal(outbox.reservedFiles, 0);
+    } finally {
+      await outbox.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test('failed stream writes release capacity for other Captures', async t => {
+  await t.test('metadata publication failure', async t => {
+    const root = temporaryRoot();
+    const outbox = new DurableCaptureOutbox({ root, relayUrl: '', maxFiles: 1,
+      minFreeBytes: 0, minFreeFiles: 0 });
+    try {
+      await outbox.start();
+      const originalLink = fsp.link;
+      let injectFailure = true;
+      t.mock.method(fsp, 'link', async (...args) => {
+        if (injectFailure && args[1] === path.join(root, 'open', 'cap-metadata-eio.open.json')) {
+          injectFailure = false;
+          throw Object.assign(new Error('synthetic metadata I/O failure'), { code: 'EIO' });
+        }
+        return originalLink(...args);
+      });
+      await assert.rejects(outbox.beginCapture({ captureId: 'cap-metadata-eio' }), { code: 'EIO' });
+      assert.equal(outbox.reservedBytes, 0);
+      assert.equal(outbox.reservedFiles, 0);
+      await outbox.beginCapture({ captureId: 'cap-metadata-after-eio' });
+      assert.deepEqual(await fsp.readdir(outbox.openDir), ['cap-metadata-after-eio.open.json']);
+      assert.equal(outbox.snapshot().openTransactions, 1);
+    } finally {
+      await outbox.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+  await t.test('spool append failure', async t => {
+    const root = temporaryRoot();
+    const outbox = new DurableCaptureOutbox({ root, relayUrl: '', maxFiles: 3, maxBytes: 1024 * 1024,
+      minFreeBytes: 0, minFreeFiles: 0 });
+    try {
+      const first = await outbox.beginCapture({ captureId: 'cap-append-eio' });
+      const second = await outbox.beginCapture({ captureId: 'cap-append-after-eio' });
+      const originalAppend = fsp.appendFile;
+      t.mock.method(fsp, 'appendFile', async (file, ...args) => {
+        if (file === first.files.request) {
+          throw Object.assign(new Error('synthetic spool I/O failure'), { code: 'EIO' });
+        }
+        return originalAppend(file, ...args);
+      });
+      const payload = Buffer.from('x'.repeat(600 * 1024));
+      await first.appendRequest(payload);
+      assert.equal(first.writeError?.code, 'EIO');
+      assert.equal(outbox.reservedBytes, 0);
+      assert.equal(outbox.reservedFiles, 0);
+      await second.appendRequest(payload);
+      assert.equal(second.writeError, null);
+      assert.deepEqual(await fsp.readFile(second.files.request), payload);
+      assert.equal(outbox.snapshot().openWriteFailures, 1);
+      assert.equal(outbox.snapshot().openCaptureHealthy, false);
+    } finally {
+      await outbox.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test('stream finalization needs physical headroom while the open spools still exist', async t => {
+  for (const quota of ['bytes', 'inodes']) await t.test(quota, async t => {
+    const root = temporaryRoot();
+    const outbox = new DurableCaptureOutbox({ root, relayUrl: '', minFreeBytes: 0, minFreeFiles: 0 });
+    try {
+      const transaction = await outbox.beginCapture({ captureId: 'cap-finalize-headroom' });
+      const request = Buffer.from('x'.repeat(16 * 1024));
+      await transaction.appendRequest(request);
+      const original = await fsp.readFile(transaction.files.metadata);
+      // Freeze the actual cached observation while configuring a waterline
+      // that permits logical replacement but cannot fit the new physical file.
+      t.mock.method(outbox, 'refreshFilesystemStats', async () => {});
+      if (quota === 'bytes') outbox.minFreeBytes = outbox.metrics.filesystemFreeBytes - 1024;
+      else outbox.minFreeFiles = outbox.metrics.filesystemFreeFiles;
+      const code = quota === 'bytes' ? 'OUTBOX_DISK_PRESSURE' : 'OUTBOX_INODE_PRESSURE';
+      await assert.rejects(transaction.finalize({ responseStatus: 200 }), { code });
+      assert.equal(outbox.snapshot().openWriteFailures, 1);
+      assert.equal(outbox.snapshot().openCaptureHealthy, false);
+      assert.deepEqual(await fsp.readFile(transaction.files.metadata), original);
+      assert.deepEqual(await fsp.readFile(transaction.files.request), request);
+      assert.deepEqual(await fsp.readdir(outbox.pendingDir), []);
+      assert.equal(outbox.reservedBytes, 0);
+      assert.equal(outbox.reservedFiles, 0);
+    } finally {
+      await outbox.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test('restart recovery releases each converted open Capture from the file quota', async () => {
+  const root = temporaryRoot();
+  const options = { root, relayUrl: '', maxFiles: 2, minFreeBytes: 0, minFreeFiles: 0 };
+  const first = new DurableCaptureOutbox(options);
+  let second;
+  try {
+    await first.beginCapture({ captureId: 'cap-recovery-capacity-a' });
+    await first.beginCapture({ captureId: 'cap-recovery-capacity-b' });
+    await first.close();
+    second = new DurableCaptureOutbox(options);
+    await second.start();
+    assert.deepEqual(await fsp.readdir(second.openDir), []);
+    assert.equal(second.snapshot().openFiles, 0);
+    assert.equal(second.snapshot().openTransactions, 0);
+    assert.equal(second.snapshot().pending, 2);
+    let bytes = 0;
+    for (const name of await fsp.readdir(second.pendingDir)) {
+      const stored = await fsp.readFile(path.join(second.pendingDir, name));
+      bytes += stored.length;
+      const record = JSON.parse(stored);
+      assert.equal(record.captureTransaction.state, 'recovered_incomplete');
+      assert.equal(record.upstreamResponseCompleted, false);
+      assert.equal(record.clientResponseFinished, false);
+    }
+    assert.equal(second.snapshot().queueBytes, bytes);
+    await assert.rejects(second.beginCapture({ captureId: 'cap-recovery-capacity-full' }),
+      { code: 'OUTBOX_FULL' });
+  } finally {
+    await first.close();
+    if (second) await second.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('file and free-space cutoffs reject new captures without deleting queued evidence', async () => {
   const fileRoot = temporaryRoot();
   const fileLimited = new DurableCaptureOutbox({

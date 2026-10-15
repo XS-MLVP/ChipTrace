@@ -14,7 +14,7 @@ async function listen(server) {
   return server.address().port;
 }
 
-test('host gateway rejects healthy delivery while a streamed Capture is stale', async () => {
+async function verifyHostHealth(mode) {
   const script = process.env.CHIPTRACE_GATEWAY_SCRIPT;
   assert.ok(script && fs.statSync(script).isFile(), 'set CHIPTRACE_GATEWAY_SCRIPT to the real gateway server.js');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chiptrace-host-health-'));
@@ -44,7 +44,9 @@ test('host gateway rejects healthy delivery while a streamed Capture is stale', 
     cwd: path.dirname(script), stdio: ['ignore', 'ignore', 'pipe'],
     env: { ...process.env, PORT: String(port), SUB2API_BASE: `http://127.0.0.1:${upstreamPort}`,
       FULL_TRACE_CAPTURE_ENABLED: 'true', FULL_TRACE_CAPTURE_BODY_ENABLED: 'true',
-      FULL_TRACE_CAPTURE_ALL_AUTHENTICATED_KEYS: 'true', FULL_TRACE_CAPTURE_HEALTH_MAX_OPEN_MS: '1000',
+      FULL_TRACE_CAPTURE_ALL_AUTHENTICATED_KEYS: 'true',
+      FULL_TRACE_CAPTURE_HEALTH_MAX_OPEN_MS: mode === 'stale' ? '1000' : '60000',
+      FULL_TRACE_CAPTURE_OUTBOX_MAX_FILES: mode === 'capacity' ? '1' : '100000',
       FULL_TRACE_CAPTURE_RELAY_URL: `http://127.0.0.1:${relayPort}`, FULL_TRACE_CAPTURE_OUTBOX_DIR: root,
       FULL_TRACE_CAPTURE_OUTBOX_MIN_FREE_BYTES: '0', FULL_TRACE_CAPTURE_OUTBOX_MIN_FREE_FILES: '0',
       FULL_TRACE_CAPTURE_SHUTDOWN_GRACE_MS: '100', WATCHDOG_ENABLED: 'false', TRACE_EXPORT_ENABLED: 'false',
@@ -69,16 +71,18 @@ test('host gateway rejects healthy delivery while a streamed Capture is stale', 
     let active;
     for (let i = 0; i < 100; i++) {
       active = await health();
-      if (active.fullTraceCapture.outbox.openTransactions === 1) break;
+      if (active.fullTraceCapture.outbox.openTransactions === 1
+        && (mode === 'stale' || active.fullTraceCapture.outbox.openWriteFailures === 1)) break;
       await new Promise(resolve => setTimeout(resolve, 10));
     }
     assert.equal(active.fullTraceCapture.outbox.openTransactions, 1, stderr);
-    await new Promise(resolve => setTimeout(resolve, 1100));
-    const stale = await health();
-    assert.equal(stale.fullTraceCapture.outbox.staleOpenTransactions, 1);
-    assert.equal(stale.fullTraceCapture.outbox.openCaptureHealthy, false);
-    assert.equal(stale.fullTraceCapture.currentDeliveryHealthy, false);
-    assert.equal(stale.status, 'degraded');
+    if (mode === 'stale') await new Promise(resolve => setTimeout(resolve, 1100));
+    const unhealthy = await health();
+    assert.equal(unhealthy.fullTraceCapture.outbox.staleOpenTransactions, mode === 'stale' ? 1 : 0);
+    assert.equal(unhealthy.fullTraceCapture.outbox.openWriteFailures, mode === 'capacity' ? 1 : 0);
+    assert.equal(unhealthy.fullTraceCapture.outbox.openCaptureHealthy, false);
+    assert.equal(unhealthy.fullTraceCapture.currentDeliveryHealthy, false);
+    assert.equal(unhealthy.status, 'degraded');
   } finally {
     stream?.end();
     request?.destroy();
@@ -94,4 +98,9 @@ test('host gateway rejects healthy delivery while a streamed Capture is stale', 
     await Promise.all([new Promise(resolve => upstream.close(resolve)), new Promise(resolve => relay.close(resolve))]);
     fs.rmSync(root, { recursive: true, force: true });
   }
-});
+}
+
+test('host gateway rejects healthy delivery while a streamed Capture is stale',
+  () => verifyHostHealth('stale'));
+test('host gateway rejects healthy delivery immediately after a streaming capacity failure',
+  () => verifyHostHealth('capacity'));
