@@ -1,16 +1,16 @@
 # 生产就绪评估
 
-评估日期：2026-10-16。最新线上只读快照为 01:45–01:46（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-16。最新线上只读快照为 02:39（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-01:45 的只读快照中，18084、3011、3012 均返回 200，Collector/Relay 仍为 `fe9fcf9`；
-Relay 累计投递 1,094,080，pending/inflight/failed 均为 0，计数守恒。
+02:39 的本机回环只读快照中，18084、3011、3012 均返回 200，Collector/Relay 仍为 `fe9fcf9`；
+Relay 累计投递 1,097,769，pending/inflight/failed 均为 0，计数守恒。
 这只是瞬时队列状态，不构成持续 SLO 或完整 Session 的证明。Wire 仍只有 1 条且已约
 15 小时未更新，覆盖为
 `degraded`；18086 连接拒绝，runtime gate 实际因 `stale_sources=wire` 退出 1。
 模型探针最后可用时间仍为 10 月 8 日，网关 trace exporter 未启用。
-01:46 的 Collector 快照累计保存 1,094,115 条 Capture；740 个 sealed Segment 共 87,007,160,193 bytes
+同一窗口 Collector 累计保存 1,097,769 条 Capture；741 个 sealed Segment 共 87,431,090,167 bytes
 保存在共享 NFS；此观测不证明已提交目标 OSS。当前状态应区分为传输进程存活、完整
 业务链路未验收和在线交付入口不可用。
 
@@ -41,6 +41,16 @@ Lite 终态沿用逐项事件重建。已完成正文冲突和缺失项目拒绝
 不证明线上、未修改生产者或真实 OSS 已达到交付标准。
 本轮完整 `cloud-test` 实际退出 0：306 个 Rust 库测试、1 个 CLI 测试和 241 个 Node
 测试通过；默认套件忽略的三项 RSS 用例继续由独立 CI 门禁执行。
+
+## 新执行的取消与断连回归
+
+隔离 patched App Server 实际完成三轮：收到文本 delta 后原生 `turn/interrupt`，下一轮
+收到 delta 后实际断开 HTTP socket 并自动重试，再正常继续一轮。4 次 HTTP 尝试逐条保留，
+3 个原生 Turn 均闭合，首轮为 `cancelled`；Interrupt Hook、四路来源、Raw 字节/哈希、
+Canonical 引用和重启恢复均通过。两条部分响应没有被后续成功覆盖，整体完整交付检查
+仍为 false。首轮测试曾因使用错误的 Hook 字段名退出 1；按实际 WAL 契约修正后退出 0，
+原失败证据保留。这补充了原生取消/断流的协议 CI，模型仍为合成且生产者带补丁，不能
+代替未修改客户端和线上真实任务验收，也没有改变线上部署。
 
 ## 既有隔离验证记录
 
@@ -154,14 +164,14 @@ parts，2 Turn、8 模型交互、6 工具记录不变，Raw SHA-256 一致。
 | --- | --- | --- |
 | 18084、3011、3012 | HTTP 200 | 入口与采集进程存活 |
 | Collector/Relay | revision `fe9fcf924b226099202cb770b7cf0da29e0c2310` | 运行版本已固定；仓库新增修复尚未部署 |
-| 投递 | 01:45 已投递 1,094,080 条，pending/inflight/failed 均为 0，计数守恒 | 该快照队列排空；不是持续 SLO 或完整 Session 数 |
-| Collector 磁盘 | 01:46 有 740 个 sealed Segment，87,007,160,193 bytes | 云端共享 NFS 上的 WAL 持续保存；不能证明 OSS 已提交 |
+| 投递 | 02:39 已投递 1,097,769 条，pending/inflight/failed 均为 0，计数守恒 | 该快照队列排空；不是持续 SLO 或完整 Session 数 |
+| Collector 磁盘 | 02:39 有 741 个 sealed Segment，87,431,090,167 bytes | 云端共享 NFS 上的 WAL 持续保存；不能证明 OSS 已提交 |
 | Wire | 新进程内仅 1 条；活动 WAL 中为无原生 Session/Turn 的 HTTP 403 | 无真实成功 Turn Wire 的证据 |
-| 来源新鲜度 | 01:45 OTLP/Hook 有流量，Wire 约 15 小时未更新；runtime gate 仍实际因 Wire 过期退出 1 | 当前采集覆盖降级 |
+| 来源新鲜度 | 02:39 OTLP/Hook 有流量，Wire 约 16 小时未更新；runtime gate 仍实际因 Wire 过期退出 1 | 当前采集覆盖降级 |
 | 历史失败 | 293 个文件，267,219,223 bytes | 保留失败取证，不能删除换取健康状态 |
 | 平台 18086 | 无法连接 | 当前无法交接在线管理、导出入口 |
 | 部署隔离 | Relay 要求 ingest token；Collector/Relay 绑定 loopback；两容器有重启策略 | 有内部入口保护；两容器尚无内存/CPU 上限或只读根文件系统 |
-| GitHub CI | 已核验基线 `9cf3f3b`：[run 38781147637](https://github.com/XS-MLVP/ChipTrace/actions/runs/38781147637) 已确认成功；5/5 作业、16 份正大小报告元数据均未过期、带 SHA-256 | 包含新执行的图片、计划、五类真实工具、双轮 resume、HTTP 重试、模型切换、实际并行及全输入/输出比较；使用带补丁生产者和合成模型，未下载报告正文，不能替代线上验收或后续提交的终态输出修复 CI |
+| GitHub CI | 已核验 `3bbca22`：[run 38785158730](https://github.com/XS-MLVP/ChipTrace/actions/runs/38785158730) 已确认成功；5/5 作业、16 份正大小报告元数据均未过期、带 SHA-256 | 包含完整终态输出保真、图片、五类真实工具、双轮 resume、HTTP 重试、模型切换、实际并行；使用带补丁生产者和合成模型，未下载报告正文；新取消回归需独立提交后核验 CI |
 | GitHub 集成 | 远端 main 仍为 `514d4cf`，公共分支 API 返回 `protected=false`；维护分支修复尚未合并 | 需设置评审和必需检查约束、完成同 SHA 验证及受控发布；分支 CI 不等于部署 |
 
 11:26 复查时三个既有服务仍返回 HTTP 200，Relay 已投递 1,036,522 条，pending 为 1、

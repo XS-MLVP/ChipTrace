@@ -44,8 +44,20 @@ opaque reasoning、summary、commentary 阶段及图片。报告只记录元数�
 服务还在实际终态 `output` 中返回一个没有独立 `output_item.done` 的项目，必须从
 Collector Raw 的终态复核其完整数组，并与 Canonical 全部项目逐项、按顺序比较。
 报告的 `terminal_output_evidence` 只保存验证结论及这类项目的数量，不包含正文。
-四类终态、added 占位补全、矛盾已完成项目和工具调用字节边界另有 Rust 回归；这些
-协议用例不能代替真实客户端取消和断连的端到端验收。
+四类终态、added 占位补全、矛盾已完成项目和工具调用字节边界另有 Rust 回归。
+
+同一 CI 步骤还顺序执行
+[protocol-interruption.test.js](../integrations/codex/protocol-interruption.test.js)。它新建隔离
+Session：首轮等待 App Server 实际收到文本 delta 后，用真实 threadId/turnId 调用
+`turn/interrupt`，必须观察到 `turn/completed.status=interrupted`、实际响应连接关闭和
+带原生 Turn 的 Interrupt Hook；第二轮也先确认 delta 到达，再实际断开服务端 socket，
+由客户端自行重试，两个 HTTP 尝试保持同一原生 Turn；第三轮正常继续。
+四次请求各有独立 Capture 和 Canonical 交互，逐次校验实际前缀的字节、SHA-256、关闭
+位置和未出现协议终态的事实。所有来源按原生身份归属且计数守恒；两条部分响应不得因
+后续成功而变完整，整体 `delivery_ready=false`。Relay/Collector 重启后复验投影和 Raw。
+工作流在既有 artifact 中另保存 `chiptrace.native-interruption-ci.v1` 元数据报告；该测试
+与正常完整 Session 的正向门禁分开断言，不放宽交付条件。两组测试共享隔离配置与固定
+生产者身份检查，不共享原生 Session 或采集目录。
 
 这项回归使用已打补丁生产者和合成模型响应，报告固定声明 `real_upstream=false`、
 `production_acceptance_claimed=false`，并验证真实上游 Canary 门禁拒绝它。它能发现协议、
@@ -61,6 +73,7 @@ GitHub 还核对构建前的源码摘要。仅同版本号、补丁文件名或�
 CHIPTRACE_PROTOCOL_SOURCE=/absolute/path/to/pinned-codex-checkout \
 CHIPTRACE_PROTOCOL_PRODUCER=/absolute/path/to/codex-app-server \
 CHIPTRACE_PROTOCOL_REPORT=/private/path/native-protocol-ci.json \
+CHIPTRACE_INTERRUPTION_REPORT=/private/path/native-interruption-ci.json \
   make protocol-collection-test
 ```
 

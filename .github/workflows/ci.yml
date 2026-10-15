@@ -198,12 +198,13 @@ jobs:
           bash scripts/ci/run-producer-check.sh collector-build \
             "$RUNNER_TEMP/producer-collector-build.log" \
             cargo +1.91.0 build --locked --bin chiptrace
-      - name: Collect new native Turns with retries, parallel tools, complete outputs, reasoning, images and resume
+      - name: Collect new native Turns with tools, resume, interruption and disconnected retries
         env:
           CHIPTRACE_PROTOCOL_PRODUCER: ${{ github.workspace }}/.ci-codex-source/codex-rs/target/debug/codex-app-server
           CHIPTRACE_PROTOCOL_SOURCE: ${{ github.workspace }}/.ci-codex-source
           CHIPTRACE_PROTOCOL_EXPECTED_SOURCE_DIGEST: ${{ steps.producer-source.outputs.digest }}
           CHIPTRACE_PROTOCOL_REPORT: ${{ runner.temp }}/native-protocol-ci.json
+          CHIPTRACE_INTERRUPTION_REPORT: ${{ runner.temp }}/native-interruption-ci.json
         run: |
           set -euo pipefail
           if make protocol-collection-test 2>&1 | tee "$RUNNER_TEMP/native-protocol-ci.tap"; then
@@ -236,6 +237,7 @@ jobs:
             ${{ runner.temp }}/producer-collector-build.log
             ${{ runner.temp }}/producer-regression-check-with-session.json
             ${{ runner.temp }}/native-protocol-ci.json
+            ${{ runner.temp }}/native-interruption-ci.json
             ${{ runner.temp }}/native-protocol-ci.tap
 
   rust:
