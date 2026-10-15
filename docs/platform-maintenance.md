@@ -116,6 +116,10 @@ SHA-256 放入 `rust-cache` 的 key，因而 fallback prefix 也限制在同一�
 负载来覆盖该差异，仍要求真实编译、复用、测试执行和源码变化后的 exit 101。
 CI 另将完整 TAP 上传为 `producer-ci-regressions-report`。收到 runner 的 Ubuntu 26
 迁移通知后，五个作业均固定 `ubuntu-24.04`，避免操作系统别名变化使构建环境漂移。
+同一轮真实注释还报告三个 v4 Action 的 Node 20 已弃用、正被强制以 Node 24 运行。
+已核对上游稳定 release、完整 `action.yml` 和 tag 对应的提交，将 checkout 7.0.1、
+setup-node 7.1.0、upload-artifact 7.0.2 固定到 SHA；三者原生使用 Node 24。测试运行时
+继续显式选择 Node 22，关闭 setup-node 新的自动包管理器缓存，保留原来的安装和报告路径。
 
 宿主网关还须使用 `openCaptureHealthy` 门禁。独立部署 smoke：
 

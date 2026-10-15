@@ -16,10 +16,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
+          package-manager-cache: false
       - name: Install the pinned unmodified client in the runner temporary directory
         run: |
           npm install --prefix "$RUNNER_TEMP/chiptrace-stock-client" \
@@ -30,7 +31,7 @@ jobs:
           set -euo pipefail
           CHIPTRACE_STOCK_CODEX_MODULES="$RUNNER_TEMP/chiptrace-stock-client/node_modules" \
             make managed-route-test | tee stock-managed-route.tap
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: stock-managed-route-report
@@ -46,9 +47,9 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check out the pinned Stock Codex source
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: openai/codex
           ref: 5425d3e625daa58eea3ad1de27c087eb3b2ffbd3
@@ -72,9 +73,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95.0"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
+          package-manager-cache: false
       - name: Reconcile only the pinned tag's local package release versions
         working-directory: .ci-codex-source/codex-rs
         run: |
@@ -129,7 +131,7 @@ jobs:
       - name: Build the patched CLI from the exact producer source
         working-directory: .ci-codex-source/codex-rs
         run: cargo build -p codex-cli --bin codex --locked
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: producer-context-report
@@ -148,15 +150,16 @@ jobs:
   rust:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.91"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
+          package-manager-cache: false
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked
@@ -167,7 +170,7 @@ jobs:
         run: |
           set -euo pipefail
           node --test integrations/codex/config-contract.test.js integrations/codex/hook-ack.test.js | tee native-hook-ack.tap
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: native-hook-ack-report
@@ -176,7 +179,7 @@ jobs:
         run: |
           node --test scripts/ci/upstream-context.test.js scripts/ci/producer-source-cache.test.js \
             | tee producer-ci-regressions.tap
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: producer-ci-regressions-report
@@ -187,7 +190,7 @@ jobs:
         run: |
           set -euo pipefail
           node --test scripts/ci/runtime-health-gate.test.js | tee runtime-health-gate.tap
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: runtime-health-gate-report
@@ -234,7 +237,7 @@ jobs:
           fi
           grep -F "requires an unmodified Stock Codex producer" \
             patched-native-canary-production-gate.log
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: native-canary-gate-report
@@ -242,14 +245,14 @@ jobs:
       - run: cargo run --locked --bin chiptrace -- self-test
       - name: Verify native context gaps, unowned batches and read-only diagnostics
         run: node --test integrations/codex/native-context.test.js | tee native-context.tap
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: native-context-report
           path: native-context.tap
       - name: Verify cloud platform delivery gates and signed OSS protocol
         run: node --test integrations/cloud-platform/platform.test.js integrations/cloud-platform/storage-oss.test.js | tee platform.tap
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: platform-report
@@ -271,7 +274,7 @@ jobs:
       - run: target/release/chiptrace --help
       - name: Verify source auditing does not retain full Session payloads
         run: node scripts/ci/audit-memory-gate.js --report audit-memory.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: audit-memory-report
@@ -279,7 +282,7 @@ jobs:
   container:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: docker build --build-arg CHIPTRACE_REVISION="$GITHUB_SHA" -t chiptrace:ci .
       - run: docker run --rm chiptrace:ci --help
       - name: Verify container JSONL delivery closure
@@ -361,16 +364,17 @@ jobs:
       AWS_EC2_METADATA_DISABLED: "true"
       CHIPTRACE_S3_ENDPOINT: http://127.0.0.1:9000
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.91"
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
+          package-manager-cache: false
       - name: Check out pinned MinIO source
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: minio/minio
           ref: 07c3a429bfed433e49018cb0f78a52145d4bedeb
@@ -392,7 +396,7 @@ jobs:
       - run: cargo build --locked --bin chiptrace
       - name: Verify multipart S3 archive and disk restoration
         run: node --test integrations/cloud-platform/storage-s3.test.js | tee storage-s3.tap
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: storage-s3-report
