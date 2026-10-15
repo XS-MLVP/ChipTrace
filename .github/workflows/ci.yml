@@ -205,10 +205,11 @@ jobs:
       - name: Verify container JSONL delivery closure
         run: |
           docker run --rm --network none chiptrace:ci self-test | python3 -c '
-          import json, sys
+          import json, os, sys
           result = json.load(sys.stdin)
           assert result["ok"] is True
           assert result["checks"] and all(result["checks"].values())
+          assert result["collection"]["build"]["revision"] == os.environ["GITHUB_SHA"]
           assert result["acceptance"]["hard_gate_pass"] is True
           assert result["acceptance"]["score"] == 100
           assert result["collection_submission"]["durable"] is True
@@ -218,7 +219,12 @@ jobs:
           assert result["checks"]["cloud_source_coverage"] is True
           assert result["checks"]["turn_source_coverage"] is True
           assert result["checks"]["turn_interaction_coverage"] is True
-          assert result["interaction"]["metrics"]["turn_interaction"]["complete"] is True
+          turn_interaction = result["interaction"]["metrics"]["turn_interaction"]
+          assert turn_interaction["complete"] is True
+          assert turn_interaction["model_interactions"] == result["interaction"]["interactions"] == 6
+          assert turn_interaction["model_interactions_assigned_to_turn"] == 6
+          assert turn_interaction["tool_execution_spans"] == 5
+          assert turn_interaction["tool_execution_spans_assigned_to_turn"] == 5
           session_view = result["interaction"]["session_view"]
           assert session_view["schema_version"] == "chiptrace.session-view.v2"
           assert session_view["turn_source_coverage_complete"] is True

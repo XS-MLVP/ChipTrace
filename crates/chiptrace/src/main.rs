@@ -1854,7 +1854,22 @@ async fn self_test(args: SelfTestArgs) -> Result<Value> {
         "turn_interaction_coverage":interaction.metrics
             .pointer("/turn_interaction/complete")
             .and_then(Value::as_bool)
-            == Some(true),
+            == Some(true)
+            && interaction
+                .metrics
+                .pointer("/turn_interaction/model_interactions")
+                .and_then(Value::as_u64)
+                == Some(interaction.interactions)
+            && interaction
+                .metrics
+                .pointer("/turn_interaction/model_interactions_assigned_to_turn")
+                .and_then(Value::as_u64)
+                == Some(interaction.interactions)
+            && interaction
+                .metrics
+                .pointer("/turn_interaction/tool_execution_spans_assigned_to_turn")
+                .and_then(Value::as_u64)
+                == Some(5),
         "m0_otlp_tree":otlp.root_spans == 1
             && otlp.internal_parent_references == otlp.resolved_internal_parents
             && otlp.resolved_internal_parent_rate == 1.0
