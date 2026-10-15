@@ -1,6 +1,6 @@
 # 生产就绪评估
 
-评估日期：2026-10-15。首次线上读取窗口为 10:53–10:59（Asia/Shanghai），11:26 再次只读复查。
+评估日期：2026-10-15。首次线上读取窗口为 10:53–10:59（Asia/Shanghai），11:26、12:17 再次只读复查。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
@@ -10,20 +10,27 @@
 | --- | --- | --- |
 | 18084、3011、3012 | HTTP 200 | 入口与采集进程存活 |
 | Collector/Relay | revision `fe9fcf924b226099202cb770b7cf0da29e0c2310` | 运行版本已固定；仓库新增修复尚未部署 |
-| 投递 | 同一快照已投递 1,034,159 条，pending/inflight/failed 为 0，计数守恒 | 累计传输闭环；不能当作并发压测结果 |
-| Collector 磁盘 | 724 个 sealed Segment，79,568,736,213 bytes；活动段仍在增长 | 云端本地 WAL 持续保存；不能证明 OSS 已提交 |
+| 投递 | 12:17 同一快照已投递 1,039,543 条，pending/inflight/failed 为 0，计数守恒 | 累计传输闭环；不能当作并发压测结果 |
+| Collector 磁盘 | 12:17 有 726 个 sealed Segment，80,540,839,951 bytes；活动段仍在增长 | 云端本地 WAL 持续保存；不能证明 OSS 已提交 |
 | Wire | 新进程内仅 1 条；活动 WAL 中为无原生 Session/Turn 的 HTTP 403 | 无真实成功 Turn Wire 的证据 |
 | 来源新鲜度 | OTLP/Hook 有流量，Wire 超过五分钟未更新；runtime gate 实际退出 1 | 当前采集覆盖降级 |
 | 历史失败 | 293 个文件，267,219,223 bytes | 保留失败取证，不能删除换取健康状态 |
 | 平台 18086 | 无法连接 | 当前无法交接在线管理、导出入口 |
 | 部署隔离 | Relay 要求 ingest token；Collector/Relay 绑定 loopback；两容器有重启策略 | 有内部入口保护；两容器尚无内存/CPU 上限或只读根文件系统 |
-| GitHub CI | `9510758` 的 [run 38676531074](https://github.com/XS-MLVP/ChipTrace/actions/runs/38676531074) 已确认 5/5 作业成功 | 覆盖 Process 冲突修复这一 SHA；不能代替后续提交或线上验收 |
+| GitHub CI | `31f9e16` 的 [run 38679669015](https://github.com/XS-MLVP/ChipTrace/actions/runs/38679669015) 已确认 5/5 作业成功 | 覆盖未归属 batch 审计与交付状态修复；不能代替后续提交或线上验收 |
 
 11:26 复查时三个既有服务仍返回 HTTP 200，Relay 已投递 1,036,522 条，pending 为 1、
 inflight/failed 为 0、计数守恒。持续流量下瞬时 pending 不能单独判定积压故障。
 OTLP logs/traces 与 Hook 仍更新，Wire 仍只有 1 条，约 43 分钟未更新，覆盖仍为
 `degraded`；18086 连接被拒绝。同一轮 runtime gate 真实退出 1，首个失败项为网关
 `rustRelay.inflight must be zero`，该瞬时门禁结果不取代来源新鲜度或逐 Session 审计。
+
+12:17 复查中入口与采集服务仍返回 HTTP 200，OTLP/Hook 继续流入，Wire 仍只有 1 条，
+约 94 分钟未更新。runtime gate 实际退出 1，原因为
+`relay.ingest_coverage.status must be complete (observed=degraded; missing_sources=none; stale_sources=wire)`；
+18086 仍返回连接拒绝。Collector/Relay 仍是 `fe9fcf9`，未设置容器 CPU/内存上限，
+根文件系统可写。WAL 所在共享 NFS 使用率为 57%，当时可用约 2.33 TB；可用空间
+不替代项目配额、保留周期和恢复演练。
 
 Wire 诊断只读取活动段打开时的固定长度快照：439,333,206 bytes、2,826 条完整记录、
 1 条 Wire，没有复制或输出对话正文。它是故障定位证据，不是从 Segment 1 开始的完整
@@ -52,6 +59,25 @@ Canonical 投影内存集合中。平台分页增加总交付状态，完整性�
 本地复跑还记录过一次 outbox 测试 18/19 通过、`make` 退出 2；随后独立 outbox 回归
 19/19 和完整 `cloud-test` 均通过，测试条件未放宽。原失败的断言细节未被当时的摘要
 保留，原因尚未定位，需继续跟踪；后续摘要已保留失败测试名称和完整断言块。
+
+后续内存回归发现，独立来源审计仍把选中 Session 的全部 Capture 正文留在内存，尽管
+返回值只需要审计结果。修复后独立审计按条释放正文，投影和检查入口的行为保持原有要求。
+同一份 134,337,249 bytes、514 条 Capture 的纯合成输入，在相同 debug CLI 两线程设置下：
+
+| 测量 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 峰值 RSS | 179,000 KiB | 42,212 KiB |
+| 耗时 | 59.17 秒 | 59.94 秒 |
+
+两次完整审计 JSON 完全一致，输入 SHA-256 均为
+`0b1d367141031f1656fbac02718b5da35881c97af3cb536ee23054509e04cb91`，原始合成输入未变。
+独立 release 门禁实测 22,508 KiB、1.90 秒，低于 96 MiB 预算；不能把该 release 结果
+与 debug 基线混作直接对比。门禁已加入 GitHub CI，校验来源计数和输入哈希，只保存精简
+合成元数据。该修复的本地 `cloud-test` 实际退出 0；精确身份索引仍随 Capture/Span
+数量增长，这项测量不证明全量数据处理内存恒定或线上已完成大归档验收。
+隔离镜像 `chiptrace:m0-audit-memory-canary` 的 `m0-test` 也实际退出 0，构建标记为
+`working-tree-audit-payload-retention`；它在断网、只读根文件系统和非 root 用户下运行，
+没有替换线上 Collector/Relay。
 
 ## 已有优势
 

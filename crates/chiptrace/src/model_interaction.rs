@@ -47,7 +47,7 @@ pub fn audit_session_context(
         bail!("no Capture JSONL inputs found");
     }
     discover_raw_sources(inputs, &discovered)?;
-    read_session_snapshot(&discovered, session_id, Some(sample_limit))?
+    read_session_snapshot(&discovered, session_id, Some(sample_limit), false)?
         .source_audit
         .context("Session snapshot has no source context audit")
 }
@@ -370,7 +370,7 @@ fn project_interactions_with_audit(
     let (captures, duplicate_captures_removed, global_scopes, source_context_audit) =
         if let Some(session) = &config.session_id {
             let snapshot =
-                read_session_snapshot(&inputs, session, include_source_audit.then_some(0))?;
+                read_session_snapshot(&inputs, session, include_source_audit.then_some(0), true)?;
             (
                 snapshot.captures,
                 snapshot.duplicates,
@@ -1182,7 +1182,7 @@ fn read_session_captures_with_scopes(
     inputs: &[PathBuf],
     session: &str,
 ) -> Result<(Vec<Value>, u64, crate::turn_identity::ExactTurnIndex)> {
-    let snapshot = read_session_snapshot(inputs, session, None)?;
+    let snapshot = read_session_snapshot(inputs, session, None, true)?;
     Ok((snapshot.captures, snapshot.duplicates, snapshot.scopes))
 }
 
@@ -1197,6 +1197,7 @@ fn read_session_snapshot(
     inputs: &[PathBuf],
     session: &str,
     audit_sample_limit: Option<usize>,
+    retain_selected_payloads: bool,
 ) -> Result<SessionCaptureSnapshot> {
     let session = session.trim();
     if session.is_empty() {
@@ -1273,7 +1274,9 @@ fn read_session_snapshot(
         {
             audit.observe_capture(&capture, &turn_index)?;
         }
-        if selected {
+        // A standalone source audit only needs the identity index and counts.
+        // Projection callers retain the selected payloads for the next stage.
+        if selected && retain_selected_payloads {
             captures.push(capture);
         }
         Ok(())

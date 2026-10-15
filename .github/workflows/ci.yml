@@ -228,6 +228,13 @@ jobs:
           '
       - run: cargo build --release --locked --bin chiptrace
       - run: target/release/chiptrace --help
+      - name: Verify source auditing does not retain full Session payloads
+        run: node scripts/ci/audit-memory-gate.js --report audit-memory.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: audit-memory-report
+          path: audit-memory.json
   container:
     runs-on: ubuntu-latest
     steps:

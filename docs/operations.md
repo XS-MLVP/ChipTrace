@@ -234,6 +234,13 @@ Session 或未归属业务记录，并通过 Canonical Runtime/协议与逐 Turn
 batch 逐批进入审计计数，不能在 Session 选择时静默遗漏；它们不会被猜测归属到当前 Turn。
 审计用的精确身份/父链索引仍占用随记录数增长的内存，大归档应测量峰值并安排磁盘索引。
 
+独立 `audit-session-context` 在计数后释放每条 Capture 的正文，不再保留整个选中 Session。
+`inspect-session` 和交互投影仍需保留选中载荷，不能套用独立审计的内存测量。
+可运行 `make audit-memory-test` 检查审计的载荷保留回归：release CLI 读取至少 128 MiB
+的合成输入，校验 514 条 Capture、来源计数和输入 SHA 不变，峰值 RSS 不超过 96 MiB。
+GitHub CI 保存 `audit-memory-report` 元数据产物；它不是大记录数压力测试或真实 Session
+交付证明，身份索引的磁盘化仍需单独迭代。
+
 平台 `/v1/jobs/{id}/turns` 的顶层 `delivery_ready` 表示检查/验收总状态；`summary` 继续
 保留已精确归属的 Session 视图。历史检查结果若没有 `source_context_audit`，分页总状态
 为 false，需使用新 job ID 重新检查原始 Archive；不要改写历史任务结果。
