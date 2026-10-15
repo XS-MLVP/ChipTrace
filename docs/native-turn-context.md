@@ -42,6 +42,13 @@ GitHub 的临时 runner 按同一 pinned producer 的 CI 配置启用非特权 u
 失败同时生成有长度限制的 check annotation，避免匿名日志访问受限时只能看到退出码；
 模型服务的断言错误会立即结束当前等待，不等待生产者耗尽网络重试。
 
+namespace 可用仍不等于原生工具可执行：一次远端新采集实际因缺少 Bubblewrap 而使
+第一个 shell 工具退出 101。debug producer 没有 release 包内的 bundled bwrap，因此 CI
+显式安装系统 bubblewrap，并在编译前执行只读
+[sandbox 检查](../scripts/ci/check-native-sandbox.sh)：检查 producer 要求的 --perms 能力，
+实际进入 user/PID namespace，绑定只读根并检查系统文件可读。缺少 bwrap 时真实退出
+127；不改用无沙箱工具或伪造成功。
+
 生产者 core/App Server 测试程序编译、回调、并行终态、完整客户端、Session 作用域和
 二进制构建各有独立 CI 步骤，便于从公开 job 状态区分编译与测试执行。上述命令要求新
 的私有日志文件并保留原始输出；失败注释同时记录命令、日志写入和最终退出码，

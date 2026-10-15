@@ -91,6 +91,16 @@ jobs:
         with:
           node-version: "22"
           package-manager-cache: false
+      - name: Install the system Bubblewrap required by the debug producer sandbox
+        run: |
+          bash scripts/ci/run-producer-check.sh sandbox-install \
+            "$RUNNER_TEMP/producer-sandbox-install.log" \
+            bash -c 'sudo apt-get update && sudo apt-get install --yes --no-install-recommends bubblewrap'
+      - name: Prove the real Bubblewrap sandbox can execute with a read-only root
+        run: |
+          bash scripts/ci/run-producer-check.sh sandbox \
+            "$RUNNER_TEMP/producer-sandbox.log" \
+            bash scripts/ci/check-native-sandbox.sh
       - name: Reconcile only the pinned tag's local package release versions
         working-directory: .ci-codex-source/codex-rs
         run: |
@@ -213,6 +223,8 @@ jobs:
             ${{ runner.temp }}/producer-cache-identity.json
             ${{ runner.temp }}/producer-cache-prepared.json
             ${{ runner.temp }}/producer-cache-observation.json
+            ${{ runner.temp }}/producer-sandbox-install.log
+            ${{ runner.temp }}/producer-sandbox.log
             ${{ runner.temp }}/producer-core-test-build.log
             ${{ runner.temp }}/producer-callbacks.log
             ${{ runner.temp }}/producer-parallel.log
