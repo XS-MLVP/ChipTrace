@@ -15,6 +15,10 @@
 发布时先更新 Relay，再更新网关模块；旧 Relay 缺少 input receipt 时，新模块会保留积压。
 必须用同一发布候选的真实进程验证确认链路，并检查积压和完整性门禁。
 
+`refreshQueueStats()` 只发布未与本进程队列变更重叠的磁盘扫描；入队、流式写入、
+最终化、投递和恢复发生在扫描期间时会重读，避免漏计新文件或把已确认记录重新计为
+pending。等待远端确认时仍可重扫并观察 processing；扫描不修改 Capture 正文或历史失败。
+
 ```js
 const {
   DurableCaptureOutbox,

@@ -630,7 +630,7 @@ class DurableCaptureTransaction {
     if (retained.length < bytes.length) this[truncatedField] = true;
     if (retained.length === 0) return this.writeChain;
     const file = this.files[side];
-    this.writeChain = this.writeChain.then(async () => {
+    this.writeChain = this.writeChain.then(() => this.outbox.withQueueMutation(async () => {
       if (this.writeError) return;
       if (this.outbox.metrics.queueBytes + retained.length > this.outbox.maxBytes) {
         const error = new Error('capture outbox byte cap is full');
@@ -647,7 +647,7 @@ class DurableCaptureTransaction {
       this.persistedBytes += retained.length;
       this.outbox.metrics.openBytes += retained.length;
       this.outbox.metrics.queueBytes += retained.length;
-    }).catch((error) => {
+    })).catch((error) => {
       this.writeError ||= error;
     });
     return this.writeChain;
@@ -658,6 +658,10 @@ class DurableCaptureTransaction {
     this.closed = true;
     await this.writeChain;
     if (this.writeError) throw this.writeError;
+    return this.outbox.withQueueMutation(() => this.finalizeRecord(fields));
+  }
+
+  async finalizeRecord(fields) {
     await Promise.all([
       syncOptionalFile(this.files.request),
       syncOptionalFile(this.files.response),
@@ -785,6 +789,32 @@ class DurableCaptureOutbox {
     this.queuedAtByName = new Map();
     this.openAtByName = new Map();
     this.openCaptures = new Map();
+    this.queueMutationVersion = 0;
+    this.queueMutations = 0;
+    this.queueIdlePromise = null;
+    this.resolveQueueIdle = null;
+  }
+
+  beginQueueMutation() {
+    if (this.queueMutations === 0) {
+      this.queueIdlePromise = new Promise(resolve => { this.resolveQueueIdle = resolve; });
+    }
+    this.queueMutations += 1;
+    this.queueMutationVersion += 1;
+    return () => {
+      this.queueMutationVersion += 1;
+      this.queueMutations -= 1;
+      if (this.queueMutations === 0) {
+        this.resolveQueueIdle();
+        this.queueIdlePromise = null;
+        this.resolveQueueIdle = null;
+      }
+    };
+  }
+
+  async withQueueMutation(action) {
+    const finish = this.beginQueueMutation();
+    try { return await action(); } finally { finish(); }
   }
 
   async start() {
@@ -810,14 +840,16 @@ class DurableCaptureOutbox {
     // A crash between claim and remote ACK leaves the file in processing.
     // Move it back before accepting new work; the no-replace link is atomic on
     // one filesystem.
-    for (const file of await listRegularFiles(this.processingDir)) {
-      const target = path.join(this.pendingDir, path.basename(file));
-      try {
-        await moveOrDeduplicate(file, target);
-      } catch (error) {
-        this.recordError(error);
+    await this.withQueueMutation(async () => {
+      for (const file of await listRegularFiles(this.processingDir)) {
+        const target = path.join(this.pendingDir, path.basename(file));
+        try {
+          await moveOrDeduplicate(file, target);
+        } catch (error) {
+          this.recordError(error);
+        }
       }
-    }
+    });
     await this.refreshQueueStats();
     // Mark the outbox started before recovery so recovered transactions can
     // reuse the same immutable enqueue path without recursively starting it.
@@ -838,6 +870,10 @@ class DurableCaptureOutbox {
   }
 
   async recoverPendingTemporaries() {
+    return this.withQueueMutation(() => this.recoverPendingTemporariesInternal());
+  }
+
+  async recoverPendingTemporariesInternal() {
     for (const temporary of await listRegularFiles(this.pendingDir, '.tmp')) {
       let captureId = null;
       try {
@@ -861,6 +897,10 @@ class DurableCaptureOutbox {
   }
 
   async recoverOpenCaptures() {
+    return this.withQueueMutation(() => this.recoverOpenCapturesInternal());
+  }
+
+  async recoverOpenCapturesInternal() {
     const metadataFiles = await listRegularFiles(this.openDir, '.open.json');
     for (const metadataFile of metadataFiles) {
       const stem = path.basename(metadataFile, '.open.json');
@@ -919,6 +959,10 @@ class DurableCaptureOutbox {
   async beginCapture(record, options = {}) {
     if (!this.started) await this.start();
     if (this.closed) throw new Error('capture outbox is closed');
+    return this.withQueueMutation(() => this.beginCaptureRecord(record, options));
+  }
+
+  async beginCaptureRecord(record, options) {
     const captureId = String(record?.captureId || '');
     if (!validCaptureId(captureId)) {
       this.metrics.rejected += 1;
@@ -1019,6 +1063,26 @@ class DurableCaptureOutbox {
   }
 
   async refreshQueueStats() {
+    for (;;) {
+      if (this.queueIdlePromise) await this.queueIdlePromise;
+      const version = this.queueMutationVersion;
+      const { metrics, queuedAtByName, openAtByName, errors } = await this.readQueueStats();
+      // A directory scan is not an atomic filesystem snapshot. Publishing a
+      // scan that overlaps enqueue, delivery or streaming can erase a live
+      // counter update, miss a new file, or resurrect an acknowledged file.
+      // Retry after mutations settle; never overwrite their current metrics.
+      if (this.queueMutations !== 0 || version !== this.queueMutationVersion) continue;
+      Object.assign(this.metrics, metrics);
+      for (const error of errors) this.recordError(error);
+      this.queuedAtByName = queuedAtByName;
+      this.openAtByName = openAtByName;
+      this.refreshOpenAgeMetrics();
+      await this.refreshFilesystemStats(true);
+      return this.metrics;
+    }
+  }
+
+  async readQueueStats() {
     let bytes = 0;
     let activeQueueBytes = 0;
     let failedBytes = 0;
@@ -1031,6 +1095,7 @@ class DurableCaptureOutbox {
     let openTransactions = 0;
     const openAtByName = new Map();
     const queuedAtByName = new Map();
+    const errors = [];
     for (const [directory, kind] of [
       [this.pendingDir, 'pending'],
       [this.processingDir, 'processing'],
@@ -1055,7 +1120,7 @@ class DurableCaptureOutbox {
             else failedFiles += 1;
           }
         } catch (error) {
-          if (error.code !== 'ENOENT') this.recordError(error);
+          if (error.code !== 'ENOENT') errors.push(error);
         }
       }
     }
@@ -1074,28 +1139,20 @@ class DurableCaptureOutbox {
             );
             if (Number.isFinite(openedAt)) openAtByName.set(path.basename(file), openedAt);
           } catch (error) {
-            this.recordError(error);
+            errors.push(error);
           }
         }
       } catch (error) {
-        if (error.code !== 'ENOENT') this.recordError(error);
+        if (error.code !== 'ENOENT') errors.push(error);
       }
     }
-    this.metrics.queueBytes = bytes;
-    this.metrics.activeQueueBytes = activeQueueBytes;
-    this.metrics.failedBytes = failedBytes;
-    this.metrics.pending = pending;
-    this.metrics.processing = processing;
-    this.metrics.openTransactions = openTransactions;
-    this.metrics.openFiles = openFiles;
-    this.metrics.openBytes = openBytes;
-    this.metrics.failedFiles = failedFiles;
-    this.metrics.auxiliaryFiles = auxiliaryFiles;
-    this.queuedAtByName = queuedAtByName;
-    this.openAtByName = openAtByName;
-    this.refreshOpenAgeMetrics();
-    await this.refreshFilesystemStats(true);
-    return this.metrics;
+    return {
+      metrics: { queueBytes: bytes, activeQueueBytes, failedBytes, pending, processing,
+        openTransactions, openFiles, openBytes, failedFiles, auxiliaryFiles },
+      queuedAtByName,
+      openAtByName,
+      errors,
+    };
   }
 
   refreshOpenAgeMetrics() {
@@ -1132,6 +1189,10 @@ class DurableCaptureOutbox {
   async enqueue(record, options = {}) {
     if (!this.started) await this.start();
     if (this.closed) throw new Error('capture outbox is closed');
+    return this.withQueueMutation(() => this.enqueueRecord(record, options));
+  }
+
+  async enqueueRecord(record, options) {
     const captureId = String(record?.captureId || '');
     if (!validCaptureId(captureId)) {
       this.metrics.rejected += 1;
@@ -1263,25 +1324,35 @@ class DurableCaptureOutbox {
           }
           if (this.activeBytes > 0 && this.activeBytes + reservedBytes > this.maxInflightBytes) break;
           const claimed = path.join(this.processingDir, path.basename(file));
+          const finishClaim = this.beginQueueMutation();
           try {
             await moveOrDeduplicate(file, claimed);
+            this.metrics.pending = Math.max(0, this.metrics.pending - 1);
+            this.metrics.processing += 1;
+            this.activeBytes += reservedBytes;
+            this.metrics.inflightBytes = this.activeBytes;
           } catch (error) {
             if (error.code !== 'ENOENT') this.recordError(error);
             continue;
+          } finally {
+            finishClaim();
           }
-          this.metrics.pending = Math.max(0, this.metrics.pending - 1);
-          this.metrics.processing += 1;
-          this.activeBytes += reservedBytes;
-          this.metrics.inflightBytes = this.activeBytes;
-          const job = this.deliverFile(claimed)
+          let finishTransition;
+          const beforeQueueChange = () => {
+            finishTransition ||= this.beginQueueMutation();
+          };
+          const job = this.deliverFile(claimed, beforeQueueChange)
             .catch(async (error) => {
               this.recordError(error);
+              beforeQueueChange();
               await this.restoreClaimAfterError(claimed);
             })
             .finally(() => {
+              beforeQueueChange();
               this.activeBytes = Math.max(0, this.activeBytes - reservedBytes);
               this.metrics.inflightBytes = this.activeBytes;
               this.metrics.processing = Math.max(0, this.metrics.processing - 1);
+              finishTransition();
             });
           jobs.push(job);
         }
@@ -1316,7 +1387,7 @@ class DurableCaptureOutbox {
     }
   }
 
-  async deliverFile(file) {
+  async deliverFile(file, beforeQueueChange) {
     let bytes;
     let storedBytesLength = 0;
     let captureId = path.basename(file, '.json');
@@ -1333,6 +1404,7 @@ class DurableCaptureOutbox {
         bytes = Buffer.from(`${JSON.stringify(reconciled.record)}\n`, 'utf8');
       }
     } catch (error) {
+      beforeQueueChange();
       this.metrics.failed += 1;
       this.recordError(error);
       await this.moveFailed(file, 'invalid_record', storedBytesLength || bytes?.length);
@@ -1367,6 +1439,7 @@ class DurableCaptureOutbox {
         }
         const receiptError = relayReceiptError(payload, captureId, bytes.length, inputSha256);
         if (response.ok && receiptError === null) {
+          beforeQueueChange();
           await fsp.rm(file, { force: false });
           await fsyncDirectory(this.processingDir);
           this.metrics.durable += 1;
@@ -1392,6 +1465,7 @@ class DurableCaptureOutbox {
         error.retryable = response.ok || isRetryableStatus(response.status);
         lastError = error;
         if (!error.retryable) {
+          beforeQueueChange();
           if (response.status === 409 || payload?.reason === 'capture_id_conflict') {
             this.metrics.conflicts += 1;
             this.onFailure?.({ captureId, reason: 'capture_id_conflict', error });
@@ -1423,6 +1497,7 @@ class DurableCaptureOutbox {
     // never silently discarded after transient failures.
     this.recordError(lastError || new Error(`delivery failed for ${captureId}`));
     this.attemptsByFile.set(file, currentAttempt + this.maxAttempts);
+    beforeQueueChange();
     try {
       await moveOrDeduplicate(file, path.join(this.pendingDir, path.basename(file)));
       // The common `finally` block accounts for the processing decrement.

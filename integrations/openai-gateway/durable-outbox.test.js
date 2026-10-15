@@ -258,6 +258,210 @@ async function fakeRelay(handler) {
   };
 }
 
+test('queue rescan cannot resurrect a Capture after its durable receipt', { timeout: 10000 }, async t => {
+  const root = temporaryRoot();
+  const relay = await fakeRelay((req, res) => {
+    req.resume();
+    req.once('end', () => res.end(JSON.stringify(syntheticReceipt(req.rawTestBody))));
+  });
+  const outbox = new DurableCaptureOutbox({ root, relayUrl: '' });
+  let releaseScan;
+  const scanReleased = new Promise(resolve => { releaseScan = resolve; });
+  let notifyScanned;
+  const scanned = new Promise(resolve => { notifyScanned = resolve; });
+  let refresh;
+  try {
+    await outbox.enqueue(capture('cap-rescan-delivered'), { schedule: false });
+    const pendingFile = path.join(root, 'pending', 'cap-rescan-delivered.json');
+    const originalStat = fsp.stat;
+    let paused = false;
+    t.mock.method(fsp, 'stat', async (file, ...args) => {
+      const stat = await originalStat(file, ...args);
+      if (file === pendingFile && !paused) {
+        paused = true;
+        notifyScanned();
+        await scanReleased;
+      }
+      return stat;
+    });
+    refresh = outbox.refreshQueueStats();
+    await scanned;
+    outbox.relayUrl = relay.url;
+    assert.equal(await outbox.flush(1000), true);
+    assert.equal(outbox.snapshot().durable, 1);
+    assert.equal(fs.existsSync(pendingFile), false);
+    releaseScan();
+    await refresh;
+    const snapshot = outbox.snapshot();
+    assert.equal(snapshot.pending, 0);
+    assert.equal(snapshot.processing, 0);
+    assert.equal(snapshot.activeQueueBytes, 0);
+    assert.equal(snapshot.queueBytes, 0);
+    assert.equal(snapshot.oldestPendingAt, null);
+    assert.equal(await outbox.flush(100), true);
+  } finally {
+    releaseScan();
+    if (refresh) await refresh;
+    await outbox.close();
+    if (outbox.drainPromise) await outbox.drainPromise;
+    await relay.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('queue rescan cannot hide a Capture accepted while its directory was scanned',
+  { timeout: 10000 }, async t => {
+    const root = temporaryRoot();
+    const outbox = new DurableCaptureOutbox({ root, relayUrl: '', maxFiles: 1 });
+    let releaseScan;
+    const scanReleased = new Promise(resolve => { releaseScan = resolve; });
+    let notifyScanned;
+    const scanned = new Promise(resolve => { notifyScanned = resolve; });
+    let refresh;
+    try {
+      await outbox.start();
+      const originalReadDir = fsp.readdir;
+      let paused = false;
+      t.mock.method(fsp, 'readdir', async (directory, ...args) => {
+        const entries = await originalReadDir(directory, ...args);
+        if (directory === outbox.pendingDir && !paused) {
+          paused = true;
+          notifyScanned();
+          await scanReleased;
+        }
+        return entries;
+      });
+      refresh = outbox.refreshQueueStats();
+      await scanned;
+      await outbox.enqueue(capture('cap-rescan-accepted'), { schedule: false });
+      const file = path.join(root, 'pending', 'cap-rescan-accepted.json');
+      const originalBytes = await fsp.readFile(file);
+      releaseScan();
+      await refresh;
+      const snapshot = outbox.snapshot();
+      assert.equal(snapshot.pending, 1);
+      assert.equal(snapshot.processing, 0);
+      assert.equal(snapshot.activeQueueBytes, originalBytes.length);
+      assert.equal(snapshot.queueBytes, originalBytes.length);
+      assert.equal(typeof snapshot.oldestPendingAt, 'string');
+      assert.equal(await outbox.flush(50), false);
+      await assert.rejects(outbox.enqueue(capture('cap-rescan-over-capacity')),
+        error => error.code === 'OUTBOX_FULL');
+      assert.deepEqual(await fsp.readFile(file), originalBytes);
+    } finally {
+      releaseScan();
+      if (refresh) await refresh;
+      await outbox.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+test('queue rescan preserves streamed bytes and finalized Capture state', { timeout: 10000 }, async t => {
+  for (const phase of ['append', 'finalize']) await t.test(phase, async t => {
+    const root = temporaryRoot();
+    const outbox = new DurableCaptureOutbox({ root, relayUrl: '' });
+    let releaseScan;
+    const scanReleased = new Promise(resolve => { releaseScan = resolve; });
+    let notifyScanned;
+    const scanned = new Promise(resolve => { notifyScanned = resolve; });
+    let refresh;
+    try {
+      const transaction = await outbox.beginCapture({ captureId: 'cap-stream-rescan', sourceNamespace: 'test' });
+      await transaction.appendRequest(Buffer.from('原始请求 '));
+      const requestFile = path.join(root, 'open', 'cap-stream-rescan.request.bin');
+      const watchedFile = phase === 'finalize' ? transaction.files.metadata : requestFile;
+      const originalStat = fsp.stat;
+      let paused = false;
+      t.mock.method(fsp, 'stat', async (file, ...args) => {
+        const stat = await originalStat(file, ...args);
+        if (file === watchedFile && !paused) {
+          paused = true;
+          notifyScanned();
+          await scanReleased;
+        }
+        return stat;
+      });
+      refresh = outbox.refreshQueueStats();
+      await scanned;
+      await transaction.appendRequest(Buffer.from('🧪 不截断'));
+      if (phase === 'finalize') await transaction.finalize({ responseStatus: 200 });
+      releaseScan();
+      await refresh;
+      const snapshot = outbox.snapshot();
+      assert.equal(snapshot.lastError, null);
+      assert.equal(snapshot.pending, phase === 'finalize' ? 1 : 0);
+      assert.equal(snapshot.openTransactions, phase === 'finalize' ? 0 : 1);
+      assert.equal(snapshot.openCaptureHealthy, true);
+      assert.equal(snapshot.openBytes, phase === 'finalize' ? 0 : transaction.persistedBytes);
+      if (phase === 'append') {
+        assert.equal(snapshot.queueBytes, transaction.persistedBytes);
+        assert.deepEqual(await fsp.readFile(requestFile), Buffer.from('原始请求 🧪 不截断'));
+      } else {
+        assert.deepEqual(await fsp.readdir(outbox.openDir), []);
+        const bytes = await fsp.readFile(path.join(root, 'pending', 'cap-stream-rescan.json'));
+        assert.equal(snapshot.activeQueueBytes, bytes.length);
+        assert.equal(snapshot.queueBytes, bytes.length);
+        const record = JSON.parse(bytes);
+        assert.equal(record.requestBodyText, '原始请求 🧪 不截断');
+        assert.equal(record.requestBytesCaptured, Buffer.byteLength(record.requestBodyText));
+        assert.equal(record.requestBodySha256, cryptoHash(record.requestBodyText));
+      }
+    } finally {
+      releaseScan();
+      if (refresh) await refresh;
+      await outbox.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test('queue rescan stays available while a Relay receipt is outstanding', { timeout: 10000 }, async () => {
+  const root = temporaryRoot();
+  let releaseReceipt;
+  const receiptReleased = new Promise(resolve => { releaseReceipt = resolve; });
+  let notifyReceived;
+  const received = new Promise(resolve => { notifyReceived = resolve; });
+  const relay = await fakeRelay((req, res) => {
+    req.resume();
+    req.once('end', async () => {
+      notifyReceived();
+      await receiptReleased;
+      res.end(JSON.stringify(syntheticReceipt(req.rawTestBody)));
+    });
+  });
+  const outbox = new DurableCaptureOutbox({ root, relayUrl: '' });
+  let delivery;
+  let refresh;
+  let timer;
+  try {
+    await outbox.enqueue(capture('cap-slow-receipt'), { schedule: false });
+    outbox.relayUrl = relay.url;
+    delivery = outbox.flush(5000);
+    await received;
+    refresh = outbox.refreshQueueStats();
+    assert.equal(await Promise.race([refresh.then(() => true),
+      new Promise(resolve => { timer = setTimeout(() => resolve(false), 2000); })]), true);
+    const snapshot = outbox.snapshot();
+    assert.equal(snapshot.processing, 1);
+    assert.equal(snapshot.pending, 0);
+    assert.equal(snapshot.durable, 0);
+    assert.ok(snapshot.activeQueueBytes > 0);
+    assert.ok(fs.existsSync(path.join(root, 'processing', 'cap-slow-receipt.json')));
+    releaseReceipt();
+    assert.equal(await delivery, true);
+    assert.equal(outbox.snapshot().processing, 0);
+    assert.equal(outbox.snapshot().queueBytes, 0);
+  } finally {
+    clearTimeout(timer);
+    releaseReceipt();
+    if (delivery) await delivery;
+    if (refresh) await refresh;
+    await outbox.close();
+    await relay.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('outbox retains exact pending bytes when Relay returns an unproven durable ACK', async t => {
   const cases = [
     ['ACK-only', () => ({ ok: true, durable: true, duplicate: false })],
