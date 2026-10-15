@@ -1,18 +1,50 @@
 # 生产就绪评估
 
-评估日期：2026-10-16。最新线上只读快照为 05:05（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-16。最新线上只读快照为 06:02（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-05:05 的本机回环只读快照中，18084、3011、3012 均返回 200，Collector/Relay 仍为 `fe9fcf9`；
-Collector Capture 与 Relay 累计投递均为 1,108,870，pending/inflight/failed 均为 0，计数守恒。
+06:02 的本机回环只读快照中，18084、3011、3012 均返回 200，Collector/Relay 仍为 `fe9fcf9`；
+Collector Capture 与 Relay 累计投递均为 1,112,762，pending/inflight/failed 均为 0，计数守恒。
 这只是瞬时队列状态，不构成持续 SLO 或完整 Session 的证明。Wire 仍只有 1 条且已约
-18.4 小时未更新，覆盖为 `degraded`；18086 连接拒绝。runtime gate 真实退出 1，明确
+19.3 小时未更新，覆盖为 `degraded`；18086 连接拒绝。runtime gate 真实退出 1，明确
 报告 `stale_sources=wire`。
 模型探针最后可用时间仍为 10 月 8 日，网关 trace exporter 未启用。
-03:15 Collector 累计保存 1,100,521 条 Capture；741 个 sealed Segment 共 87,431,090,167 bytes
+同一快照中，744 个 sealed Segment 共 89,018,977,042 bytes
 保存在共享 NFS；此观测不证明已提交目标 OSS。当前状态应区分为传输进程存活、完整
 业务链路未验收和在线交付入口不可用。
+
+当前已提交基线 `b5526c0` 的 [CI run 38810483478](https://github.com/XS-MLVP/ChipTrace/actions/runs/38810483478)
+已独立确认 5/5 作业成功，16 个 artifact 元数据有效；未下载正文重新计算哈希。
+它包含工作区编译/执行的独立超时和诊断，不证明线上已升级。新增正式版上下文诊断
+有独立作业，不能沿用基线的成功状态宣称该新增作业已通过。
+
+## 官方正式版 0.163.0 的新采集
+
+官方 npm 的未修改 Linux x64 二进制在私有 user/PID/mount namespace 中新执行同模型
+双轮、resume、真实失败工具和异步轮询。来源为官方 commit
+`83086188ae0614bd882818ff1aa23f3194962012`，完整源码树和实际 ELF 均有固定 SHA-256；
+生产者没有补丁，模型和 usage 仍为本地合成，不能称为真实上游验收。
+
+首次隔离结果为 2 个闭合 Native Turn、2 个闭合 epoch、12 次 HTTP 尝试、10 条工具记录；
+四源、协议、Raw 和 Runtime 完整性均为 true，但有 399 条未归属 Turn 记录及另 151 条
+未知 Session span，整体 `delivery_ready=false`。重复只读审计得到相同结果，原始
+7,072,139-byte sealed Segment 的 SHA-256 保持
+`5875479a061ad89d8e359520f4d2e3536629eaceda0b4def8ecbc71332d7aec6`。
+
+仓库新增 `stock-release-context` CI 作业直接使用官方二进制和同一正向测试，不再需要
+修改临时 harness。新执行本地复验又保留 2 Turn / 12 请求 / 10 工具记录，实际未归属
+Turn 为 422、未知 Session 为 153；初始化 span 数量会变化，不能写成固定生产统计。
+正向测试仍真实退出 1；独立诊断门禁只在完整采集和计数守恒成立、且确有来源缺口时
+接受这一拒绝结果。启动/配置/工具失败、超时、缺少报告、身份不符或意外可交付都会
+使该诊断作业失败。其通过仅表示已复现已知缺口，报告始终为
+`production_ready=false`、`real_upstream=false`，不是生产门禁通过。
+
+报告上限 16 KiB，仅保存计数、版本/源码/二进制和 Raw 哈希，不保存对话、工具正文或
+完整 Turn 数组；GitHub artifact 只选择精简报告和测试日志，失败 Raw 保留在临时 runner。
+具体运行命令和身份约束见[原生 Turn 验收记录](native-turn-context.md)。
+
+## 平台状态验收
 
 本轮分支修复了历史平台状态误报：旧任务即使独立完整性证据不通过，只凭顶层 ready
 标记和来源审计也可能在查询、分页中被误报可交付；重复提交还会直接返回旧记录。

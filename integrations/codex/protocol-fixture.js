@@ -15,11 +15,15 @@ const { execFile, spawn } = require('node:child_process');
 const { promisify } = require('node:util');
 const { DurableCaptureOutbox } = require('../openai-gateway/durable-outbox');
 const { prepareProducerSourceCache } = require('../../scripts/ci/producer-source-cache');
+const stockRelease = require('./stock-release.json');
 
 const run = promisify(execFile);
-const version = '0.163.0-alpha.11';
-const upstream = '5425d3e625daa58eea3ad1de27c087eb3b2ffbd3';
-const patches = ['upstream-sse-context.patch', 'upstream-sse-context-test.patch',
+const producerMode = process.env.CHIPTRACE_PROTOCOL_MODE || 'patched_stock_debug_app_server';
+assert.ok(['patched_stock_debug_app_server', 'unmodified_stock'].includes(producerMode), 'unsupported protocol producer mode');
+const unmodifiedStock = producerMode === 'unmodified_stock';
+const version = unmodifiedStock ? stockRelease.version : '0.163.0-alpha.11';
+const upstream = unmodifiedStock ? stockRelease.upstream_commit : '5425d3e625daa58eea3ad1de27c087eb3b2ffbd3';
+const patches = unmodifiedStock ? [] : ['upstream-sse-context.patch', 'upstream-sse-context-test.patch',
   'upstream-session-scope.patch', 'upstream-session-scope-extension.patch',
   'upstream-session-scope-process.patch', 'upstream-config-read-scope.patch'];
 const chiptrace = process.env.CHIPTRACE_BIN || path.resolve(__dirname, '../../target/debug/chiptrace');
@@ -177,12 +181,19 @@ function rpc(handle, externalFailure) {
 }
 
 async function protocolFixture(t, prefix) {
-  assert.ok(process.env.CHIPTRACE_PROTOCOL_PRODUCER, 'set CHIPTRACE_PROTOCOL_PRODUCER to the pinned patched debug App Server');
-  assert.ok(process.env.CHIPTRACE_PROTOCOL_SOURCE, 'set CHIPTRACE_PROTOCOL_SOURCE to its pinned patched checkout');
+  assert.ok(process.env.CHIPTRACE_PROTOCOL_PRODUCER, 'set CHIPTRACE_PROTOCOL_PRODUCER to the selected pinned producer');
+  assert.ok(process.env.CHIPTRACE_PROTOCOL_SOURCE, 'set CHIPTRACE_PROTOCOL_SOURCE to its pinned checkout');
   const producer = await fs.realpath(process.env.CHIPTRACE_PROTOCOL_PRODUCER);
   const sourceRoot = await fs.realpath(process.env.CHIPTRACE_PROTOCOL_SOURCE);
   const source = prepareProducerSourceCache(sourceRoot);
   assert.equal(source.upstream_commit, upstream);
+  if (unmodifiedStock) {
+    assert.equal(process.platform, 'linux');
+    assert.equal(process.arch, 'x64');
+    assert.equal((await run('git', ['-C', sourceRoot, 'status', '--porcelain'])).stdout, '', 'stock source must be clean');
+    assert.equal(source.source_sha256, stockRelease.source_sha256, 'stock source must match the complete pinned tree');
+    assert.equal(await fileDigest(producer), stockRelease.linux_x64_binary_sha256, 'stock binary must be the pinned official ELF');
+  }
   if (process.env.CHIPTRACE_PROTOCOL_EXPECTED_SOURCE_DIGEST) {
     assert.equal(source.source_sha256, process.env.CHIPTRACE_PROTOCOL_EXPECTED_SOURCE_DIGEST,
       'producer source must still match the cache/build identity');
@@ -227,7 +238,7 @@ async function protocolFixture(t, prefix) {
   outbox = new DurableCaptureOutbox({ root: path.join(root, 'outbox'), relayUrl,
     bearerToken: token, minFreeBytes: 0, minFreeFiles: 0, sanitize: false });
   await outbox.start();
-  return { root, token, source, producer, patchSet, capture, collectorUrl, relayUrl,
+  return { root, token, source, producer, producerMode, unmodifiedStock, patchSet, capture, collectorUrl, relayUrl,
     collectorArgs, relayArgs, collector, relay, outbox, launch,
     assertHealthy() { if (failure) throw failure; },
     passed() { passed = true; },
@@ -268,7 +279,20 @@ async function protocolFixture(t, prefix) {
         CHIPTRACE_INGEST_TOKEN: token, OTEL_EXPORTER_OTLP_HEADERS: `Authorization=Bearer%20${token}`,
         CODEX_APP_SERVER_MANAGED_CONFIG_PATH: path.join(managed, 'managed_config.toml') };
       return async () => {
-        const handle = launch(producer, ['--strict-config', '--disable-plugin-startup-tasks-for-tests'], producerEnv);
+        // The release CLI has no debug managed-config/startup-task switches.
+        // Build a private /etc even when the host has no /etc/codex. Only known
+        // public OS files and this fixture's config are visible in that mount.
+        const publicEtc = ['passwd', 'group', 'hosts', 'resolv.conf', 'nsswitch.conf', 'os-release', 'ssl/certs'];
+        const args = unmodifiedStock ? [
+          '--unshare-user', '--unshare-pid', '--die-with-parent',
+          '--ro-bind', '/', '/', '--proc', '/proc', '--dev', '/dev',
+          '--bind', root, root, '--tmpfs', '/etc',
+          ...publicEtc.flatMap(name => ['--ro-bind-try', `/etc/${name}`, `/etc/${name}`]),
+          '--ro-bind', path.join(home, 'config.toml'), '/etc/codex/config.toml',
+          '--ro-bind', path.join(managed, 'requirements.toml'), '/etc/codex/requirements.toml',
+          '--remount-ro', '/etc', '--chdir', root, '--', producer, '--strict-config', 'app-server',
+        ] : ['--strict-config', '--disable-plugin-startup-tasks-for-tests'];
+        const handle = launch(unmodifiedStock ? 'bwrap' : producer, args, producerEnv);
         const client = rpc(handle, () => failure);
         const initialized = await client.request('initialize', {
           clientInfo: { name: 'chiptrace-protocol-ci', version: '1.0.0' }, capabilities: { experimentalApi: true } });

@@ -1,0 +1,7 @@
+{
+  "version": "0.163.0",
+  "npm_spec": "@openai/codex@0.163.0",
+  "upstream_commit": "83086188ae0614bd882818ff1aa23f3194962012",
+  "source_sha256": "90037d43c7e570ebc72a6d70ad54f470cce1bf1699d4adde4097994b45fcc6ca",
+  "linux_x64_binary_sha256": "399ff69c431c066e40de318fba45c2b07f45a76b19939d247ee4828fc70c4215"
+}

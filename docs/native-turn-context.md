@@ -4,6 +4,46 @@
 目前已实现精确关联和拒绝不完整交付，但真实 Stock Codex 仍有来源上下文缺口。
 上线、完整交付或新客户端版本支持均需重新完成真实验收。
 
+## 官方正式版的独立上下文诊断
+
+`stock-release-context` CI 作业安装
+[stock-release.json](../integrations/codex/stock-release.json) 固定的官方 npm Linux x64 二进制，
+另检出对应 commit 并核对完整源码摘要、干净 Git 状态和 ELF SHA-256。它不会更换
+原有六补丁生产者、终端 CLI 或正向交付门槛。源码 tag 与 npm 包身份分别核验；这不是
+下载二进制的可复现构建证明。
+
+`CHIPTRACE_PROTOCOL_MODE=unmodified_stock` 使共享 fixture 通过系统 Bubblewrap 启动
+普通 `codex --strict-config app-server`，不传 debug-only 启动参数。根文件系统只读，
+本次临时目录可写，私有 `/etc` 仅绑定必要的公开 OS 文件和本次 config/requirements，
+最后重新挂为只读；宿主没有 `/etc/codex` 也能运行，不读取或改写宿主 Provider 配置。
+
+```bash
+CHIPTRACE_PROTOCOL_PRODUCER=/absolute/path/to/official/codex \
+CHIPTRACE_PROTOCOL_SOURCE=/absolute/path/to/clean/stable-checkout \
+  bash scripts/ci/qualify-stock-release.sh /private/new-qualification-directory
+```
+
+输出目录必须不存在，脚本以 0700 创建，避免复用上次报告。它运行同模型双轮正向
+测试；保留真实测试退出码，在原有 `delivery_ready=true` 断言之前排他写入
+`chiptrace.stock-release-qualification.v1` 元数据。模型响应仍是本地合成；未修改客户端
+不能把合成模型实验变为生产验收。后面的 Buyer 下载和重启检查在该断言失败后不执行。
+
+正式版 0.163.0 两次本地新采集均完成 2 个 Native Turn、12 次 HTTP 尝试、10 条真实工具
+结果，整体交付均被拒绝。首次为 399 条未归属 Turn、151 条未知 Session span；仓库
+新入口复验为 422 和 153。全部分类计数守恒；缺口包括没有 Trace/Span 的 SSE 日志和
+缺少来源端 Session/Process scope 的初始化、配置、文件与生命周期 span。完整协议和
+四源存在不足以证明所有业务记录均能精确归属。
+
+外层 `stock-release-gate.js` 只验证这一明确的已知拒绝：实际子测试必须退出 1，完整
+双轮/epoch、HTTP/工具、四源和协议/Runtime 证据均须成立，来源计数守恒且确有缺口。
+启动/工具失败、超时、缺少或超过 16 KiB 的报告、错误二进制/源码以及意外交付成功
+都不能让作业通过。诊断输出固定声明 `delivery_ready=false`、`production_ready=false`、
+`real_upstream=false`，并保留 `collection_exit_code=1`。未来候选版本须重新固定身份、
+执行资格验证，再通过真实上游生产 Canary；不能以诊断作业绿色替代生产准入。
+
+GitHub 只上传精简计数/身份/哈希报告和本次测试日志；Raw、模型正文、工具正文及完整
+Session/Turn 不上传。正向的 patched 五场景仍独立执行，原有所有验收断言保持不变。
+
 ## 每次 CI 新执行的协议采集
 
 `upstream-context` 除生产者单元测试和 CLI 构建外，还构建固定源码的 debug App Server，

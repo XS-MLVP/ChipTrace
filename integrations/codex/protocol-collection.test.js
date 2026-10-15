@@ -1,8 +1,8 @@
 'use strict';
 
-// Execute a real, pinned, patched debug App Server against a local deterministic
-// Responses endpoint. These newly collected bytes are protocol regression
-// evidence, never real-model or unmodified-producer production acceptance.
+// Execute a pinned producer against a local deterministic Responses endpoint.
+// Default: patched debug App Server; explicit stock mode: pinned official ELF.
+// Neither synthetic experiment is real-model production acceptance.
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
@@ -198,7 +198,7 @@ function deterministicModel(image, switchModel) {
 
 async function collectProtocol(t, switchModel) {
     const fixture = await protocolFixture(t, 'chiptrace-protocol-');
-    const { root, token, source, producer, patchSet, capture, collectorUrl, relayUrl,
+    const { root, token, source, producer, producerMode, unmodifiedStock, patchSet, capture, collectorUrl, relayUrl,
       collectorArgs, relayArgs, outbox, launch } = fixture;
     let { collector, relay } = fixture;
     const imagePath = 'docs/assets/xs-mlvp-avatar.png';
@@ -342,6 +342,36 @@ async function collectProtocol(t, switchModel) {
     await fs.writeFile(path.join(root, 'audit.json'), JSON.stringify(audit, null, 2));
     t.diagnostic(JSON.stringify({ phase: 'new_collection', delivery_ready: inspection.delivery_ready,
       integrity: inspection.integrity, source_coverage: inspection.source_coverage, source_counts: audit.sources }));
+    const qualificationFile = process.env.CHIPTRACE_PROTOCOL_QUALIFICATION_REPORT;
+    if (qualificationFile) {
+      const segments = [];
+      for (const name of (await fs.readdir(path.join(capture, 'segments'))).sort()) {
+        if (!name.endsWith('.sealed.ndjson')) continue;
+        const file = path.join(capture, 'segments', name);
+        segments.push({ file: name, bytes: (await fs.stat(file)).size, sha256: await fileDigest(file) });
+      }
+      // Save bounded metadata before the unchanged positive delivery assertion.
+      // No Raw, conversation, model body, tool body or full Turn arrays here.
+      await fs.writeFile(qualificationFile, JSON.stringify({
+        schema_version: 'chiptrace.stock-release-qualification.v1',
+        checked_at: new Date().toISOString(), real_upstream: false,
+        production_acceptance_claimed: false, unmodified_stock: unmodifiedStock,
+        producer: { mode: producerMode, version, source, patch_set: patchSet,
+          binary_sha256: await fileDigest(producer) },
+        session_id: session, native_turns: inspection.session.native_turns,
+        closed_turns: inspection.session.closed_turns, session_epochs: inspection.session.session_epochs,
+        closed_session_epochs: inspection.session.closed_session_epochs,
+        model_interactions: inspection.session.model_interactions,
+        observed_http_attempts: wire.length, tool_execution_records: inspection.session.tool_execution_records,
+        delivery_ready: inspection.delivery_ready, validation_status: inspection.validation_status,
+        integrity: inspection.integrity, source_coverage: inspection.source_coverage,
+        scenario_evidence_complete: inspection.scenario_evidence.complete,
+        source_audit: { schema_version: audit.schema_version, session_id: audit.session_id,
+          sources: audit.sources, unscoped_otlp_records: audit.unscoped_otlp_records },
+        inspection_sha256: await fileDigest(path.join(root, 'inspection.json')),
+        audit_sha256: await fileDigest(path.join(root, 'audit.json')), raw_segments: segments,
+      }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    }
     assert.equal(inspection.delivery_ready, true);
     assert.equal(inspection.integrity.delivery_ready, true);
     assert.equal(inspection.session.native_turns, 2);
@@ -528,10 +558,10 @@ async function collectProtocol(t, switchModel) {
     for (const record of rawDigests) assert.equal(await fileDigest(path.join(capture, 'segments', record.file)), record.sha256);
     const platformEvidence = await fixture.verifyPlatform(switchModel ? 'model-switch' : 'complete');
     const report = { schema_version: 'chiptrace.native-protocol-ci.v1', ok: true,
-      checked_at: new Date().toISOString(), real_upstream: false, unmodified_stock: false,
+      checked_at: new Date().toISOString(), real_upstream: false, unmodified_stock: unmodifiedStock,
       production_acceptance_claimed: false, model_mode: 'local_deterministic_responses',
       model_switch: switchModel,
-      producer_mode: 'patched_stock_debug_app_server', client_version: version,
+      producer_mode: producerMode, client_version: version,
       producer_source: source, patch_set: patchSet, producer_binary_sha256: await fileDigest(producer),
       native_turns: 2, session_epochs: 2, model_interactions: wire.length,
       tool_execution_records: inspection.session.tool_execution_records,
