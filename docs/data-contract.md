@@ -31,6 +31,24 @@ Relay 的 `/capture` 和 `/captures` 只接收 `recordType=api_snapshot` 且来�
 出现在这两个入口时整条或整批返回 400，不能绕过对应的权威来源。历史字段仅由离线读取器
 验证原始字节和哈希，不属于在线采集契约。
 
+## Collector 持久化确认
+
+Relay 只有在下游 HTTP 成功且收到绑定当前 Capture 的持久化确认后，才能把投递账本
+记为 `delivered`。确认中的 `capture.capture_id`、`capture.raw_sha256` 和
+`capture.length` 必须分别等于本地账本的原始身份、SHA-256 和包含行尾换行的 WAL 字节
+长度。外层与 Capture 内的 `durable` 都必须为 true，`duplicate` 必须一致，状态只能是
+`accepted`/false 或 `duplicate`/true。远端 Segment 与 offset 独立于 Relay，只检查其
+有效性；不能要求两台服务使用相同磁盘位置。
+
+批量响应按 Capture ID 对应，每个已投递项必须有且只有一个有效确认。响应顺序不影响
+归属；缺项、重复 ID、缺失明细、身份或哈希不符、矛盾状态和无效 JSON 都保留为
+`pending`，由原有退避重试继续发送同一份 WAL 字节。部分响应中已经证明的成功、明确
+冲突与待重试项分别记账；HTTP 失败不能被响应正文中的成功标志覆盖。
+
+Relay 本地 durable ACK 只确认其自身 WAL 已提交，下游 Collector 确认和 OSS 归档仍是
+后续独立阶段。升级确认校验不会重新认证历史 `delivered` 记录；历史数据的交付结论仍需
+从保留的 Raw 和目标存储逐项验收。
+
 ## 身份与关联
 
 Stock Codex 已在 Responses 请求中提供：

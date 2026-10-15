@@ -1008,20 +1008,23 @@ async fn send_delivery_batch(
             .map(|payload| async move { send_single(inner, &payload.record, payload.body).await });
         return futures_util::future::join_all(futures).await;
     }
+    if !status.is_success() {
+        return batch
+            .iter()
+            .map(|payload| http_delivery_failure(inner, &payload.record, status))
+            .collect();
+    }
     let payload: Value = match response.json().await {
         Ok(payload) => payload,
-        Err(error) => {
+        Err(_) => {
             return batch
                 .iter()
                 .map(|payload| {
-                    let record = &payload.record;
-                    if status == StatusCode::CONFLICT {
-                        conflict_update(record, error.to_string())
-                    } else if is_retryable(status) {
-                        retry_update(inner, record, error.to_string())
-                    } else {
-                        failed_update(record, error.to_string())
-                    }
+                    retry_update(
+                        inner,
+                        &payload.record,
+                        "invalid Collector batch acknowledgement JSON".to_owned(),
+                    )
                 })
                 .collect();
         }
@@ -1031,25 +1034,35 @@ async fn send_delivery_batch(
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let by_id: std::collections::HashMap<&str, &Value> = outcomes
-        .iter()
-        .filter_map(|outcome| {
-            outcome
-                .get("capture_id")
-                .and_then(Value::as_str)
-                .map(|capture_id| (capture_id, outcome))
-        })
-        .collect();
+    let mut by_id = std::collections::HashMap::new();
+    let mut ambiguous_ids = HashSet::new();
+    for outcome in outcomes {
+        if let Some(capture_id) = outcome.get("capture_id").and_then(Value::as_str)
+            && by_id.insert(capture_id, outcome).is_some()
+        {
+            ambiguous_ids.insert(capture_id);
+        }
+    }
     batch
         .iter()
         .map(|payload| {
             let record = &payload.record;
+            if ambiguous_ids.contains(record.capture_id.as_str()) {
+                return retry_update(
+                    inner,
+                    record,
+                    "duplicate Collector batch outcomes for Capture".to_owned(),
+                );
+            }
             match by_id.get(record.capture_id.as_str()) {
                 Some(outcome)
                     if outcome.get("ok").and_then(Value::as_bool) == Some(true)
-                        && outcome.get("durable").and_then(Value::as_bool) == Some(true) =>
+                        || outcome.get("durable").and_then(Value::as_bool) == Some(true) =>
                 {
-                    delivered_update(record)
+                    match verify_collector_receipt(record, outcome) {
+                        Ok(()) => delivered_update(record),
+                        Err(error) => retry_update(inner, record, error.to_owned()),
+                    }
                 }
                 Some(outcome)
                     if outcome.get("http_status").and_then(Value::as_u64) == Some(409)
@@ -1062,7 +1075,8 @@ async fn send_delivery_batch(
                     let item_status = outcome
                         .get("http_status")
                         .and_then(Value::as_u64)
-                        .and_then(|status| StatusCode::from_u16(status as u16).ok());
+                        .and_then(|status| u16::try_from(status).ok())
+                        .and_then(|status| StatusCode::from_u16(status).ok());
                     let error = outcome
                         .get("detail")
                         .and_then(Value::as_str)
@@ -1074,16 +1088,8 @@ async fn send_delivery_batch(
                         failed_update(record, error)
                     }
                 }
-                None if status == StatusCode::CONFLICT => conflict_update(
-                    record,
-                    format!("remote HTTP {status} omitted batch outcome"),
-                ),
-                None if is_retryable(status) => retry_update(
+                None => retry_update(
                     inner,
-                    record,
-                    format!("remote HTTP {status} omitted batch outcome"),
-                ),
-                None => failed_update(
                     record,
                     format!("remote HTTP {status} omitted batch outcome"),
                 ),
@@ -1109,18 +1115,81 @@ async fn send_single(inner: &RelayInner, record: &DeliveryRecord, body: Vec<u8>)
         Err(error) => return retry_update(inner, record, error.to_string()),
     };
     let status = response.status();
-    let payload: Value = response.json().await.unwrap_or_else(|_| json!({}));
-    if status.is_success()
-        && payload.get("ok").and_then(Value::as_bool) == Some(true)
-        && payload.get("durable").and_then(Value::as_bool) == Some(true)
+    if !status.is_success() {
+        return http_delivery_failure(inner, record, status);
+    }
+    let payload: Value = match response.json().await {
+        Ok(payload) => payload,
+        Err(_) => {
+            return retry_update(
+                inner,
+                record,
+                "invalid Collector acknowledgement JSON".to_owned(),
+            );
+        }
+    };
+    match verify_collector_receipt(record, &payload) {
+        Ok(()) => delivered_update(record),
+        Err(error) => retry_update(inner, record, error.to_owned()),
+    }
+}
+
+fn verify_collector_receipt(
+    record: &DeliveryRecord,
+    payload: &Value,
+) -> std::result::Result<(), &'static str> {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true)
+        || payload.get("durable").and_then(Value::as_bool) != Some(true)
     {
-        delivered_update(record)
-    } else if status == StatusCode::CONFLICT {
-        conflict_update(record, format!("remote HTTP {status}"))
+        return Err("Collector acknowledgement does not confirm durability");
+    }
+    let ack: SubmitAck =
+        serde_json::from_value(payload.get("capture").cloned().unwrap_or(Value::Null))
+            .map_err(|_| "Collector acknowledgement has no valid Capture receipt")?;
+    if ack.capture_id != record.capture_id || ack.raw_sha256 != record.raw_sha256 {
+        return Err("Collector Capture receipt identity or SHA-256 mismatch");
+    }
+    if record.bytes == 0 || ack.length != record.bytes {
+        return Err("Collector Capture receipt byte length mismatch");
+    }
+    if !ack.durable
+        || payload.get("duplicate").and_then(Value::as_bool) != Some(ack.duplicate)
+        || !matches!(
+            (ack.state.as_str(), ack.duplicate),
+            ("accepted", false) | ("duplicate", true)
+        )
+    {
+        return Err("Collector Capture receipt state is inconsistent");
+    }
+    // Collector and Relay have independent WAL layouts; only require a valid
+    // remote locator, never equality with the Relay's local segment or offset.
+    if ack.segment_id == 0 || ack.offset.checked_add(ack.length).is_none() {
+        return Err("Collector Capture receipt locator is invalid");
+    }
+    if let Some(status) = payload.get("http_status")
+        && !status
+            .as_u64()
+            .and_then(|status| u16::try_from(status).ok())
+            .and_then(|status| StatusCode::from_u16(status).ok())
+            .is_some_and(|status| status.is_success())
+    {
+        return Err("Collector Capture receipt contradicts item HTTP status");
+    }
+    Ok(())
+}
+
+fn http_delivery_failure(
+    inner: &RelayInner,
+    record: &DeliveryRecord,
+    status: StatusCode,
+) -> DeliveryUpdate {
+    let error = format!("remote HTTP {status}");
+    if status == StatusCode::CONFLICT {
+        conflict_update(record, error)
     } else if is_retryable(status) {
-        retry_update(inner, record, format!("remote HTTP {status}"))
+        retry_update(inner, record, error)
     } else {
-        failed_update(record, format!("remote HTTP {status}"))
+        failed_update(record, error)
     }
 }
 
@@ -2004,38 +2073,304 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::routing::post;
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    async fn durable_ack() -> impl IntoResponse {
-        (
-            StatusCode::ACCEPTED,
-            Json(json!({"ok":true,"durable":true,"duplicate":false})),
-        )
-    }
+    type ReceiptReply = Arc<Mutex<(StatusCode, String)>>;
 
-    async fn durable_batch(
-        State(hits): State<Arc<AtomicUsize>>,
+    async fn receipt_reply(
+        State(reply): State<ReceiptReply>,
         request: Request,
     ) -> impl IntoResponse {
-        hits.fetch_add(1, Ordering::Relaxed);
-        let body = to_bytes(request.into_body(), 1024 * 1024).await.unwrap();
-        let results: Vec<Value> = body
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                let capture: Value = serde_json::from_slice(line).unwrap();
-                json!({
-                    "capture_id": capture["captureId"],
-                    "ok": true,
-                    "durable": true,
-                    "duplicate": false,
-                })
-            })
-            .collect();
-        (
-            StatusCode::ACCEPTED,
-            Json(json!({"ok": true, "durable": true, "results": results})),
+        let _ = to_bytes(request.into_body(), 1024 * 1024).await.unwrap();
+        reply.lock().unwrap().clone()
+    }
+
+    fn receipt_record(capture_id: &str) -> (DeliveryRecord, Vec<u8>) {
+        let capture = normalize_capture(
+            &serde_json::to_vec(&json!({
+                "captureId": capture_id,
+                "responseStatus": 503,
+                "captureError": "synthetic receipt regression"
+            }))
+            .unwrap(),
+            1024 * 1024,
         )
+        .unwrap();
+        let record = DeliveryRecord {
+            capture_id: capture.capture_id,
+            raw_sha256: capture.sha256,
+            bytes: capture.canonical.len() as u64 + 1,
+            state: "inflight".to_owned(),
+            attempts: 1,
+            next_attempt_unix_ms: 0,
+            lease_until_unix_ms: 0,
+            last_attempt_at: None,
+            delivered_at: None,
+            last_error: None,
+        };
+        (record, capture.canonical)
+    }
+
+    fn receipt(record: &DeliveryRecord, duplicate: bool) -> Value {
+        json!({
+            "capture_id": record.capture_id,
+            "ok": true,
+            "durable": true,
+            "duplicate": duplicate,
+            "capture": SubmitAck {
+                capture_id: record.capture_id.clone(),
+                state: if duplicate { "duplicate" } else { "accepted" }.to_owned(),
+                durable: true,
+                duplicate,
+                raw_sha256: record.raw_sha256.clone(),
+                segment_id: 42,
+                offset: 8192,
+                length: record.bytes,
+            },
+        })
+    }
+
+    fn invalid_receipts(record: &DeliveryRecord) -> Vec<(&'static str, Value)> {
+        let valid = receipt(record, false);
+        let mut cases = vec![
+            (
+                "ack_only",
+                json!({"ok": true, "durable": true, "duplicate": false}),
+            ),
+            ("missing_receipt", valid.clone()),
+            ("wrong_capture_id", valid.clone()),
+            ("wrong_hash", valid.clone()),
+            ("wrong_length", valid.clone()),
+            ("not_durable", valid.clone()),
+            ("invalid_state", valid.clone()),
+            ("duplicate_disagrees", valid.clone()),
+            ("invalid_segment", valid.clone()),
+            ("overflowing_locator", valid.clone()),
+            ("contradictory_http_status", valid.clone()),
+            ("overflowing_http_status", valid),
+        ];
+        cases[1].1.as_object_mut().unwrap().remove("capture");
+        cases[2].1["capture"]["capture_id"] = json!("cap-unrelated-receipt");
+        cases[3].1["capture"]["raw_sha256"] = json!("0".repeat(64));
+        cases[4].1["capture"]["length"] = json!(record.bytes + 1);
+        cases[5].1["capture"]["durable"] = json!(false);
+        cases[6].1["capture"]["state"] = json!("pending");
+        cases[7].1["duplicate"] = json!(true);
+        cases[8].1["capture"]["segment_id"] = json!(0);
+        cases[9].1["capture"]["offset"] = json!(u64::MAX);
+        cases[10].1["http_status"] = json!(409);
+        cases[11].1["http_status"] = json!(65536 + 202);
+        cases
+    }
+
+    async fn receipt_test_relay() -> (
+        tempfile::TempDir,
+        DurableRelay,
+        ReceiptReply,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let reply = Arc::new(Mutex::new((StatusCode::ACCEPTED, "{}".to_owned())));
+        let app = Router::new()
+            .route("/capture", post(receipt_reply))
+            .route("/captures", post(receipt_reply))
+            .with_state(Arc::clone(&reply));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = test_config(&temporary);
+        config.collector_url = format!("http://{address}");
+        config.request_timeout = Duration::from_secs(2);
+        let relay = DurableRelay::open(config).await.unwrap();
+        (temporary, relay, reply, server)
+    }
+
+    async fn receipt_payload(
+        relay: &DurableRelay,
+        record: &DeliveryRecord,
+        body: &[u8],
+    ) -> DeliveryPayload {
+        DeliveryPayload {
+            record: record.clone(),
+            body: body.to_vec(),
+            _permit: Arc::clone(&relay.inner.delivery_body_budget)
+                .acquire_many_owned(record.bytes as u32)
+                .await
+                .unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_receipt_single_rejects_unproven_and_mismatched_acknowledgements() {
+        let (_temporary, relay, reply, server) = receipt_test_relay().await;
+        let (record, body) = receipt_record("cap-single-receipt");
+        for (name, payload) in invalid_receipts(&record) {
+            *reply.lock().unwrap() = (StatusCode::ACCEPTED, payload.to_string());
+            let update = send_single(&relay.inner, &record, body.clone()).await;
+            assert_eq!(update.state, "pending", "invalid receipt: {name}");
+            assert!(update.error.is_some(), "invalid receipt: {name}");
+        }
+        relay.close().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delivery_receipt_batch_rejects_unproven_and_mismatched_acknowledgements() {
+        let (_temporary, relay, reply, server) = receipt_test_relay().await;
+        let (first, first_body) = receipt_record("cap-first-receipt");
+        let (second, second_body) = receipt_record("cap-second-receipt");
+        for (name, mut invalid) in invalid_receipts(&first) {
+            // The item ID routes this result but does not prove its stored bytes.
+            invalid["capture_id"] = json!(first.capture_id);
+            *reply.lock().unwrap() = (
+                StatusCode::MULTI_STATUS,
+                json!({"ok": false, "durable": false,
+                    "results": [invalid, receipt(&second, true)]})
+                .to_string(),
+            );
+            let batch = vec![
+                receipt_payload(&relay, &first, &first_body).await,
+                receipt_payload(&relay, &second, &second_body).await,
+            ];
+            let updates = send_delivery_batch(&relay.inner, batch).await;
+            assert_eq!(updates[0].state, "pending", "invalid receipt: {name}");
+            assert_eq!(updates[1].state, "delivered", "valid receipt: {name}");
+        }
+        relay.close().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delivery_receipt_accepts_exact_accepted_and_duplicate_receipts() {
+        let (_temporary, relay, reply, server) = receipt_test_relay().await;
+        let (first, first_body) = receipt_record("cap-valid-first-receipt");
+        let (second, second_body) = receipt_record("cap-valid-second-receipt");
+        for (status, duplicate) in [(StatusCode::ACCEPTED, false), (StatusCode::OK, true)] {
+            *reply.lock().unwrap() = (status, receipt(&first, duplicate).to_string());
+            assert_eq!(
+                send_single(&relay.inner, &first, first_body.clone())
+                    .await
+                    .state,
+                "delivered"
+            );
+            *reply.lock().unwrap() = (
+                status,
+                json!({"ok": true, "durable": true,
+                    "results": [receipt(&second, duplicate), receipt(&first, duplicate)]})
+                .to_string(),
+            );
+            let batch = vec![
+                receipt_payload(&relay, &first, &first_body).await,
+                receipt_payload(&relay, &second, &second_body).await,
+            ];
+            let updates = send_delivery_batch(&relay.inner, batch).await;
+            assert!(updates.iter().all(|update| update.state == "delivered"));
+        }
+        relay.close().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delivery_receipt_preserves_http_errors_and_retries_invalid_json() {
+        let (_temporary, relay, reply, server) = receipt_test_relay().await;
+        let (first, first_body) = receipt_record("cap-http-first-receipt");
+        let (second, second_body) = receipt_record("cap-http-second-receipt");
+        for (status, expected) in [
+            (StatusCode::SERVICE_UNAVAILABLE, "pending"),
+            (StatusCode::TOO_MANY_REQUESTS, "pending"),
+            (StatusCode::CONFLICT, "conflict"),
+            (StatusCode::BAD_REQUEST, "failed"),
+        ] {
+            *reply.lock().unwrap() = (status, receipt(&first, false).to_string());
+            assert_eq!(
+                send_single(&relay.inner, &first, first_body.clone())
+                    .await
+                    .state,
+                expected,
+                "single HTTP {status}"
+            );
+            *reply.lock().unwrap() = (
+                status,
+                json!({"ok": true, "durable": true,
+                    "results": [receipt(&first, false), receipt(&second, false)]})
+                .to_string(),
+            );
+            let batch = vec![
+                receipt_payload(&relay, &first, &first_body).await,
+                receipt_payload(&relay, &second, &second_body).await,
+            ];
+            let updates = send_delivery_batch(&relay.inner, batch).await;
+            assert!(
+                updates.iter().all(|update| update.state == expected),
+                "batch HTTP {status}"
+            );
+        }
+        for body in ["{", "{}"] {
+            *reply.lock().unwrap() = (StatusCode::ACCEPTED, body.to_owned());
+            assert_eq!(
+                send_single(&relay.inner, &first, first_body.clone())
+                    .await
+                    .state,
+                "pending"
+            );
+            let batch = vec![
+                receipt_payload(&relay, &first, &first_body).await,
+                receipt_payload(&relay, &second, &second_body).await,
+            ];
+            let updates = send_delivery_batch(&relay.inner, batch).await;
+            assert!(updates.iter().all(|update| update.state == "pending"));
+        }
+        relay.close().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delivery_receipt_batch_rejects_duplicate_ids_and_keeps_proven_partial_results() {
+        let (_temporary, relay, reply, server) = receipt_test_relay().await;
+        let (first, first_body) = receipt_record("cap-ambiguous-first-receipt");
+        let (second, second_body) = receipt_record("cap-ambiguous-second-receipt");
+        let mut wrong_hash = receipt(&first, false);
+        wrong_hash["capture"]["raw_sha256"] = json!("0".repeat(64));
+        for results in [
+            vec![
+                wrong_hash.clone(),
+                receipt(&first, false),
+                receipt(&second, true),
+            ],
+            vec![receipt(&first, false), wrong_hash, receipt(&second, true)],
+            vec![receipt(&second, true)],
+        ] {
+            *reply.lock().unwrap() = (
+                StatusCode::MULTI_STATUS,
+                json!({"ok": false, "durable": false, "results": results}).to_string(),
+            );
+            let batch = vec![
+                receipt_payload(&relay, &first, &first_body).await,
+                receipt_payload(&relay, &second, &second_body).await,
+            ];
+            let updates = send_delivery_batch(&relay.inner, batch).await;
+            assert_eq!(updates[0].state, "pending");
+            assert_eq!(updates[1].state, "delivered");
+        }
+        *reply.lock().unwrap() = (
+            StatusCode::MULTI_STATUS,
+            json!({"ok": false, "durable": false, "results": [
+                {"capture_id": first.capture_id, "ok": false, "durable": false,
+                    "http_status": 409, "reason": "capture_id_conflict"},
+                receipt(&second, true)
+            ]})
+            .to_string(),
+        );
+        let batch = vec![
+            receipt_payload(&relay, &first, &first_body).await,
+            receipt_payload(&relay, &second, &second_body).await,
+        ];
+        let updates = send_delivery_batch(&relay.inner, batch).await;
+        assert_eq!(updates[0].state, "conflict");
+        assert_eq!(updates[1].state, "delivered");
+        relay.close().await.unwrap();
+        server.abort();
     }
 
     fn test_config(temporary: &tempfile::TempDir) -> RelayConfig {
@@ -2640,11 +2975,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbox_restarts_and_delivers_same_capture() {
+    async fn delivery_receipt_unproven_ack_survives_restart_to_real_collector() {
         let temporary = tempfile::tempdir().unwrap();
-        let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = reserved.local_addr().unwrap();
-        drop(reserved);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let invalid_reply = Arc::new(Mutex::new((
+            StatusCode::ACCEPTED,
+            json!({"ok": true, "durable": true, "duplicate": false}).to_string(),
+        )));
+        let invalid_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/capture", post(receipt_reply))
+                    .route("/captures", post(receipt_reply))
+                    .with_state(invalid_reply),
+            )
+            .await
+            .unwrap();
+        });
         let config = RelayConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             store: StoreConfig {
@@ -2667,56 +3016,73 @@ mod tests {
             delivery_batch_bytes: 1024 * 1024,
             delivery_batch_wait: Duration::from_millis(1),
             max_delivery_inflight_bytes: 4 * 1024 * 1024,
-            request_timeout: Duration::from_millis(100),
-            base_retry_delay: Duration::from_millis(5),
-            max_retry_delay: Duration::from_millis(20),
+            request_timeout: Duration::from_secs(1),
+            base_retry_delay: Duration::from_millis(500),
+            max_retry_delay: Duration::from_secs(1),
             max_connections: 16,
             max_envelope_bytes: 1024 * 1024,
             max_inflight_body_bytes: 4 * 1024 * 1024,
             max_batch_records: 32,
             ingest_bearer_token: None,
         };
-        let relay = DurableRelay::open(config.clone()).await.unwrap();
-        relay
-            .enqueue(
-                &serde_json::to_vec(&json!({
-                    "captureId":"cap-relay-one",
-                    "responseStatus":503,
-                    "captureError":"kept"
-                }))
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        let records = ["two", "three"]
+        let expected: Vec<(DeliveryRecord, Vec<u8>)> = ["one", "two", "three"]
             .into_iter()
-            .map(|suffix| {
-                let value = json!({
-                    "captureId": format!("cap-relay-{suffix}"),
-                    "responseStatus": 503,
-                    "captureError": "kept"
-                });
-                normalize_capture(&serde_json::to_vec(&value).unwrap(), 1024 * 1024).unwrap()
-            })
+            .map(|suffix| receipt_record(&format!("cap-relay-{suffix}")))
+            .collect();
+        let relay = DurableRelay::open(config.clone()).await.unwrap();
+        relay.enqueue(&expected[0].1).await.unwrap();
+        let records = expected[1..]
+            .iter()
+            .map(|(_, body)| normalize_capture(body, 1024 * 1024).unwrap())
             .collect();
         let results = relay.enqueue_batch(records).await.unwrap();
         assert!(results.iter().all(std::result::Result::is_ok));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let health = relay.health().await.unwrap();
+            assert_eq!(health.delivered, 0);
+            assert_eq!(health.failed, 0);
+            assert!(health.conservation_ok);
+            if health.delivery_attempts >= 3 && health.pending == 3 && health.inflight == 0 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for (record, body) in &expected {
+            assert_eq!(
+                relay
+                    .inner
+                    .store
+                    .read_capture(&record.capture_id)
+                    .await
+                    .unwrap(),
+                *body
+            );
+        }
         relay.close().await.unwrap();
         drop(relay);
+        invalid_server.abort();
+        let _ = invalid_server.await;
 
-        let listener = TcpListener::bind(address).await.unwrap();
-        let batch_hits = Arc::new(AtomicUsize::new(0));
-        let server_batch_hits = Arc::clone(&batch_hits);
+        let mut collector_store = config.store.clone();
+        collector_store.root = temporary.path().join("collector");
+        collector_store.state_root = temporary.path().join("collector-state");
+        let collector_config = crate::collector::CollectorConfig {
+            bind: address,
+            store: collector_store.clone(),
+            store_shards: 1,
+            max_connections: 16,
+            max_envelope_bytes: 1024 * 1024,
+            max_inflight_body_bytes: 4 * 1024 * 1024,
+            max_batch_records: 32,
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/capture", post(durable_ack))
-                    .route("/captures", post(durable_batch))
-                    .with_state(server_batch_hits),
-            )
+            crate::collector::serve(collector_config, async {
+                let _ = shutdown_rx.await;
+            })
             .await
-            .unwrap();
         });
         let reopened = DurableRelay::open(config).await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -2730,10 +3096,29 @@ mod tests {
         };
         assert_eq!(health.delivery_records, 3);
         assert_eq!(health.delivered, 3);
-        assert!(batch_hits.load(Ordering::Relaxed) >= 1);
+        assert_eq!((health.pending, health.inflight, health.failed), (0, 0, 0));
         assert!(health.conservation_ok);
+        // The real Collector returns a duplicate receipt on replay. It must
+        // still bind to these exact bytes, not the Relay's WAL coordinates.
+        for (record, body) in &expected {
+            assert_eq!(
+                send_single(&reopened.inner, record, body.clone())
+                    .await
+                    .state,
+                "delivered"
+            );
+        }
         reopened.close().await.unwrap();
-        server.abort();
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
+        let collector = ShardedCaptureStore::open(collector_store, 1).await.unwrap();
+        assert_eq!(collector.health().captures, 3);
+        for (record, body) in &expected {
+            let restored = collector.read_capture(&record.capture_id).await.unwrap();
+            assert_eq!(restored, *body);
+            assert_eq!(crate::jsonl::sha256_bytes(&restored), record.raw_sha256);
+        }
+        collector.close().await.unwrap();
     }
 
     #[test]
