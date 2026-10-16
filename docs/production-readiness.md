@@ -5,9 +5,9 @@
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
 本次复核（2026-10-17 00:58，Asia/Shanghai）发现维护提交 `11ff05c1211debc167f75633940c9656c1290073`
-已运行在 Collector/Relay，Collector 与 Relay 的累计计数约为 `1,181,292`，队列曾出现 1 条在途记录且
+已运行在 Collector/Relay，Collector 与 Relay 的累计计数约为 `1,181,292`，队列曾出现 1 条待处理记录且
 传输失败为零；这只证明传输闭环存活。带生产门禁参数 `--max-quality-errors 0 --max-historical-failed-files 0`
-的 runtime gate 实际退出 1，报告了 Gateway 的 `293` 个历史失败 outbox 文件（约 267 MB）以及当前在途记录。
+的 runtime gate 实际退出 1，报告了 Gateway 的 `293` 个历史失败 outbox 文件（约 267 MB）以及该待处理记录。
 同一快照的 Relay 业务覆盖为 `degraded`：Wire 已约 4,627 秒未刷新，`quality_errors=165` 且全部来自
 `otlp_traces` 转换错误，`successful_turn_scoped_captures=0`，`turn_capture_ready=false`。
 18084 的 trace exporter 仍关闭，Gateway watchdog 仍报告上游访问失败；因此当前服务不能按生产标准
