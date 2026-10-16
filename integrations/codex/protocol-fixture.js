@@ -16,6 +16,7 @@ const { promisify } = require('node:util');
 const { DurableCaptureOutbox } = require('../openai-gateway/durable-outbox');
 const { prepareProducerSourceCache } = require('../../scripts/ci/producer-source-cache');
 const stockRelease = require('./stock-release.json');
+const { describePlatformProcessFailure } = require('./protocol-process-error');
 
 const run = promisify(execFile);
 const producerMode = process.env.CHIPTRACE_PROTOCOL_MODE || 'patched_stock_debug_app_server';
@@ -246,11 +247,24 @@ async function protocolFixture(t, prefix) {
     assertHealthy() { if (failure) throw failure; },
     passed() { passed = true; },
     async verifyPlatform(mode = 'partial') {
-      const result = await run(process.execPath, [path.join(__dirname, 'protocol-platform.js'), root, path.resolve(chiptrace), mode],
-        { env: { PATH: process.env.PATH, HOME: root, TMPDIR: root, LANG: 'C.UTF-8',
-          ...(process.env.CHIPTRACE_PROTOCOL_MINIO_BINARY
-            ? { CHIPTRACE_PROTOCOL_MINIO_BINARY: path.resolve(process.env.CHIPTRACE_PROTOCOL_MINIO_BINARY) } : {}),
-          TOKIO_WORKER_THREADS: '2', RAYON_NUM_THREADS: '2' }, timeout: 120000, maxBuffer: 1024 * 1024 });
+      const started = performance.now();
+      const timeoutMs = 120000;
+      let result;
+      try {
+        result = await run(process.execPath, [path.join(__dirname, 'protocol-platform.js'), root, path.resolve(chiptrace), mode],
+          { env: { PATH: process.env.PATH, HOME: root, TMPDIR: root, LANG: 'C.UTF-8',
+            ...(process.env.CHIPTRACE_PROTOCOL_MINIO_BINARY
+              ? { CHIPTRACE_PROTOCOL_MINIO_BINARY: path.resolve(process.env.CHIPTRACE_PROTOCOL_MINIO_BINARY) } : {}),
+            TOKIO_WORKER_THREADS: '2', RAYON_NUM_THREADS: '2' }, timeout: timeoutMs, maxBuffer: 1024 * 1024 });
+      } catch (error) {
+        const details = describePlatformProcessFailure(error,
+          { mode, elapsedMs: performance.now() - started, timeoutMs });
+        await fs.writeFile(path.join(root, `platform-child-${mode}-failure.json`),
+          JSON.stringify(details, null, 2) + '\n', { mode: 0o600 });
+        throw new Error(`Native platform child failed: ${JSON.stringify(details)}`);
+      }
+      t.diagnostic(JSON.stringify({ phase: 'native_platform_child', mode,
+        elapsed_ms: Math.round(performance.now() - started), timeout_ms: timeoutMs }));
       return JSON.parse(result.stdout);
     },
     async serve(handler) {

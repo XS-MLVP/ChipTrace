@@ -1,19 +1,19 @@
 # 生产就绪评估
 
-评估日期：2026-10-16。最新线上只读快照为 09:54（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-16。最新线上只读快照为 10:54（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-09:54 的本机回环只读快照中，18084、3011（Collector）、3012（Relay）均返回 200，
-Collector/Relay 仍为 `fe9fcf9`；Collector Capture 与 Relay 累计投递均为 1,127,751，
+10:54 的本机回环只读快照中，18084、3011（Collector）、3012（Relay）均返回 200，
+Collector/Relay 仍为 `fe9fcf9`；Collector Capture 与 Relay 累计投递均为 1,132,461，
 pending/inflight/failed 均为 0，计数守恒。
 这只是瞬时队列状态，不构成持续 SLO 或完整 Session 的证明。Wire 仍只有 1 条且已约
-23.2 小时未更新，覆盖为 `degraded`；同轮 18086 连接拒绝。使用三个 `/health` URL 的
+24.2 小时未更新，覆盖为 `degraded`；同轮 18086 连接拒绝。使用三个 `/health` URL 的
 runtime gate v3 真实退出 1，明确
 报告 `stale_sources=wire`。
 网关独立 trace exporter 的 `enabled=false`；Full Trace Raw Capture 仍为启用状态。
-上一轮观察到模型探针最后可用时间为 10 月 8 日，本次未复验模型探针。
-Collector health 报告 748 个 sealed Segment 共 91,084,888,450 bytes，保存在共享 NFS；
+网关 health 仍报告模型探针最后可用时间为 10 月 8 日，最近错误为连续失败；未主动调用模型。
+Collector health 报告 749 个 sealed Segment 共 91,621,474,853 bytes，保存在共享 NFS；
 此观测不证明已提交目标 OSS。当前状态应区分为传输进程存活、完整
 业务链路未验收和在线交付入口不可用。
 
@@ -192,6 +192,16 @@ logs 在派生前检查，traces 和离线审计使用相同规则；省略/null
 291 个 Node 测试通过；三项默认忽略的 RSS 仍须由独立 CI 门禁实际执行。
 这些是合成结构回归；对应新提交的远端 CI 仍须核验，不证明线上、未修改生产者、
 目标 OSS 或租户授权交付已经通过，也不宣称实现全部 OTLP 字段语义验证。
+
+该提交 `f40bdbf` 的 [CI run 38840675811](https://github.com/XS-MLVP/ChipTrace/actions/runs/38840675811)
+实际为 5/6 作业通过，`upstream-context` 的正常双轮 Buyer 平台子进程失败。采集检查已
+通过，但平台报告没有生成；现有日志缺少真实退出码、信号和 watchdog 状态，不能据
+总耗时推定超时。失败产物的 ZIP 已独立匹配 GitHub SHA-256，失败证据保留。
+同源码本地新采集通过仅证明该隔离路径可用，不能抵消远端失败。后续诊断只输出进程
+元数据、有界源码位置和耗时，不公开子进程正文，仍保留原有 120 秒预算及全部验收门禁。
+诊断补丁的真实进程回归 9/9 通过，新增完整五场景联测也实际 5/5、无跳过；正常双轮的
+平台子进程耗时 104.4 秒，同一 Raw 的 FS/S3 与 Buyer 下载摘要一致。该本地结果仍不
+解释旧远端失败；对应新提交的远端结果须独立核验。
 
 ## 平台状态验收
 

@@ -1,7 +1,8 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { execFileSync, spawnSync } = require('node:child_process');
+const { execFile, execFileSync, spawnSync } = require('node:child_process');
+const { promisify } = require('node:util');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -16,6 +17,7 @@ const {
 } = require('./check-producer-regressions');
 
 const { version } = require('../../integrations/codex/stock-release.json');
+const { describePlatformProcessFailure } = require('../../integrations/codex/protocol-process-error');
 const metadata = {
   workspace_members: [`path+file:///source/core#codex-core@${version}`],
   packages: [{ id: `path+file:///source/core#codex-core@${version}`,
@@ -145,4 +147,46 @@ test('producer session report requires both scope propagation tests exactly once
   ]) {
     assert.throws(() => verifyProducerSessionRegressions(sessionLog));
   }
+});
+
+test('native platform diagnostics preserve a real exit code without exporting child payloads', async () => {
+  const marker = 'PRIVATE_CHILD_PAYLOAD_MUST_NOT_APPEAR';
+  const script = 'process.stdout.write("Process exited with code 0\\n");'
+    + `process.stderr.write(${JSON.stringify(marker + '\n at verify (protocol-platform.js:42:7)\nBearer secret-value\n'
+      + 'plugin.js:' + '1'.repeat(2048) + ':7\nprivate-file.js:99:2\n')});`
+    + 'process.exit(7);';
+  await assert.rejects(promisify(execFile)(process.execPath, ['-e', script]), error => {
+    const details = describePlatformProcessFailure(error, { mode: 'complete', elapsedMs: 42, timeoutMs: 120000 });
+    assert.equal(details.exit_code, 7);
+    assert.equal(details.signal, null);
+    assert.equal(details.killed, false);
+    assert.equal(details.stdout_bytes, Buffer.byteLength(error.stdout));
+    assert.equal(details.stderr_bytes, Buffer.byteLength(error.stderr));
+    assert.deepEqual(details.reported_stderr_locations, ['protocol-platform.js:42:7']);
+    assert.ok(!JSON.stringify(details).includes(marker));
+    assert.ok(!JSON.stringify(details).includes('secret-value'));
+    assert.ok(JSON.stringify(details).length < 1024);
+    return true;
+  });
+});
+
+test('native platform diagnostics distinguish the actual watchdog kill from a child signal', async () => {
+  const run = promisify(execFile);
+  const observe = async (script, options) => {
+    const started = performance.now();
+    try { await run(process.execPath, ['-e', script], options); }
+    catch (error) { return describePlatformProcessFailure(error,
+      { mode: 'complete', elapsedMs: performance.now() - started, timeoutMs: options?.timeout || 120000 }); }
+    assert.fail('the controlled child must not exit successfully');
+  };
+  const signaled = await observe('process.kill(process.pid, "SIGTERM");');
+  assert.equal(signaled.exit_code, null);
+  assert.equal(signaled.signal, 'SIGTERM');
+  assert.equal(signaled.killed, false);
+  const timed = await observe('setTimeout(() => {}, 10000);', { timeout: 100 });
+  assert.equal(timed.exit_code, null);
+  assert.equal(timed.signal, 'SIGTERM');
+  assert.equal(timed.killed, true);
+  assert.equal(timed.timeout_ms, 100);
+  assert.ok(timed.elapsed_ms >= timed.timeout_ms);
 });
