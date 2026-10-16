@@ -38,6 +38,7 @@ COPY integrations/cloud-platform/plugin.js integrations/cloud-platform/server.js
 RUN mkdir -p /data/platform /data/capture /data/objects \
     && chown -R 10001:10001 /data /opt/chiptrace
 ENV CHIPTRACE_BIN=/usr/local/bin/chiptrace \
+    CHIPTRACE_BUILD_REVISION=${CHIPTRACE_REVISION} \
     CHIPTRACE_PLATFORM_ROOT=/data/platform \
     CHIPTRACE_CAPTURE_ROOT=/data/capture \
     CHIPTRACE_OBJECT_ROOT=/data/objects \

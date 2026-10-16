@@ -161,8 +161,8 @@ Delivery ledger 恢复，`quality_errors_scope` 必须为 `durable_relay_state`�
 `quality_errors_current_process` 仅用于区分本次进程新增错误。重启不能把历史错误静默归零；
 若历史错误已存在，应先保留其报告并修复生产者或采集配置，再开始新的 Canary。
 
-Live preflight 同时调用 `scripts/ci/platform-health-gate.js` 检查 18086 的平台版本、持久
-任务计数和存储失败状态。平台健康只证明导出服务进程可用；它不替代目标 Session 的
+Live preflight 同时调用 `scripts/ci/platform-health-gate.js` 检查 18086 的平台版本、运行
+revision、持久任务计数和存储失败状态。平台健康只证明导出服务进程可用；它不替代目标 Session 的
 `cloud-acceptance`、真实 OSS 上传/下载和 SHA-256 复验。
 
 从旧 Relay 升级时，旧 Delivery ledger 没有质量历史字段。若账本已有投递记录，新版本会拒绝

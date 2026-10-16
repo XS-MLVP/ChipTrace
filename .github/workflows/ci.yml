@@ -101,10 +101,12 @@ jobs:
         if: ${{ always() }}
         env:
           CHIPTRACE_PLATFORM_HEALTH_URL: ${{ vars.CHIPTRACE_PLATFORM_HEALTH_URL }}
+          CHIPTRACE_EXPECTED_REVISION: ${{ inputs.expected_revision }}
         run: |
           set -euo pipefail
           node scripts/ci/platform-health-gate.js \
             --platform-url "$CHIPTRACE_PLATFORM_HEALTH_URL" \
+            --expected-revision "$CHIPTRACE_EXPECTED_REVISION" \
             --report "$RUNNER_TEMP/platform-health.json" \
             | tee "$RUNNER_TEMP/platform-health.stdout.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

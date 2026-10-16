@@ -1082,6 +1082,7 @@ class ChipTracePlugin {
   }
 
   health() { return { ok: this.started && !this.closing && !this.failure, version: 'chiptrace.platform.v1',
+    build: { revision: process.env.CHIPTRACE_BUILD_REVISION || null },
     queued: this.queue.length, running: this.running.size, active_reads: this.activeReads,
     jobs: this.jobs.size, failure: this.failure || null }; }
 
