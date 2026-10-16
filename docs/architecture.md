@@ -85,10 +85,12 @@ Wire、OTLP logs、OTLP traces 和 Hook 活动；当 Wire 持续活跃而任一 
 `missing_sources` 包含所有尚未观察到的来源，包括 Wire；Wire 从未到达而 Runtime 持续
 流入时，会同时列入 `missing_sources` 和 `stale_sources`。runtime gate 的非零退出会附带
 有界的来源名称，兼容旧 Relay 在 Wire 为 0 时遗漏缺失列表的诊断。
-`wire_turn_coverage` 独立统计有原生 Session/Turn、无上下文冲突的 Wire、其中 HTTP 2xx
+`ingest_coverage.turn_capture_ready` 只有在四路来源同步且存在近期成功的身份化 Turn Wire
+时才为 true；它是进程级就绪信号，不代表任意特定 Session 已完整。`wire_turn_coverage`
+独立统计有原生 Session/Turn、无上下文冲突的 Wire、其中 HTTP 2xx
 的数量，以及无归属/冲突数量。这些计数按真实 durable ACK 累加，包含重复 ACK；批量中
 冲突或失败的项不计入。成功证据的新鲜度仅由非重复的有归属 HTTP 2xx Capture 刷新，
-403、无身份请求和历史重投不能维持该新鲜度。runtime health gate v2 同时校验该独立
+403、无身份请求和历史重投不能维持该新鲜度。runtime health gate v3 同时校验该独立
 证据与四源传输状态，缺少新统计的旧 Relay 不能通过。
 该统计从 normalization 已解析的对象派生，只保留少量内存元数据，不改写 Raw 或其 SHA。
 HTTP 2xx 也不证明 Responses 终态或客户端交付；门禁声明 `session_delivery_claimed=false`。

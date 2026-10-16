@@ -58,6 +58,7 @@ function relay() {
       required_sources_observed: true,
       required_sources_fresh: true,
       freshness_applicable: true,
+      turn_capture_ready: true,
       freshness_window_ms: 300000,
       wire_age_ms: 0,
       missing_sources: [],
@@ -202,6 +203,7 @@ test('runtime gate report records bounded failure state without arbitrary health
   assert.equal(observed.schema_version, 'chiptrace.runtime-health-observation.v1');
   assert.deepEqual(observed.relay.coverage.missing_sources, ['wire']);
   assert.deepEqual(observed.relay.coverage.stale_sources, ['wire']);
+  assert.equal(observed.relay.coverage.turn_capture_ready, false);
   assert.equal(observed.relay.coverage.wire.requests, 0);
   assert.equal(Object.hasOwn(observed, 'collector_private'), false);
   assert.doesNotMatch(JSON.stringify(observed), /PRIVATE_/);
@@ -214,6 +216,7 @@ test('runtime health gate requires fresh scoped HTTP success without claiming Se
   assert.equal(result.session_delivery_claimed, false);
   assert.equal(result.gateway.open_capture_healthy, true);
   assert.equal(result.relay.freshness_applicable, true);
+  assert.equal(result.relay.turn_capture_ready, true);
   assert.deepEqual(result.relay.sources, { wire: 8, otlp_logs: 15, otlp_traces: 9, hooks: 8 });
   assert.equal(result.relay.wire_turn_coverage.successful_turn_scoped_captures, 5);
   assert.equal(result.relay.wire_turn_coverage.successful_turn_scoped_fresh, true);
@@ -274,6 +277,14 @@ test('a stale or non-applicable Wire source cannot pass', () => {
   value.ingest_coverage.freshness_applicable = true;
   value.ingest_coverage.required_sources_fresh = false;
   assert.throws(() => verifyRuntimeHealth(gateway(), value), /required_sources_fresh must be true/);
+});
+
+test('runtime gate fails closed when Relay does not explicitly advertise Turn readiness', () => {
+  const value = relay();
+  delete value.ingest_coverage.turn_capture_ready;
+  assert.throws(() => verifyRuntimeHealth(gateway(), value), /turn_capture_ready must be true/);
+  value.ingest_coverage.turn_capture_ready = false;
+  assert.throws(() => verifyRuntimeHealth(gateway(), value), /turn_capture_ready must be true/);
 });
 
 test('missing or stale source lists fail even when Relay status says complete', () => {

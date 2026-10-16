@@ -128,6 +128,7 @@ function healthObservation(gateway, relay, collector) {
           last_successful_age_ms: safeInteger(turnCoverage?.last_successful_age_ms),
           successful_turn_scoped_fresh: turnCoverage?.successful_turn_scoped_fresh === true,
         },
+        turn_capture_ready: coverage?.status === 'complete' && coverage?.turn_capture_ready === true,
       },
     },
     collector: {
@@ -300,6 +301,7 @@ function verifyRelayHealth(health) {
   if (!Array.isArray(coverage.stale_sources) || coverage.stale_sources.length !== 0) {
     fail('relay.ingest_coverage.stale_sources must be empty');
   }
+  requireTrue(coverage.turn_capture_ready, 'relay.ingest_coverage.turn_capture_ready');
   nonNegativeInteger(coverage.freshness_window_ms, 'relay.ingest_coverage.freshness_window_ms');
   nonNegativeInteger(coverage.wire_age_ms, 'relay.ingest_coverage.wire_age_ms');
   for (const source of REQUIRED_SOURCES) verifyCoverageRoute(coverage[source], source);
@@ -312,6 +314,7 @@ function verifyRelayHealth(health) {
     coverage_status: coverage.status,
     freshness_applicable: coverage.freshness_applicable,
     required_sources_fresh: coverage.required_sources_fresh,
+    turn_capture_ready: coverage.turn_capture_ready,
     wire_turn_coverage: wireTurnCoverage,
     sources: REQUIRED_SOURCES.reduce((result, source) => {
       result[source] = coverage[source].source_records;

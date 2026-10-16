@@ -121,10 +121,12 @@ paths:
         传输健康不代表 Session 完整。Relay ingest_coverage.wire_turn_coverage
         按 durable ACK 统计有原生 Session/Turn 且无上下文冲突的 Wire、其中 HTTP 2xx
         的数量及无归属/冲突数量；只有非重复的有归属 HTTP 2xx Capture 刷新成功证据时间。
-        HTTP 2xx 不证明 SSE 终态。runtime health gate v2 要求该证据近期有效，
+        ingest_coverage.turn_capture_ready=true 才表示当前进程具备近期成功 Turn Wire
+        的采集就绪证据；它不代表任何特定 Session 已完整。HTTP 2xx 不证明 SSE 终态。
+        runtime health gate v3 要求该证据近期有效，
         并固定声明 session_delivery_claimed=false。
       responses:
-        "200": {description: 就绪}
+        "200": {description: Relay 进程和传输层存活；Turn 采集就绪需检查 ingest_coverage.turn_capture_ready}
         "503": {description: 未就绪}
   /flush:
     post:

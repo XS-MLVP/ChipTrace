@@ -1458,6 +1458,15 @@ impl IngestCoverageState {
         } else {
             "warming"
         };
+        let successful_turn_scoped_fresh = successful_turn_scoped_age_ms
+            .is_some_and(|age| age <= INGEST_COVERAGE_FRESHNESS_WINDOW_MS);
+        // This is a process-level canary signal. It proves that the Relay has
+        // recently received at least one fresh, identity-scoped successful
+        // Turn Wire alongside synchronized source routes; it never claims
+        // that any particular Session is complete.
+        let turn_capture_ready = status == "complete"
+            && turns.successful_turn_scoped_captures > 0
+            && successful_turn_scoped_fresh;
         json!({
             "scope":"current_relay_process",
             "started_at":self.started_at,
@@ -1479,6 +1488,7 @@ impl IngestCoverageState {
             },
             "buyer_eligibility_claimed":false,
             "session_delivery_claimed":false,
+            "turn_capture_ready":turn_capture_ready,
             "wire":route_coverage_value(&self.wire),
             "wire_turn_coverage":{
                 "success_definition":"http_2xx",
@@ -1489,8 +1499,7 @@ impl IngestCoverageState {
                 "identity_conflict_captures":turns.identity_conflict_captures,
                 "last_successful_at":turns.last_successful_at,
                 "last_successful_age_ms":successful_turn_scoped_age_ms,
-                "successful_turn_scoped_fresh":successful_turn_scoped_age_ms
-                    .is_some_and(|age| age <= INGEST_COVERAGE_FRESHNESS_WINDOW_MS),
+                "successful_turn_scoped_fresh":successful_turn_scoped_fresh,
             },
             "otlp_logs":route_coverage_value(&self.otlp_logs),
             "otlp_traces":route_coverage_value(&self.otlp_traces),
@@ -2835,6 +2844,7 @@ mod tests {
     fn ingest_coverage_lists_all_missing_sources_while_warming() {
         let snapshot = IngestCoverageState::new().snapshot();
         assert_eq!(snapshot["status"], "warming");
+        assert_eq!(snapshot["turn_capture_ready"], false);
         assert_eq!(snapshot["required_sources_observed"], false);
         assert_eq!(
             snapshot["missing_sources"],
@@ -2868,6 +2878,7 @@ mod tests {
         }
         let snapshot = coverage.snapshot();
         assert_eq!(snapshot["status"], "degraded");
+        assert_eq!(snapshot["turn_capture_ready"], false);
         assert_eq!(snapshot["required_sources_observed"], false);
         assert_eq!(snapshot["required_sources_fresh"], false);
         assert_eq!(snapshot["missing_sources"], json!(["wire"]));
@@ -2902,6 +2913,7 @@ mod tests {
         }
         let snapshot = coverage.snapshot();
         assert_eq!(snapshot["status"], "complete");
+        assert_eq!(snapshot["turn_capture_ready"], false);
         assert_eq!(snapshot["required_sources_observed"], true);
         assert_eq!(snapshot["required_sources_fresh"], true);
         assert_eq!(snapshot["freshness_applicable"], true);
@@ -2910,6 +2922,51 @@ mod tests {
         assert_eq!(snapshot["buyer_eligibility_claimed"], false);
         assert_eq!(snapshot["derived"]["lifecycle_events"], 1);
         assert_eq!(snapshot["derived"]["tool_executions"], 1);
+    }
+
+    #[test]
+    fn ingest_coverage_turn_capture_ready_requires_fresh_successful_scoped_wire() {
+        let mut coverage = IngestCoverageState::new();
+        coverage.observe_wire(&[(
+            WireCaptureEvidence {
+                turn_scoped: true,
+                http_success: true,
+                identity_conflict: false,
+            },
+            false,
+        )]);
+        for endpoint in [
+            CloudEndpoint::OtlpLogs,
+            CloudEndpoint::OtlpTraces,
+            CloudEndpoint::CodexHook,
+        ] {
+            coverage.observe_cloud(
+                endpoint,
+                &crate::cloud_ingest::CloudIngestSummary {
+                    endpoint: "test".to_owned(),
+                    source_records: 1,
+                    derived_captures: 1,
+                    unknown_events: 0,
+                    attributed_quality_errors: 0,
+                    conversion_errors: Vec::new(),
+                },
+                1,
+                0,
+                0,
+                0,
+            );
+        }
+        let snapshot = coverage.snapshot();
+        assert_eq!(snapshot["status"], "complete");
+        assert_eq!(snapshot["turn_capture_ready"], true);
+        assert_eq!(
+            snapshot["wire_turn_coverage"]["successful_turn_scoped_captures"],
+            1
+        );
+        assert_eq!(
+            snapshot["wire_turn_coverage"]["successful_turn_scoped_fresh"],
+            true
+        );
     }
 
     #[test]

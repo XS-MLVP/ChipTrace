@@ -50,6 +50,8 @@ function requireSuccessfulTurnWireCoverage(liveGate) {
   'deployment smoke requires a successful Turn-scoped Wire capture');
   assert.equal(coverage.successful_turn_scoped_fresh, true,
     'deployment smoke requires fresh successful Turn-scoped Wire evidence');
+  assert.equal(liveGate.relay.turn_capture_ready, true,
+    'deployment smoke requires Relay turn_capture_ready');
   return {
     success_definition: coverage.success_definition,
     freshness_definition: coverage.freshness_definition,
@@ -60,6 +62,7 @@ function requireSuccessfulTurnWireCoverage(liveGate) {
     last_successful_at: coverage.last_successful_at,
     last_successful_age_ms: coverage.last_successful_age_ms,
     successful_turn_scoped_fresh: coverage.successful_turn_scoped_fresh,
+    turn_capture_ready: liveGate.relay.turn_capture_ready,
   };
 }
 

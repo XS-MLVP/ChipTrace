@@ -222,6 +222,8 @@ Relay/Collector 的精确 Raw、重复确认、平台归档/恢复、Turn 和采
 - Relay `pending`、`inflight`、最老队列时间、磁盘空间和 attempt 守恒。
 - `ingest_coverage.wire_turn_coverage` 的成功 Turn Wire 数及新鲜度。无身份、上下文冲突、
   非 2xx 请求和重复投递均不能刷新 `last_successful_at`；它们仍计入各自真实 ACK 统计。
+- `ingest_coverage.turn_capture_ready` 必须为 `true` 才能把进程交给新的真实 Canary；
+  `false` 只表示当前进程缺少就绪证据，不代表已有 Raw 可以补造为完整 Session。
 - `output_truncated=true`、未知 OTLP 事件、转换错误和身份冲突。
 - Session start/end、模型调用/结果/执行、内部父引用的完整率；以及每个 Turn 的 Wire、
   OTLP logs、OTLP traces、required Hook 覆盖和 `incomplete_turns`。
