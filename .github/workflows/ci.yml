@@ -262,11 +262,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.91.0"
-      - name: Build the current Collector and Relay for newly executed protocol collection
+      - name: Build the current release Collector and Relay for newly executed protocol collection
+        env:
+          CHIPTRACE_BUILD_REVISION: ${{ github.sha }}
         run: |
           bash scripts/ci/run-producer-check.sh collector-build \
             "$RUNNER_TEMP/producer-collector-build.log" \
-            cargo +1.91.0 build --locked --bin chiptrace
+            cargo +1.91.0 build --release --locked --bin chiptrace
       - name: Check out the pinned MinIO source for native Raw storage verification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -286,6 +288,7 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/native-minio-build.log"
       - name: Collect native Turns through the CLI and verify FS/S3 Buyer, interruption and compaction recovery
         env:
+          CHIPTRACE_BIN: ${{ github.workspace }}/target/release/chiptrace
           CHIPTRACE_PROTOCOL_MODE: patched_stock_cli
           CHIPTRACE_PROTOCOL_PRODUCER: ${{ github.workspace }}/.ci-codex-source/codex-rs/target/debug/codex
           CHIPTRACE_PROTOCOL_SOURCE: ${{ github.workspace }}/.ci-codex-source
