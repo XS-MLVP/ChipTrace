@@ -53,6 +53,7 @@ function verifyTurnCoverage(platform, sourceCoverage, nativeTurns, modelInteract
   let modelTotal = 0;
   let wireTotal = 0;
   let toolTotal = 0;
+  const sourceTotals = { otlp_logs: 0, otlp_traces: 0, hooks: 0 };
   let expectedSessionId;
   const turns = platform.turn_coverage.map((turn, index) => {
     const value = object(turn, `platform.turn_coverage[${index}]`);
@@ -89,12 +90,17 @@ function verifyTurnCoverage(platform, sourceCoverage, nativeTurns, modelInteract
     modelTotal += interactions;
     wireTotal += counts.wire;
     toolTotal += tools;
+    for (const source of Object.keys(sourceTotals)) sourceTotals[source] += counts[source];
     return { session_id: sessionId, turn_id: turnId, status,
       model_interactions: interactions, tool_execution_records: tools,
       source_coverage: { complete: coverage.complete, missing_sources: [...coverage.missing_sources], ...counts } };
   });
   assert.equal(modelTotal, modelInteractions, 'per-Turn model interactions must conserve the Session total');
   assert.equal(wireTotal, sourceCoverage.wire, 'per-Turn Wire evidence must conserve the Session total');
+  for (const source of Object.keys(sourceTotals)) {
+    assert.ok(sourceTotals[source] <= sourceCoverage[source],
+      `per-Turn ${source} evidence cannot exceed the Session total`);
+  }
   if (toolExecutionRecords !== undefined) {
     assert.equal(toolTotal, nonNegativeInteger(toolExecutionRecords, 'report.tool_execution_records'),
       'per-Turn tool execution records must conserve the Session total');

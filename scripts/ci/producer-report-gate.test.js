@@ -89,4 +89,10 @@ test('producer report gate rejects a Turn with missing source evidence or intera
   const openTurn = report();
   openTurn.platform_evidence.turn_coverage[0].status = 'open';
   assert.throws(() => verifyProducerReport(openTurn, policy), /status must be closed or cancelled/);
+
+  const inflatedLogs = report();
+  for (const turn of inflatedLogs.platform_evidence.turn_coverage) {
+    turn.source_coverage.otlp_logs = 5;
+  }
+  assert.throws(() => verifyProducerReport(inflatedLogs, policy), /otlp_logs evidence cannot exceed/);
 });
