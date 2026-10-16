@@ -1516,6 +1516,8 @@ test('historical failed evidence is reported without poisoning fresh health', as
     let snapshot = outbox.snapshot();
     assert.equal(snapshot.historicalFailedFiles, 1);
     assert.equal(snapshot.historicalAuxiliaryFiles, 1);
+    assert.equal(snapshot.unresolvedHistoricalFailedFiles, 1);
+    assert.equal(snapshot.recoveryReceiptFiles, 0);
     assert.equal(snapshot.recentFailureCount, 0);
     assert.equal(snapshot.currentFailureCount, 0);
     await outbox.enqueue(capture('cap-fresh'));
@@ -1524,6 +1526,102 @@ test('historical failed evidence is reported without poisoning fresh health', as
     assert.equal(snapshot.recentFailureCount, 0);
     assert.equal(snapshot.currentFailureCount, 0);
     assert.equal(snapshot.historicalFailureCount, 2);
+  } finally {
+    await outbox.close();
+    await relay.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('recovery ACK writes a durable receipt and resolves only the matching historical file', async () => {
+  const root = temporaryRoot();
+  const failedFileName = 'cap-historical-receipt.json';
+  const failedFile = path.join(root, 'failed', failedFileName);
+  const original = capture('cap-historical-receipt');
+  const originalBytes = Buffer.from(`${JSON.stringify(original)}\n`, 'utf8');
+  await fsp.mkdir(path.join(root, 'failed'), { recursive: true });
+  await fsp.writeFile(failedFile, originalBytes, { mode: 0o600 });
+  await fsp.writeFile(`${failedFile}.error.json`, `${JSON.stringify({
+    captureId: original.captureId, reason: 'http_400',
+  })}\n`, { mode: 0o600 });
+  const relay = await fakeRelay((req, res) => {
+    req.resume();
+    req.once('end', () => {
+      res.statusCode = 202;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify(syntheticReceipt(req.rawTestBody)));
+    });
+  });
+  const outbox = new DurableCaptureOutbox({
+    root,
+    relayUrl: relay.url,
+    retryBaseMs: 1,
+    retryMaxMs: 1,
+    retryJitterPercent: 0,
+    maxAttempts: 20,
+    minFreeBytes: 0,
+    minFreeFiles: 0,
+  });
+  try {
+    await outbox.start();
+    const recovered = {
+      ...original,
+      outboxRecovery: {
+        schema_version: 'chiptrace.failed-outbox-recovery.v1',
+        original_capture_id: original.captureId,
+        replay_capture_id: original.captureId,
+        original_failed_file_name: failedFileName,
+        original_failed_file_sha256: cryptoHash(originalBytes),
+        original_failure_reason: 'http_400',
+        normalized_at: new Date().toISOString(),
+        body_metadata_reconciled: false,
+        trace_context_fields_added: [],
+      },
+    };
+    await fsp.writeFile(
+      path.join(root, 'pending', 'cap-historical-receipt.json'),
+      `${JSON.stringify(recovered)}\n`,
+      { mode: 0o600 },
+    );
+    await outbox.refreshQueueStats();
+    outbox.scheduleDrain(0);
+    assert.equal(await outbox.flush(2000), true);
+    let snapshot = outbox.snapshot();
+    assert.equal(snapshot.historicalFailedFiles, 1);
+    assert.equal(snapshot.unresolvedHistoricalFailedFiles, 0);
+    assert.equal(snapshot.recoveryReceiptFiles, 1);
+    const receiptFiles = await fsp.readdir(path.join(root, 'recovery-receipts'));
+    assert.equal(receiptFiles.length, 1);
+    const receipt = JSON.parse(await fsp.readFile(
+      path.join(root, 'recovery-receipts', receiptFiles[0]), 'utf8',
+    ));
+    assert.equal(receipt.schema_version, 'chiptrace.outbox-recovery-receipt.v1');
+    assert.equal(receipt.original_capture_id, original.captureId);
+    assert.equal(receipt.original_failed_file_name, failedFileName);
+    assert.equal(receipt.original_failed_file_sha256, cryptoHash(originalBytes));
+    assert.equal(receipt.relay.capture_id, original.captureId);
+    assert.equal(receipt.relay.durable, true);
+    assert.deepEqual(await fsp.readFile(failedFile), originalBytes);
+
+    await outbox.close();
+    const restarted = new DurableCaptureOutbox({ root, relayUrl: '' });
+    try {
+      await restarted.start();
+      snapshot = restarted.snapshot();
+      assert.equal(snapshot.historicalFailedFiles, 1);
+      assert.equal(snapshot.unresolvedHistoricalFailedFiles, 0);
+      assert.equal(snapshot.recoveryReceiptFiles, 1);
+    } finally {
+      await restarted.close();
+    }
+    await fsp.writeFile(failedFile, Buffer.concat([originalBytes, Buffer.from('tampered\n')]), { mode: 0o600 });
+    const tampered = new DurableCaptureOutbox({ root, relayUrl: '' });
+    try {
+      await tampered.start();
+      assert.equal(tampered.snapshot().unresolvedHistoricalFailedFiles, 1);
+    } finally {
+      await tampered.close();
+    }
   } finally {
     await outbox.close();
     await relay.close();

@@ -23,6 +23,7 @@ function gateway() {
         openCaptureHealthy: true,
         openTransactions: 0,
         failedFiles: 3,
+        unresolvedHistoricalFailedFiles: 3,
       },
       rustRelay: {
         configured: true,
@@ -213,6 +214,7 @@ test('runtime gate report records bounded failure state without arbitrary health
   assert.deepEqual(observed.relay.coverage.stale_sources, ['wire']);
   assert.equal(observed.relay.coverage.turn_capture_ready, false);
   assert.equal(observed.gateway.historical_failed_files, 3);
+  assert.equal(observed.gateway.unresolved_historical_failed_files, 3);
   assert.equal(observed.relay.coverage.wire.requests, 0);
   assert.equal(Object.hasOwn(observed, 'collector_private'), false);
   assert.doesNotMatch(JSON.stringify(observed), /PRIVATE_/);
@@ -282,13 +284,23 @@ test('production gate can refuse retained historical Gateway outbox failures', (
       collectorHealth: collector(),
       maxHistoricalFailedFiles: 0,
     }),
-    /gateway outbox historical failed files exceed the configured maximum \(observed=3; maximum=0\)/,
+    /gateway outbox unresolved historical failed files exceed the configured maximum \(observed=3; maximum=0\)/,
   );
   const result = verifyRuntimeHealth(gateway(), relay(), {
     collectorHealth: collector(),
     maxHistoricalFailedFiles: 3,
   });
   assert.equal(result.gateway.historical_failed_files, 3);
+  const recovered = gateway();
+  recovered.fullTraceCapture.outbox.unresolvedHistoricalFailedFiles = 0;
+  const recoveredResult = verifyRuntimeHealth(recovered, relay(), {
+    collectorHealth: collector(), maxHistoricalFailedFiles: 0,
+  });
+  assert.equal(recoveredResult.gateway.unresolved_historical_failed_files, 0);
+  const recoveredObservation = healthObservation(recovered, relay(), collector(), {
+    maxHistoricalFailedFiles: 0,
+  });
+  assert.deepEqual(recoveredObservation.blocking_reasons, []);
   assert.throws(
     () => verifyRuntimeHealth(gateway(), relay(), {
       collectorHealth: collector(),

@@ -39,6 +39,9 @@ const RESPONSES_TERMINAL_EVENTS = new Set([
   'response.incomplete',
 ]);
 const SSE_LINE_PREFIX_LIMIT = 1024;
+const FAILED_OUTBOX_RECOVERY_SCHEMA = 'chiptrace.failed-outbox-recovery.v1';
+const OUTBOX_RECOVERY_RECEIPT_SCHEMA = 'chiptrace.outbox-recovery-receipt.v1';
+const SHA256_RE = /^[a-f0-9]{64}$/;
 
 class ResponsesSseBoundaryTracker {
   constructor() {
@@ -274,6 +277,44 @@ function codexTraceContextFromHeaders(requestHeaders, responseHeaders = {}) {
 function captureFileName(captureId) {
   if (Buffer.byteLength(`${captureId}.json`, 'utf8') <= 240) return `${captureId}.json`;
   return `${captureId.slice(0, 80)}-${sha256(Buffer.from(captureId, 'utf8'))}.json`;
+}
+
+function recoveryReceiptFileName(captureId, originalFailedFileSha256) {
+  const stem = captureFileName(captureId).replace(/\.json$/, '');
+  const suffix = `.${originalFailedFileSha256}.receipt.json`;
+  if (Buffer.byteLength(`${stem}${suffix}`, 'utf8') <= 240) return `${stem}${suffix}`;
+  return `${captureId.slice(0, 64)}-${sha256(Buffer.from(captureId, 'utf8')).slice(0, 16)}${suffix}`;
+}
+
+function recoveryReceiptKey(fileName, originalFailedFileSha256) {
+  return `${fileName}\u0000${originalFailedFileSha256}`;
+}
+
+function validRecoveryReceipt(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (value.schema_version !== OUTBOX_RECOVERY_RECEIPT_SCHEMA
+    || !validCaptureId(value.capture_id)
+    || typeof value.original_failed_file_name !== 'string'
+    || value.original_failed_file_name.length === 0
+    || value.original_failed_file_name.includes('/')
+    || (value.original_capture_id !== undefined && !validCaptureId(value.original_capture_id))
+    || !SHA256_RE.test(String(value.original_failed_file_sha256 || ''))
+    || !SHA256_RE.test(String(value.replay_record_sha256 || ''))
+    || !Number.isSafeInteger(value.replay_record_bytes)
+    || value.replay_record_bytes <= 0
+    || typeof value.recorded_at !== 'string'
+    || !value.relay || value.relay.durable !== true
+    || value.relay.capture_id !== value.capture_id
+    || !SHA256_RE.test(String(value.relay.raw_sha256 || ''))
+    || !Number.isSafeInteger(value.relay.length)
+    || value.relay.length <= 0
+    || !Number.isSafeInteger(value.relay.segment_id)
+    || value.relay.segment_id <= 0
+    || !Number.isSafeInteger(value.relay.offset)
+    || value.relay.offset < 0) {
+    return false;
+  }
+  return true;
 }
 
 function openCapturePaths(directory, captureId) {
@@ -823,6 +864,7 @@ class DurableCaptureOutbox {
     this.processingDir = path.join(this.root, 'processing');
     this.failedDir = path.join(this.root, 'failed');
     this.openDir = path.join(this.root, 'open');
+    this.recoveryReceiptDir = path.join(this.root, 'recovery-receipts');
     this.relayUrl = String(options.relayUrl || '').replace(/\/$/, '');
     this.bearerToken = String(options.bearerToken || '').trim();
     this.maxBytes = positiveInteger(options.maxBytes, 10 * 1024 * 1024 * 1024, 1024 * 1024);
@@ -875,6 +917,9 @@ class DurableCaptureOutbox {
       historicalFailedFiles: 0,
       historicalAuxiliaryFiles: 0,
       historicalFailedBytes: 0,
+      unresolvedHistoricalFailedFiles: 0,
+      recoveryReceiptFiles: 0,
+      recoveryReceiptBytes: 0,
       recentFailedFiles: 0,
       recentAuxiliaryFiles: 0,
       recentFailureBytes: 0,
@@ -904,6 +949,9 @@ class DurableCaptureOutbox {
     this.queuedAtByName = new Map();
     this.openAtByName = new Map();
     this.openCaptures = new Map();
+    this.failedEvidenceCache = new Map();
+    this.historicalFailedEvidence = null;
+    this.recoveryReceiptKeys = new Set();
     this.queueMutationVersion = 0;
     this.queueMutations = 0;
     this.queueIdlePromise = null;
@@ -950,6 +998,7 @@ class DurableCaptureOutbox {
       fsp.mkdir(this.processingDir, { recursive: true, mode: 0o700 }),
       fsp.mkdir(this.failedDir, { recursive: true, mode: 0o700 }),
       fsp.mkdir(this.openDir, { recursive: true, mode: 0o700 }),
+      fsp.mkdir(this.recoveryReceiptDir, { recursive: true, mode: 0o700 }),
     ]);
     await this.recoverPendingTemporaries();
     // A crash between claim and remote ACK leaves the file in processing.
@@ -966,6 +1015,13 @@ class DurableCaptureOutbox {
       }
     });
     await this.refreshQueueStats();
+    // Capture the immutable failed-file set before this process begins doing
+    // new work. A retained file is resolved only by a matching persisted
+    // recovery receipt; the source evidence itself is never removed.
+    this.historicalFailedEvidence = new Map(this.failedEvidenceCache);
+    this.metrics.historicalFailedFiles = this.metrics.failedFiles;
+    this.metrics.historicalAuxiliaryFiles = this.metrics.auxiliaryFiles;
+    this.metrics.historicalFailedBytes = this.metrics.failedBytes;
     // Mark the outbox started before recovery so recovered transactions can
     // reuse the same immutable enqueue path without recursively starting it.
     this.started = true;
@@ -977,9 +1033,6 @@ class DurableCaptureOutbox {
       throw error;
     }
     await this.refreshQueueStats();
-    this.metrics.historicalFailedFiles = this.metrics.failedFiles;
-    this.metrics.historicalAuxiliaryFiles = this.metrics.auxiliaryFiles;
-    this.metrics.historicalFailedBytes = this.metrics.failedBytes;
     this.metrics.startedAt = new Date().toISOString();
     this.scheduleDrain(0);
     return this.snapshot();
@@ -1265,11 +1318,66 @@ class DurableCaptureOutbox {
             queuedAtByName.set(path.basename(file), stat.mtimeMs);
           } else {
             failedBytes += stat.size;
-            if (file.endsWith('.error.json')) auxiliaryFiles += 1;
-            else failedFiles += 1;
+            if (file.endsWith('.error.json')) {
+              auxiliaryFiles += 1;
+            } else {
+              failedFiles += 1;
+              const name = path.basename(file);
+              const cached = this.failedEvidenceCache.get(name);
+              if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+                continue;
+              }
+              try {
+                const bytes = await fsp.readFile(file);
+                this.failedEvidenceCache.set(name, {
+                  fileName: name,
+                  size: stat.size,
+                  mtimeMs: stat.mtimeMs,
+                  sha256: sha256(bytes),
+                });
+              } catch (readError) {
+                if (readError.code !== 'ENOENT') errors.push(readError);
+                this.failedEvidenceCache.set(name, {
+                  fileName: name,
+                  size: stat.size,
+                  mtimeMs: stat.mtimeMs,
+                  sha256: null,
+                });
+              }
+            }
           }
         } catch (error) {
           if (error.code !== 'ENOENT') errors.push(error);
+        }
+      }
+    }
+    const recoveryReceiptFiles = await listRegularFiles(this.recoveryReceiptDir);
+    let recoveryReceiptBytes = 0;
+    const recoveryReceiptKeys = new Set();
+    for (const file of recoveryReceiptFiles) {
+      try {
+        const bytes = await fsp.readFile(file);
+        recoveryReceiptBytes += bytes.length;
+        const receipt = JSON.parse(bytes.toString('utf8'));
+        if (validRecoveryReceipt(receipt)) {
+          recoveryReceiptKeys.add(recoveryReceiptKey(
+            receipt.original_failed_file_name,
+            receipt.original_failed_file_sha256,
+          ));
+        } else {
+          errors.push(new Error('invalid recovery receipt'));
+        }
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    bytes += recoveryReceiptBytes;
+    this.recoveryReceiptKeys = recoveryReceiptKeys;
+    let unresolvedHistoricalFailedFiles = 0;
+    if (this.historicalFailedEvidence) {
+      for (const evidence of this.historicalFailedEvidence.values()) {
+        if (!recoveryReceiptKeys.has(recoveryReceiptKey(evidence.fileName, evidence.sha256))) {
+          unresolvedHistoricalFailedFiles += 1;
         }
       }
     }
@@ -1297,7 +1405,10 @@ class DurableCaptureOutbox {
     }
     return {
       metrics: { queueBytes: bytes, activeQueueBytes, failedBytes, pending, processing,
-        openTransactions, openFiles, openBytes, failedFiles, auxiliaryFiles },
+        openTransactions, openFiles, openBytes, failedFiles, auxiliaryFiles,
+        recoveryReceiptFiles: recoveryReceiptFiles.length,
+        recoveryReceiptBytes,
+        unresolvedHistoricalFailedFiles },
       queuedAtByName,
       openAtByName,
       errors,
@@ -1365,6 +1476,7 @@ class DurableCaptureOutbox {
     }
     if (this.metrics.pending + this.metrics.processing + this.metrics.failedFiles
       + this.metrics.auxiliaryFiles + this.metrics.openFiles + this.metrics.stalledFiles
+      + this.metrics.recoveryReceiptFiles
       + this.reservedFiles - creditFiles + files > this.maxFiles) {
       reject('capture outbox file cap is full', 'OUTBOX_FULL');
     }
@@ -1547,14 +1659,124 @@ class DurableCaptureOutbox {
     }
   }
 
+  async writeRecoveryReceipt(record, inputSha256, inputBytes, payload) {
+    const recovery = record?.outboxRecovery;
+    if (!recovery || recovery.schema_version !== FAILED_OUTBOX_RECOVERY_SCHEMA) return null;
+    const originalFailedFileSha256 = String(recovery.original_failed_file_sha256 || '');
+    if (!SHA256_RE.test(originalFailedFileSha256)) {
+      const error = new Error('outbox recovery record has an invalid original failed-file hash');
+      error.code = 'CAPTURE_RECOVERY_RECEIPT_INVALID';
+      throw error;
+    }
+    const captureId = String(record.captureId || '');
+    const capture = payload?.capture;
+    if (recovery.replay_capture_id !== undefined
+      && recovery.replay_capture_id !== captureId) {
+      const error = new Error('outbox recovery replay Capture ID does not match record');
+      error.code = 'CAPTURE_RECOVERY_RECEIPT_INVALID';
+      throw error;
+    }
+    if (recovery.original_capture_id !== undefined
+      && !validCaptureId(recovery.original_capture_id)) {
+      const error = new Error('outbox recovery original Capture ID is invalid');
+      error.code = 'CAPTURE_RECOVERY_RECEIPT_INVALID';
+      throw error;
+    }
+    const originalFailedFileName = String(
+      recovery.original_failed_file_name || captureFileName(captureId),
+    );
+    if (!originalFailedFileName || originalFailedFileName.includes('/')) {
+      const error = new Error('outbox recovery record has an invalid original failed-file name');
+      error.code = 'CAPTURE_RECOVERY_RECEIPT_INVALID';
+      throw error;
+    }
+    const receipt = {
+      schema_version: OUTBOX_RECOVERY_RECEIPT_SCHEMA,
+      capture_id: captureId,
+      original_capture_id: validCaptureId(recovery.original_capture_id)
+        ? recovery.original_capture_id : captureId,
+      original_failed_file_name: originalFailedFileName,
+      original_failed_file_sha256: originalFailedFileSha256,
+      replay_record_sha256: inputSha256,
+      replay_record_bytes: inputBytes.length,
+      original_failure_reason: typeof recovery.original_failure_reason === 'string'
+        ? recovery.original_failure_reason.slice(0, 200) : null,
+      normalized_at: typeof recovery.normalized_at === 'string' ? recovery.normalized_at : null,
+      recorded_at: new Date().toISOString(),
+      relay: {
+        durable: true,
+        duplicate: payload.duplicate === true,
+        capture_id: capture.capture_id,
+        raw_sha256: capture.raw_sha256,
+        length: capture.length,
+        segment_id: capture.segment_id,
+        offset: capture.offset,
+      },
+    };
+    if (!validRecoveryReceipt(receipt)) {
+      const error = new Error('Relay recovery receipt fields are invalid');
+      error.code = 'CAPTURE_RECOVERY_RECEIPT_INVALID';
+      throw error;
+    }
+    const bytes = Buffer.from(`${JSON.stringify(receipt)}\n`, 'utf8');
+    const target = path.join(
+      this.recoveryReceiptDir,
+      recoveryReceiptFileName(captureId, originalFailedFileSha256),
+    );
+    let created = false;
+    try {
+      await atomicWrite(target, bytes);
+      created = true;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const existing = await fsp.readFile(target);
+      let sameReceipt = isDeepStrictEqual(existing, bytes);
+      if (!sameReceipt) {
+        try {
+          const existingReceipt = JSON.parse(existing.toString('utf8'));
+          const comparable = { ...receipt, recorded_at: existingReceipt.recorded_at };
+          sameReceipt = isDeepStrictEqual(existingReceipt, comparable);
+        } catch {
+          sameReceipt = false;
+        }
+      }
+      if (!sameReceipt) {
+        const conflict = new Error('recovery receipt already exists with different bytes');
+        conflict.code = 'CAPTURE_RECOVERY_RECEIPT_CONFLICT';
+        throw conflict;
+      }
+    }
+    if (created) {
+      this.metrics.recoveryReceiptFiles += 1;
+      this.metrics.recoveryReceiptBytes += bytes.length;
+      this.metrics.queueBytes += bytes.length;
+      this.accountFilesystemAllocation(bytes.length, 1);
+    }
+    this.recoveryReceiptKeys.add(recoveryReceiptKey(
+      originalFailedFileName,
+      originalFailedFileSha256,
+    ));
+    if (this.historicalFailedEvidence) {
+      let unresolved = 0;
+      for (const evidence of this.historicalFailedEvidence.values()) {
+        if (!this.recoveryReceiptKeys.has(recoveryReceiptKey(evidence.fileName, evidence.sha256))) {
+          unresolved += 1;
+        }
+      }
+      this.metrics.unresolvedHistoricalFailedFiles = unresolved;
+    }
+    return receipt;
+  }
+
   async deliverFile(file, beforeQueueChange) {
     let bytes;
+    let record;
     let storedBytesLength = 0;
     let captureId = path.basename(file, '.json');
     try {
       bytes = await fsp.readFile(file);
       storedBytesLength = bytes.length;
-      const record = JSON.parse(bytes.toString('utf8'));
+      record = JSON.parse(bytes.toString('utf8'));
       captureId = String(record.captureId || captureId);
       if (!validCaptureId(captureId)) throw new Error('outbox file has invalid captureId');
       const reconciled = reconcileCaptureBodyMetadata(record);
@@ -1600,6 +1822,7 @@ class DurableCaptureOutbox {
         const receiptError = relayReceiptError(payload, captureId, bytes.length, inputSha256);
         if (response.ok && receiptError === null) {
           beforeQueueChange();
+          await this.writeRecoveryReceipt(record, inputSha256, bytes, payload);
           await fsp.rm(file, { force: false });
           await fsyncDirectory(this.processingDir);
           this.metrics.durable += 1;
@@ -1756,6 +1979,8 @@ class DurableCaptureOutbox {
       ...this.metrics,
       historicalFailureCount: this.metrics.historicalFailedFiles
         + this.metrics.historicalAuxiliaryFiles,
+      unresolvedHistoricalFailureCount: this.metrics.unresolvedHistoricalFailedFiles,
+      recoveryReceiptCount: this.metrics.recoveryReceiptFiles,
       recentFailureCount: this.metrics.recentFailedFiles
         + this.metrics.recentAuxiliaryFiles,
       currentFailureCount: this.metrics.recentFailedFiles

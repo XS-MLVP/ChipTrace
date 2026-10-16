@@ -350,6 +350,35 @@ Wire 停止时返回 `freshness_applicable=false`，都会失败；历史失败�
 重放失败证据时只能复制到 `pending`（不要移动或删除 `failed` 原件），确认 Relay durable
 ACK 后再以 pending/processing 清零作为完成条件。
 
+对于旧网关在正文脱敏后留下旧长度/哈希的失败文件，使用仓库内的恢复工具生成可审计的
+`pending` 副本。工具默认只做 dry-run；它按实际 UTF-8 正文重算长度和 SHA-256，从原始
+请求/响应头派生没有冲突的 Session/Turn 身份，并把原失败文件 SHA-256、失败原因和新增
+字段写入 `outboxRecovery`。身份冲突、损坏文件和目标文件差异会被拒绝；`failed/` 原件及
+`.error.json` 标记永远不移动、不覆盖、不删除。
+
+重放副本使用 `cap-replay-<deterministic-digest>` 作为新的 Capture ID，并在
+`outboxRecovery.original_capture_id` 中保留旧 ID。旧版本可能已经用原 ID 写入了不同的
+规范化字节；继续复用原 ID 会得到不可重试的 409，因此新 ID 是避免冲突且可审计的恢复边界。
+Session/Turn 关联仍来自已验证的 `traceContext`，原失败文件名和完整 SHA-256 绑定到 receipt。
+
+```bash
+node scripts/ops/replay-failed-outbox.js \
+  --root /nfs/home/zhangyuxin/router_v2-data/relay-shell-outbox
+
+node scripts/ops/replay-failed-outbox.js \
+  --root /nfs/home/zhangyuxin/router_v2-data/relay-shell-outbox \
+  --apply
+```
+
+应用后等待网关把 `pending/` 发送并得到 Relay durable ACK；成功 ACK 先在
+`recovery-receipts/` 原子写入 `chiptrace.outbox-recovery-receipt.v1`，再删除重放副本。
+随后确认 `pending=0`、`processing=0`、`recentFailureCount=0`，并检查
+`unresolvedHistoricalFailedFiles=0`。`failed/` 原件、`.error.json` 和 recovery receipt 都
+要保留；runtime gate 的 `--max-historical-failed-files 0` 只按有回执的历史记录解除阻断，
+没有回执的旧文件仍会失败。重启后门禁会重新按失败文件 SHA-256、文件名和 Relay WAL
+定位校验回执，不能手工伪造回执。该恢复只修复传输元数据，不能把没有原生身份的 Wire
+补成 Turn，也不能清除历史 OTLP 质量错误；真实 Session 仍须按四源和 Buyer 验收。
+
 生命周期 Hook 不是心跳。单个 Turn 超过 5 分钟且没有新的生命周期边界时，可能出现
 `stale_sources=["hooks"]`；这是需要核对的来源新鲜度告警，不单独证明数据丢失。
 应检查目标 Session 的起始 Hook、持续 OTLP，以及结束后的 `SessionEnd` 和投影完整性。

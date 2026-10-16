@@ -553,6 +553,13 @@ jobs:
         with:
           name: gateway-outbox-report
           path: gateway-outbox.tap
+      - name: Verify legacy failed-outbox recovery preserves evidence and identity
+        run: node --test scripts/ops/replay-failed-outbox.test.js | tee failed-outbox-replay.tap
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: failed-outbox-replay-report
+          path: failed-outbox-replay.tap
       - name: Build the CLI used by native Hook and platform regressions
         run: cargo build --locked --bin chiptrace
       - name: Verify delivery receipts, OTLP identity, metadata and structure refusal, tool provenance and exact Raw

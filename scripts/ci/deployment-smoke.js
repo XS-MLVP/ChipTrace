@@ -234,7 +234,8 @@ async function main({ runtimeImage, platformImage, revision, reportPath }) {
           const relay = await json(`${urls.relay}/health`);
           value = { status: 'healthy', fullTraceCapture: { enabled: true, currentDeliveryHealthy: true,
             outbox: { pending: 0, processing: 0, recentFailureCount: 0, openCaptureHealthy: true,
-              openTransactions: 0, failedFiles: 0 },
+              openTransactions: 0, failedFiles: 0, unresolvedHistoricalFailedFiles: 0,
+              recoveryReceiptFiles: 0 },
             rustRelay: { configured: true, healthy: true, conservationOk: relay.conservation_ok,
               pending: relay.pending, inflight: relay.inflight, failed: relay.failed, delivered: relay.delivered } } };
         } else if (req.url === '/collector-other-revision') {

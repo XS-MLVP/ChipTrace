@@ -108,8 +108,11 @@ function blockingReasons(
   if (gateway.inflight !== 0) add('gateway_inflight_records');
   if (gateway.failed !== 0) add('gateway_failed_records');
   if (maxHistoricalFailedFiles !== undefined
-    && Number.isSafeInteger(gateway.historical_failed_files)
-    && gateway.historical_failed_files > maxHistoricalFailedFiles) {
+    && Number.isSafeInteger(
+      gateway.unresolved_historical_failed_files ?? gateway.historical_failed_files,
+    )
+    && (gateway.unresolved_historical_failed_files ?? gateway.historical_failed_files)
+      > maxHistoricalFailedFiles) {
     add('gateway_historical_failed_files_exceed_max');
   }
 
@@ -193,6 +196,10 @@ function healthObservation(
       inflight: safeInteger(gatewayRelay?.inflight),
       failed: safeInteger(gatewayRelay?.failed),
       historical_failed_files: safeInteger(capture?.outbox?.failedFiles),
+      unresolved_historical_failed_files: safeInteger(
+        capture?.outbox?.unresolvedHistoricalFailedFiles,
+      ),
+      recovery_receipt_files: safeInteger(capture?.outbox?.recoveryReceiptFiles),
     },
     relay: {
       status: typeof relay?.status === 'string' ? relay.status : null,
@@ -309,13 +316,17 @@ function verifyGatewayHealth(health, { maxHistoricalFailedFiles } = {}) {
   requireTrue(outbox.openCaptureHealthy, 'gateway outbox.openCaptureHealthy');
   nonNegativeInteger(outbox.openTransactions, 'gateway outbox.openTransactions');
   const historicalFailedFiles = nonNegativeInteger(outbox.failedFiles, 'gateway outbox.failedFiles');
+  const unresolvedHistoricalFailedFiles = nonNegativeInteger(
+    outbox.unresolvedHistoricalFailedFiles ?? historicalFailedFiles,
+    'gateway outbox.unresolvedHistoricalFailedFiles',
+  );
   if (maxHistoricalFailedFiles !== undefined) {
     if (!Number.isSafeInteger(maxHistoricalFailedFiles) || maxHistoricalFailedFiles < 0) {
       fail('max historical failed files must be a non-negative integer');
     }
-    if (historicalFailedFiles > maxHistoricalFailedFiles) {
-      fail('gateway outbox historical failed files exceed the configured maximum '
-        + `(observed=${historicalFailedFiles}; maximum=${maxHistoricalFailedFiles})`);
+    if (unresolvedHistoricalFailedFiles > maxHistoricalFailedFiles) {
+      fail('gateway outbox unresolved historical failed files exceed the configured maximum '
+        + `(observed=${unresolvedHistoricalFailedFiles}; maximum=${maxHistoricalFailedFiles})`);
     }
   }
 
@@ -334,6 +345,11 @@ function verifyGatewayHealth(health, { maxHistoricalFailedFiles } = {}) {
     open_capture_healthy: outbox.openCaptureHealthy,
     open_transactions: outbox.openTransactions,
     historical_failed_files: historicalFailedFiles,
+    unresolved_historical_failed_files: unresolvedHistoricalFailedFiles,
+    recovery_receipt_files: nonNegativeInteger(
+      outbox.recoveryReceiptFiles ?? 0,
+      'gateway outbox.recoveryReceiptFiles',
+    ),
     delivered: relay.delivered,
   };
 }
