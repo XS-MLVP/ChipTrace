@@ -30,5 +30,6 @@ test('live provider preflight requires protected endpoints and runs both gates',
   assert.match(workflow, /node scripts\/ci\/runtime-health-gate\.js/);
   assert.match(workflow, /name: Verify live Collector, Relay and Gateway readiness\n        if: \$\{\{ always\(\) \}\}/);
   assert.match(workflow, /--expected-revision "\$CHIPTRACE_EXPECTED_REVISION"/);
+  assert.match(workflow, /--max-quality-errors 0/);
   assert.match(workflow, /name: live-provider-runtime-preflight/);
 });

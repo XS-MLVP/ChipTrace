@@ -135,6 +135,8 @@ GitHub CI 的 `live-provider-runtime-preflight` 只在手工 `workflow_dispatch`
 实际构建的完整 Git SHA。普通 push/PR 不接触这些 Secret，也不会因为缺少 Runner 或变量而
 跳过真实预检。该作业只确认 Provider 请求和当前进程 readiness，随后仍须用同一 Session
 执行未修改 Stock Codex 的多轮四源 Canary、OSS 验收和 `cloud-acceptance`。
+Live preflight 还要求 Relay 当前进程的 `quality_errors` 为 0；该计数是进程累计值，若历史
+错误已存在，应先保留其报告并重启/修复采集进程，再开始新的 Canary，不能把旧错误静默归零。
 
 先确认目标 Session 的 `SessionEnd` 已到达 Collector，且该 Session 的 Wire、OTLP 和
 Hook 均已持久化。网关 outbox 和 Relay 的待投递队列需要排空；持续业务流量下，全局

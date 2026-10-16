@@ -80,6 +80,7 @@ jobs:
             --relay-url "$CHIPTRACE_RELAY_HEALTH_URL" \
             --collector-url "$CHIPTRACE_COLLECTOR_HEALTH_URL" \
             --expected-revision "$CHIPTRACE_EXPECTED_REVISION" \
+            --max-quality-errors 0 \
             --report "$RUNNER_TEMP/runtime-health.json" \
             | tee "$RUNNER_TEMP/runtime-health.stdout.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

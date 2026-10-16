@@ -78,6 +78,7 @@ function relay() {
       otlp_logs: route(15),
       otlp_traces: route(9),
       hooks: route(8),
+      quality_errors: 0,
     },
   };
 }
@@ -217,11 +218,25 @@ test('runtime health gate requires fresh scoped HTTP success without claiming Se
   assert.equal(result.gateway.open_capture_healthy, true);
   assert.equal(result.relay.freshness_applicable, true);
   assert.equal(result.relay.turn_capture_ready, true);
+  assert.equal(result.relay.quality_errors, 0);
   assert.deepEqual(result.relay.sources, { wire: 8, otlp_logs: 15, otlp_traces: 9, hooks: 8 });
   assert.equal(result.relay.wire_turn_coverage.successful_turn_scoped_captures, 5);
   assert.equal(result.relay.wire_turn_coverage.successful_turn_scoped_fresh, true);
   assert.equal(result.collector.captures, 33);
   assert.equal(result.collector.build_revision, relay().build.revision);
+});
+
+test('live quality-error maximum rejects accumulated source conversion errors', () => {
+  const value = relay();
+  value.ingest_coverage.quality_errors = 1;
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), value, { collectorHealth: collector(), maxQualityErrors: 0 }),
+    /quality_errors exceeds the configured maximum \(observed=1; maximum=0\)/,
+  );
+  const result = verifyRuntimeHealth(gateway(), value, {
+    collectorHealth: collector(), maxQualityErrors: 1,
+  });
+  assert.equal(result.relay.quality_errors, 1);
 });
 
 test('older health with only global Wire traffic fails closed', () => {

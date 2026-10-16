@@ -119,6 +119,7 @@ function healthObservation(gateway, relay, collector) {
         otlp_logs: routeObservation(coverage?.otlp_logs),
         otlp_traces: routeObservation(coverage?.otlp_traces),
         hooks: routeObservation(coverage?.hooks),
+        quality_errors: safeInteger(coverage?.quality_errors),
         wire_turn_coverage: {
           turn_scoped_captures: safeInteger(turnCoverage?.turn_scoped_captures),
           successful_turn_scoped_captures: safeInteger(turnCoverage?.successful_turn_scoped_captures),
@@ -264,7 +265,7 @@ function verifyWireTurnCoverage(coverage) {
   };
 }
 
-function verifyRelayHealth(health) {
+function verifyRelayHealth(health, { maxQualityErrors } = {}) {
   object(health, 'relay health');
   if (health.status !== 'healthy') fail('relay status must be healthy');
   requireTrue(health.ok, 'relay.ok');
@@ -275,6 +276,19 @@ function verifyRelayHealth(health) {
   nonNegativeInteger(health.delivered, 'relay.delivered');
 
   const coverage = object(health.ingest_coverage, 'relay.ingest_coverage');
+  const qualityErrors = nonNegativeInteger(
+    coverage.quality_errors ?? 0,
+    'relay.ingest_coverage.quality_errors',
+  );
+  if (maxQualityErrors !== undefined) {
+    if (!Number.isSafeInteger(maxQualityErrors) || maxQualityErrors < 0) {
+      fail('max quality errors must be a non-negative integer');
+    }
+    if (qualityErrors > maxQualityErrors) {
+      fail('relay.ingest_coverage.quality_errors exceeds the configured maximum '
+        + `(observed=${qualityErrors}; maximum=${maxQualityErrors})`);
+    }
+  }
   if (coverage.status !== 'complete') {
     // Keep failure diagnostics bounded and free of arbitrary health response
     // text. Older Relays omitted Wire from missing_sources even at count zero.
@@ -315,6 +329,7 @@ function verifyRelayHealth(health) {
     freshness_applicable: coverage.freshness_applicable,
     required_sources_fresh: coverage.required_sources_fresh,
     turn_capture_ready: coverage.turn_capture_ready,
+    quality_errors: qualityErrors,
     wire_turn_coverage: wireTurnCoverage,
     sources: REQUIRED_SOURCES.reduce((result, source) => {
       result[source] = coverage[source].source_records;
@@ -323,9 +338,13 @@ function verifyRelayHealth(health) {
   };
 }
 
-function verifyRuntimeHealth(gatewayHealth, relayHealth, { expectedRevision, collectorHealth } = {}) {
+function verifyRuntimeHealth(
+  gatewayHealth,
+  relayHealth,
+  { expectedRevision, collectorHealth, maxQualityErrors } = {},
+) {
   const gateway = verifyGatewayHealth(gatewayHealth);
-  const relay = verifyRelayHealth(relayHealth);
+  const relay = verifyRelayHealth(relayHealth, { maxQualityErrors });
   const buildRevision = verifyBuildRevision(relayHealth, expectedRevision, 'relay health');
   if (gateway.delivered !== relay.delivered) {
     fail(
@@ -376,6 +395,7 @@ async function runRemoteHealthGate(
   timeoutMs = DEFAULT_TIMEOUT_MS,
   expectedRevision,
   reportPath,
+  maxQualityErrors,
 ) {
   if (!gatewayUrl || !relayUrl || !collectorUrl) fail('gateway, relay and collector health URLs are required');
   let health;
@@ -398,7 +418,9 @@ async function runRemoteHealthGate(
   const [gateway, relay, collector] = health;
   let result;
   try {
-    result = verifyRuntimeHealth(gateway, relay, { expectedRevision, collectorHealth: collector });
+    result = verifyRuntimeHealth(gateway, relay, {
+      expectedRevision, collectorHealth: collector, maxQualityErrors,
+    });
   } catch (error) {
     writeReport(reportPath, {
       ok: false,
@@ -418,6 +440,7 @@ function parseArgs(argv) {
   let timeout = DEFAULT_TIMEOUT_MS;
   let expectedRevision;
   let report;
+  let maxQualityErrors;
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     const value = argv[index + 1];
@@ -426,18 +449,22 @@ function parseArgs(argv) {
     else if (flag === '--collector-url' && value) { collector = value; index += 1; }
     else if (flag === '--timeout-ms' && value) { timeout = Number(value); index += 1; }
     else if (flag === '--expected-revision' && value) { expectedRevision = value; index += 1; }
+    else if (flag === '--max-quality-errors' && value) { maxQualityErrors = Number(value); index += 1; }
     else if (flag === '--report' && value) { report = value; index += 1; }
-    else fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--report PATH]');
+    else fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--max-quality-errors N] [--report PATH]');
   }
-  if (!gateway || !relay || !collector || !Number.isSafeInteger(timeout) || timeout < 100) {
-    fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--report PATH]');
+  if (!gateway || !relay || !collector || !Number.isSafeInteger(timeout) || timeout < 100
+    || (maxQualityErrors !== undefined
+      && (!Number.isSafeInteger(maxQualityErrors) || maxQualityErrors < 0))) {
+    fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--max-quality-errors N] [--report PATH]');
   }
-  return { gateway, relay, collector, timeout, expectedRevision, report };
+  return { gateway, relay, collector, timeout, expectedRevision, maxQualityErrors, report };
 }
 
 if (require.main === module) {
   const args = parseArgs(process.argv.slice(2));
-  runRemoteHealthGate(args.gateway, args.relay, args.collector, args.timeout, args.expectedRevision, args.report)
+  runRemoteHealthGate(args.gateway, args.relay, args.collector, args.timeout,
+    args.expectedRevision, args.report, args.maxQualityErrors)
     .then(result => process.stdout.write(`${JSON.stringify(result, null, 2)}\n`))
     .catch(error => {
       process.stderr.write(`${error.message || String(error)}\n`);
