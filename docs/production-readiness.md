@@ -25,9 +25,10 @@ Collector health 报告 755 个 sealed Segment 共 94,069,563,151 bytes，保存
 及存储作业均实际执行；五项新采集的同一 Raw 已分别走 FS 和私有 MinIO S3，报告检查也
 实际执行。它不证明线上已升级，也不能替代后续修复对应提交的远端 CI。
 
-本轮维护提交 `2af2ae0` 已推送到 `fix/oss-disk-session-platform`。本地 `make cloud-test`
+本轮维护提交 `3e7e5f2`（包含 `2af2ae0`）已推送到 `fix/oss-disk-session-platform`。本地 `make cloud-test`
 实际退出 0；新增报告门禁要求每个 Turn 的唯一身份、闭合/取消终态、模型交互数、工具数和
-四源完整覆盖，并要求 FS/私有 S3 摘要一致。GitHub Actions API 在本次复核中未认证且连接
+四源完整覆盖，并要求 FS/私有 S3 摘要一致；逐 Turn OTLP/Hook 计数不得超过 Session 总量。
+GitHub Actions API 在本次复核中未认证且连接
 超时，故该提交的远端作业状态仍为未核验；本地验证不能替代同 SHA 的远端 CI。
 
 17:05 的 runtime gate 复核再次真实退出 1：网关、Relay、Collector 的 delivered/capture
