@@ -15,11 +15,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::{self, StreamExt};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::fs;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -39,6 +41,9 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const DELIVERY_SCHEMA_VERSION: &str = "chiptrace.delivery-ledger.v1";
 const DELIVERY_COUNTERS_KEY: &str = "delivery_counters_v1";
 const INGEST_QUALITY_COUNTERS_KEY: &str = "ingest_quality_counters_v1";
+const INGEST_QUALITY_SEED_SCHEMA_VERSION: &str = "chiptrace.ingest-quality-seed.v1";
+const INGEST_QUALITY_SEED_FILE: &str = "ingest-quality-seed.json";
+const MAX_INGEST_QUALITY_SEED_BYTES: u64 = 64 * 1024;
 const INGEST_COVERAGE_FRESHNESS_WINDOW_MS: u64 = 5 * 60 * 1_000;
 
 #[derive(Debug, Clone)]
@@ -104,6 +109,7 @@ struct DeliveryCounters {
 /// prevents a Relay restart from turning a known malformed source into a
 /// false green readiness result.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IngestQualityCounters {
     #[serde(default)]
     otlp_logs_unknown_events: u64,
@@ -117,6 +123,38 @@ struct IngestQualityCounters {
     codex_hook_unknown_events: u64,
     #[serde(default)]
     codex_hook_conversion_errors: u64,
+}
+
+/// One-time migration evidence for a Delivery ledger created before quality
+/// counters were durable. The file is read only when the ledger has no
+/// `ingest_quality_counters_v1` key; once imported, the ledger remains the
+/// source of truth and later restarts cannot silently lower the counters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IngestQualitySeed {
+    schema_version: String,
+    source_quality_errors: u64,
+    counters: IngestQualityCounters,
+}
+
+impl IngestQualitySeed {
+    fn into_counters(self) -> Result<IngestQualityCounters> {
+        if self.schema_version != INGEST_QUALITY_SEED_SCHEMA_VERSION {
+            bail!(
+                "unsupported ingest quality seed schema: {}",
+                self.schema_version
+            );
+        }
+        let total = self.counters.total();
+        if self.source_quality_errors != total {
+            bail!(
+                "ingest quality seed total mismatch: source={}, counters={}",
+                self.source_quality_errors,
+                total
+            );
+        }
+        Ok(self.counters)
+    }
 }
 
 impl IngestQualityCounters {
@@ -203,10 +241,26 @@ impl DeliveryLedger {
             } else {
                 meta.insert("schema_version", DELIVERY_SCHEMA_VERSION.as_bytes())?;
             }
-            if meta.get(INGEST_QUALITY_COUNTERS_KEY)?.is_none() {
-                write_ingest_quality_counters(&mut meta, &IngestQualityCounters::default())?;
-            }
+            let quality_history_missing = meta.get(INGEST_QUALITY_COUNTERS_KEY)?.is_none();
             drop(meta);
+            let quality_seed = if quality_history_missing {
+                read_ingest_quality_seed(path)?
+            } else {
+                None
+            };
+            if quality_history_missing {
+                let deliveries = transaction.open_table(DELIVERIES)?;
+                if deliveries.len()? > 0 && quality_seed.is_none() {
+                    bail!(
+                        "Relay delivery ledger requires ingest quality history migration; create {} beside the ledger",
+                        INGEST_QUALITY_SEED_FILE
+                    );
+                }
+                drop(deliveries);
+                let mut meta = transaction.open_table(META)?;
+                write_ingest_quality_counters(&mut meta, &quality_seed.unwrap_or_default())?;
+                drop(meta);
+            }
             let mut deliveries = transaction.open_table(DELIVERIES)?;
             let keys: Vec<String> = deliveries
                 .iter()?
@@ -607,6 +661,34 @@ fn write_delivery_counters(
     let bytes = serde_json::to_vec(counters)?;
     meta.insert(DELIVERY_COUNTERS_KEY, bytes.as_slice())?;
     Ok(())
+}
+
+fn read_ingest_quality_seed(path: &Path) -> Result<Option<IngestQualityCounters>> {
+    let seed_path = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(INGEST_QUALITY_SEED_FILE);
+    let metadata = match fs::symlink_metadata(&seed_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        bail!(
+            "Relay ingest quality seed must be a regular file: {}",
+            seed_path.display()
+        );
+    }
+    if metadata.len() > MAX_INGEST_QUALITY_SEED_BYTES {
+        bail!(
+            "Relay ingest quality seed exceeds {} bytes",
+            MAX_INGEST_QUALITY_SEED_BYTES
+        );
+    }
+    let bytes = fs::read(&seed_path)?;
+    let seed: IngestQualitySeed = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid Relay ingest quality seed: {}", seed_path.display()))?;
+    seed.into_counters().map(Some)
 }
 
 fn read_ingest_quality_counters<T>(meta: &T) -> Result<IngestQualityCounters>
@@ -3504,6 +3586,63 @@ mod tests {
         assert_eq!(
             coverage["quality_errors_by_endpoint"]["otlp_traces"]["total"],
             5
+        );
+    }
+
+    #[test]
+    fn legacy_delivery_ledger_requires_and_imports_quality_seed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("delivery.redb");
+        {
+            let ledger = DeliveryLedger::open(&path).unwrap();
+            ledger
+                .ensure(&CaptureLocator {
+                    capture_id: "legacy-capture".to_owned(),
+                    raw_sha256: "a".repeat(64),
+                    segment_id: 1,
+                    offset: 0,
+                    length: 12,
+                    received_at: None,
+                    model: None,
+                })
+                .unwrap();
+        }
+        {
+            let database = Database::create(&path).unwrap();
+            let transaction = database.begin_write().unwrap();
+            let mut meta = transaction.open_table(META).unwrap();
+            meta.remove(INGEST_QUALITY_COUNTERS_KEY).unwrap();
+            drop(meta);
+            transaction.commit().unwrap();
+        }
+        let error = match DeliveryLedger::open(&path) {
+            Ok(_) => panic!("legacy ledger without quality seed must refuse startup"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("quality history migration"));
+
+        let counters = IngestQualityCounters {
+            otlp_traces_conversion_errors: 7,
+            ..IngestQualityCounters::default()
+        };
+        let seed = IngestQualitySeed {
+            schema_version: INGEST_QUALITY_SEED_SCHEMA_VERSION.to_owned(),
+            source_quality_errors: counters.total(),
+            counters,
+        };
+        fs::write(
+            temporary.path().join(INGEST_QUALITY_SEED_FILE),
+            serde_json::to_vec(&seed).unwrap(),
+        )
+        .unwrap();
+        let reopened = DeliveryLedger::open(&path).unwrap();
+        assert_eq!(reopened.ingest_quality_counters().unwrap().total(), 7);
+        assert_eq!(
+            reopened
+                .ingest_quality_counters()
+                .unwrap()
+                .otlp_traces_conversion_errors,
+            7
         );
     }
 }

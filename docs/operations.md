@@ -153,6 +153,21 @@ Delivery ledger 恢复，`quality_errors_scope` 必须为 `durable_relay_state`�
 `quality_errors_current_process` 仅用于区分本次进程新增错误。重启不能把历史错误静默归零；
 若历史错误已存在，应先保留其报告并修复生产者或采集配置，再开始新的 Canary。
 
+从旧 Relay 升级时，旧 Delivery ledger 没有质量历史字段。若账本已有投递记录，新版本会拒绝
+启动，直到把升级前的 gate 报告转换为一次性迁移文件；这一步防止升级把已知错误变成零。报告
+必须先用旧进程生成并保留：
+
+```bash
+node scripts/ci/relay-quality-seed.js \
+  --input /var/tmp/chiptrace-runtime-health.json \
+  --output /srv/chiptrace/relay-state/ingest-quality-seed.json
+```
+
+将文件放在 Relay `delivery-state-root` 的根目录后再启动新镜像。Relay 首次打开旧账本时校验
+`chiptrace.ingest-quality-seed.v1` 和按端点总数，成功写入 `ingest_quality_counters_v1`；之后健康
+状态只从账本读取，迁移文件不会覆盖已有计数。缺少文件、符号链接、超大文件或总数不一致都会
+保持非零启动失败，原始 Delivery ledger 不会被改写。
+
 先确认目标 Session 的 `SessionEnd` 已到达 Collector，且该 Session 的 Wire、OTLP 和
 Hook 均已持久化。网关 outbox 和 Relay 的待投递队列需要排空；持续业务流量下，全局
 计数器不能代替目标 Session 的完整性校验。
