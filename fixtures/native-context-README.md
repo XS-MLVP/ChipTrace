@@ -11,6 +11,14 @@ native `thread_id`. Bodies, timestamps, file paths, tools, auth and unrelated
 attributes are omitted. This is a transformed regression fixture, not original
 Raw, a complete canary, or a qualified delivery package.
 
+The observed `session_task.turn` span contains both an OS number and a legacy
+Session UUID under `thread.id`. This ambiguity stays unchanged in the fixture
+and Raw. Interpreted attribute maps omit that key entirely; native Session
+attribution uses explicit supported identities and exact ancestry. Other
+contradictory attribute duplicates fail before scalar parsing or attribution,
+including tool output/success/truncation and missing versus populated values.
+Equal duplicates and precedence between separate attribute layers are retained.
+
 The subset has 3 logs and 26 spans: 1 log and 15 spans remain unscoped, while 1
 additional span has no exact Session owner. The `model_client.stream_responses_api`
 ancestry reaches native Turn attributes; the SSE record still has no Trace/Span.

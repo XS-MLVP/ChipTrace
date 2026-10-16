@@ -270,6 +270,152 @@ test('malformed OTLP containers and metadata fail HTTP and source auditing witho
     passed = true;
   });
 
+test('conflicting tool attributes fail quality ACKs while valid neighbors and exact Raw survive restart',
+  { timeout: 60000 }, async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-tool-attributes-'));
+    let collector;
+    let relay;
+    let passed = false;
+    t.after(async () => {
+      if (relay) await stop(relay);
+      if (collector) await stop(collector);
+      if (passed && process.env.CHIPTRACE_RECEIPT_KEEP !== '1') await fs.rm(root, { recursive: true, force: true });
+      else t.diagnostic(`isolated tool attribute evidence retained: ${root}`);
+    });
+    const collectorUrl = `http://127.0.0.1:${await reservePort()}`;
+    const collectorArgs = ['collector', '--host', '127.0.0.1', '--port', new URL(collectorUrl).port,
+      '--root', path.join(root, 'collector'), '--state-root', path.join(root, 'collector-state')];
+    collector = start(collectorArgs);
+    await health(collectorUrl, collector);
+    const relayUrl = `http://127.0.0.1:${await reservePort()}`;
+    const relayArgs = ['relay', '--host', '127.0.0.1', '--port', new URL(relayUrl).port,
+      '--root', path.join(root, 'relay'), '--state-root', path.join(root, 'relay-state'),
+      '--delivery-state-root', path.join(root, 'delivery'), '--collector-url', collectorUrl];
+    relay = start(relayArgs);
+    await health(relayUrl, relay);
+    const marker = 'PRIVATE_TOOL_OUTPUT_中文_🧪';
+    const attr = (key, value) => value === undefined ? { key }
+      : { key, value: { [typeof value === 'boolean' ? 'boolValue' : 'stringValue']: value } };
+    const expected = new Map();
+    const toolIds = new Set();
+    let first;
+    for (const endpoint of ['logs', 'traces']) {
+      const resources = endpoint === 'logs' ? 'resourceLogs' : 'resourceSpans';
+      const scopes = endpoint === 'logs' ? 'scopeLogs' : 'scopeSpans';
+      const records = endpoint === 'logs' ? 'logRecords' : 'spans';
+      for (const layer of ['resource', 'scope', 'record']) {
+        for (const [name, values, invalid] of [
+          ['truncated-first', [true, false], true], ['truncated-last', [false, true], true],
+          ['missing-first', [undefined, false], true], ['missing-last', [false, undefined], true],
+          ['equal', [false, false], false],
+        ]) {
+          const id = `${endpoint}-${layer}-${name}`;
+          const record = callId => ({ name: 'codex.tool_result', attributes: [
+            attr('event.name', 'codex.tool_result'), attr('conversation.id', 'native-session'),
+            attr('turn.id', 'native-turn'), attr('call_id', callId), attr('tool_name', 'exec_command'),
+            attr('tool_namespace', 'functions'), attr('arguments', '{}'), attr('success', true),
+            attr('output_truncated', false), attr('output', marker),
+          ] });
+          const good = { [scopes]: [{ [records]: [record(`good-${id}`)] }] };
+          const candidate = record(`candidate-${id}`);
+          const scope = { [records]: [candidate] };
+          const resource = { [scopes]: [scope] };
+          const duplicate = values.map(value => attr('output_truncated', value));
+          if (layer === 'resource') resource.resource = { attributes: duplicate };
+          if (layer === 'scope') scope.scope = { attributes: duplicate };
+          if (layer === 'record') candidate.attributes = [
+            ...candidate.attributes.filter(a => a.key !== 'output_truncated'), ...duplicate,
+          ];
+          const body = JSON.stringify({ [resources]: [good, resource] }, null, 2) + '\n';
+          expected.set(digest(Buffer.from(body)), body);
+          if (endpoint === 'logs') {
+            toolIds.add(`good-${id}`);
+            if (!invalid) toolIds.add(`candidate-${id}`);
+          }
+          first ||= { endpoint, body };
+          const derived = endpoint === 'logs' ? (invalid ? 1 : 2) : 0;
+          for (let attempt = 0; attempt < (invalid ? 2 : 1); attempt++) {
+            const response = await fetch(`${relayUrl}/otel/v1/${endpoint}`, { method: 'POST',
+              headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+              body, signal: AbortSignal.timeout(5000) });
+            const receipt = await response.json();
+            const detail = invalid ? receipt : receipt.chiptrace;
+            assert.equal(response.status, invalid ? 400 : 200, id);
+            assert.equal(detail.durable, true);
+            assert.equal(detail.captures, 1 + derived);
+            assert.equal(detail.duplicates, attempt * (1 + derived));
+            assert.equal(detail.summary.source_records, 2);
+            assert.equal(detail.summary.derived_captures, derived);
+            assert.equal(detail.summary.conversion_errors.length, invalid ? 1 : 0);
+            if (invalid) {
+              assert.equal(receipt.ok, false);
+              assert.equal(receipt.local_durable, true);
+              assert.equal(receipt.reason, 'cloud_ingest_quality_error');
+              assert.equal(receipt.unattributed_quality_errors, 1);
+              assert.match(receipt.detail, /conflicting duplicate OTLP attribute/);
+            }
+            assert.ok(!JSON.stringify(receipt).includes(marker));
+          }
+        }
+      }
+    }
+    assert.equal(expected.size, 30);
+    assert.equal(toolIds.size, 18);
+    const captures = expected.size + toolIds.size;
+    const delivered = await health(relayUrl, relay,
+      h => h.delivered === captures && h.pending === 0 && h.inflight === 0);
+    assert.equal(delivered.conservation_ok, true);
+    assert.equal(delivered.ingest_coverage.quality_errors, 48);
+    await health(collectorUrl, collector, h => h.collector.captures === captures);
+    for (const url of [relayUrl, collectorUrl]) {
+      const response = await fetch(`${url}/flush`, { method: 'POST',
+        headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(5000) });
+      assert.equal(response.ok, true);
+    }
+    const collectorRaw = await sealedRecords(path.join(root, 'collector'));
+    assert.equal(collectorRaw.size, captures);
+    assert.deepEqual(await sealedRecords(path.join(root, 'relay')), collectorRaw);
+    const foundTools = new Set();
+    for (const { record } of collectorRaw.values()) {
+      if (record.telemetryBatch) {
+        const batch = record.telemetryBatch;
+        assert.equal(batch.raw_json, expected.get(batch.raw_sha256));
+        assert.equal(batch.raw_bytes, Buffer.byteLength(batch.raw_json));
+        assert.equal(batch.raw_sha256, digest(Buffer.from(batch.raw_json)));
+      } else {
+        assert.ok(record.toolExecution);
+        foundTools.add(record.toolExecution.call_id);
+        assert.equal(record.toolExecution.result, marker);
+        assert.equal(record.toolExecution.output_truncated, false);
+      }
+    }
+    assert.deepEqual(foundTools, toolIds);
+    const audit = () => run(binary, ['audit-session-context', '--input', path.join(root, 'collector'),
+      '--session-id', 'native-session', '--sample-limit', '0'], { maxBuffer: 1024 * 1024 });
+    const refused = error => error.code === 1 && error.stdout === ''
+      && /conflicting duplicate OTLP attribute/.test(error.stderr) && !error.stderr.includes(marker);
+    await assert.rejects(audit, refused);
+    assert.equal((await stop(relay)).code, 0);
+    assert.equal((await stop(collector)).code, 0);
+    collector = start(collectorArgs);
+    await health(collectorUrl, collector, h => h.collector.captures === captures);
+    relay = start(relayArgs);
+    await health(relayUrl, relay, h => h.delivered === captures && h.conservation_ok);
+    const replay = await fetch(`${relayUrl}/otel/v1/${first.endpoint}`, { method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: first.body, signal: AbortSignal.timeout(5000) });
+    const receipt = await replay.json();
+    assert.equal(replay.status, 400);
+    assert.equal(receipt.durable, true);
+    assert.equal(receipt.duplicates, 2);
+    assert.equal(receipt.summary.derived_captures, 1);
+    assert.ok(!JSON.stringify(receipt).includes(marker));
+    await assert.rejects(audit, refused);
+    assert.deepEqual(await sealedRecords(path.join(root, 'collector')), collectorRaw);
+    assert.deepEqual(await sealedRecords(path.join(root, 'relay')), collectorRaw);
+    passed = true;
+  });
+
 test('cloud ingest reports duplicate context conflicts after preserving exact Raw in both WALs',
   { timeout: 30000 }, async t => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-cloud-context-'));

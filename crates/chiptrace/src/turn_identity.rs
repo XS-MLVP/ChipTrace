@@ -573,7 +573,7 @@ fn is_identity_attribute(key: &str) -> bool {
 pub(crate) fn validate_otlp_identity_layers(layers: [Option<&Value>; 3]) -> Result<()> {
     let mut merged = BTreeMap::new();
     for layer in layers {
-        validate_context_attributes(layer)?;
+        validate_otlp_attributes(layer)?;
         for attribute in layer.and_then(Value::as_array).into_iter().flatten() {
             let Some(key) = attribute.get("key").and_then(Value::as_str) else {
                 continue;
@@ -603,41 +603,54 @@ pub(crate) fn otlp_message_attributes<'a>(
     }
 }
 
-pub(crate) fn validate_context_attributes(value: Option<&Value>) -> Result<()> {
-    let mut context_values = BTreeMap::new();
+/// Native tracing emits both OS thread numbers and legacy Session UUIDs as
+/// thread.id, sometimes in the same list. Retain all of them in Raw only;
+/// none may enter the interpreted map or supply a native Session identity.
+pub(crate) fn otlp_attribute_key(attribute: &Value) -> Option<&str> {
+    attribute
+        .get("key")
+        .and_then(Value::as_str)
+        .filter(|key| *key != "thread.id")
+}
+
+pub(crate) fn validate_otlp_attributes(value: Option<&Value>) -> Result<()> {
+    let mut attribute_values = BTreeMap::new();
     for (index, attribute) in optional_otlp_array(value, "attributes")?.iter().enumerate() {
         if !attribute.is_object() {
             bail!("OTLP attributes[{index}] must be an object");
         }
-        let (Some(key), Some(value)) = (
-            attribute.get("key").and_then(Value::as_str),
-            attribute.get("value"),
-        ) else {
+        let Some(key) = otlp_attribute_key(attribute) else {
             continue;
         };
+        let value = attribute.get("value");
         // Check the original AnyValue before scalar parsing or map insertion:
-        // otherwise a duplicate can erase a native identity, source boundary,
-        // or business event name before conflict detection sees it. Resource,
-        // scope and record attributes remain separate attribute lists.
-        if (is_identity_attribute(key) || matches!(key, "codex.context_scope" | "event.name"))
-            && context_values
-                .insert(key, value)
-                .is_some_and(|previous| previous != value)
+        // a duplicate must not erase identity, tool output, success or truncation
+        // evidence, including a missing versus populated value. Borrow values
+        // so this check does not copy payloads. Resource/scope/record remain
+        // separate lists with their existing precedence.
+        if let Some((previous_index, previous)) = attribute_values.insert(key, (index, value))
+            && previous != value
         {
-            bail!("OTLP has conflicting duplicate context attribute {key:?}");
+            if is_identity_attribute(key) || matches!(key, "codex.context_scope" | "event.name") {
+                bail!("OTLP has conflicting duplicate context attribute {key:?}");
+            }
+            // Arbitrary attribute names can contain private data too.
+            bail!(
+                "conflicting duplicate OTLP attribute at attributes[{previous_index}] and attributes[{index}]"
+            );
         }
     }
     Ok(())
 }
 
 fn attributes(value: Option<&Value>) -> Result<BTreeMap<String, String>> {
-    validate_context_attributes(value)?;
+    validate_otlp_attributes(value)?;
     Ok(value
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|attribute| {
-            let key = attribute.get("key")?.as_str()?;
+            let key = otlp_attribute_key(attribute)?;
             let parsed = attribute.get("value").and_then(attribute_text)?;
             Some((key.to_owned(), parsed))
         })
@@ -1026,6 +1039,59 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_duplicate_tool_attributes_fail_before_visitor_assignment() {
+        for endpoint in ["otlp_logs", "otlp_traces"] {
+            for layer in ["resource", "scope", "record"] {
+                for key in [
+                    "call_id",
+                    "tool_name",
+                    "tool_namespace",
+                    "arguments",
+                    "output",
+                    "success",
+                    "output_truncated",
+                    "PRIVATE_ATTRIBUTE_KEY",
+                ] {
+                    for values in [
+                        [
+                            Some(json!({"stringValue":"PRIVATE_FIRST"})),
+                            Some(json!({"stringValue":"PRIVATE_SECOND"})),
+                        ],
+                        [
+                            Some(json!({"boolValue":true})),
+                            Some(json!({"boolValue":false})),
+                        ],
+                        [None, Some(json!({"stringValue":"PRIVATE_SECOND"}))],
+                        [Some(json!({"stringValue":"PRIVATE_FIRST"})), None],
+                    ] {
+                        let attributes = values
+                            .into_iter()
+                            .map(|value| {
+                                let mut attribute = json!({"key":key});
+                                if let Some(value) = value {
+                                    attribute["value"] = value;
+                                }
+                                attribute
+                            })
+                            .collect::<Vec<_>>();
+                        let capture = attributes_at_layer(endpoint, layer, json!(attributes));
+                        let error = visit_otlp(&capture, |_, _, _| {
+                            panic!("contradictory tool attributes must not reach the visitor")
+                        })
+                        .unwrap_err()
+                        .to_string();
+                        assert!(error.contains("conflicting duplicate OTLP attribute"));
+                        assert!(
+                            !error.contains("PRIVATE_"),
+                            "only attribute positions may leave the validator"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn equal_context_duplicates_count_one_record_and_keep_attribute_layer_precedence() {
         for endpoint in ["otlp_logs", "otlp_traces"] {
             for layer in ["resource", "scope", "record"] {
@@ -1036,7 +1102,13 @@ mod tests {
                         {"key":"conversation.id","value":{"stringValue":"s"}},
                         {"key":"conversation.id","value":{"stringValue":"s"}},
                         {"key":"turn.id","value":{"stringValue":"t"}},
-                        {"key":"turn.id","value":{"stringValue":"t"}}
+                        {"key":"turn.id","value":{"stringValue":"t"}},
+                        {"key":"call_id","value":{"stringValue":"call"}},
+                        {"key":"call_id","value":{"stringValue":"call"}},
+                        {"key":"success","value":{"boolValue":false}},
+                        {"key":"success","value":{"boolValue":false}},
+                        {"key":"unset"},
+                        {"key":"unset"}
                     ]),
                 );
                 let mut observed = 0;
@@ -1044,6 +1116,7 @@ mod tests {
                     observed += 1;
                     assert_eq!(session_attribute(&attributes)?.as_deref(), Some("s"));
                     assert_eq!(turn_attribute(&attributes)?.as_deref(), Some("t"));
+                    assert_eq!(attributes.get("call_id").map(String::as_str), Some("call"));
                     Ok(())
                 })
                 .unwrap();
@@ -1074,6 +1147,37 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn overloaded_os_thread_attributes_stay_raw_without_supplying_a_session() {
+        for endpoint in ["otlp_logs", "otlp_traces"] {
+            for layer in ["resource", "scope", "record"] {
+                for reverse in [false, true] {
+                    let mut attributes = vec![
+                        json!({"key":"thread.id","value":{"intValue":"3"}}),
+                        json!({"key":"thread.id","value":{"stringValue":"00000000-0000-7000-8000-000000000001"}}),
+                        json!({"key":"turn.id","value":{"stringValue":"t"}}),
+                    ];
+                    if reverse {
+                        attributes.reverse();
+                    }
+                    let capture = attributes_at_layer(endpoint, layer, json!(attributes));
+                    let before = capture.clone();
+                    let mut observed = 0;
+                    visit_otlp(&capture, |_, _, attributes| {
+                        observed += 1;
+                        assert!(!attributes.contains_key("thread.id"));
+                        assert_eq!(session_attribute(&attributes)?, None);
+                        assert_eq!(turn_attribute(&attributes)?.as_deref(), Some("t"));
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(observed, 1);
+                    assert_eq!(capture, before);
+                }
+            }
+        }
     }
 
     fn scoped_spans(spans: Value) -> Value {

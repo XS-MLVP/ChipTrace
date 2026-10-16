@@ -125,6 +125,53 @@ test('conflicting duplicate context attributes fail without choosing a native ow
   }
 });
 
+test('conflicting tool attributes cannot pass a read-only source audit through inherited context',
+  { timeout: 30000 }, async t => {
+    for (const endpoint of ['otlp_logs', 'otlp_traces']) {
+      const resources = endpoint === 'otlp_logs' ? 'resourceLogs' : 'resourceSpans';
+      const scopes = endpoint === 'otlp_logs' ? 'scopeLogs' : 'scopeSpans';
+      const records = endpoint === 'otlp_logs' ? 'logRecords' : 'spans';
+      for (const layer of ['resource', 'scope', 'record']) {
+        for (const [key, values] of [
+          ['output_truncated', [{ boolValue: true }, { boolValue: false }]],
+          ['PRIVATE_ATTRIBUTE_KEY', [{ stringValue: 'PRIVATE_ATTRIBUTE_VALUE' }, { stringValue: 'other' }]],
+          ['success', [undefined, { boolValue: true }]],
+        ]) {
+          for (const reverse of [false, true]) {
+            const attributes = (reverse ? [...values].reverse() : values)
+              .map(value => value === undefined ? { key } : { key, value });
+            const record = { name: 'codex.turn', attributes: [
+              { key: 'conversation.id', value: { stringValue: 'selected' } },
+              { key: 'turn.id', value: { stringValue: 'native-turn' } },
+            ] };
+            const scope = { [records]: [record] };
+            const resource = { [scopes]: [scope] };
+            if (layer === 'resource') resource.resource = { attributes };
+            if (layer === 'scope') scope.scope = { attributes };
+            if (layer === 'record') record.attributes.push(...attributes);
+            const data = await input(t, [
+              { captureId: 'cap-tool-attributes-wire', recordType: 'api_snapshot', traceContext: {
+                session_id: 'selected', turn_id: 'native-turn',
+              } },
+              batch(endpoint, { [resources]: [resource] }, 1),
+            ]);
+            await assert.rejects(run(binary, ['audit-session-context', '--input', data.file,
+              '--session-id', 'selected', '--sample-limit', '0']), error => {
+              assert.equal(error.code, 1);
+              assert.equal(error.stdout, '');
+              assert.match(error.stderr, /conflicting duplicate OTLP attribute/);
+              assert.ok(!error.stderr.includes('PRIVATE_'));
+              assert.ok(error.stderr.length < 4096);
+              return true;
+            });
+            assert.deepEqual(await fs.readFile(data.file), data.bytes);
+            assert.deepEqual(await fs.readdir(data.root), ['input.ndjson']);
+          }
+        }
+      }
+    }
+  });
+
 test('malformed OTLP metadata cannot disappear behind a valid native context', async t => {
   const attr = (key, value) => ({ key, value: { stringValue: value } });
   const marker = 'PRIVATE_MALFORMED_ATTRIBUTE_METADATA';

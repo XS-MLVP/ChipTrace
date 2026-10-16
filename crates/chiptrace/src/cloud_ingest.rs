@@ -1,8 +1,9 @@
 use crate::capture::{CaptureRecord, normalize_capture};
 use crate::tool_schema::{canonical_runtime_tool_name, is_stock_unified_exec_tool};
 use crate::turn_identity::{
-    otlp_message_attributes, session_attribute, turn_attribute, validate_context_attributes,
-    validate_otlp_identity_layers, validate_otlp_structure, visit_otlp_envelope,
+    otlp_attribute_key, otlp_message_attributes, session_attribute, turn_attribute,
+    validate_otlp_attributes, validate_otlp_identity_layers, validate_otlp_structure,
+    visit_otlp_envelope,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -910,10 +911,10 @@ fn trace_context(record: &Value, attributes: &BTreeMap<String, Value>, session_i
 }
 
 fn attributes_map(attributes: Option<&Value>) -> Result<BTreeMap<String, Value>> {
-    validate_context_attributes(attributes)?;
+    validate_otlp_attributes(attributes)?;
     let mut output = BTreeMap::new();
     for attribute in attributes.and_then(Value::as_array).into_iter().flatten() {
-        let Some(key) = attribute.get("key").and_then(Value::as_str) else {
+        let Some(key) = otlp_attribute_key(attribute) else {
             continue;
         };
         let Some(value) = attribute.get("value").map(otlp_any_value) else {
@@ -1392,6 +1393,82 @@ mod tests {
                 .map(|record| (&record.capture_id, &record.sha256))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn conflicting_duplicate_tool_attributes_preserve_raw_without_deriving_a_result() {
+        let marker = "PRIVATE_CONFLICTING_TOOL_ATTRIBUTE";
+        for (key, alternative) in [
+            ("output_truncated", json!({"boolValue":true})),
+            ("success", json!({"boolValue":false})),
+            ("arguments", json!({"stringValue":marker})),
+            ("output", json!({"stringValue":marker})),
+            ("call_id", json!({"stringValue":marker})),
+            ("tool_name", json!({"stringValue":marker})),
+            ("tool_namespace", json!({"stringValue":marker})),
+        ] {
+            for prepend in [true, false] {
+                let mut raw: Value = serde_json::from_slice(&stock_logs(false, true)).unwrap();
+                let attributes =
+                    raw["resourceLogs"][0]["scopeLogs"][0]["logRecords"][1]["attributes"]
+                        .as_array_mut()
+                        .unwrap();
+                let index = if prepend { 0 } else { attributes.len() };
+                attributes.insert(index, attr(key, alternative.clone()));
+                let raw = serde_json::to_vec_pretty(&raw).unwrap();
+                let batch =
+                    prepare_cloud_ingest(CloudEndpoint::OtlpLogs, &raw, 1024 * 1024).unwrap();
+                assert_eq!(batch.summary.source_records, 2);
+                assert_eq!(batch.summary.conversion_errors.len(), 1, "{key}");
+                assert!(
+                    batch.summary.conversion_errors[0]
+                        .contains("conflicting duplicate OTLP attribute")
+                );
+                assert!(!batch.summary.conversion_errors[0].contains(marker));
+                assert_eq!(batch.summary.derived_captures, 1);
+                let captured = values(&batch);
+                assert_eq!(captured.len(), 2);
+                assert_eq!(
+                    captured[0]["telemetryBatch"]["raw_json"],
+                    String::from_utf8(raw.clone()).unwrap()
+                );
+                assert_eq!(captured[0]["telemetryBatch"]["raw_sha256"], sha256(&raw));
+                assert_eq!(captured[1]["lifecycleEvent"]["type"], "session_start");
+            }
+        }
+    }
+
+    #[test]
+    fn equal_duplicate_tool_attributes_preserve_results_and_exact_raw() {
+        let mut raw: Value = serde_json::from_slice(&stock_logs(false, true)).unwrap();
+        let attributes = raw["resourceLogs"][0]["scopeLogs"][0]["logRecords"][1]["attributes"]
+            .as_array_mut()
+            .unwrap();
+        attributes.extend(attributes.clone());
+        attributes.extend([json!({"key":"unset"}), json!({"key":"unset"})]);
+        attributes.extend([
+            attr("thread.id", json!({"intValue":"3"})),
+            attr(
+                "thread.id",
+                json!({"stringValue":"legacy-session-must-not-own-the-tool"}),
+            ),
+        ]);
+        let raw = serde_json::to_vec_pretty(&raw).unwrap();
+        let batch = prepare_cloud_ingest(CloudEndpoint::OtlpLogs, &raw, 1024 * 1024).unwrap();
+        assert!(batch.summary.conversion_errors.is_empty());
+        assert_eq!(batch.summary.derived_captures, 2);
+        let captured = values(&batch);
+        assert_eq!(captured.len(), 3);
+        assert_eq!(captured[0]["telemetryBatch"]["raw_sha256"], sha256(&raw));
+        assert_eq!(
+            captured[0]["telemetryBatch"]["raw_json"],
+            String::from_utf8(raw).unwrap()
+        );
+        assert_eq!(captured[2]["toolExecution"]["call_id"], "call-1");
+        assert_eq!(captured[2]["traceContext"]["session_id"], "session-1");
+        assert_eq!(captured[2]["toolExecution"]["result"], "ok");
+        assert_eq!(captured[2]["toolExecution"]["status"], "success");
+        assert_eq!(captured[2]["toolExecution"]["output_truncated"], false);
     }
 
     #[test]
