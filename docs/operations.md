@@ -48,6 +48,19 @@ docker compose -f deploy/collector-relay.yml up -d --no-build --pull never
 峰值后配置，监控 OOM 和磁盘余量；不能直接把小样本 CI 的成功当作生产负载验收。
 三个服务均以非 root 用户、只读根运行，仅显式数据挂载和平台 tmpfs 可写。
 
+18084 网关也必须通过容器级隔离预检。它拥有原始 Wire 的 durable outbox，不能继续使用
+可变镜像 tag、可写根文件系统或无资源上限的容器：
+
+```bash
+node scripts/deploy/gateway-preflight.js --container <gateway-container>
+```
+
+预检只输出镜像摘要、OCI revision、资源限额和挂载/采集开关，不输出环境变量或凭据；失败时
+不得以重启或清理 outbox 绕过。生产 Gateway 还必须通过同一 runtime gate 的历史失败文件、
+质量错误和新鲜 Turn Wire 门禁。当前 router_v2 的 `router-v2-relay-shell` 仍使用
+`weishaw/claude-relay-service:latest`，根可写且没有 CPU/内存/PID 限额，因此该容器级门禁
+在现状下应退出非零；这与 HTTP `/health` 返回 200 是两条独立证据。
+
 18084 对外提供 Responses、`/models`、`/otel/v1/logs`、`/otel/v1/traces` 和
 `/hooks/codex`。Responses 与 `/models` 使用 Provider 业务鉴权，网关使用内部采集凭据读取
 Relay 目录；OTLP 与 Hook 使用独立采集凭据。Wire Capture 使用网关磁盘 outbox，其余采集

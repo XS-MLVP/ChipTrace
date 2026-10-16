@@ -46,11 +46,12 @@ jobs:
           CHIPTRACE_GATEWAY_HEALTH_URL: ${{ vars.CHIPTRACE_GATEWAY_HEALTH_URL }}
           CHIPTRACE_RELAY_HEALTH_URL: ${{ vars.CHIPTRACE_RELAY_HEALTH_URL }}
           CHIPTRACE_COLLECTOR_HEALTH_URL: ${{ vars.CHIPTRACE_COLLECTOR_HEALTH_URL }}
+          CHIPTRACE_GATEWAY_CONTAINER: ${{ vars.CHIPTRACE_GATEWAY_CONTAINER }}
           CHIPTRACE_EXPECTED_REVISION: ${{ inputs.expected_revision }}
         run: |
           set -euo pipefail
           test -n "${CHIPTRACE_API_KEY:-}" || { echo 'CHIPTRACE_API_KEY is missing from the protected environment' >&2; exit 1; }
-          for name in CHIPTRACE_RESPONSES_URL CHIPTRACE_GATEWAY_HEALTH_URL CHIPTRACE_RELAY_HEALTH_URL CHIPTRACE_COLLECTOR_HEALTH_URL CHIPTRACE_EXPECTED_REVISION; do
+          for name in CHIPTRACE_RESPONSES_URL CHIPTRACE_GATEWAY_HEALTH_URL CHIPTRACE_RELAY_HEALTH_URL CHIPTRACE_COLLECTOR_HEALTH_URL CHIPTRACE_GATEWAY_CONTAINER CHIPTRACE_EXPECTED_REVISION; do
             test -n "${!name:-}" || { echo "$name is missing from the protected environment or dispatch input" >&2; exit 1; }
           done
           echo 'protected live preflight configuration is present'
@@ -84,6 +85,15 @@ jobs:
             --max-historical-failed-files 0 \
             --report "$RUNNER_TEMP/runtime-health.json" \
             | tee "$RUNNER_TEMP/runtime-health.stdout.json"
+      - name: Verify live Gateway container isolation and capture contract
+        if: ${{ always() }}
+        env:
+          CHIPTRACE_GATEWAY_CONTAINER: ${{ vars.CHIPTRACE_GATEWAY_CONTAINER }}
+        run: |
+          set -euo pipefail
+          node scripts/deploy/gateway-preflight.js \
+            --container "$CHIPTRACE_GATEWAY_CONTAINER" \
+            | tee "$RUNNER_TEMP/gateway-preflight.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -93,6 +103,7 @@ jobs:
             ${{ runner.temp }}/provider-response.stdout.json
             ${{ runner.temp }}/runtime-health.json
             ${{ runner.temp }}/runtime-health.stdout.json
+            ${{ runner.temp }}/gateway-preflight.json
 
   stock-managed-route:
     runs-on: ubuntu-24.04
@@ -775,7 +786,7 @@ jobs:
       - name: Verify actual deployment templates reject mutable images and missing limits
         run: |
           set -euo pipefail
-          node --test scripts/deploy/preflight.test.js 2>&1 | tee deployment-preflight.tap
+          node --test scripts/deploy/preflight.test.js scripts/deploy/gateway-preflight.test.js 2>&1 | tee deployment-preflight.tap
       - name: Verify template deployment, Collector runtime gate, Raw delivery, export and restart
         timeout-minutes: 8
         run: |

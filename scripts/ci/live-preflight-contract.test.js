@@ -22,6 +22,7 @@ test('live provider preflight requires protected endpoints and runs both gates',
     'CHIPTRACE_GATEWAY_HEALTH_URL',
     'CHIPTRACE_RELAY_HEALTH_URL',
     'CHIPTRACE_COLLECTOR_HEALTH_URL',
+    'CHIPTRACE_GATEWAY_CONTAINER',
     'CHIPTRACE_EXPECTED_REVISION',
   ]) {
     assert.match(workflow, new RegExp(name));
@@ -32,5 +33,7 @@ test('live provider preflight requires protected endpoints and runs both gates',
   assert.match(workflow, /--expected-revision "\$CHIPTRACE_EXPECTED_REVISION"/);
   assert.match(workflow, /--max-quality-errors 0/);
   assert.match(workflow, /--max-historical-failed-files 0/);
+  assert.match(workflow, /node scripts\/deploy\/gateway-preflight\.js/);
+  assert.match(workflow, /--container "\$CHIPTRACE_GATEWAY_CONTAINER"/);
   assert.match(workflow, /name: live-provider-runtime-preflight/);
 });
