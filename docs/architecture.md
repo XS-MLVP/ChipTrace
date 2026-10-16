@@ -76,8 +76,8 @@ Relay durable ACK 后返回。Relay 和 Collector 使用确定性 Capture ID、W
 纯云端模式不能保证客户端断网后补发尚未到达云端的事件。因此 required `SessionStart`
 在采集入口不可达时阻止任务开始；运行中缺失的 Session 保留作取证，但不会进入 Release。
 
-Relay `/health` 分开报告传输健康与 `ingest_coverage`。后者只统计当前 Relay 进程观察到的
-Wire、OTLP logs、OTLP traces 和 Hook 活动；当 Wire 持续活跃而任一 Runtime 来源缺失或相对
+Relay `/health` 分开报告传输健康与 `ingest_coverage`。来源新鲜度和 Turn Wire 只统计当前
+Relay 进程观察到的 Wire、OTLP logs、OTLP traces 和 Hook 活动；当 Wire 持续活跃而任一 Runtime 来源缺失或相对
 最新 Wire 落后超过 5 分钟时，状态为 `degraded`，并列出 `missing_sources`、`stale_sources`
 和 `source_lag_ms`。如果 OTLP/Hook 在近 5 分钟仍有活动而 Wire 已停止或相对 Runtime
 落后超过 5 分钟，也必须为 `degraded`，并把 `wire` 列入 `stale_sources`；Runtime 继续流入
@@ -95,5 +95,7 @@ Wire、OTLP logs、OTLP traces 和 Hook 活动；当 Wire 持续活跃而任一 
 该统计从 normalization 已解析的对象派生，只保留少量内存元数据，不改写 Raw 或其 SHA。
 HTTP 2xx 也不证明 Responses 终态或客户端交付；门禁声明 `session_delivery_claimed=false`。
 Session 是否可交付仍只由 `cloud-acceptance` 判定。
-Collector 和 Relay 的健康响应还包含 `build.version` 与 `build.revision`；部署门禁可以用
+质量错误计数从持久 Delivery ledger 恢复。`quality_errors_scope` 必须为
+`durable_relay_state`；`quality_errors_current_process` 单独报告本次进程新增值，避免重启
+掩盖历史错误。Collector 和 Relay 的健康响应还包含 `build.version` 与 `build.revision`；部署门禁可以用
 固定 Git revision 拒绝旧镜像继续接收或交接数据。

@@ -38,6 +38,7 @@ const INFLIGHT_DELIVERIES: TableDefinition<&str, &[u8]> =
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const DELIVERY_SCHEMA_VERSION: &str = "chiptrace.delivery-ledger.v1";
 const DELIVERY_COUNTERS_KEY: &str = "delivery_counters_v1";
+const INGEST_QUALITY_COUNTERS_KEY: &str = "ingest_quality_counters_v1";
 const INGEST_COVERAGE_FRESHNESS_WINDOW_MS: u64 = 5 * 60 * 1_000;
 
 #[derive(Debug, Clone)]
@@ -98,6 +99,65 @@ struct DeliveryCounters {
     attempts: u64,
 }
 
+/// Quality errors are durable evidence about producer data, rather than a
+/// process-local health sample. Keeping these counters in the Delivery ledger
+/// prevents a Relay restart from turning a known malformed source into a
+/// false green readiness result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct IngestQualityCounters {
+    #[serde(default)]
+    otlp_logs_unknown_events: u64,
+    #[serde(default)]
+    otlp_logs_conversion_errors: u64,
+    #[serde(default)]
+    otlp_traces_unknown_events: u64,
+    #[serde(default)]
+    otlp_traces_conversion_errors: u64,
+    #[serde(default)]
+    codex_hook_unknown_events: u64,
+    #[serde(default)]
+    codex_hook_conversion_errors: u64,
+}
+
+impl IngestQualityCounters {
+    fn add(&mut self, endpoint: CloudEndpoint, unknown_events: u64, conversion_errors: u64) {
+        match endpoint {
+            CloudEndpoint::OtlpLogs => {
+                self.otlp_logs_unknown_events =
+                    self.otlp_logs_unknown_events.saturating_add(unknown_events);
+                self.otlp_logs_conversion_errors = self
+                    .otlp_logs_conversion_errors
+                    .saturating_add(conversion_errors);
+            }
+            CloudEndpoint::OtlpTraces => {
+                self.otlp_traces_unknown_events = self
+                    .otlp_traces_unknown_events
+                    .saturating_add(unknown_events);
+                self.otlp_traces_conversion_errors = self
+                    .otlp_traces_conversion_errors
+                    .saturating_add(conversion_errors);
+            }
+            CloudEndpoint::CodexHook => {
+                self.codex_hook_unknown_events = self
+                    .codex_hook_unknown_events
+                    .saturating_add(unknown_events);
+                self.codex_hook_conversion_errors = self
+                    .codex_hook_conversion_errors
+                    .saturating_add(conversion_errors);
+            }
+        }
+    }
+
+    fn total(&self) -> u64 {
+        self.otlp_logs_unknown_events
+            .saturating_add(self.otlp_logs_conversion_errors)
+            .saturating_add(self.otlp_traces_unknown_events)
+            .saturating_add(self.otlp_traces_conversion_errors)
+            .saturating_add(self.codex_hook_unknown_events)
+            .saturating_add(self.codex_hook_conversion_errors)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RelayHealth {
     pub ok: bool,
@@ -142,6 +202,9 @@ impl DeliveryLedger {
                 }
             } else {
                 meta.insert("schema_version", DELIVERY_SCHEMA_VERSION.as_bytes())?;
+            }
+            if meta.get(INGEST_QUALITY_COUNTERS_KEY)?.is_none() {
+                write_ingest_quality_counters(&mut meta, &IngestQualityCounters::default())?;
             }
             drop(meta);
             let mut deliveries = transaction.open_table(DELIVERIES)?;
@@ -481,6 +544,33 @@ impl DeliveryLedger {
             total, pending, inflight, delivered, conflicts, failed, attempts,
         ))
     }
+
+    fn ingest_quality_counters(&self) -> Result<IngestQualityCounters> {
+        let transaction = self.database.begin_read()?;
+        let meta = transaction.open_table(META)?;
+        read_ingest_quality_counters(&meta)
+    }
+
+    fn record_ingest_quality(
+        &self,
+        endpoint: CloudEndpoint,
+        unknown_events: u64,
+        conversion_errors: u64,
+    ) -> Result<IngestQualityCounters> {
+        if unknown_events == 0 && conversion_errors == 0 {
+            return self.ingest_quality_counters();
+        }
+        let transaction = self.database.begin_write()?;
+        let counters = {
+            let mut meta = transaction.open_table(META)?;
+            let mut counters = read_ingest_quality_counters(&meta)?;
+            counters.add(endpoint, unknown_events, conversion_errors);
+            write_ingest_quality_counters(&mut meta, &counters)?;
+            counters
+        };
+        transaction.commit()?;
+        Ok(counters)
+    }
 }
 
 fn delivery_counters_from_table<T>(table: &T) -> Result<DeliveryCounters>
@@ -516,6 +606,25 @@ fn write_delivery_counters(
 ) -> Result<()> {
     let bytes = serde_json::to_vec(counters)?;
     meta.insert(DELIVERY_COUNTERS_KEY, bytes.as_slice())?;
+    Ok(())
+}
+
+fn read_ingest_quality_counters<T>(meta: &T) -> Result<IngestQualityCounters>
+where
+    T: ReadableTable<&'static str, &'static [u8]>,
+{
+    meta.get(INGEST_QUALITY_COUNTERS_KEY)?
+        .map(|value| serde_json::from_slice(value.value()).map_err(anyhow::Error::from))
+        .transpose()
+        .map(|value| value.unwrap_or_default())
+}
+
+fn write_ingest_quality_counters(
+    meta: &mut redb::Table<'_, &'static str, &'static [u8]>,
+    counters: &IngestQualityCounters,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(counters)?;
+    meta.insert(INGEST_QUALITY_COUNTERS_KEY, bytes.as_slice())?;
     Ok(())
 }
 
@@ -682,6 +791,27 @@ impl DurableRelay {
             queue_capture(&self.inner, locator.capture_id);
         }
         Ok(results)
+    }
+
+    fn ingest_quality_counters(&self) -> Result<IngestQualityCounters> {
+        self.inner
+            .ledger
+            .lock()
+            .expect("delivery ledger poisoned")
+            .ingest_quality_counters()
+    }
+
+    fn record_ingest_quality(
+        &self,
+        endpoint: CloudEndpoint,
+        unknown_events: u64,
+        conversion_errors: u64,
+    ) -> Result<IngestQualityCounters> {
+        self.inner
+            .ledger
+            .lock()
+            .expect("delivery ledger poisoned")
+            .record_ingest_quality(endpoint, unknown_events, conversion_errors)
     }
 
     pub async fn flush(&self) -> Result<Vec<crate::store::SegmentMetadata>> {
@@ -1288,11 +1418,17 @@ struct IngestCoverageState {
     lifecycle_events: u64,
     tool_executions: u64,
     quality_errors: u64,
+    quality_errors_current_process: u64,
 }
 
 impl IngestCoverageState {
+    #[cfg(test)]
     fn new() -> Self {
-        Self {
+        Self::with_quality_counters(IngestQualityCounters::default())
+    }
+
+    fn with_quality_counters(counters: IngestQualityCounters) -> Self {
+        let mut state = Self {
             started_at: utc_now(),
             wire: RouteCoverage::default(),
             wire_turn_coverage: WireTurnCoverage::default(),
@@ -1301,8 +1437,16 @@ impl IngestCoverageState {
             hooks: RouteCoverage::default(),
             lifecycle_events: 0,
             tool_executions: 0,
-            quality_errors: 0,
-        }
+            quality_errors: counters.total(),
+            quality_errors_current_process: 0,
+        };
+        state.otlp_logs.quality_unknown_events = counters.otlp_logs_unknown_events;
+        state.otlp_logs.quality_conversion_errors = counters.otlp_logs_conversion_errors;
+        state.otlp_traces.quality_unknown_events = counters.otlp_traces_unknown_events;
+        state.otlp_traces.quality_conversion_errors = counters.otlp_traces_conversion_errors;
+        state.hooks.quality_unknown_events = counters.codex_hook_unknown_events;
+        state.hooks.quality_conversion_errors = counters.codex_hook_conversion_errors;
+        state
     }
 
     fn observe_wire(&mut self, acknowledged: &[(WireCaptureEvidence, bool)]) {
@@ -1374,10 +1518,11 @@ impl IngestCoverageState {
         self.lifecycle_events = self.lifecycle_events.saturating_add(lifecycle_events);
         self.tool_executions = self.tool_executions.saturating_add(tool_executions);
         let conversion_errors = summary.conversion_errors.len() as u64;
-        self.quality_errors = self
-            .quality_errors
-            .saturating_add(summary.unknown_events)
-            .saturating_add(conversion_errors);
+        let quality_errors = summary.unknown_events.saturating_add(conversion_errors);
+        self.quality_errors = self.quality_errors.saturating_add(quality_errors);
+        self.quality_errors_current_process = self
+            .quality_errors_current_process
+            .saturating_add(quality_errors);
         route.quality_unknown_events = route
             .quality_unknown_events
             .saturating_add(summary.unknown_events);
@@ -1478,6 +1623,7 @@ impl IngestCoverageState {
             && successful_turn_scoped_fresh;
         json!({
             "scope":"current_relay_process",
+            "quality_errors_scope":"durable_relay_state",
             "started_at":self.started_at,
             "status":status,
             "required_sources_observed":sources_observed,
@@ -1523,6 +1669,7 @@ impl IngestCoverageState {
                 "tool_executions":self.tool_executions,
             },
             "quality_errors":self.quality_errors,
+            "quality_errors_current_process":self.quality_errors_current_process,
         })
     }
 }
@@ -1575,6 +1722,7 @@ pub async fn serve_relay(
     let max_connections = config.max_connections;
     let max_envelope_bytes = config.max_envelope_bytes;
     let relay = DurableRelay::open(config).await?;
+    let ingest_quality_counters = relay.ingest_quality_counters()?;
     let body_budget = InflightBodyBudget::new(
         relay.inner.config.max_inflight_body_bytes,
         relay.inner.config.max_envelope_bytes,
@@ -1602,7 +1750,9 @@ pub async fn serve_relay(
             max_batch_records: relay.inner.config.max_batch_records,
             relay: relay.clone(),
             body_budget,
-            ingest_coverage: Arc::new(Mutex::new(IngestCoverageState::new())),
+            ingest_coverage: Arc::new(Mutex::new(IngestCoverageState::with_quality_counters(
+                ingest_quality_counters,
+            ))),
         });
     let listener = TcpListener::bind(bind).await?;
     info!(address = %bind, "Relay ready");
@@ -1718,6 +1868,25 @@ async fn relay_cloud_ingest(
             json!({"ok":false,"reason":"relay_unavailable","detail":detail}),
         );
     }
+    let quality_rejections = summary
+        .unknown_events
+        .saturating_add(summary.conversion_errors.len() as u64);
+    if quality_rejections > 0
+        && let Err(error) = state.relay.record_ingest_quality(
+            endpoint,
+            summary.unknown_events,
+            summary.conversion_errors.len() as u64,
+        )
+    {
+        // The raw batch is already durable. Refuse the request until its
+        // quality evidence can also be committed, so a ledger failure
+        // cannot become a silent green health result after restart.
+        warn!(error = %error, endpoint = endpoint.as_str(), "failed to persist ingest quality counters");
+        return relay_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"ok":false,"reason":"quality_ledger_unavailable"}),
+        );
+    }
     state
         .ingest_coverage
         .lock()
@@ -1734,9 +1903,6 @@ async fn relay_cloud_ingest(
     // make an invalid or unknown producer event acceptable. Fail closed after
     // enqueueing so SDKs and required hooks stop/retry instead of silently
     // treating a partial trace as valid.
-    let quality_rejections = summary
-        .unknown_events
-        .saturating_add(summary.conversion_errors.len() as u64);
     let unattributed_quality_errors =
         quality_rejections.saturating_sub(summary.attributed_quality_errors);
     if quality_rejections > 0
@@ -2675,6 +2841,11 @@ mod tests {
         );
         assert_eq!(coverage["buyer_eligibility_claimed"], false);
         relay.close().await.unwrap();
+        drop(state);
+        drop(relay);
+        let reopened = DurableRelay::open(test_config(&temporary)).await.unwrap();
+        assert_eq!(reopened.ingest_quality_counters().unwrap().total(), 1);
+        reopened.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -3305,5 +3476,34 @@ mod tests {
         assert_eq!(ledger.pending_ids(8).unwrap(), vec![locator.capture_id]);
         let (_, pending, inflight, _, _, _, _) = ledger.health().unwrap();
         assert_eq!((pending, inflight), (1, 0));
+    }
+
+    #[test]
+    fn ingest_quality_counters_survive_relay_ledger_reopen() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("delivery.redb");
+        {
+            let ledger = DeliveryLedger::open(&path).unwrap();
+            assert_eq!(ledger.ingest_quality_counters().unwrap().total(), 0);
+            let counters = ledger
+                .record_ingest_quality(CloudEndpoint::OtlpTraces, 2, 3)
+                .unwrap();
+            assert_eq!(counters.total(), 5);
+            assert_eq!(counters.otlp_traces_unknown_events, 2);
+            assert_eq!(counters.otlp_traces_conversion_errors, 3);
+        }
+        let reopened = DeliveryLedger::open(&path).unwrap();
+        let counters = reopened.ingest_quality_counters().unwrap();
+        assert_eq!(counters.total(), 5);
+        assert_eq!(counters.otlp_traces_unknown_events, 2);
+        assert_eq!(counters.otlp_traces_conversion_errors, 3);
+        let coverage = IngestCoverageState::with_quality_counters(counters).snapshot();
+        assert_eq!(coverage["quality_errors_scope"], "durable_relay_state");
+        assert_eq!(coverage["quality_errors"], 5);
+        assert_eq!(coverage["quality_errors_current_process"], 0);
+        assert_eq!(
+            coverage["quality_errors_by_endpoint"]["otlp_traces"]["total"],
+            5
+        );
     }
 }

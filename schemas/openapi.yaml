@@ -123,6 +123,9 @@ paths:
         的数量及无归属/冲突数量；只有非重复的有归属 HTTP 2xx Capture 刷新成功证据时间。
         ingest_coverage.turn_capture_ready=true 才表示当前进程具备近期成功 Turn Wire
         的采集就绪证据；它不代表任何特定 Session 已完整。HTTP 2xx 不证明 SSE 终态。
+        ingest_coverage.quality_errors 从持久 Delivery ledger 恢复，必须带有
+        quality_errors_scope=durable_relay_state；quality_errors_current_process 只表示本次
+        进程新增质量错误，不能用重启掩盖历史错误。
         runtime health gate v3 要求该证据近期有效，
         并固定声明 session_delivery_claimed=false。
       responses:

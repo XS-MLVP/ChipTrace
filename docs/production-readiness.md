@@ -16,6 +16,10 @@
 同一复核中的 Gateway preflight 对实际容器 `router-v2-relay-shell` 真实退出 1，原因是镜像仍使用可变
 标签 `weishaw/claude-relay-service:latest`；容器隔离、资源限制和不可变镜像要求尚未在 18084 生效。
 
+本轮维护分支还把 Relay 质量错误计数写入持久 Delivery ledger，并让 runtime gate 拒绝缺少
+`quality_errors_scope=durable_relay_state` 的旧健康响应；该修复尚未部署到线上，因此线上当前
+进程仍不具备这项历史质量保护。
+
 21:22 的热服务只读复核显示：18084、3011、3012、18086 均返回 HTTP 200；Gateway
 health 为 `healthy`，outbox 的 pending/processing/open 均为 0，最近失败为 0。Collector
 与 Relay 均报告 revision `ec8a6b2f687e8454f96366abd5efa8542761a98e`、version `0.6.0`；

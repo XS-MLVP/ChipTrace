@@ -148,8 +148,10 @@ GitHub CI 的 `live-provider-runtime-preflight` 只在手工 `workflow_dispatch`
 实际构建的完整 Git SHA。普通 push/PR 不接触这些 Secret，也不会因为缺少 Runner 或变量而
 跳过真实预检。该作业只确认 Provider 请求和当前进程 readiness，随后仍须用同一 Session
 执行未修改 Stock Codex 的多轮四源 Canary、OSS 验收和 `cloud-acceptance`。
-Live preflight 还要求 Relay 当前进程的 `quality_errors` 为 0；该计数是进程累计值，若历史
-错误已存在，应先保留其报告并重启/修复采集进程，再开始新的 Canary，不能把旧错误静默归零。
+Live preflight 还要求 Relay 的 `ingest_coverage.quality_errors` 为 0；该计数从持久
+Delivery ledger 恢复，`quality_errors_scope` 必须为 `durable_relay_state`，而
+`quality_errors_current_process` 仅用于区分本次进程新增错误。重启不能把历史错误静默归零；
+若历史错误已存在，应先保留其报告并修复生产者或采集配置，再开始新的 Canary。
 
 先确认目标 Session 的 `SessionEnd` 已到达 Collector，且该 Session 的 Wire、OTLP 和
 Hook 均已持久化。网关 outbox 和 Relay 的待投递队列需要排空；持续业务流量下，全局
@@ -270,8 +272,9 @@ Relay/Collector 的精确 Raw、重复确认、平台归档/恢复、Turn 和采
   `false` 只表示当前进程缺少就绪证据，不代表已有 Raw 可以补造为完整 Session。
 - `output_truncated=true`、未知 OTLP 事件、转换错误和身份冲突。
 - `ingest_coverage.quality_errors_by_endpoint` 用于区分 `otlp_logs`、`otlp_traces` 和 `hooks`
-  的 `unknown_events`、`conversion_errors` 与总数；总数必须和进程级 `quality_errors` 对账，
-  不能用重启静默清零。先保留失败快照，再修正生产者或采集配置。
+  的 `unknown_events`、`conversion_errors` 与总数；总数必须和持久化的 `quality_errors` 对账，
+  `quality_errors_current_process` 仅表示本次进程增量。`quality_errors_scope` 缺失或不是
+  `durable_relay_state` 时门禁必须失败。先保留失败快照，再修正生产者或采集配置。
 - Session start/end、模型调用/结果/执行、内部父引用的完整率；以及每个 Turn 的 Wire、
   OTLP logs、OTLP traces、required Hook 覆盖和 `incomplete_turns`。
 - Buyer v7 失败原因、合格 Session 数和四种 Token 口径。

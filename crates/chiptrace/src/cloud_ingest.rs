@@ -24,7 +24,7 @@ pub enum CloudEndpoint {
 }
 
 impl CloudEndpoint {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::OtlpLogs => "otlp_logs",
             Self::OtlpTraces => "otlp_traces",

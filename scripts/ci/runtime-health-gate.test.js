@@ -79,6 +79,8 @@ function relay() {
       otlp_traces: route(9),
       hooks: route(8),
       quality_errors: 0,
+      quality_errors_current_process: 0,
+      quality_errors_scope: 'durable_relay_state',
       quality_errors_by_endpoint: {
         otlp_logs: { unknown_events: 0, conversion_errors: 0, total: 0 },
         otlp_traces: { unknown_events: 0, conversion_errors: 0, total: 0 },
@@ -309,6 +311,18 @@ test('live quality-error maximum rejects accumulated source conversion errors', 
     collectorHealth: collector(), maxQualityErrors: 1,
   });
   assert.equal(result.relay.quality_errors, 1);
+});
+
+test('runtime gate rejects quality counters that are only process-local', () => {
+  const value = relay();
+  delete value.ingest_coverage.quality_errors_scope;
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), value, { collectorHealth: collector() }),
+    /quality_errors_scope must be durable_relay_state/,
+  );
+  const observed = healthObservation(gateway(), value, collector());
+  assert.deepEqual(observed.blocking_reasons, ['relay_quality_history_not_durable']);
+  assert.equal(observed.relay.coverage.quality_errors_scope, null);
 });
 
 test('runtime observations preserve endpoint quality-error breakdowns', () => {

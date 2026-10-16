@@ -608,7 +608,7 @@ jobs:
         with:
           name: live-preflight-contract-report
           path: live-preflight-contract.tap
-      - name: Verify runtime delivery, Collector persistence and Turn Wire evidence fails closed
+      - name: Verify runtime delivery, Collector persistence, durable quality history and Turn Wire evidence fails closed
         run: |
           set -euo pipefail
           node --test scripts/ci/runtime-health-gate.test.js | tee runtime-health-gate.tap

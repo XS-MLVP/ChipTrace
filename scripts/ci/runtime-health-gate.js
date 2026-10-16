@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const DEFAULT_TIMEOUT_MS = 5000;
 const REQUIRED_SOURCES = ['wire', 'otlp_logs', 'otlp_traces', 'hooks'];
 const QUALITY_ENDPOINTS = ['otlp_logs', 'otlp_traces', 'hooks'];
+const QUALITY_ERRORS_SCOPE = 'durable_relay_state';
 const REVISION_PATTERN = /^[a-f0-9]{40}$/;
 
 function fail(message) {
@@ -133,6 +134,9 @@ function blockingReasons(
     add('relay_quality_errors_exceed_max');
   }
   if (coverage.turn_capture_ready !== true) add('relay_turn_capture_not_ready');
+  if (coverage.quality_errors_scope !== QUALITY_ERRORS_SCOPE) {
+    add('relay_quality_history_not_durable');
+  }
   if (Number.isSafeInteger(turns.successful_turn_scoped_captures)
     && turns.successful_turn_scoped_captures === 0) {
     add('relay_no_successful_turn_scoped_wire');
@@ -218,6 +222,9 @@ function healthObservation(
         otlp_traces: routeObservation(coverage?.otlp_traces),
         hooks: routeObservation(coverage?.hooks),
         quality_errors: safeInteger(coverage?.quality_errors),
+        quality_errors_current_process: safeInteger(coverage?.quality_errors_current_process),
+        quality_errors_scope: typeof coverage?.quality_errors_scope === 'string'
+          ? coverage.quality_errors_scope : null,
         quality_errors_by_endpoint: {
           otlp_logs: qualityErrorObservation(coverage?.quality_errors_by_endpoint?.otlp_logs),
           otlp_traces: qualityErrorObservation(coverage?.quality_errors_by_endpoint?.otlp_traces),
@@ -441,6 +448,13 @@ function verifyRelayHealth(health, { maxQualityErrors } = {}) {
   nonNegativeInteger(health.delivered, 'relay.delivered');
 
   const coverage = object(health.ingest_coverage, 'relay.ingest_coverage');
+  if (coverage.quality_errors_scope !== QUALITY_ERRORS_SCOPE) {
+    fail('relay.ingest_coverage.quality_errors_scope must be durable_relay_state');
+  }
+  nonNegativeInteger(
+    coverage.quality_errors_current_process,
+    'relay.ingest_coverage.quality_errors_current_process',
+  );
   const qualityErrors = nonNegativeInteger(
     coverage.quality_errors ?? 0,
     'relay.ingest_coverage.quality_errors',
@@ -496,6 +510,8 @@ function verifyRelayHealth(health, { maxQualityErrors } = {}) {
     required_sources_fresh: coverage.required_sources_fresh,
     turn_capture_ready: coverage.turn_capture_ready,
     quality_errors: qualityErrors,
+    quality_errors_current_process: coverage.quality_errors_current_process,
+    quality_errors_scope: coverage.quality_errors_scope,
     quality_errors_by_endpoint: qualityBreakdown,
     wire_turn_coverage: wireTurnCoverage,
     sources: REQUIRED_SOURCES.reduce((result, source) => {
