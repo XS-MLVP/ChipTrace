@@ -154,7 +154,7 @@ test('identity aliases fail cloud quality ACKs while exact Raw and equal aliases
     passed = true;
   });
 
-test('malformed OTLP siblings fail HTTP and source auditing without losing either WAL',
+test('malformed OTLP containers and metadata fail HTTP and source auditing without losing either WAL',
   { timeout: 30000 }, async t => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-otlp-shape-'));
     let collector;
@@ -179,41 +179,58 @@ test('malformed OTLP siblings fail HTTP and source auditing without losing eithe
     await health(relayUrl, relay);
     const expected = new Map();
     const marker = 'PRIVATE_MALFORMED_BODY_MUST_NOT_APPEAR_IN_DIAGNOSTICS';
+    let metadataReplay;
     const attr = (key, value) => ({ key, value: { stringValue: value } });
     for (const endpoint of ['logs', 'traces']) {
       const resources = endpoint === 'logs' ? 'resourceLogs' : 'resourceSpans';
       const scopes = endpoint === 'logs' ? 'scopeLogs' : 'scopeSpans';
       const records = endpoint === 'logs' ? 'logRecords' : 'spans';
-      const envelope = { [resources]: [{ [scopes]: [{ [records]: [{ name: 'codex.turn', attributes: [
+      const valid = { [scopes]: [{ [records]: [{ name: 'codex.turn', attributes: [
         attr('event.name', 'codex.user_prompt'), attr('conversation.id', 'native-session'),
         attr('turn.id', 'native-turn'), attr('test.utf8', '中文 🧪'),
-      ] }] }] }, { [scopes]: [{ [records]: { private: marker } }] }] };
-      const body = JSON.stringify(envelope, null, 2) + '\n';
-      expected.set(digest(Buffer.from(body)), body);
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const response = await fetch(`${relayUrl}/otel/v1/${endpoint}`, { method: 'POST',
-          headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-          body, signal: AbortSignal.timeout(5000) });
-        const receipt = await response.json();
-        assert.equal(response.status, 400, 'a well-shaped record must not hide its malformed sibling');
-        assert.equal(receipt.ok, false);
-        assert.equal(receipt.durable, true);
-        assert.equal(receipt.local_durable, true);
-        assert.equal(receipt.reason, 'cloud_ingest_quality_error');
-        assert.equal(receipt.captures, 1);
-        assert.equal(receipt.duplicates, attempt);
-        assert.equal(receipt.summary.source_records, 1);
-        assert.equal(receipt.summary.derived_captures, 0);
-        assert.equal(receipt.summary.conversion_errors.length, 1);
-        assert.equal(receipt.unattributed_quality_errors, 1);
-        assert.ok(!JSON.stringify(receipt).includes(marker));
+      ] }] }] };
+      for (const layer of ['container', 'resource', 'scope', 'record', 'resource-entry',
+        'scope-entry', 'record-entry', 'resource-message', 'scope-message']) {
+        const malformed = structuredClone(valid);
+        if (layer === 'container') malformed[scopes][0][records] = { private: marker };
+        if (layer === 'resource') malformed.resource = { attributes: { private: marker } };
+        if (layer === 'scope') malformed[scopes][0].scope = { attributes: { private: marker } };
+        if (layer === 'record') malformed[scopes][0][records][0].attributes = { private: marker };
+        if (layer === 'resource-entry') malformed.resource = { attributes: [null] };
+        if (layer === 'scope-entry') malformed[scopes][0].scope = { attributes: [null] };
+        if (layer === 'record-entry') malformed[scopes][0][records][0].attributes.push(null);
+        if (layer === 'resource-message') malformed.resource = [marker];
+        if (layer === 'scope-message') malformed[scopes][0].scope = [marker];
+        const envelope = { [resources]: [valid, malformed] };
+        const body = JSON.stringify(envelope, null, 2) + '\n';
+        if (layer === 'resource') metadataReplay ||= { endpoint, body };
+        expected.set(digest(Buffer.from(body)), body);
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const response = await fetch(`${relayUrl}/otel/v1/${endpoint}`, { method: 'POST',
+            headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+            body, signal: AbortSignal.timeout(5000) });
+          const receipt = await response.json();
+          assert.equal(response.status, 400, `${endpoint} ${layer}: a valid record must not hide malformed metadata`);
+          assert.equal(receipt.ok, false);
+          assert.equal(receipt.durable, true);
+          assert.equal(receipt.local_durable, true);
+          assert.equal(receipt.reason, 'cloud_ingest_quality_error');
+          assert.equal(receipt.captures, 1);
+          assert.equal(receipt.duplicates, attempt);
+          assert.equal(receipt.summary.source_records, layer === 'container' ? 1 : 2);
+          assert.equal(receipt.summary.derived_captures, 0);
+          assert.equal(receipt.summary.conversion_errors.length, 1);
+          assert.equal(receipt.unattributed_quality_errors, 1);
+          assert.ok(!JSON.stringify(receipt).includes(marker));
+        }
       }
     }
+    assert.equal(expected.size, 18);
     const delivered = await health(relayUrl, relay,
-      h => h.delivered === 2 && h.pending === 0 && h.inflight === 0);
+      h => h.delivered === expected.size && h.pending === 0 && h.inflight === 0);
     assert.equal(delivered.conservation_ok, true);
-    assert.equal(delivered.ingest_coverage.quality_errors, 4);
-    await health(collectorUrl, collector, h => h.collector.captures === 2);
+    assert.equal(delivered.ingest_coverage.quality_errors, 2 * expected.size);
+    await health(collectorUrl, collector, h => h.collector.captures === expected.size);
     for (const url of [relayUrl, collectorUrl]) {
       const response = await fetch(`${url}/flush`, { method: 'POST',
         headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(5000) });
@@ -221,7 +238,7 @@ test('malformed OTLP siblings fail HTTP and source auditing without losing eithe
     }
     const relayRaw = await sealedRecords(path.join(root, 'relay'));
     const collectorRaw = await sealedRecords(path.join(root, 'collector'));
-    assert.equal(collectorRaw.size, 2);
+    assert.equal(collectorRaw.size, expected.size);
     assert.deepEqual(collectorRaw, relayRaw);
     for (const { record } of collectorRaw.values()) {
       const batch = record.telemetryBatch;
@@ -232,14 +249,23 @@ test('malformed OTLP siblings fail HTTP and source auditing without losing eithe
     const audit = () => run(binary, ['audit-session-context', '--input', path.join(root, 'collector'),
       '--session-id', 'native-session', '--sample-limit', '0'], { maxBuffer: 1024 * 1024 });
     await assert.rejects(audit, error => error.code === 1
-      && /OTLP.*must be an array/.test(error.stderr) && !error.stderr.includes(marker));
+      && /OTLP.*must be an? (array|object)/.test(error.stderr) && !error.stderr.includes(marker));
     assert.equal((await stop(relay)).code, 0);
     assert.equal((await stop(collector)).code, 0);
     collector = start(collectorArgs);
-    await health(collectorUrl, collector, h => h.collector.captures === 2);
+    await health(collectorUrl, collector, h => h.collector.captures === expected.size);
     relay = start(relayArgs);
-    await health(relayUrl, relay, h => h.delivered === 2 && h.conservation_ok);
+    await health(relayUrl, relay, h => h.delivered === expected.size && h.conservation_ok);
     await assert.rejects(audit, { code: 1 });
+    const replay = await fetch(`${relayUrl}/otel/v1/${metadataReplay.endpoint}`, { method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: metadataReplay.body, signal: AbortSignal.timeout(5000) });
+    const replayReceipt = await replay.json();
+    assert.equal(replay.status, 400);
+    assert.equal(replayReceipt.durable, true);
+    assert.equal(replayReceipt.duplicates, 1);
+    assert.equal(replayReceipt.summary.conversion_errors.length, 1);
+    assert.ok(!JSON.stringify(replayReceipt).includes(marker));
     assert.deepEqual(await sealedRecords(path.join(root, 'collector')), collectorRaw);
     passed = true;
   });

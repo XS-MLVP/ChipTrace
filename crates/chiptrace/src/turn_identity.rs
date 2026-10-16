@@ -590,9 +590,25 @@ pub(crate) fn validate_otlp_identity_layers(layers: [Option<&Value>; 3]) -> Resu
     Ok(())
 }
 
+/// Metadata messages are optional, but a present non-message cannot be treated
+/// as if it carried no attributes. Do not include the rejected value in errors.
+pub(crate) fn otlp_message_attributes<'a>(
+    message: Option<&'a Value>,
+    field: &str,
+) -> Result<Option<&'a Value>> {
+    match message {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(fields)) => Ok(fields.get("attributes")),
+        Some(_) => bail!("OTLP {field} must be an object"),
+    }
+}
+
 pub(crate) fn validate_context_attributes(value: Option<&Value>) -> Result<()> {
     let mut context_values = BTreeMap::new();
-    for attribute in value.and_then(Value::as_array).into_iter().flatten() {
+    for (index, attribute) in optional_otlp_array(value, "attributes")?.iter().enumerate() {
+        if !attribute.is_object() {
+            bail!("OTLP attributes[{index}] must be an object");
+        }
         let (Some(key), Some(value)) = (
             attribute.get("key").and_then(Value::as_str),
             attribute.get("value"),
@@ -677,7 +693,10 @@ pub(crate) fn visit_otlp_envelope(
         .into_iter()
         .flatten()
     {
-        let resource_attributes = attributes(resource.pointer("/resource/attributes"))?;
+        let resource_attributes = attributes(otlp_message_attributes(
+            resource.get("resource"),
+            "resource",
+        )?)?;
         for scope in resource
             .get(scopes)
             .and_then(Value::as_array)
@@ -685,7 +704,10 @@ pub(crate) fn visit_otlp_envelope(
             .flatten()
         {
             let mut scoped = resource_attributes.clone();
-            scoped.extend(attributes(scope.pointer("/scope/attributes"))?);
+            scoped.extend(attributes(otlp_message_attributes(
+                scope.get("scope"),
+                "scope",
+            )?)?);
             for record in scope
                 .get(records)
                 .and_then(Value::as_array)
@@ -823,6 +845,78 @@ mod tests {
                 .expect_err("source auditing must not accept only the well-shaped subset");
                 assert_eq!(visited, 0);
                 assert!(!error.to_string().contains("BODY_MUST"));
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_otlp_metadata_cannot_be_erased_before_source_auditing() {
+        let private = "PRIVATE_MALFORMED_CONTEXT_MUST_NOT_APPEAR";
+        for endpoint in ["otlp_logs", "otlp_traces"] {
+            for layer in ["resource", "scope", "record"] {
+                for malformed in [
+                    json!({"private":private}),
+                    json!(private),
+                    json!(42),
+                    json!([null]),
+                    json!([private]),
+                    json!([[]]),
+                ] {
+                    let capture = attributes_at_layer(endpoint, layer, malformed);
+                    let error = visit_otlp(&capture, |_, _, _| Ok(()))
+                        .expect_err("malformed metadata must not disappear as empty attributes");
+                    assert!(error.to_string().contains("OTLP"));
+                    assert!(!error.to_string().contains(private));
+                }
+            }
+            let (_, resources, scopes, _) = otlp_fields(endpoint).unwrap();
+            for layer in ["resource", "scope"] {
+                let mut raw =
+                    raw_batch(&attributes_at_layer(endpoint, "record", json!([]))).unwrap();
+                let message = if layer == "resource" {
+                    &mut raw[resources][0]["resource"]
+                } else {
+                    &mut raw[resources][0][scopes][0]["scope"]
+                };
+                *message = json!([private]);
+                let error = visit_otlp_envelope(endpoint, &raw, |_, _, _| Ok(()))
+                    .expect_err("a malformed metadata message is not an omitted message");
+                assert!(error.to_string().contains("OTLP"));
+                assert!(!error.to_string().contains(private));
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_null_and_empty_metadata_remains_optional() {
+        for endpoint in ["otlp_logs", "otlp_traces"] {
+            for layer in ["resource", "scope", "record"] {
+                for empty in [Value::Null, json!([])] {
+                    let capture = attributes_at_layer(endpoint, layer, empty);
+                    let mut visited = 0;
+                    visit_otlp(&capture, |_, _, attributes| {
+                        visited += 1;
+                        assert!(attributes.is_empty());
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(visited, 1);
+                }
+            }
+            let (_, resources, scopes, _) = otlp_fields(endpoint).unwrap();
+            for empty in [Value::Null, json!({})] {
+                let mut raw =
+                    raw_batch(&attributes_at_layer(endpoint, "record", json!([]))).unwrap();
+                raw[resources][0]["resource"] = empty.clone();
+                raw[resources][0][scopes][0]["scope"] = empty;
+                let mut visited = 0;
+                visit_otlp_envelope(endpoint, &raw, |_, _, attributes| {
+                    visited += 1;
+                    assert!(attributes.is_empty());
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(visited, 1);
             }
         }
     }

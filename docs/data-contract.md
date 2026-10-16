@@ -239,6 +239,12 @@ Session 被移出载荷而宣称唯一。`thread.id` 是 OS 线程号，不是 S
 不代表质量合格。源记录数仍按实际输入统计，重试同一正文不新增 Capture。logs 只从上下文
 有效的记录派生事实，按 resource → scope → record 合并属性，保留合法 scope 中的原生身份。
 
+resource/scope 元数据可以省略或为 null，存在时必须是对象；三层 `attributes` 可以省略、
+为 null 或空数组，存在时必须是数组，元素必须是对象。错误类型不能当成空属性而借用
+继承的身份或工具字段。在线 logs/traces 与离线审计共用这些检查；错误原文保留后，
+入口返回上述质量错误，同批正常记录继续处理。诊断只包含字段名和数组序号，
+不展开错误字段或正文。这是上下文容器检查，不替代全部 OTLP 字段语义验证。
+
 Turn 覆盖中的 Wire 是 Capture 数，OTLP logs/traces 是原始记录数，Hook 是原始批次中的
 事件数。派生生命周期和工具事件不重复计为 Hook。Session 级 `source_coverage` 的 OTLP
 数仍是批次数，两种统计不能直接相加或比较。

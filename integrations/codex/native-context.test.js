@@ -125,6 +125,41 @@ test('conflicting duplicate context attributes fail without choosing a native ow
   }
 });
 
+test('malformed OTLP metadata cannot disappear behind a valid native context', async t => {
+  const attr = (key, value) => ({ key, value: { stringValue: value } });
+  const marker = 'PRIVATE_MALFORMED_ATTRIBUTE_METADATA';
+  for (const endpoint of ['otlp_logs', 'otlp_traces']) {
+    const resources = endpoint === 'otlp_logs' ? 'resourceLogs' : 'resourceSpans';
+    const scopes = endpoint === 'otlp_logs' ? 'scopeLogs' : 'scopeSpans';
+    const records = endpoint === 'otlp_logs' ? 'logRecords' : 'spans';
+    for (const layer of ['resource', 'scope', 'record', 'resource-message', 'scope-message']) {
+      for (const malformed of layer.endsWith('-message') ? [[marker]] : [{ private: marker }, [marker], [null]]) {
+        const context = [attr('conversation.id', 'selected'), attr('turn.id', 'native-turn')];
+        const record = { name: 'codex.turn', attributes: context };
+        const scope = { [records]: [record] };
+        const resource = { [scopes]: [scope] };
+        if (layer === 'resource') resource.resource = { attributes: malformed };
+        if (layer === 'scope') scope.scope = { attributes: malformed };
+        if (layer === 'record') { resource.resource = { attributes: context }; record.attributes = malformed; }
+        if (layer === 'resource-message') resource.resource = [marker];
+        if (layer === 'scope-message') scope.scope = [marker];
+        const data = await input(t, [
+          { captureId: 'cap-metadata-wire', recordType: 'api_snapshot', traceContext: {
+            session_id: 'selected', turn_id: 'native-turn',
+          } },
+          batch(endpoint, { [resources]: [resource] }, 1),
+        ]);
+        await assert.rejects(run(binary, ['audit-session-context', '--input', data.file,
+          '--session-id', 'selected', '--sample-limit', '0']), error => error.code === 1
+          && error.stdout === '' && /OTLP.*must be an? (array|object)/.test(error.stderr)
+          && !error.stderr.includes(marker));
+        assert.deepEqual(await fs.readFile(data.file), data.bytes);
+        assert.deepEqual(await fs.readdir(data.root), ['input.ndjson']);
+      }
+    }
+  }
+});
+
 test('codex root Turn aliases retain exact attribution and reject contradictions without changing Raw', async t => {
   const attr = (key, value) => ({ key, value: { stringValue: value } });
   const marker = 'PRIVATE_ROOT_ALIAS_IDENTITY';

@@ -1,8 +1,8 @@
 use crate::capture::{CaptureRecord, normalize_capture};
 use crate::tool_schema::{canonical_runtime_tool_name, is_stock_unified_exec_tool};
 use crate::turn_identity::{
-    session_attribute, turn_attribute, validate_context_attributes, validate_otlp_identity_layers,
-    validate_otlp_structure, visit_otlp_envelope,
+    otlp_message_attributes, session_attribute, turn_attribute, validate_context_attributes,
+    validate_otlp_identity_layers, validate_otlp_structure, visit_otlp_envelope,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -178,14 +178,16 @@ fn derive_otlp_logs(envelope: &Value, raw_sha256: &str, max_bytes: usize) -> Res
         .flatten()
         .enumerate()
     {
-        let resource_attributes = match attributes_map(resource_log.pointer("/resource/attributes"))
-        {
-            Ok(attributes) => Some(attributes),
-            Err(error) => {
-                errors.push(format!("resourceLogs[{resource_index}]: {error}"));
-                None
-            }
-        };
+        let resource_attributes =
+            match otlp_message_attributes(resource_log.get("resource"), "resource")
+                .and_then(attributes_map)
+            {
+                Ok(attributes) => Some(attributes),
+                Err(error) => {
+                    errors.push(format!("resourceLogs[{resource_index}]: {error}"));
+                    None
+                }
+            };
         for (scope_index, scope_log) in resource_log
             .get("scopeLogs")
             .and_then(Value::as_array)
@@ -193,7 +195,9 @@ fn derive_otlp_logs(envelope: &Value, raw_sha256: &str, max_bytes: usize) -> Res
             .flatten()
             .enumerate()
         {
-            let scope_attributes = match attributes_map(scope_log.pointer("/scope/attributes")) {
+            let scope_attributes = match otlp_message_attributes(scope_log.get("scope"), "scope")
+                .and_then(attributes_map)
+            {
                 Ok(attributes) => Some(attributes),
                 Err(error) => {
                     errors.push(format!(
@@ -1234,6 +1238,94 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    #[test]
+    fn malformed_otlp_metadata_is_not_acknowledged_as_quality_success() {
+        for (endpoint, resources, scopes, records) in [
+            (
+                CloudEndpoint::OtlpLogs,
+                "resourceLogs",
+                "scopeLogs",
+                "logRecords",
+            ),
+            (
+                CloudEndpoint::OtlpTraces,
+                "resourceSpans",
+                "scopeSpans",
+                "spans",
+            ),
+        ] {
+            let record = json!({"name":"codex.turn","attributes":[
+                attr("event.name", json!({"stringValue":"codex.user_prompt"})),
+                attr("conversation.id", json!({"stringValue":"session-1"})),
+                attr("turn.id", json!({"stringValue":"turn-1"}))
+            ]});
+            let valid = json!({resources:[{scopes:[{records:[record]}]}]});
+            let private = "PRIVATE_MALFORMED_METADATA";
+            for layer in ["resource", "scope", "record"] {
+                for malformed in [json!({"private":private}), json!([private]), json!([null])] {
+                    let mut envelope = valid.clone();
+                    match layer {
+                        "resource" => {
+                            envelope[resources][0]["resource"] = json!({"attributes":malformed})
+                        }
+                        "scope" => {
+                            envelope[resources][0][scopes][0]["scope"] =
+                                json!({"attributes":malformed})
+                        }
+                        "record" => {
+                            envelope[resources][0][scopes][0][records][0]["attributes"] = malformed
+                        }
+                        _ => unreachable!(),
+                    }
+                    let raw = serde_json::to_vec_pretty(&envelope).unwrap();
+                    let batch = prepare_cloud_ingest(endpoint, &raw, 1024 * 1024).unwrap();
+                    assert_eq!(batch.summary.source_records, 1);
+                    assert_eq!(
+                        batch.summary.conversion_errors.len(),
+                        1,
+                        "{endpoint:?}: {layer} malformed attributes must remain a quality error"
+                    );
+                    assert_eq!(batch.summary.derived_captures, 0);
+                    assert_eq!(batch.summary.attributed_quality_errors, 0);
+                    assert!(!batch.summary.conversion_errors[0].contains(private));
+                    let saved = values(&batch).remove(0);
+                    assert_eq!(
+                        saved["telemetryBatch"]["raw_json"],
+                        String::from_utf8(raw.clone()).unwrap()
+                    );
+                    assert_eq!(saved["telemetryBatch"]["raw_sha256"], sha256(&raw));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_record_attributes_cannot_borrow_a_tool_owner_from_the_resource() {
+        let mut envelope: Value = serde_json::from_slice(&stock_logs(false, true)).unwrap();
+        let attributes =
+            envelope["resourceLogs"][0]["scopeLogs"][0]["logRecords"][1]["attributes"].take();
+        envelope["resourceLogs"][0]["resource"]["attributes"] = attributes;
+        envelope["resourceLogs"][0]["scopeLogs"][0]["logRecords"][1]["attributes"] =
+            json!({"private":"PRIVATE_MALFORMED_TOOL_METADATA"});
+        let raw = serde_json::to_vec_pretty(&envelope).unwrap();
+        let batch = prepare_cloud_ingest(CloudEndpoint::OtlpLogs, &raw, 1024 * 1024).unwrap();
+        assert_eq!(batch.summary.source_records, 2);
+        assert_eq!(batch.summary.conversion_errors.len(), 1);
+        assert_eq!(batch.summary.attributed_quality_errors, 0);
+        assert_eq!(batch.summary.derived_captures, 1);
+        let captured = values(&batch);
+        assert_eq!(captured[1]["lifecycleEvent"]["type"], "session_start");
+        assert!(
+            captured
+                .iter()
+                .all(|capture| capture.get("toolExecution").is_none())
+        );
+        assert_eq!(
+            captured[0]["telemetryBatch"]["raw_json"],
+            String::from_utf8(raw).unwrap()
+        );
     }
 
     #[test]
