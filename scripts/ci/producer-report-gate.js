@@ -139,7 +139,10 @@ function main(argv = process.argv.slice(2)) {
   const policy = readJson(SUPPORT_PATH);
   const stock = readJson(STOCK_RELEASE_PATH);
   const support = verifyProducerSupport(policy, stock);
-  const reports = parseArgs(argv).map(file => ({ file, ...verifyProducerReport(readJson(file), policy, support) }));
+  const reports = parseArgs(argv).map(file => ({
+    file: path.basename(file),
+    ...verifyProducerReport(readJson(file), policy, support),
+  }));
   const result = { schema_version: 'chiptrace.producer-report-gate.v1', reports };
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   return result;
