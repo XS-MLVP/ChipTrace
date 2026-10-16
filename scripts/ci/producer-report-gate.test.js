@@ -20,12 +20,20 @@ function report() {
     patch_set: policy.producer.patches.map(patch => ({ ...patch })),
     native_turns: 2,
     model_interactions: 4,
+    tool_execution_records: 2,
     source_coverage: { complete: true, missing_sources: [], wire: 4, otlp_logs: 8, otlp_traces: 8, hooks: 4 },
     platform_evidence: {
       backend: 'fs', production_acceptance_claimed: false, native_turns: 2, model_interactions: 4,
+      turn_coverage: [1, 2].map(index => ({ session_id: 'session', turn_id: `turn-${index}`, status: 'closed',
+        model_interactions: 2, tool_execution_records: 1,
+        source_coverage: { complete: true, missing_sources: [], wire: 2, otlp_logs: 3, otlp_traces: 4, hooks: 2 } })),
       additional_storage_backends: [{ backend: 's3', real_oss_account: false,
         production_acceptance_claimed: false, remote_checkpoint_verified: true,
-        remote_segment_objects_verified: 3, native_turns: 2, model_interactions: 4 }],
+        remote_segment_objects_verified: 3, native_turns: 2, model_interactions: 4,
+        turn_coverage: [1, 2].map(index => ({ session_id: 'session', turn_id: `turn-${index}`, status: 'closed',
+          model_interactions: 2, tool_execution_records: 1,
+          source_coverage: { complete: true, missing_sources: [], wire: 2, otlp_logs: 3, otlp_traces: 4, hooks: 2 } })),
+      }],
     },
   };
 }
@@ -56,4 +64,29 @@ test('producer report gate rejects incomplete Turn source coverage and productio
   const claimed = report();
   claimed.production_acceptance_claimed = true;
   assert.throws(() => verifyProducerReport(claimed, policy), /production acceptance/);
+});
+
+test('producer report gate rejects per-Turn Wire gaps and FS/S3 summary drift', () => {
+  const missingTurnWire = report();
+  missingTurnWire.platform_evidence.turn_coverage[0].source_coverage.wire = 1;
+  assert.throws(() => verifyProducerReport(missingTurnWire, policy), /source_coverage\.wire/);
+
+  const driftedRemote = report();
+  driftedRemote.platform_evidence.additional_storage_backends[0].turn_coverage[1].turn_id = 'different-turn';
+  assert.throws(() => verifyProducerReport(driftedRemote, policy), /FS and private S3 Turn summaries/);
+});
+
+test('producer report gate rejects a Turn with missing source evidence or interaction totals', () => {
+  const incomplete = report();
+  incomplete.platform_evidence.turn_coverage[0].source_coverage.complete = false;
+  incomplete.platform_evidence.turn_coverage[0].source_coverage.missing_sources = ['hooks'];
+  assert.throws(() => verifyProducerReport(incomplete, policy), /source_coverage\.complete/);
+
+  const missingTools = report();
+  delete missingTools.tool_execution_records;
+  assert.throws(() => verifyProducerReport(missingTools, policy), /report\.tool_execution_records/);
+
+  const openTurn = report();
+  openTurn.platform_evidence.turn_coverage[0].status = 'open';
+  assert.throws(() => verifyProducerReport(openTurn, policy), /status must be closed or cancelled/);
 });

@@ -141,6 +141,26 @@ async function verifyPlatform(root, binary, mode = 'partial', storage = { backen
   const inspectId = 'native-inspect';
   const archiveId = complete ? 'native-protocol-raw' : 'native-interruption-raw';
   const expectedTurns = baseline.session.turns;
+  const turnCoverage = expectedTurns.map((turn, index) => {
+    assert.ok(turn && typeof turn === 'object', `missing native Turn ${index}`);
+    const coverage = turn.source_coverage;
+    assert.ok(coverage && typeof coverage === 'object', `missing source coverage for Turn ${index}`);
+    return {
+      session_id: turn.session_id,
+      turn_id: turn.turn_id,
+      status: turn.status,
+      model_interactions: turn.model_interactions,
+      tool_execution_records: turn.tool_execution_records,
+      source_coverage: {
+        complete: coverage.complete === true,
+        missing_sources: Array.isArray(coverage.missing_sources) ? [...coverage.missing_sources] : [],
+        wire: coverage.wire,
+        otlp_logs: coverage.otlp_logs,
+        otlp_traces: coverage.otlp_traces,
+        hooks: coverage.hooks,
+      },
+    };
+  });
   const expectedTurnBytes = Buffer.from(expectedTurns.map(turn => JSON.stringify(turn)).join('\n') + '\n');
   const expectedSession = { ...baseline.session };
   delete expectedSession.turns;
@@ -323,6 +343,7 @@ async function verifyPlatform(root, binary, mode = 'partial', storage = { backen
         archive_id: archiveId, session_id: sessionId,
         archive_restore_verified: true, raw_bytes: archive.result.total_bytes, raw_records: records,
         native_turns: expectedTurns.length, model_interactions: wire.length,
+        turn_coverage: turnCoverage,
         all_projection_parts_verified: true, authenticated_downloads_verified: true,
         buyer_export_checked: false, restart_verified: true, idempotent_responses_verified: true };
     }
@@ -362,6 +383,7 @@ async function verifyPlatform(root, binary, mode = 'partial', storage = { backen
       usage_source: complete ? 'synthetic_endpoint_observations' : 'synthetic_raw_fixture',
       archive_restore_verified: true, raw_bytes: archive.result.total_bytes, raw_records: records,
       native_turns: expectedTurns.length, model_interactions: wire.length,
+      turn_coverage: turnCoverage,
       all_projection_parts_verified: true, authenticated_downloads_verified: true,
       ...(accepted ? { accepted_export_verified: true, buyer_score: exported.result.score,
         effective_turns: exported.result.effective_turns, buyer_packages: exported.artifacts.length,

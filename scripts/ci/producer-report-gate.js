@@ -45,6 +45,63 @@ function verifySourceCoverage(coverage, modelInteractions) {
   return value;
 }
 
+function verifyTurnCoverage(platform, sourceCoverage, nativeTurns, modelInteractions, toolExecutionRecords) {
+  assert.ok(Array.isArray(platform.turn_coverage), 'platform.turn_coverage must be an array');
+  assert.equal(platform.turn_coverage.length, nativeTurns,
+    'platform.turn_coverage must contain one entry per native Turn');
+  const identities = new Set();
+  let modelTotal = 0;
+  let wireTotal = 0;
+  let toolTotal = 0;
+  let expectedSessionId;
+  const turns = platform.turn_coverage.map((turn, index) => {
+    const value = object(turn, `platform.turn_coverage[${index}]`);
+    const sessionId = nonEmptyString(value.session_id, `platform.turn_coverage[${index}].session_id`);
+    const turnId = nonEmptyString(value.turn_id, `platform.turn_coverage[${index}].turn_id`);
+    if (expectedSessionId === undefined) expectedSessionId = sessionId;
+    else assert.equal(sessionId, expectedSessionId, 'platform.turn_coverage must contain one Session');
+    const identity = `${sessionId}\u0000${turnId}`;
+    assert.equal(identities.has(identity), false, `platform.turn_coverage[${index}] duplicates a native Turn`);
+    identities.add(identity);
+    const status = nonEmptyString(value.status, `platform.turn_coverage[${index}].status`);
+    assert.ok(['closed', 'cancelled'].includes(status),
+      `platform.turn_coverage[${index}].status must be closed or cancelled`);
+    const interactions = nonNegativeInteger(value.model_interactions,
+      `platform.turn_coverage[${index}].model_interactions`);
+    assert.ok(interactions > 0,
+      `platform.turn_coverage[${index}].model_interactions must be positive`);
+    const tools = nonNegativeInteger(value.tool_execution_records,
+      `platform.turn_coverage[${index}].tool_execution_records`);
+    const coverage = object(value.source_coverage, `platform.turn_coverage[${index}].source_coverage`);
+    assert.equal(coverage.complete, true,
+      `platform.turn_coverage[${index}].source_coverage.complete must be true`);
+    assert.deepEqual(coverage.missing_sources, [],
+      `platform.turn_coverage[${index}].source_coverage.missing_sources must be empty`);
+    const counts = {};
+    for (const source of ['wire', 'otlp_logs', 'otlp_traces', 'hooks']) {
+      counts[source] = nonNegativeInteger(coverage[source],
+        `platform.turn_coverage[${index}].source_coverage.${source}`);
+      assert.ok(counts[source] > 0,
+        `platform.turn_coverage[${index}].source_coverage.${source} must be positive`);
+    }
+    assert.equal(counts.wire, interactions,
+      `platform.turn_coverage[${index}].source_coverage.wire must equal model_interactions`);
+    modelTotal += interactions;
+    wireTotal += counts.wire;
+    toolTotal += tools;
+    return { session_id: sessionId, turn_id: turnId, status,
+      model_interactions: interactions, tool_execution_records: tools,
+      source_coverage: { complete: coverage.complete, missing_sources: [...coverage.missing_sources], ...counts } };
+  });
+  assert.equal(modelTotal, modelInteractions, 'per-Turn model interactions must conserve the Session total');
+  assert.equal(wireTotal, sourceCoverage.wire, 'per-Turn Wire evidence must conserve the Session total');
+  if (toolExecutionRecords !== undefined) {
+    assert.equal(toolTotal, nonNegativeInteger(toolExecutionRecords, 'report.tool_execution_records'),
+      'per-Turn tool execution records must conserve the Session total');
+  }
+  return turns;
+}
+
 function verifyPatchSet(report, policy) {
   assert.ok(Array.isArray(report.patch_set), 'report.patch_set must be an array');
   const patches = report.patch_set.map((patch, index) => {
@@ -81,6 +138,9 @@ function verifyProducerReport(report, policy, support = verifyProducerSupport(
 
   const modelInteractions = nonNegativeInteger(report.model_interactions, 'report.model_interactions');
   assert.ok(modelInteractions > 0, 'report.model_interactions must be positive');
+  const toolExecutionRecords = nonNegativeInteger(
+    report.tool_execution_records, 'report.tool_execution_records',
+  );
   const nativeTurns = nonNegativeInteger(report.native_turns, 'report.native_turns');
   assert.ok(nativeTurns >= support.minimum_native_turns,
     `report.native_turns must be at least ${support.minimum_native_turns}`);
@@ -91,6 +151,9 @@ function verifyProducerReport(report, policy, support = verifyProducerSupport(
   assert.equal(platform.production_acceptance_claimed, false);
   assert.equal(platform.native_turns, nativeTurns);
   assert.equal(platform.model_interactions, modelInteractions);
+  const turnCoverage = verifyTurnCoverage(
+    platform, sourceCoverage, nativeTurns, modelInteractions, toolExecutionRecords,
+  );
   assert.equal(platform.remote_checkpoint_verified, undefined,
     'primary FS evidence must not masquerade as remote object evidence');
   assert.ok(Array.isArray(platform.additional_storage_backends),
@@ -105,6 +168,11 @@ function verifyProducerReport(report, policy, support = verifyProducerSupport(
     'platform.additional_storage_backends[0].remote_segment_objects_verified') > 0);
   assert.equal(remote.native_turns, nativeTurns);
   assert.equal(remote.model_interactions, modelInteractions);
+  assert.deepEqual(
+    verifyTurnCoverage(remote, sourceCoverage, nativeTurns, modelInteractions, toolExecutionRecords),
+    turnCoverage,
+    'FS and private S3 Turn summaries must match',
+  );
 
   return {
     schema_version: 'chiptrace.producer-report-gate.v1',
@@ -115,7 +183,9 @@ function verifyProducerReport(report, policy, support = verifyProducerSupport(
     source_sha256: source.source_sha256,
     native_turns: nativeTurns,
     model_interactions: modelInteractions,
+    tool_execution_records: toolExecutionRecords,
     source_coverage: sourceCoverage,
+    turn_coverage: turnCoverage,
     storage_backends: ['fs', 's3'],
     production_acceptance_claimed: false,
   };
