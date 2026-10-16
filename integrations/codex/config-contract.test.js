@@ -164,6 +164,34 @@ test('production deployment templates require an immutable image revision', () =
   assert.match(dockerfile, /ENV CHIPTRACE_BUILD_REVISION=\$\{CHIPTRACE_REVISION\}/);
 });
 
+test('standalone platform server refuses an implicit or invalid storage backend', async () => {
+  for (const backend of [undefined, 'local']) {
+    const env = { ...process.env };
+    if (backend === undefined) delete env.CHIPTRACE_BACKEND;
+    else env.CHIPTRACE_BACKEND = backend;
+    const child = spawn(process.execPath, [platformServerPath], {
+      cwd: path.resolve(integrationRoot, '..', '..'),
+      env,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    const stderr = [];
+    child.stderr.on('data', chunk => stderr.push(chunk));
+    const result = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        child.kill('SIGTERM');
+        reject(new Error(`platform server did not reject backend=${backend ?? '<missing>'}`));
+      }, 5000);
+      child.once('error', reject);
+      child.once('close', (code, signal) => {
+        clearTimeout(timer);
+        resolve({ code, signal });
+      });
+    });
+    assert.equal(result.code, 1, `backend=${backend ?? '<missing>'} signal=${result.signal}`);
+    assert.match(Buffer.concat(stderr).toString('utf8'), /CHIPTRACE_BACKEND must be explicitly set to fs, oss, or s3/);
+  }
+});
+
 test('separate native hook invocations survive while HTTP retries deduplicate', async () => {
   const bodies = [];
   const server = http.createServer((req, res) => {
