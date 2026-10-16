@@ -14,12 +14,14 @@ const readmePath = path.join(integrationRoot, 'README.md');
 const collectorComposePath = path.join(integrationRoot, '..', '..', 'deploy', 'collector-relay.yml');
 const platformComposePath = path.join(integrationRoot, '..', '..', 'deploy', 'cloud-platform.yml');
 const dockerfilePath = path.join(integrationRoot, '..', '..', 'Dockerfile');
+const platformServerPath = path.join(integrationRoot, '..', 'cloud-platform', 'server.js');
 const config = fs.readFileSync(configPath, 'utf8');
 const requirements = fs.readFileSync(requirementsPath, 'utf8');
 const readme = fs.readFileSync(readmePath, 'utf8');
 const collectorCompose = fs.readFileSync(collectorComposePath, 'utf8');
 const platformCompose = fs.readFileSync(platformComposePath, 'utf8');
 const dockerfile = fs.readFileSync(dockerfilePath, 'utf8');
+const platformServer = fs.readFileSync(platformServerPath, 'utf8');
 
 test('Stock Codex uses the current system configuration contract', () => {
   assert.equal(
@@ -151,6 +153,8 @@ test('production deployment templates require an immutable image revision', () =
   assert.match(platformCompose, /image: \$\{CHIPTRACE_PLATFORM_IMAGE:\?set CHIPTRACE_PLATFORM_IMAGE to an immutable ChipTrace platform image\}/);
   assert.match(platformCompose, /CHIPTRACE_BACKEND: \$\{CHIPTRACE_BACKEND:\?set CHIPTRACE_BACKEND to fs, oss, or s3\}/);
   assert.doesNotMatch(platformCompose, /CHIPTRACE_BACKEND: \$\{CHIPTRACE_BACKEND:-fs\}/);
+  assert.match(platformServer, /CHIPTRACE_BACKEND must be explicitly set to fs, oss, or s3/);
+  assert.doesNotMatch(platformServer, /process\.env\.CHIPTRACE_BACKEND \|\| 'fs'/);
   for (const compose of [collectorCompose, platformCompose]) {
     assert.match(compose, /CHIPTRACE_REVISION:\?set CHIPTRACE_REVISION to the full Git commit SHA/);
     assert.doesNotMatch(compose, /^\s+build:/m);

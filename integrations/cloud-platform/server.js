@@ -127,31 +127,37 @@ async function createPlatformServer(options) {
 }
 
 if (require.main === module) {
-  createPlatformServer({
-    root: process.env.CHIPTRACE_PLATFORM_ROOT || '/data/platform',
-    projectId: process.env.CHIPTRACE_PROJECT_ID,
-    captureRoot: process.env.CHIPTRACE_CAPTURE_ROOT,
-    binary: process.env.CHIPTRACE_BIN || 'chiptrace',
-    backend: process.env.CHIPTRACE_BACKEND || 'fs',
-    objectRoot: process.env.CHIPTRACE_OBJECT_ROOT,
-    prefix: process.env.CHIPTRACE_OBJECT_PREFIX || 'chiptrace',
-    endpoint: process.env.CHIPTRACE_OBJECT_ENDPOINT,
-    bucket: process.env.CHIPTRACE_OBJECT_BUCKET,
-    region: process.env.CHIPTRACE_OBJECT_REGION,
-    token: process.env.CHIPTRACE_PLATFORM_TOKEN,
-    concurrency: Number(process.env.CHIPTRACE_JOB_CONCURRENCY || '2'),
-    maxQueuedJobs: Number(process.env.CHIPTRACE_MAX_QUEUED_JOBS || '128'),
-    maxJobs: Number(process.env.CHIPTRACE_MAX_JOBS || '10000'),
-    maxUsageBytes: Number(process.env.CHIPTRACE_MAX_USAGE_BYTES || String(64 * 1024 * 1024)),
-    maxOutputBytes: Number(process.env.CHIPTRACE_MAX_OUTPUT_BYTES || String(64 * 1024 * 1024)),
-    maxTurnBytes: Number(process.env.CHIPTRACE_MAX_TURN_BYTES || String(64 * 1024 * 1024)),
-    jobTimeoutMs: Number(process.env.CHIPTRACE_JOB_TIMEOUT_MS || String(60 * 60 * 1000)),
-  }).then(app => {
-    app.server.listen(Number(process.env.CHIPTRACE_PLATFORM_PORT || '18086'), process.env.CHIPTRACE_PLATFORM_HOST || '127.0.0.1', () => {
-      process.stdout.write(`${JSON.stringify({ event: 'platform_ready', port: app.server.address().port })}\n`);
-    });
-    for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => app.close().then(() => process.exit(0)));
-  }).catch(error => { process.stderr.write(`${error.message}\n`); process.exitCode = 1; });
+  const backend = process.env.CHIPTRACE_BACKEND;
+  if (!['fs', 'oss', 's3'].includes(backend)) {
+    process.stderr.write('CHIPTRACE_BACKEND must be explicitly set to fs, oss, or s3\n');
+    process.exitCode = 1;
+  } else {
+    createPlatformServer({
+      root: process.env.CHIPTRACE_PLATFORM_ROOT || '/data/platform',
+      projectId: process.env.CHIPTRACE_PROJECT_ID,
+      captureRoot: process.env.CHIPTRACE_CAPTURE_ROOT,
+      binary: process.env.CHIPTRACE_BIN || 'chiptrace',
+      backend,
+      objectRoot: process.env.CHIPTRACE_OBJECT_ROOT,
+      prefix: process.env.CHIPTRACE_OBJECT_PREFIX || 'chiptrace',
+      endpoint: process.env.CHIPTRACE_OBJECT_ENDPOINT,
+      bucket: process.env.CHIPTRACE_OBJECT_BUCKET,
+      region: process.env.CHIPTRACE_OBJECT_REGION,
+      token: process.env.CHIPTRACE_PLATFORM_TOKEN,
+      concurrency: Number(process.env.CHIPTRACE_JOB_CONCURRENCY || '2'),
+      maxQueuedJobs: Number(process.env.CHIPTRACE_MAX_QUEUED_JOBS || '128'),
+      maxJobs: Number(process.env.CHIPTRACE_MAX_JOBS || '10000'),
+      maxUsageBytes: Number(process.env.CHIPTRACE_MAX_USAGE_BYTES || String(64 * 1024 * 1024)),
+      maxOutputBytes: Number(process.env.CHIPTRACE_MAX_OUTPUT_BYTES || String(64 * 1024 * 1024)),
+      maxTurnBytes: Number(process.env.CHIPTRACE_MAX_TURN_BYTES || String(64 * 1024 * 1024)),
+      jobTimeoutMs: Number(process.env.CHIPTRACE_JOB_TIMEOUT_MS || String(60 * 60 * 1000)),
+    }).then(app => {
+      app.server.listen(Number(process.env.CHIPTRACE_PLATFORM_PORT || '18086'), process.env.CHIPTRACE_PLATFORM_HOST || '127.0.0.1', () => {
+        process.stdout.write(`${JSON.stringify({ event: 'platform_ready', port: app.server.address().port })}\n`);
+      });
+      for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => app.close().then(() => process.exit(0)));
+    }).catch(error => { process.stderr.write(`${error.message}\n`); process.exitCode = 1; });
+  }
 }
 
 module.exports = { createPlatformHandler, createPlatformServer };
