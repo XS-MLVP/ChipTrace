@@ -1,6 +1,6 @@
 //! Exact native Turn attribution for OTLP records. Never join by time or position.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -649,11 +649,12 @@ pub(crate) fn visit_otlp_envelope(
     raw: &Value,
     mut visit: impl FnMut(&'static str, &Value, BTreeMap<String, String>) -> Result<()>,
 ) -> Result<()> {
-    let (source, resources, scopes, records) = match endpoint {
-        "otlp_logs" => ("otlp_logs", "resourceLogs", "scopeLogs", "logRecords"),
-        "otlp_traces" => ("otlp_traces", "resourceSpans", "scopeSpans", "spans"),
-        _ => return Ok(()),
+    let Some((source, resources, scopes, records)) = otlp_fields(endpoint) else {
+        return Ok(());
     };
+    // A malformed sibling must not disappear from the source audit merely
+    // because filter_map/as_array can still traverse the well-shaped subset.
+    validate_otlp_structure(endpoint, raw)?;
     for resource in raw
         .get(resources)
         .and_then(Value::as_array)
@@ -678,6 +679,59 @@ pub(crate) fn visit_otlp_envelope(
                 let mut merged = scoped.clone();
                 merged.extend(attributes(record.get("attributes"))?);
                 visit(source, record, merged)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn otlp_fields(endpoint: &str) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
+    match endpoint {
+        "otlp_logs" => Some(("otlp_logs", "resourceLogs", "scopeLogs", "logRecords")),
+        "otlp_traces" => Some(("otlp_traces", "resourceSpans", "scopeSpans", "spans")),
+        _ => None,
+    }
+}
+
+fn optional_otlp_array<'a>(value: Option<&'a Value>, path: &str) -> Result<&'a [Value]> {
+    match value {
+        // Omitted repeated fields and protobuf JSON null both mean empty.
+        None | Some(Value::Null) => Ok(&[]),
+        Some(Value::Array(items)) => Ok(items),
+        Some(_) => bail!("OTLP {path} must be an array"),
+    }
+}
+
+/// Validate the message containers before counting or assigning any records.
+/// Errors include only structural paths, never the rejected field's contents.
+pub(crate) fn validate_otlp_structure(endpoint: &str, raw: &Value) -> Result<()> {
+    let Some((_, resources, scopes, records)) = otlp_fields(endpoint) else {
+        return Ok(());
+    };
+    let resources_array = raw
+        .get(resources)
+        .and_then(Value::as_array)
+        .with_context(|| format!("OTLP body requires {resources} array"))?;
+    for (resource_index, resource) in resources_array.iter().enumerate() {
+        if !resource.is_object() {
+            bail!("OTLP {resources}[{resource_index}] must be an object");
+        }
+        let scope_path = format!("{resources}[{resource_index}].{scopes}");
+        for (scope_index, scope) in optional_otlp_array(resource.get(scopes), &scope_path)?
+            .iter()
+            .enumerate()
+        {
+            if !scope.is_object() {
+                bail!("OTLP {scope_path}[{scope_index}] must be an object");
+            }
+            let record_path = format!("{scope_path}[{scope_index}].{records}");
+            for (record_index, record) in optional_otlp_array(scope.get(records), &record_path)?
+                .iter()
+                .enumerate()
+            {
+                if !record.is_object() {
+                    bail!("OTLP {record_path}[{record_index}] must be an object");
+                }
             }
         }
     }
@@ -725,6 +779,58 @@ mod tests {
         let mut raw = json!({});
         raw[resources] = json!([resource]);
         batch(endpoint, raw)
+    }
+
+    #[test]
+    fn malformed_otlp_sibling_cannot_be_skipped_by_source_auditing() {
+        for (endpoint, resources, scopes, records) in [
+            ("otlp_logs", "resourceLogs", "scopeLogs", "logRecords"),
+            ("otlp_traces", "resourceSpans", "scopeSpans", "spans"),
+        ] {
+            let private = json!({"private":"BODY_MUST_NOT_APPEAR_IN_DIAGNOSTICS"});
+            for raw in [
+                json!({}),
+                json!({resources:private}),
+                json!({resources:null}),
+                json!({resources:[{scopes:[{records:[{}]}]},null]}),
+                json!({resources:[{scopes:[{records:[{}]}]},{scopes:private}]}),
+                json!({resources:[{scopes:[{records:[{}]},null]}]}),
+                json!({resources:[{scopes:[{records:[{}]}]}, {scopes:[{records:private}]}]}),
+                json!({resources:[{scopes:[{records:[{},null]}]}]}),
+                json!({resources:[{scopes:[{records:[{},"BODY_MUST_NOT_APPEAR_IN_DIAGNOSTICS"]}]}]}),
+            ] {
+                let mut visited = 0;
+                let error = visit_otlp_envelope(endpoint, &raw, |_, _, _| {
+                    visited += 1;
+                    Ok(())
+                })
+                .expect_err("source auditing must not accept only the well-shaped subset");
+                assert_eq!(visited, 0);
+                assert!(!error.to_string().contains("BODY_MUST"));
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_null_and_empty_optional_otlp_arrays_do_not_invent_records() {
+        for (endpoint, resources, scopes, records) in [
+            ("otlp_logs", "resourceLogs", "scopeLogs", "logRecords"),
+            ("otlp_traces", "resourceSpans", "scopeSpans", "spans"),
+        ] {
+            for raw in [
+                json!({resources:[]}),
+                json!({resources:[{},{scopes:null},{scopes:[]},
+                    {scopes:[{},{records:null},{records:[]}]}]}),
+            ] {
+                let mut visited = 0;
+                visit_otlp_envelope(endpoint, &raw, |_, _, _| {
+                    visited += 1;
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(visited, 0);
+            }
+        }
     }
 
     #[test]

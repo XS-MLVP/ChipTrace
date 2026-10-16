@@ -7,13 +7,15 @@ const http = require('node:http');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+const { execFile, spawn } = require('node:child_process');
+const { promisify } = require('node:util');
 const test = require('node:test');
 const { DurableCaptureOutbox } = require('./durable-outbox');
 
 const binary = process.env.CHIPTRACE_BIN || path.resolve(__dirname, '../../target/debug/chiptrace');
 const token = 'synthetic-wire-receipt-credential-at-least-32-bytes';
 const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
+const run = promisify(execFile);
 
 async function reservePort() {
   const server = net.createServer();
@@ -34,6 +36,96 @@ function start(args) {
   });
   return handle;
 }
+
+test('malformed OTLP siblings fail HTTP and source auditing without losing either WAL',
+  { timeout: 30000 }, async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-otlp-shape-'));
+    let collector;
+    let relay;
+    let passed = false;
+    t.after(async () => {
+      if (relay) await stop(relay);
+      if (collector) await stop(collector);
+      if (passed && process.env.CHIPTRACE_RECEIPT_KEEP !== '1') await fs.rm(root, { recursive: true, force: true });
+      else t.diagnostic(`isolated OTLP shape evidence retained: ${root}`);
+    });
+    const collectorUrl = `http://127.0.0.1:${await reservePort()}`;
+    const collectorArgs = ['collector', '--host', '127.0.0.1', '--port', new URL(collectorUrl).port,
+      '--root', path.join(root, 'collector'), '--state-root', path.join(root, 'collector-state')];
+    collector = start(collectorArgs);
+    await health(collectorUrl, collector);
+    const relayUrl = `http://127.0.0.1:${await reservePort()}`;
+    const relayArgs = ['relay', '--host', '127.0.0.1', '--port', new URL(relayUrl).port,
+      '--root', path.join(root, 'relay'), '--state-root', path.join(root, 'relay-state'),
+      '--delivery-state-root', path.join(root, 'delivery'), '--collector-url', collectorUrl];
+    relay = start(relayArgs);
+    await health(relayUrl, relay);
+    const expected = new Map();
+    const marker = 'PRIVATE_MALFORMED_BODY_MUST_NOT_APPEAR_IN_DIAGNOSTICS';
+    const attr = (key, value) => ({ key, value: { stringValue: value } });
+    for (const endpoint of ['logs', 'traces']) {
+      const resources = endpoint === 'logs' ? 'resourceLogs' : 'resourceSpans';
+      const scopes = endpoint === 'logs' ? 'scopeLogs' : 'scopeSpans';
+      const records = endpoint === 'logs' ? 'logRecords' : 'spans';
+      const envelope = { [resources]: [{ [scopes]: [{ [records]: [{ name: 'codex.turn', attributes: [
+        attr('event.name', 'codex.user_prompt'), attr('conversation.id', 'native-session'),
+        attr('turn.id', 'native-turn'), attr('test.utf8', '中文 🧪'),
+      ] }] }] }, { [scopes]: [{ [records]: { private: marker } }] }] };
+      const body = JSON.stringify(envelope, null, 2) + '\n';
+      expected.set(digest(Buffer.from(body)), body);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await fetch(`${relayUrl}/otel/v1/${endpoint}`, { method: 'POST',
+          headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+          body, signal: AbortSignal.timeout(5000) });
+        const receipt = await response.json();
+        assert.equal(response.status, 400, 'a well-shaped record must not hide its malformed sibling');
+        assert.equal(receipt.ok, false);
+        assert.equal(receipt.durable, true);
+        assert.equal(receipt.local_durable, true);
+        assert.equal(receipt.reason, 'cloud_ingest_quality_error');
+        assert.equal(receipt.captures, 1);
+        assert.equal(receipt.duplicates, attempt);
+        assert.equal(receipt.summary.source_records, 1);
+        assert.equal(receipt.summary.derived_captures, 0);
+        assert.equal(receipt.summary.conversion_errors.length, 1);
+        assert.equal(receipt.unattributed_quality_errors, 1);
+        assert.ok(!JSON.stringify(receipt).includes(marker));
+      }
+    }
+    const delivered = await health(relayUrl, relay,
+      h => h.delivered === 2 && h.pending === 0 && h.inflight === 0);
+    assert.equal(delivered.conservation_ok, true);
+    assert.equal(delivered.ingest_coverage.quality_errors, 4);
+    await health(collectorUrl, collector, h => h.collector.captures === 2);
+    for (const url of [relayUrl, collectorUrl]) {
+      const response = await fetch(`${url}/flush`, { method: 'POST',
+        headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(5000) });
+      assert.equal(response.ok, true);
+    }
+    const relayRaw = await sealedRecords(path.join(root, 'relay'));
+    const collectorRaw = await sealedRecords(path.join(root, 'collector'));
+    assert.equal(collectorRaw.size, 2);
+    assert.deepEqual(collectorRaw, relayRaw);
+    for (const { record } of collectorRaw.values()) {
+      const batch = record.telemetryBatch;
+      assert.equal(batch.raw_json, expected.get(batch.raw_sha256));
+      assert.equal(batch.raw_bytes, Buffer.byteLength(batch.raw_json));
+      assert.equal(batch.raw_sha256, digest(Buffer.from(batch.raw_json)));
+    }
+    const audit = () => run(binary, ['audit-session-context', '--input', path.join(root, 'collector'),
+      '--session-id', 'native-session', '--sample-limit', '0'], { maxBuffer: 1024 * 1024 });
+    await assert.rejects(audit, error => error.code === 1
+      && /OTLP.*must be an array/.test(error.stderr) && !error.stderr.includes(marker));
+    assert.equal((await stop(relay)).code, 0);
+    assert.equal((await stop(collector)).code, 0);
+    collector = start(collectorArgs);
+    await health(collectorUrl, collector, h => h.collector.captures === 2);
+    relay = start(relayArgs);
+    await health(relayUrl, relay, h => h.delivered === 2 && h.conservation_ok);
+    await assert.rejects(audit, { code: 1 });
+    assert.deepEqual(await sealedRecords(path.join(root, 'collector')), collectorRaw);
+    passed = true;
+  });
 
 test('cloud ingest reports duplicate context conflicts after preserving exact Raw in both WALs',
   { timeout: 30000 }, async t => {

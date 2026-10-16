@@ -1,26 +1,27 @@
 # 生产就绪评估
 
-评估日期：2026-10-16。最新线上只读快照为 07:10（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-16。最新线上只读快照为 08:01（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-07:10 的本机回环只读快照中，18084、3011（Collector）、3012（Relay）均返回 200，
-Collector/Relay 仍为 `fe9fcf9`；Relay 累计投递为 1,117,321，pending/inflight/failed
+08:01 的本机回环只读快照中，18084、3011（Collector）、3012（Relay）均返回 200，
+Collector/Relay 仍为 `fe9fcf9`；Collector Capture 与 Relay 累计投递均为 1,120,574，pending/inflight/failed
 均为 0，计数守恒。
 这只是瞬时队列状态，不构成持续 SLO 或完整 Session 的证明。Wire 仍只有 1 条且已约
-20.4 小时未更新，覆盖为 `degraded`；18086 连接拒绝。使用两个 `/health` URL 的
+21.3 小时未更新，覆盖为 `degraded`；18086 连接拒绝。使用两个 `/health` URL 的
 runtime gate 真实退出 1，明确
 报告 `stale_sources=wire`。
-上一轮观察到模型探针最后可用时间为 10 月 8 日、网关 trace exporter 未启用；本次未复验这两项。
-同轮文件元数据统计中，745 个 sealed Segment 共 89,521,805,706 bytes
+网关独立 trace exporter 的 `enabled=false`；Full Trace Raw Capture 仍为启用状态。
+上一轮观察到模型探针最后可用时间为 10 月 8 日，本次未复验模型探针。
+同轮文件元数据统计与 Collector health 一致：746 个 sealed Segment 共 90,032,483,679 bytes
 保存在共享 NFS；此观测不证明已提交目标 OSS。当前状态应区分为传输进程存活、完整
 业务链路未验收和在线交付入口不可用。
 
-完整 CLI 基线 `429206c` 的 [CI run 38822474420](https://github.com/XS-MLVP/ChipTrace/actions/runs/38822474420)
+原生 Raw FS/S3 基线 `4e6c177` 的 [CI run 38826013418](https://github.com/XS-MLVP/ChipTrace/actions/runs/38826013418)
 已独立确认 6/6 作业成功，17 个 artifact 元数据有效；未下载正文重新计算哈希。
 固定正式版的生产者回归、五场景完整 CLI 采集、官方原版拒绝诊断、受管路由、容器
-及存储作业均实际执行。该提交的原生平台联测使用 FS；它不证明线上已升级，也不能
-替代后续同一 Raw 的 FS/S3 联测改动对应提交的远端 CI。
+及存储作业均实际执行；五项新采集的同一 Raw 已分别走 FS 和私有 MinIO S3，报告检查也
+实际执行。它不证明线上已升级，也不能替代后续修复对应提交的远端 CI。
 
 ## 官方正式版 0.163.0 的新采集
 
@@ -80,6 +81,28 @@ FS/S3 重启前后四次下载的完整 Buyer Session JSONL 已独立核对字�
 Node 测试通过；三项 RSS 默认忽略，仍须由独立 CI 门禁执行。MinIO multipart/损坏
 拒绝回归另行通过。这仍是带补丁生产者、合成模型和隔离 S3，不证明目标阿里 OSS、
 未修改生产者或线上授权交付已验收。
+
+## 同批 OTLP 结构错误的拒绝
+
+隔离 HTTP 回归实际复现：同批一个正常日志旁的 `logRecords` 被写成对象时，旧 Relay
+返回 200、`source_records=1`、`conversion_errors=[]`，来源审计也跳过异常同批结构。
+两个新增 Rust 回归先真实失败；失败请求的 Relay/Collector 原始 WAL 均保留。
+
+共享遍历器现在先检查资源、Scope 和记录数组及其元素，结构错误使来源审计拒绝。
+入口保留精确 Raw 和仍可读取的派生工具结果，记录不可归属的结构错误，再由现有持久
+确认逻辑返回 HTTP 400。可选数组缺省、null 或为空时仍表示零条记录；诊断只含字段路径，
+不展开错误字段正文。两端日志/Trace 的重复请求、WAL 字节、重启恢复和实际 CLI 拒绝
+均已通过；此前误接受的同一份 Raw 只读重放现真实退出 1，原始 SHA-256 不变。
+
+本轮完整 `cloud-test` 实际退出 0：fmt/Clippy、316 个 Rust 库测试、1 个 CLI 测试和
+285 个 Node 测试通过；三项 RSS 默认忽略，继续由独立 CI 门禁执行。受限容器作业也
+纳入相同 HTTP/WAL 回归；其远端结果仍须核对本修复对应的提交。这是未部署的结构完整性
+修复，不证明真实上游、目标 OSS 或线上逐 Turn 采集已验收。
+
+修复后的引擎另完成五项新的完整 CLI 采集，实际 5/5、无跳过；同一 Raw 的 FS/S3
+报告检查通过，全部来源分类守恒且未知 Session/未归属 Turn 均为 0。正向 Buyer 下载
+仍为 score=100，FS/S3 与重启后完整 Session JSONL 的字节/SHA 一致；混合模型和取消/
+断流继续拒绝采购，压缩样本不冒称满足采购准入。生产者补丁和合成模型身份均未改变。
 
 ## 平台状态验收
 
@@ -319,14 +342,14 @@ parts，2 Turn、8 模型交互、6 工具记录不变，Raw SHA-256 一致。
 | --- | --- | --- |
 | 18084、3011、3012 | HTTP 200 | 入口与采集进程存活 |
 | Collector/Relay | revision `fe9fcf924b226099202cb770b7cf0da29e0c2310` | 运行版本已固定；仓库新增修复尚未部署 |
-| 投递 | 05:05 Collector Capture/Relay 投递均为 1,108,870，pending/inflight/failed 均为 0，计数守恒 | 瞬时传输状态；不是持续 SLO 或完整 Session 数 |
-| Collector 磁盘 | 03:15 有 741 个 sealed Segment，87,431,090,167 bytes | 云端共享 NFS 上的 WAL 持续保存；不能证明 OSS 已提交 |
-| Wire | 新进程内仅 1 条；活动 WAL 中为无原生 Session/Turn 的 HTTP 403 | 无真实成功 Turn Wire 的证据 |
-| 来源新鲜度 | 05:05 Wire 约 18.4 小时未更新；覆盖 `degraded`；runtime gate 因 `stale_sources=wire` 退出 1 | 当前采集覆盖降级 |
+| 投递 | 08:01 Collector Capture/Relay 投递均为 1,120,574，pending/inflight/failed 均为 0，计数守恒 | 瞬时传输状态；不是持续 SLO 或完整 Session 数 |
+| Collector 磁盘 | 08:01 有 746 个 sealed Segment，90,032,483,679 bytes | 云端共享 NFS 上的 WAL 持续保存；不能证明 OSS 已提交 |
+| Wire | 当前进程内仅 1 条，最后更新为 10 月 15 日 10:43（Asia/Shanghai） | 无近期真实成功 Turn Wire 的证据 |
+| 来源新鲜度 | 08:01 Wire 约 21.3 小时未更新；覆盖 `degraded`；runtime gate 因 `stale_sources=wire` 退出 1 | 当前采集覆盖降级 |
 | 历史失败 | 293 个文件，267,219,223 bytes | 保留失败取证，不能删除换取健康状态 |
 | 平台 18086 | 无法连接 | 当前无法交接在线管理、导出入口 |
 | 部署隔离 | 本轮只读复查：两容器均为旧镜像、绑定 loopback，有 `unless-stopped` 重启策略，CPU/内存/PID 无上限，根文件系统可写 | 有内部入口保护；尚缺资源配额与只读隔离 |
-| GitHub CI | 已核验基线 `08cadf5`：[run 38803206117](https://github.com/XS-MLVP/ChipTrace/actions/runs/38803206117) 已确认成功；5/5 作业、16 份有效报告元数据 | 包括独立手动压缩、原生采集到 Buyer 下载的正向与拒绝回归、独立 RSS 门禁；使用带补丁生产者和合成模型，未下载报告正文；新增自动压缩修复仍需对应提交的 CI |
+| GitHub CI | 已核验基线 `4e6c177`：[run 38826013418](https://github.com/XS-MLVP/ChipTrace/actions/runs/38826013418) 已确认成功；6/6 作业、17 份有效报告元数据 | 包括五场景新采集的 FS/S3 贯通、独立 RSS 门禁和官方原版拒绝诊断；使用带补丁生产者和合成模型，未下载报告正文；后续修复仍需对应提交的 CI |
 | GitHub 集成 | 远端 main 仍为 `514d4cf`，公共分支 API 返回 `protected=false`；维护分支修复尚未合并 | 需设置评审和必需检查约束、完成同 SHA 验证及受控发布；分支 CI 不等于部署 |
 
 11:26 复查时三个既有服务仍返回 HTTP 200，Relay 已投递 1,036,522 条，pending 为 1、

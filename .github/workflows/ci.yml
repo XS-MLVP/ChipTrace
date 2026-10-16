@@ -447,7 +447,7 @@ jobs:
           path: gateway-outbox.tap
       - name: Build the CLI used by native Hook and platform regressions
         run: cargo build --locked --bin chiptrace
-      - name: Verify delivery receipts, tool namespace provenance and exact OTLP Raw
+      - name: Verify delivery receipts, malformed OTLP refusal, tool provenance and exact Raw
         run: |
           set -euo pipefail
           node --test integrations/openai-gateway/relay-receipt.test.js 2>&1 | tee gateway-receipt.tap
@@ -638,7 +638,7 @@ jobs:
           '
       - name: Build cloud platform image
         run: docker build --target platform --build-arg CHIPTRACE_REVISION="$GITHUB_SHA" -t chiptrace-platform:ci .
-      - name: Verify tool provenance and Raw delivery through container Relay and Collector
+      - name: Verify malformed OTLP refusal, tool provenance and Raw delivery through container Relay and Collector
         run: |
           set -euo pipefail
           # Keep the outbox's production 5 GiB free-space floor enabled.
