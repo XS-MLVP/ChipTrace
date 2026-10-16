@@ -81,8 +81,9 @@ Stop 和四源存在也拒绝完整交付，原始失败证据保留。验证范
 gate 的 Wire/Hook 缺失正是该风险的可观测结果。
 仓库 runtime gate v3 另要求近期有明确 Session/Turn、无上下文冲突的 HTTP 2xx Wire，
 并拒绝缺少该统计的旧 Relay；重复投递不能刷新这类证据。完整评估和发布条件见
-[生产就绪评估](docs/production-readiness.md)。该门禁已部署到 `30f6d243`，当前真实失败仍须在
-受管 Provider 和完整 Hook 生效后重新验收。
+[生产就绪评估](docs/production-readiness.md)。维护分支包含该门禁；线上是否生效必须用实际
+部署 revision 运行 runtime gate 核对，不能按分支或历史提交号推断。当前真实失败仍须在受管
+Provider 和完整 Hook 生效后重新验收。
 
 ## 构建
 
