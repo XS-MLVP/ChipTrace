@@ -39,12 +39,24 @@ function inspect() {
 }
 
 test('Gateway preflight accepts immutable isolated full-trace configuration', () => {
-  const result = validateGatewayInspect(inspect());
+  const result = validateGatewayInspect(inspect(), { expectedRevision: 'f'.repeat(40) });
   assert.equal(result.schema_version, 'chiptrace.gateway-preflight.v1');
   assert.equal(result.ok, true);
+  assert.equal(result.expected_revision, 'f'.repeat(40));
   assert.equal(result.full_trace_capture_enabled, true);
   assert.equal(result.body_capture_enabled, true);
   assert.equal(Object.hasOwn(result, 'ingest_token'), false);
+});
+
+test('Gateway preflight rejects a revision that is not the release revision', () => {
+  assert.throws(
+    () => validateGatewayInspect(inspect(), { expectedRevision: 'e'.repeat(40) }),
+    /Gateway OCI revision must equal/,
+  );
+  assert.throws(
+    () => validateGatewayInspect(inspect(), { expectedRevision: 'short' }),
+    /expected Gateway revision must be a full Git SHA/,
+  );
 });
 
 test('Gateway preflight rejects mutable images and missing isolation', () => {

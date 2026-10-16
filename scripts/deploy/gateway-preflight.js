@@ -31,7 +31,7 @@ function requireEnvironment(values, name, expected) {
   if (expected !== undefined) assert.equal(value, expected, `${name} must equal ${expected}`);
 }
 
-function validateGatewayInspect(info) {
+function validateGatewayInspect(info, { expectedRevision } = {}) {
   assert.ok(info && typeof info === 'object' && !Array.isArray(info), 'docker inspect result must be an object');
   const config = info.Config;
   const host = info.HostConfig;
@@ -73,12 +73,19 @@ function validateGatewayInspect(info) {
 
   const revision = config.Labels?.['org.opencontainers.image.revision'];
   assert.match(revision || '', REVISION_PATTERN, 'Gateway OCI revision must be a full Git SHA');
+  if (expectedRevision !== undefined) {
+    assert.match(expectedRevision, REVISION_PATTERN,
+      'expected Gateway revision must be a full Git SHA');
+    assert.equal(revision, expectedRevision,
+      `Gateway OCI revision must equal ${expectedRevision}`);
+  }
   return {
     schema_version: 'chiptrace.gateway-preflight.v1',
     ok: true,
     image: config.Image,
     image_id: info.Image,
     revision,
+    expected_revision: expectedRevision ?? null,
     user: config.User,
     read_only: host.ReadonlyRootfs,
     nano_cpus: host.NanoCpus,
@@ -91,21 +98,38 @@ function validateGatewayInspect(info) {
   };
 }
 
-async function inspectContainer(name) {
+async function inspectContainer(name, options = {}) {
   assert.match(name || '', /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/, 'container name is invalid');
   const { stdout } = await run('docker', ['inspect', name], {
     maxBuffer: 4 * 1024 * 1024,
   });
   const values = JSON.parse(stdout);
   assert.ok(Array.isArray(values) && values.length === 1, 'docker inspect must return one container');
-  return validateGatewayInspect(values[0]);
+  return validateGatewayInspect(values[0], options);
 }
 
 async function main(argv = process.argv.slice(2)) {
-  if (argv.length !== 2 || argv[0] !== '--container') {
-    throw new Error('usage: gateway-preflight.js --container CONTAINER');
+  let name;
+  let expectedRevision;
+  for (let index = 0; index < argv.length; index += 1) {
+    const flag = argv[index];
+    const value = argv[index + 1];
+    if (!value || (flag !== '--container' && flag !== '--expected-revision')) {
+      throw new Error('usage: gateway-preflight.js --container CONTAINER [--expected-revision SHA]');
+    }
+    if (flag === '--container') {
+      if (name !== undefined) throw new Error('usage: gateway-preflight.js --container CONTAINER [--expected-revision SHA]');
+      name = value;
+    } else {
+      if (expectedRevision !== undefined) throw new Error('usage: gateway-preflight.js --container CONTAINER [--expected-revision SHA]');
+      expectedRevision = value;
+    }
+    index += 1;
   }
-  const result = await inspectContainer(argv[1]);
+  if (name === undefined) {
+    throw new Error('usage: gateway-preflight.js --container CONTAINER [--expected-revision SHA]');
+  }
+  const result = await inspectContainer(name, { expectedRevision });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   return result;
 }

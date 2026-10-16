@@ -1,24 +1,26 @@
 # 生产就绪评估
 
-评估日期：2026-10-17。最新线上只读快照为 00:58（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
-结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
+评估日期：2026-10-17。最新线上只读快照为 04:06（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-本次复核（2026-10-17 00:58，Asia/Shanghai）发现维护提交 `11ff05c1211debc167f75633940c9656c1290073`
-已运行在 Collector/Relay，Collector 与 Relay 的累计计数约为 `1,181,292`，队列曾出现 1 条待处理记录且
-传输失败为零；这只证明传输闭环存活。带生产门禁参数 `--max-quality-errors 0 --max-historical-failed-files 0`
-的 runtime gate 实际退出 1，报告了 Gateway 的 `293` 个历史失败 outbox 文件（约 267 MB）以及该待处理记录。
-同一快照的 Relay 业务覆盖为 `degraded`：Wire 已约 4,627 秒未刷新，`quality_errors=165` 且全部来自
-`otlp_traces` 转换错误，`successful_turn_scoped_captures=0`，`turn_capture_ready=false`。
-18084 的 trace exporter 仍关闭，Gateway watchdog 仍报告上游访问失败；因此当前服务不能按生产标准
-声称已完成真实 Session/Turn 全量收集。历史失败文件的安全恢复与新鲜 Wire/Provider 修复仍是发布前置条件。
+本次复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
+failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留，Collector/Relay 队列为空且
+`conservation_ok=true`。Collector/Relay 实际 revision 为 `e5237065ff3a48623179c5846ff1916040030c9a`，
+维护分支 HEAD 为 `a4ad64d186cd7f6230fa64f0a1a230dd553de16a`；因此线上未运行本维护分支最新代码。
 
-同一复核中的 Gateway preflight 对实际容器 `router-v2-relay-shell` 真实退出 1，原因是镜像仍使用可变
-标签 `weishaw/claude-relay-service:latest`；容器隔离、资源限制和不可变镜像要求尚未在 18084 生效。
+同一快照的 Relay `ingest_coverage.status=degraded`，`quality_errors=659`（全部来自 `otlp_traces`），
+Wire 已约 44.6 分钟未刷新，`required_sources_fresh=false`、`turn_capture_ready=false`，
+`successful_turn_scoped_captures=279/293`。runtime gate 使用质量错误、新鲜度、历史失败和 revision
+门禁真实退出 1；不能将传输进程健康解释为逐 Session/Turn 交付。
 
-本轮维护分支还把 Relay 质量错误计数写入持久 Delivery ledger，并让 runtime gate 拒绝缺少
-`quality_errors_scope=durable_relay_state` 的旧健康响应；该修复尚未部署到线上，因此线上当前
-进程仍不具备这项历史质量保护。
+18084 trace exporter 当前关闭；平台 18086 `/health` 返回成功且无排队任务，但这只证明平台进程存活。
+Gateway 容器 OCI revision 为 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`，新的 Gateway preflight
+在传入待发布 SHA 后会拒绝该版本。真实 Alibaba OSS、未修改 Stock Codex 的新鲜多轮 Canary 和
+目标 Session 的 `cloud-acceptance` 仍未完成，因此当前服务不满足真实生产发布标准。
+
+本轮维护新增 Gateway revision 对齐护栏和 Platform health gate；本地 `make cloud-test` 已真实退出 0，
+但本地绿色测试不能替代待发布 SHA 的 GitHub Actions、真实 OSS 和生产 Canary 证据。
 
 21:22 的热服务只读复核显示：18084、3011、3012、18086 均返回 HTTP 200；Gateway
 health 为 `healthy`，outbox 的 pending/processing/open 均为 0，最近失败为 0。Collector

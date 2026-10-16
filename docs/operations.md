@@ -52,18 +52,22 @@ docker compose -f deploy/collector-relay.yml up -d --no-build --pull never
 可变镜像 tag、可写根文件系统或无资源上限的容器：
 
 ```bash
-node scripts/deploy/gateway-preflight.js --container <gateway-container>
+node scripts/deploy/gateway-preflight.js \
+  --container <gateway-container> \
+  --expected-revision "$(git rev-parse HEAD)"
 ```
 
-预检只输出镜像摘要、OCI revision、资源限额和挂载/采集开关，不输出环境变量或凭据；失败时
+预检只输出镜像摘要、OCI revision、资源限额和挂载/采集开关，不输出环境变量或凭据；传入
+`--expected-revision` 时还会拒绝 OCI revision 与待发布 Git SHA 不一致的 Gateway。失败时
 不得以重启或清理 outbox 绕过。生产 Gateway 还必须通过同一 runtime gate 的历史失败文件、
 质量错误和新鲜 Turn Wire 门禁。2026-10-17 对实际 `router-v2-relay-shell` 执行该预检已
 返回成功：容器使用只读根、非 root、CPU/内存/PID 限额、`no-new-privileges` 和 durable
 outbox/watchdog 挂载。不过其镜像 OCI revision 仍是
-`e57480eca4fe11769c5fcb8787266ab6b77ce4d5`，而维护分支 HEAD 是 `8ff67da`；本轮 outbox
-修复通过只读工作区 bind mount 注入，尚未形成包含维护分支 SHA 的不可变 Gateway 镜像。
-因此 preflight 通过只证明容器隔离，不能替代发布 revision、runtime gate 和真实
-Session/Turn 验收；这与 HTTP `/health` 返回 200 仍是独立证据。
+`e57480eca4fe11769c5fcb8787266ab6b77ce4d5`，而维护分支 HEAD 是
+`a4ad64d186cd7f6230fa64f0a1a230dd553de16a`；不传预期值的旧预检可以证明隔离，传入维护分支
+SHA 的新预检会真实拒绝该容器。本轮 outbox 修复通过只读工作区 bind mount 注入，尚未形成包含
+维护分支 SHA 的不可变 Gateway 镜像。因此 preflight 通过只证明容器隔离，不能替代发布 revision、
+runtime gate 和真实 Session/Turn 验收；这与 HTTP `/health` 返回 200 仍是独立证据。
 
 18084 对外提供 Responses、`/models`、`/otel/v1/logs`、`/otel/v1/traces` 和
 `/hooks/codex`。Responses 与 `/models` 使用 Provider 业务鉴权，网关使用内部采集凭据读取
@@ -147,8 +151,8 @@ GitHub CI 的 `live-provider-runtime-preflight` 只在手工 `workflow_dispatch`
 `live_preflight=true`、受保护分支/规则集、受保护的 `production-canary` Environment 和标签为
 `self-hosted, linux, chiptrace-canary` 的内网 Runner 上执行。Environment Secret 必须提供
 `CHIPTRACE_API_KEY`；Environment Variables 必须提供
-`CHIPTRACE_RESPONSES_URL`、`CHIPTRACE_GATEWAY_HEALTH_URL`、`CHIPTRACE_RELAY_HEALTH_URL`
-和 `CHIPTRACE_COLLECTOR_HEALTH_URL`。手工输入的 `expected_revision` 必须是 Collector/Relay
+`CHIPTRACE_RESPONSES_URL`、`CHIPTRACE_GATEWAY_HEALTH_URL`、`CHIPTRACE_RELAY_HEALTH_URL`、
+`CHIPTRACE_COLLECTOR_HEALTH_URL` 和 `CHIPTRACE_PLATFORM_HEALTH_URL`。手工输入的 `expected_revision` 必须是 Collector/Relay
 实际构建的完整 Git SHA。普通 push/PR 不接触这些 Secret，也不会因为缺少 Runner 或变量而
 跳过真实预检。该作业只确认 Provider 请求和当前进程 readiness，随后仍须用同一 Session
 执行未修改 Stock Codex 的多轮四源 Canary、OSS 验收和 `cloud-acceptance`。
@@ -156,6 +160,10 @@ Live preflight 还要求 Relay 的 `ingest_coverage.quality_errors` 为 0；该�
 Delivery ledger 恢复，`quality_errors_scope` 必须为 `durable_relay_state`，而
 `quality_errors_current_process` 仅用于区分本次进程新增错误。重启不能把历史错误静默归零；
 若历史错误已存在，应先保留其报告并修复生产者或采集配置，再开始新的 Canary。
+
+Live preflight 同时调用 `scripts/ci/platform-health-gate.js` 检查 18086 的平台版本、持久
+任务计数和存储失败状态。平台健康只证明导出服务进程可用；它不替代目标 Session 的
+`cloud-acceptance`、真实 OSS 上传/下载和 SHA-256 复验。
 
 从旧 Relay 升级时，旧 Delivery ledger 没有质量历史字段。若账本已有投递记录，新版本会拒绝
 启动，直到把升级前的 gate 报告转换为一次性迁移文件；这一步防止升级把已知错误变成零。报告

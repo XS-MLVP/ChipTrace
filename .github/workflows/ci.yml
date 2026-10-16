@@ -46,12 +46,13 @@ jobs:
           CHIPTRACE_GATEWAY_HEALTH_URL: ${{ vars.CHIPTRACE_GATEWAY_HEALTH_URL }}
           CHIPTRACE_RELAY_HEALTH_URL: ${{ vars.CHIPTRACE_RELAY_HEALTH_URL }}
           CHIPTRACE_COLLECTOR_HEALTH_URL: ${{ vars.CHIPTRACE_COLLECTOR_HEALTH_URL }}
+          CHIPTRACE_PLATFORM_HEALTH_URL: ${{ vars.CHIPTRACE_PLATFORM_HEALTH_URL }}
           CHIPTRACE_GATEWAY_CONTAINER: ${{ vars.CHIPTRACE_GATEWAY_CONTAINER }}
           CHIPTRACE_EXPECTED_REVISION: ${{ inputs.expected_revision }}
         run: |
           set -euo pipefail
           test -n "${CHIPTRACE_API_KEY:-}" || { echo 'CHIPTRACE_API_KEY is missing from the protected environment' >&2; exit 1; }
-          for name in CHIPTRACE_RESPONSES_URL CHIPTRACE_GATEWAY_HEALTH_URL CHIPTRACE_RELAY_HEALTH_URL CHIPTRACE_COLLECTOR_HEALTH_URL CHIPTRACE_GATEWAY_CONTAINER CHIPTRACE_EXPECTED_REVISION; do
+          for name in CHIPTRACE_RESPONSES_URL CHIPTRACE_GATEWAY_HEALTH_URL CHIPTRACE_RELAY_HEALTH_URL CHIPTRACE_COLLECTOR_HEALTH_URL CHIPTRACE_PLATFORM_HEALTH_URL CHIPTRACE_GATEWAY_CONTAINER CHIPTRACE_EXPECTED_REVISION; do
             test -n "${!name:-}" || { echo "$name is missing from the protected environment or dispatch input" >&2; exit 1; }
           done
           echo 'protected live preflight configuration is present'
@@ -89,11 +90,23 @@ jobs:
         if: ${{ always() }}
         env:
           CHIPTRACE_GATEWAY_CONTAINER: ${{ vars.CHIPTRACE_GATEWAY_CONTAINER }}
+          CHIPTRACE_EXPECTED_REVISION: ${{ inputs.expected_revision }}
         run: |
           set -euo pipefail
           node scripts/deploy/gateway-preflight.js \
             --container "$CHIPTRACE_GATEWAY_CONTAINER" \
+            --expected-revision "$CHIPTRACE_EXPECTED_REVISION" \
             | tee "$RUNNER_TEMP/gateway-preflight.json"
+      - name: Verify live Platform export service health
+        if: ${{ always() }}
+        env:
+          CHIPTRACE_PLATFORM_HEALTH_URL: ${{ vars.CHIPTRACE_PLATFORM_HEALTH_URL }}
+        run: |
+          set -euo pipefail
+          node scripts/ci/platform-health-gate.js \
+            --platform-url "$CHIPTRACE_PLATFORM_HEALTH_URL" \
+            --report "$RUNNER_TEMP/platform-health.json" \
+            | tee "$RUNNER_TEMP/platform-health.stdout.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -104,6 +117,8 @@ jobs:
             ${{ runner.temp }}/runtime-health.json
             ${{ runner.temp }}/runtime-health.stdout.json
             ${{ runner.temp }}/gateway-preflight.json
+            ${{ runner.temp }}/platform-health.json
+            ${{ runner.temp }}/platform-health.stdout.json
 
   stock-managed-route:
     runs-on: ubuntu-24.04
@@ -624,6 +639,13 @@ jobs:
         with:
           name: runtime-health-gate-report
           path: runtime-health-gate.tap
+      - name: Verify Platform export health gate fails closed
+        run: node --test scripts/ci/platform-health-gate.test.js | tee platform-health-gate.tap
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: platform-health-gate-report
+          path: platform-health-gate.tap
       - name: Verify legacy Relay quality-history migration evidence
         run: node --test scripts/ci/relay-quality-seed.test.js | tee relay-quality-seed.tap
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
