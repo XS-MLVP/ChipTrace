@@ -8,7 +8,7 @@ const path = require('node:path');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const test = require('node:test');
-const { verifyRuntimeHealth } = require('./runtime-health-gate');
+const { healthObservation, verifyRuntimeHealth } = require('./runtime-health-gate');
 
 function gateway() {
   return {
@@ -79,6 +79,11 @@ function relay() {
       otlp_traces: route(9),
       hooks: route(8),
       quality_errors: 0,
+      quality_errors_by_endpoint: {
+        otlp_logs: { unknown_events: 0, conversion_errors: 0, total: 0 },
+        otlp_traces: { unknown_events: 0, conversion_errors: 0, total: 0 },
+        hooks: { unknown_events: 0, conversion_errors: 0, total: 0 },
+      },
     },
   };
 }
@@ -237,6 +242,18 @@ test('live quality-error maximum rejects accumulated source conversion errors', 
     collectorHealth: collector(), maxQualityErrors: 1,
   });
   assert.equal(result.relay.quality_errors, 1);
+});
+
+test('runtime observations preserve endpoint quality-error breakdowns', () => {
+  const value = relay();
+  value.ingest_coverage.quality_errors = 3;
+  value.ingest_coverage.quality_errors_by_endpoint = {
+    otlp_logs: { unknown_events: 1, conversion_errors: 0, total: 1 },
+    otlp_traces: { unknown_events: 0, conversion_errors: 2, total: 2 },
+    hooks: { unknown_events: 0, conversion_errors: 0, total: 0 },
+  };
+  const observed = healthObservation(gateway(), value, collector());
+  assert.deepEqual(observed.relay.coverage.quality_errors_by_endpoint, value.ingest_coverage.quality_errors_by_endpoint);
 });
 
 test('older health with only global Wire traffic fails closed', () => {

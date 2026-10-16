@@ -1260,6 +1260,8 @@ struct RouteCoverage {
     source_records: u64,
     durable_captures: u64,
     duplicates: u64,
+    quality_unknown_events: u64,
+    quality_conversion_errors: u64,
     last_at: Option<String>,
     first_observed_millis: Option<u64>,
     last_observed_millis: Option<u64>,
@@ -1371,10 +1373,17 @@ impl IngestCoverageState {
         route.last_at = Some(utc_now());
         self.lifecycle_events = self.lifecycle_events.saturating_add(lifecycle_events);
         self.tool_executions = self.tool_executions.saturating_add(tool_executions);
+        let conversion_errors = summary.conversion_errors.len() as u64;
         self.quality_errors = self
             .quality_errors
             .saturating_add(summary.unknown_events)
-            .saturating_add(summary.conversion_errors.len() as u64);
+            .saturating_add(conversion_errors);
+        route.quality_unknown_events = route
+            .quality_unknown_events
+            .saturating_add(summary.unknown_events);
+        route.quality_conversion_errors = route
+            .quality_conversion_errors
+            .saturating_add(conversion_errors);
     }
 
     fn snapshot(&self) -> Value {
@@ -1504,6 +1513,11 @@ impl IngestCoverageState {
             "otlp_logs":route_coverage_value(&self.otlp_logs),
             "otlp_traces":route_coverage_value(&self.otlp_traces),
             "hooks":route_coverage_value(&self.hooks),
+            "quality_errors_by_endpoint":{
+                "otlp_logs":route_quality_value(&self.otlp_logs),
+                "otlp_traces":route_quality_value(&self.otlp_traces),
+                "hooks":route_quality_value(&self.hooks),
+            },
             "derived":{
                 "lifecycle_events":self.lifecycle_events,
                 "tool_executions":self.tool_executions,
@@ -1520,6 +1534,16 @@ fn route_coverage_value(route: &RouteCoverage) -> Value {
         "durable_captures":route.durable_captures,
         "duplicates":route.duplicates,
         "last_at":route.last_at,
+    })
+}
+
+fn route_quality_value(route: &RouteCoverage) -> Value {
+    json!({
+        "unknown_events":route.quality_unknown_events,
+        "conversion_errors":route.quality_conversion_errors,
+        "total":route
+            .quality_unknown_events
+            .saturating_add(route.quality_conversion_errors),
     })
 }
 
@@ -2641,6 +2665,14 @@ mod tests {
         assert_eq!(coverage["wire"]["requests"], 1);
         assert_eq!(coverage["wire"]["durable_captures"], 1);
         assert_eq!(coverage["quality_errors"], 1);
+        assert_eq!(
+            coverage["quality_errors_by_endpoint"]["otlp_logs"]["total"],
+            1
+        );
+        assert_eq!(
+            coverage["quality_errors_by_endpoint"]["otlp_traces"]["total"],
+            0
+        );
         assert_eq!(coverage["buyer_eligibility_claimed"], false);
         relay.close().await.unwrap();
     }

@@ -69,7 +69,21 @@ function routeObservation(route) {
     source_records: safeInteger(route.source_records),
     durable_captures: safeInteger(route.durable_captures),
     duplicates: safeInteger(route.duplicates),
+    quality: {
+      unknown_events: safeInteger(route.quality?.unknown_events),
+      conversion_errors: safeInteger(route.quality?.conversion_errors),
+      total: safeInteger(route.quality?.total),
+    },
     last_at: safeTimestamp(route.last_at),
+  };
+}
+
+function qualityErrorObservation(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return {
+    unknown_events: safeInteger(value.unknown_events),
+    conversion_errors: safeInteger(value.conversion_errors),
+    total: safeInteger(value.total),
   };
 }
 
@@ -120,6 +134,11 @@ function healthObservation(gateway, relay, collector) {
         otlp_traces: routeObservation(coverage?.otlp_traces),
         hooks: routeObservation(coverage?.hooks),
         quality_errors: safeInteger(coverage?.quality_errors),
+        quality_errors_by_endpoint: {
+          otlp_logs: qualityErrorObservation(coverage?.quality_errors_by_endpoint?.otlp_logs),
+          otlp_traces: qualityErrorObservation(coverage?.quality_errors_by_endpoint?.otlp_traces),
+          hooks: qualityErrorObservation(coverage?.quality_errors_by_endpoint?.hooks),
+        },
         wire_turn_coverage: {
           turn_scoped_captures: safeInteger(turnCoverage?.turn_scoped_captures),
           successful_turn_scoped_captures: safeInteger(turnCoverage?.successful_turn_scoped_captures),

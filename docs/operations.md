@@ -256,6 +256,9 @@ Relay/Collector 的精确 Raw、重复确认、平台归档/恢复、Turn 和采
 - `ingest_coverage.turn_capture_ready` 必须为 `true` 才能把进程交给新的真实 Canary；
   `false` 只表示当前进程缺少就绪证据，不代表已有 Raw 可以补造为完整 Session。
 - `output_truncated=true`、未知 OTLP 事件、转换错误和身份冲突。
+- `ingest_coverage.quality_errors_by_endpoint` 用于区分 `otlp_logs`、`otlp_traces` 和 `hooks`
+  的 `unknown_events`、`conversion_errors` 与总数；总数必须和进程级 `quality_errors` 对账，
+  不能用重启静默清零。先保留失败快照，再修正生产者或采集配置。
 - Session start/end、模型调用/结果/执行、内部父引用的完整率；以及每个 Turn 的 Wire、
   OTLP logs、OTLP traces、required Hook 覆盖和 `incomplete_turns`。
 - Buyer v7 失败原因、合格 Session 数和四种 Token 口径。
@@ -304,7 +307,7 @@ Wire 停止时返回 `freshness_applicable=false`，都会失败；历史失败�
 不会被当作当前失败清理。
 传入 `--report` 时，成功结果写入完整门禁摘要；失败结果写入一次性、0600 的
 `chiptrace.runtime-health-observation.v1` 快照。快照只包含版本、计数、队列、来源新鲜度、
-Turn Wire 统计和错误类别，不包含健康 URL、Raw、对话正文、工具参数、凭据或任意错误字段；
+按端点质量错误分解、Turn Wire 统计和错误类别，不包含健康 URL、Raw、对话正文、工具参数、凭据或任意错误字段；
 目标路径必须事先不存在，避免覆盖事故证据。即使 Collector/Relay 探测失败，也会留下
 `failure_kind=fetch_failed` 的最小快照。
 重放失败证据时只能复制到 `pending`（不要移动或删除 `failed` 原件），确认 Relay durable
