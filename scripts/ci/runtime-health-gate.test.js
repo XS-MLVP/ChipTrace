@@ -231,6 +231,28 @@ test('runtime health gate requires fresh scoped HTTP success without claiming Se
   assert.equal(result.collector.build_revision, relay().build.revision);
 });
 
+test('production gate can refuse retained historical Gateway outbox failures', () => {
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), relay(), {
+      collectorHealth: collector(),
+      maxHistoricalFailedFiles: 0,
+    }),
+    /gateway outbox historical failed files exceed the configured maximum \(observed=3; maximum=0\)/,
+  );
+  const result = verifyRuntimeHealth(gateway(), relay(), {
+    collectorHealth: collector(),
+    maxHistoricalFailedFiles: 3,
+  });
+  assert.equal(result.gateway.historical_failed_files, 3);
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), relay(), {
+      collectorHealth: collector(),
+      maxHistoricalFailedFiles: -1,
+    }),
+    /max historical failed files must be a non-negative integer/,
+  );
+});
+
 test('live quality-error maximum rejects accumulated source conversion errors', () => {
   const value = relay();
   value.ingest_coverage.quality_errors = 1;

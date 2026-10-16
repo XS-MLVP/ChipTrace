@@ -16,6 +16,11 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
+当前线上复核（2026-10-16 23:54，Asia/Shanghai）仅确认 Collector/Relay 传输闭环健康；
+维护 revision `11ff05c` 的 runtime gate 因 293 个历史失败 outbox 文件、36 个 OTLP trace
+转换错误、过期 Wire 和 0 个成功的 Turn-scoped Wire 而失败。服务尚未达到对外承诺真实
+Session/Turn 全量收集的发布条件，详见[生产就绪评估](docs/production-readiness.md)。
+
 ## 主线
 
 ```mermaid

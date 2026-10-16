@@ -253,7 +253,8 @@ async function main({ runtimeImage, platformImage, revision, reportPath }) {
     const runtimeGate = async (collectorUrl = `${urls.collector}/health`) => {
       const result = await run(process.execPath, [require.resolve('./runtime-health-gate'),
         '--gateway-url', `${fixtureUrl}/gateway`, '--relay-url', `${urls.relay}/health`,
-        '--collector-url', collectorUrl, '--expected-revision', revision],
+        '--collector-url', collectorUrl, '--expected-revision', revision,
+        '--max-historical-failed-files', '0'],
       { env: environment, timeout: 10000, maxBuffer: 128 * 1024 });
       return JSON.parse(result.stdout);
     };

@@ -269,6 +269,9 @@ Relay/Collector 的精确 Raw、重复确认、平台归档/恢复、Turn 和采
 `historicalFailures` 是启动前保留的审计证据，不应因
 数量非零而清理或把服务标成故障。旧版本在正文脱敏后可能留下过期的 body 长度/哈希；当前
 outbox 会在新写入和发送历史副本前按实际 UTF-8 正文幂等重算元数据，并保留已有的原文哈希。
+生产发布门禁可以用 `--max-historical-failed-files 0` 把仍未成功 ACK 的历史文件列为阻断条件；
+这不会删除或覆盖 `failed/` 原件。若需要先恢复证据，应按下文的只复制到 `pending/` 流程处理，
+直到文件重新得到 durable ACK，再重新运行门禁。
 `outbox.openTransactions`、`outbox.oldestOpenAgeMs` 和 `outbox.staleOpenTransactions` 也必须
 纳入告警；长期 open 的流式 Capture 不是已交付证据，必须保留为未完成证据或完成最终化后
 再交付。
@@ -283,6 +286,8 @@ node scripts/ci/runtime-health-gate.js \
   --relay-url http://127.0.0.1:3012/health \
   --collector-url http://127.0.0.1:3011/health \
   --expected-revision <git-revision> \
+  --max-quality-errors 0 \
+  --max-historical-failed-files 0 \
   --report /var/tmp/chiptrace-runtime-health.json
 ```
 

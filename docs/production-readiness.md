@@ -1,8 +1,17 @@
 # 生产就绪评估
 
-评估日期：2026-10-16。最新线上只读快照为 21:22（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-16。最新线上只读快照为 23:54（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
+
+本次复核（2026-10-16 23:54，Asia/Shanghai）发现维护提交 `11ff05c1211debc167f75633940c9656c1290073`
+已运行在 Collector/Relay，Collector 与 Relay 的累计计数为 `1,178,726` 且队列和传输失败为零；
+这只证明传输闭环存活。带生产门禁参数 `--max-quality-errors 0 --max-historical-failed-files 0`
+的 runtime gate 实际退出 1，首个有界阻断为 Gateway 仍保留 `293` 个历史失败 outbox 文件。
+同一快照的 Relay 业务覆盖为 `degraded`：Wire 已过期约 13.2 分钟，`quality_errors=36`（全部
+来自 `otlp_traces` 转换错误），`successful_turn_scoped_captures=0`，`turn_capture_ready=false`。
+18084 的 trace exporter 仍关闭，watchdog 仍报告上游 403/超时；因此当前服务不能按生产标准
+声称已完成真实 Session/Turn 全量收集。历史失败文件的安全恢复与新鲜 Wire/Provider 修复仍是发布前置条件。
 
 21:22 的热服务只读复核显示：18084、3011、3012、18086 均返回 HTTP 200；Gateway
 health 为 `healthy`，outbox 的 pending/processing/open 均为 0，最近失败为 0。Collector

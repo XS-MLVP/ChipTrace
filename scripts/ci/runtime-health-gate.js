@@ -194,7 +194,7 @@ function verifyCollectorHealth(health) {
   return { ok: true, ready: true, captures, queue_depth: store.queue_depth };
 }
 
-function verifyGatewayHealth(health) {
+function verifyGatewayHealth(health, { maxHistoricalFailedFiles } = {}) {
   object(health, 'gateway health');
   if (health.status !== 'healthy') fail('gateway status must be healthy');
   const capture = object(health.fullTraceCapture, 'gateway.fullTraceCapture');
@@ -212,7 +212,16 @@ function verifyGatewayHealth(health) {
   // streaming capture is safe to hand off.
   requireTrue(outbox.openCaptureHealthy, 'gateway outbox.openCaptureHealthy');
   nonNegativeInteger(outbox.openTransactions, 'gateway outbox.openTransactions');
-  nonNegativeInteger(outbox.failedFiles, 'gateway outbox.failedFiles');
+  const historicalFailedFiles = nonNegativeInteger(outbox.failedFiles, 'gateway outbox.failedFiles');
+  if (maxHistoricalFailedFiles !== undefined) {
+    if (!Number.isSafeInteger(maxHistoricalFailedFiles) || maxHistoricalFailedFiles < 0) {
+      fail('max historical failed files must be a non-negative integer');
+    }
+    if (historicalFailedFiles > maxHistoricalFailedFiles) {
+      fail('gateway outbox historical failed files exceed the configured maximum '
+        + `(observed=${historicalFailedFiles}; maximum=${maxHistoricalFailedFiles})`);
+    }
+  }
 
   const relay = object(capture.rustRelay, 'gateway.fullTraceCapture.rustRelay');
   requireTrue(relay.configured, 'gateway rustRelay.configured');
@@ -228,7 +237,7 @@ function verifyGatewayHealth(health) {
     current_delivery_healthy: capture.currentDeliveryHealthy,
     open_capture_healthy: outbox.openCaptureHealthy,
     open_transactions: outbox.openTransactions,
-    historical_failed_files: outbox.failedFiles,
+    historical_failed_files: historicalFailedFiles,
     delivered: relay.delivered,
   };
 }
@@ -410,9 +419,9 @@ function verifyRelayHealth(health, { maxQualityErrors } = {}) {
 function verifyRuntimeHealth(
   gatewayHealth,
   relayHealth,
-  { expectedRevision, collectorHealth, maxQualityErrors } = {},
+  { expectedRevision, collectorHealth, maxQualityErrors, maxHistoricalFailedFiles } = {},
 ) {
-  const gateway = verifyGatewayHealth(gatewayHealth);
+  const gateway = verifyGatewayHealth(gatewayHealth, { maxHistoricalFailedFiles });
   const relay = verifyRelayHealth(relayHealth, { maxQualityErrors });
   const buildRevision = verifyBuildRevision(relayHealth, expectedRevision, 'relay health');
   if (gateway.delivered !== relay.delivered) {
@@ -465,6 +474,7 @@ async function runRemoteHealthGate(
   expectedRevision,
   reportPath,
   maxQualityErrors,
+  maxHistoricalFailedFiles,
 ) {
   if (!gatewayUrl || !relayUrl || !collectorUrl) fail('gateway, relay and collector health URLs are required');
   let health;
@@ -488,7 +498,10 @@ async function runRemoteHealthGate(
   let result;
   try {
     result = verifyRuntimeHealth(gateway, relay, {
-      expectedRevision, collectorHealth: collector, maxQualityErrors,
+      expectedRevision,
+      collectorHealth: collector,
+      maxQualityErrors,
+      maxHistoricalFailedFiles,
     });
   } catch (error) {
     writeReport(reportPath, {
@@ -510,6 +523,7 @@ function parseArgs(argv) {
   let expectedRevision;
   let report;
   let maxQualityErrors;
+  let maxHistoricalFailedFiles;
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     const value = argv[index + 1];
@@ -519,21 +533,41 @@ function parseArgs(argv) {
     else if (flag === '--timeout-ms' && value) { timeout = Number(value); index += 1; }
     else if (flag === '--expected-revision' && value) { expectedRevision = value; index += 1; }
     else if (flag === '--max-quality-errors' && value) { maxQualityErrors = Number(value); index += 1; }
+    else if (flag === '--max-historical-failed-files' && value) {
+      maxHistoricalFailedFiles = Number(value);
+      index += 1;
+    }
     else if (flag === '--report' && value) { report = value; index += 1; }
-    else fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--max-quality-errors N] [--report PATH]');
+    else fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--max-quality-errors N] [--max-historical-failed-files N] [--report PATH]');
   }
   if (!gateway || !relay || !collector || !Number.isSafeInteger(timeout) || timeout < 100
     || (maxQualityErrors !== undefined
       && (!Number.isSafeInteger(maxQualityErrors) || maxQualityErrors < 0))) {
-    fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--max-quality-errors N] [--report PATH]');
+    fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--max-quality-errors N] [--max-historical-failed-files N] [--report PATH]');
   }
-  return { gateway, relay, collector, timeout, expectedRevision, maxQualityErrors, report };
+  if (maxHistoricalFailedFiles !== undefined
+    && (!Number.isSafeInteger(maxHistoricalFailedFiles) || maxHistoricalFailedFiles < 0)) {
+    fail('usage: runtime-health-gate.js --max-historical-failed-files N requires a non-negative integer');
+  }
+  return {
+    gateway,
+    relay,
+    collector,
+    timeout,
+    expectedRevision,
+    maxQualityErrors,
+    maxHistoricalFailedFiles,
+    report,
+  };
 }
 
 if (require.main === module) {
   const args = parseArgs(process.argv.slice(2));
   runRemoteHealthGate(args.gateway, args.relay, args.collector, args.timeout,
-    args.expectedRevision, args.report, args.maxQualityErrors)
+    args.expectedRevision,
+    args.report,
+    args.maxQualityErrors,
+    args.maxHistoricalFailedFiles)
     .then(result => process.stdout.write(`${JSON.stringify(result, null, 2)}\n`))
     .catch(error => {
       process.stderr.write(`${error.message || String(error)}\n`);
