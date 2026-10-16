@@ -1,8 +1,22 @@
 # 生产就绪评估
 
-评估日期：2026-10-16。最新线上只读快照为 18:42（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-16。最新线上只读快照为 21:22（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
+
+21:22 的热服务只读复核显示：18084、3011、3012、18086 均返回 HTTP 200；Gateway
+health 为 `healthy`，outbox 的 pending/processing/open 均为 0，最近失败为 0。Collector
+与 Relay 均报告 revision `ec8a6b2f687e8454f96366abd5efa8542761a98e`、version `0.6.0`；
+Collector ready、队列深度 0、Capture `1,173,531` 且守恒通过，Relay delivered 同为
+`1,173,531`，pending/inflight/failed 为 0 且守恒通过。传输进程健康不等于业务完整：Relay
+`ingest_coverage.status=degraded`，`stale_sources=["wire"]`，Wire age 约 43 分钟，
+`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，并报告 163 个质量错误。
+使用同一 revision 的 runtime gate 实际退出 1，原因是 `status` 仍为 `degraded`。当前热服务
+尚未部署维护分支 `84686f4` 的 CI/文档提交；该提交只改善门禁和审计，不会凭空恢复 Wire。
+
+本次 shell 未设置 Provider/采集凭据，因此没有发送真实 Responses 请求；对应 Provider gate
+和未修改 Stock Codex 多轮验收仍为未观测状态。GitHub CLI 未认证且公开 Actions API 请求
+超时，`84686f4` 的远端 CI 结果仍不能声明为通过。
 
 18:42 的实际部署复核已将 Collector、Relay 和平台服务升级到维护提交
 `30f6d243d527732acbfae4970a740ec88c8451cf`。Collector/Relay 使用同一内容摘要镜像
