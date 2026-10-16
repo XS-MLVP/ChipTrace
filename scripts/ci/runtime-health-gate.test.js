@@ -1,7 +1,10 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs/promises');
 const http = require('node:http');
+const os = require('node:os');
+const path = require('node:path');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const test = require('node:test');
@@ -123,6 +126,8 @@ test('runtime gate rejects a different Collector build and unknown deployment re
 test('runtime CLI observes all three endpoints and refuses Collector faults or missing probes', async t => {
   let mode = 'healthy';
   const requests = [];
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-runtime-gate-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
   const server = http.createServer((req, res) => {
     requests.push(req.url);
     const value = req.url === '/gateway' ? gateway() : req.url === '/relay' ? relay() : collector();
@@ -138,11 +143,15 @@ test('runtime CLI observes all three endpoints and refuses Collector faults or m
   const url = `http://127.0.0.1:${server.address().port}`;
   const flags = ['--gateway-url', `${url}/gateway`, '--relay-url', `${url}/relay`];
   const invoke = args => promisify(execFile)(process.execPath, [require.resolve('./runtime-health-gate'), ...args], { timeout: 10000 });
+  const report = path.join(root, 'healthy.json');
   const complete = [...flags, '--collector-url', `${url}/collector`, '--expected-revision', 'f'.repeat(40)];
-  const result = JSON.parse((await invoke(complete)).stdout);
+  const result = JSON.parse((await invoke([...complete, '--report', report])).stdout);
   assert.equal(result.schema_version, 'chiptrace.runtime-health-gate.v3');
   assert.equal(result.session_delivery_claimed, false);
   assert.equal(result.collector.captures, 33);
+  const healthyReport = JSON.parse(await fs.readFile(report, 'utf8'));
+  assert.equal(healthyReport.ok, true);
+  assert.equal(healthyReport.schema_version, 'chiptrace.runtime-health-gate.v3');
   assert.deepEqual(requests.sort(), ['/collector', '/gateway', '/relay']);
   for (const [fault, pattern] of [
     ['old', /collector health\.build\.revision does not match expected revision/],
@@ -158,6 +167,45 @@ test('runtime CLI observes all three endpoints and refuses Collector faults or m
   const missing = await invoke(flags).then(() => null, error => error);
   assert.equal(missing.code, 1);
   assert.match(missing.stderr, /--collector-url URL/);
+});
+
+test('runtime gate report records bounded failure state without arbitrary health payloads', async t => {
+  const current = relay();
+  current.ingest_coverage.status = 'degraded';
+  current.ingest_coverage.required_sources_observed = false;
+  current.ingest_coverage.required_sources_fresh = false;
+  current.ingest_coverage.wire = { requests: 0, source_records: 0, last_at: null };
+  current.ingest_coverage.stale_sources = ['wire', 'PRIVATE_SOURCE_MUST_NOT_LEAK'];
+  current.collector_private = 'PRIVATE_COLLECTOR_BODY_MUST_NOT_LEAK';
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json', connection: 'close' });
+    res.end(JSON.stringify(req.url === '/gateway' ? gateway() : req.url === '/collector' ? collector() : current));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-runtime-report-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const report = path.join(root, 'failed.json');
+  const url = `http://127.0.0.1:${server.address().port}`;
+  await assert.rejects(promisify(execFile)(process.execPath, [require.resolve('./runtime-health-gate'),
+    '--gateway-url', `${url}/gateway`, '--relay-url', `${url}/relay`, '--collector-url', `${url}/collector`,
+    '--expected-revision', current.build.revision, '--report', report], { timeout: 10000 }), error => {
+    assert.equal(error.code, 1);
+    assert.equal(error.stdout, '');
+    assert.match(error.stderr, /observed=degraded; missing_sources=wire; stale_sources=wire/);
+    assert.doesNotMatch(error.stderr, /PRIVATE_SOURCE_MUST_NOT_LEAK/);
+    return true;
+  });
+  const observed = JSON.parse(await fs.readFile(report, 'utf8'));
+  assert.equal(observed.ok, false);
+  assert.equal(observed.failure_kind, 'validation_failed');
+  assert.equal(observed.schema_version, 'chiptrace.runtime-health-observation.v1');
+  assert.deepEqual(observed.relay.coverage.missing_sources, ['wire']);
+  assert.deepEqual(observed.relay.coverage.stale_sources, ['wire']);
+  assert.equal(observed.relay.coverage.wire.requests, 0);
+  assert.equal(Object.hasOwn(observed, 'collector_private'), false);
+  assert.doesNotMatch(JSON.stringify(observed), /PRIVATE_/);
+  assert.equal(Object.hasOwn(observed, 'gateway_url'), false);
 });
 
 test('runtime health gate requires fresh scoped HTTP success without claiming Session delivery', () => {

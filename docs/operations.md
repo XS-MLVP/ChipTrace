@@ -243,7 +243,8 @@ node scripts/ci/runtime-health-gate.js \
   --gateway-url http://127.0.0.1:18084/health \
   --relay-url http://127.0.0.1:3012/health \
   --collector-url http://127.0.0.1:3011/health \
-  --expected-revision <git-revision>
+  --expected-revision <git-revision> \
+  --report /var/tmp/chiptrace-runtime-health.json
 ```
 
 三个参数都须传完整 `/health` URL；Collector 端口按实际映射调整。v3 要求同时观察
@@ -265,6 +266,11 @@ Relay 重启后进程级来源证据重新开始；旧 Raw 和导出仍可验证
 旧网关缺少 `openCaptureHealthy`，或旧 Relay 在 Runtime 有流量而
 Wire 停止时返回 `freshness_applicable=false`，都会失败；历史失败文件仍保留为审计证据，
 不会被当作当前失败清理。
+传入 `--report` 时，成功结果写入完整门禁摘要；失败结果写入一次性、0600 的
+`chiptrace.runtime-health-observation.v1` 快照。快照只包含版本、计数、队列、来源新鲜度、
+Turn Wire 统计和错误类别，不包含健康 URL、Raw、对话正文、工具参数、凭据或任意错误字段；
+目标路径必须事先不存在，避免覆盖事故证据。即使 Collector/Relay 探测失败，也会留下
+`failure_kind=fetch_failed` 的最小快照。
 重放失败证据时只能复制到 `pending`（不要移动或删除 `failed` 原件），确认 Relay durable
 ACK 后再以 pending/processing 清零作为完成条件。
 
