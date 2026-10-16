@@ -63,10 +63,9 @@ node scripts/deploy/gateway-preflight.js \
 质量错误和新鲜 Turn Wire 门禁。2026-10-17 对实际 `router-v2-relay-shell` 执行该预检已
 返回成功：容器使用只读根、非 root、CPU/内存/PID 限额、`no-new-privileges` 和 durable
 outbox/watchdog 挂载。不过其镜像 OCI revision 仍是
-`e57480eca4fe11769c5fcb8787266ab6b77ce4d5`，而维护分支 HEAD 是
-`a4ad64d186cd7f6230fa64f0a1a230dd553de16a`；不传预期值的旧预检可以证明隔离，传入维护分支
-SHA 的新预检会真实拒绝该容器。本轮 outbox 修复通过只读工作区 bind mount 注入，尚未形成包含
-维护分支 SHA 的不可变 Gateway 镜像。因此 preflight 通过只证明容器隔离，不能替代发布 revision、
+`e57480eca4fe11769c5fcb8787266ab6b77ce4d5`，与待发布维护 revision 不一致；不传预期值的旧预检可以
+证明隔离，传入维护分支 SHA 的新预检会真实拒绝该容器。本轮 outbox 修复通过只读工作区 bind mount
+注入，尚未形成包含维护分支 SHA 的不可变 Gateway 镜像。因此 preflight 通过只证明容器隔离，不能替代发布 revision、
 runtime gate 和真实 Session/Turn 验收；这与 HTTP `/health` 返回 200 仍是独立证据。
 
 18084 对外提供 Responses、`/models`、`/otel/v1/logs`、`/otel/v1/traces` 和

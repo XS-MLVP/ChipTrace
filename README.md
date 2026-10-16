@@ -20,13 +20,13 @@ Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 Gateway outbox `pending=0`、`processing=0`、`recentFailureCount=0`、
 `unresolvedHistoricalFailedFiles=0`，293 个历史失败原件和 293 个 recovery receipt 均保留；
 Collector/Relay 队列为空且 `conservation_ok=true`，Collector/Relay 实际 revision 都是
-`e5237065ff3a48623179c5846ff1916040030c9a`，而维护分支 HEAD 已是
-`a4ad64d186cd7f6230fa64f0a1a230dd553de16a`。
+`e5237065ff3a48623179c5846ff1916040030c9a`；维护分支已包含 Gateway/Platform revision
+对齐门禁，但这些修复尚未部署。
 Relay 的 `ingest_coverage` 为 `degraded`：`quality_errors=659`（全部来自 `otlp_traces`）、
 Wire 已约 44.6 分钟未刷新，`required_sources_fresh=false`、`turn_capture_ready=false`，
 279/293 条历史 Wire 有 Turn 身份。带质量、新鲜度和 revision 门禁的 runtime gate 真实退出 1。
 18086 平台 `/health` 当前通过，但这只证明导出进程存活；Gateway OCI revision
-`e57480eca4fe11769c5fcb8787266ab6b77ce4d5` 与维护分支不一致，新的 Gateway preflight 会拒绝它。
+`e57480eca4fe11769c5fcb8787266ab6b77ce4d5` 与待发布维护 revision 不一致，新的 Gateway preflight 会拒绝它。
 因此当前不能对外承诺真实 Session/Turn 全量采集或生产导出。详见[生产就绪评估](docs/production-readiness.md)。
 
 ## 主线

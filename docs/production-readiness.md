@@ -6,8 +6,8 @@
 
 本次复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
 failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留，Collector/Relay 队列为空且
-`conservation_ok=true`。Collector/Relay 实际 revision 为 `e5237065ff3a48623179c5846ff1916040030c9a`，
-维护分支 HEAD 为 `a4ad64d186cd7f6230fa64f0a1a230dd553de16a`；因此线上未运行本维护分支最新代码。
+`conservation_ok=true`。Collector/Relay 实际 revision 为 `e5237065ff3a48623179c5846ff1916040030c9a`；
+维护分支已加入 Gateway/Platform revision 对齐护栏，但线上未运行这些最新修复。
 
 同一快照的 Relay `ingest_coverage.status=degraded`，`quality_errors=659`（全部来自 `otlp_traces`），
 Wire 已约 44.6 分钟未刷新，`required_sources_fresh=false`、`turn_capture_ready=false`，
