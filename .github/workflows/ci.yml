@@ -614,6 +614,9 @@ jobs:
           assert turn_interaction["tool_execution_spans"] == 5
           assert turn_interaction["tool_execution_spans_assigned_to_turn"] == 5
           session_view = result["interaction"]["session_view"]
+          assert result["interaction"]["source_coverage"]["wire"] == result["interaction"]["interactions"]
+          assert session_view["model_interactions"] == sum(turn["model_interactions"] for turn in session_view["turns"])
+          assert all(turn["source_coverage"]["wire"] == turn["model_interactions"] for turn in session_view["turns"])
           assert session_view["schema_version"] == "chiptrace.session-view.v2"
           assert session_view["turn_source_coverage_complete"] is True
           assert session_view["delivery_ready"] is True

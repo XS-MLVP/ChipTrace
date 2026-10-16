@@ -1879,6 +1879,7 @@ async fn self_test(args: SelfTestArgs) -> Result<Value> {
         "cloud_runtime_evidence":cloud_runtime_audit_pass,
         "cloud_source_coverage":interaction.source_coverage.complete
             && interaction.source_coverage.wire == 6
+            && interaction.source_coverage.wire == interaction.interactions
             && interaction.source_coverage.otlp_logs == 1
             && interaction.source_coverage.otlp_traces == 1
             && interaction.source_coverage.hooks == 7,
@@ -1892,10 +1893,17 @@ async fn self_test(args: SelfTestArgs) -> Result<Value> {
                 && view.unscoped_turn_records == 0
                 && view.turn_source_coverage_complete
                 && view.delivery_ready
+                && view
+                    .turns
+                    .iter()
+                    .try_fold(0_u64, |total, turn| {
+                        total.checked_add(turn.model_interactions)
+                    })
+                    == Some(view.model_interactions)
                 && view.turns.iter().all(|turn| {
                     turn.status == "closed"
                         && turn.source_coverage.complete
-                        && turn.source_coverage.wire > 0
+                        && turn.source_coverage.wire == turn.model_interactions
                         && turn.source_coverage.otlp_logs > 0
                         && turn.source_coverage.otlp_traces > 0
                         && turn.source_coverage.hooks == 1
