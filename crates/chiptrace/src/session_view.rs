@@ -171,6 +171,7 @@ impl SessionView {
             || scoped_interactions.is_none_or(|total| total > self.model_interactions)
             || scoped_tools.is_none_or(|total| total > self.tool_execution_records)
             || (self.delivery_ready && scoped_interactions != Some(self.model_interactions))
+            || (self.delivery_ready && scoped_tools != Some(self.tool_execution_records))
             || (self.delivery_ready
                 && self
                     .turns
@@ -934,5 +935,43 @@ mod tests {
         .unwrap();
         session_mismatch.model_interactions = 2;
         assert!(session_mismatch.validate(Some("s"), 2).is_err());
+
+        let mut tool_mismatch = summarize_session(
+            &[
+                json!({"captureId":"session-start-tool","recordType":"lifecycle_event",
+                    "traceContext":{"session_id":"s"},
+                    "lifecycleEvent":{"source_event_name":"SessionStart",
+                        "source_event":{"session_id":"s","source":"startup"}}}),
+                json!({"captureId":"wire-tool","recordType":"api_snapshot",
+                    "traceContext":{"session_id":"s","turn_id":"t"}}),
+                telemetry("logs-tool", "otlp_logs", json!({
+                    "resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[
+                        {"key":"event.name","value":{"stringValue":"codex.tool_result"}},
+                        {"key":"conversation.id","value":{"stringValue":"s"}},
+                        {"key":"turn.id","value":{"stringValue":"t"}}
+                    ]}]}]}]
+                })),
+                telemetry("traces-tool", "otlp_traces", json!({
+                    "resourceSpans":[{"scopeSpans":[{"spans":[{"name":"codex.turn","attributes":[
+                        {"key":"conversation.id","value":{"stringValue":"s"}},
+                        {"key":"turn.id","value":{"stringValue":"t"}}
+                    ]}]}]}]
+                })),
+                telemetry("hook-tool", "codex_hook", json!({
+                    "hook_event_name":"Stop","session_id":"s","turn_id":"t"
+                })),
+                json!({"captureId":"end-tool","recordType":"lifecycle_event",
+                    "traceContext":{"session_id":"s","turn_id":"t"},
+                    "lifecycleEvent":{"type":"turn_end","source_event_name":"Stop"}}),
+                json!({"captureId":"session-end-tool","recordType":"lifecycle_event",
+                    "traceContext":{"session_id":"s"},
+                    "lifecycleEvent":{"source_event_name":"SessionEnd",
+                        "source_event":{"session_id":"s","source":""}}}),
+            ],
+            "s",
+        )
+        .unwrap();
+        tool_mismatch.tool_execution_records = 1;
+        assert!(tool_mismatch.validate(Some("s"), 1).is_err());
     }
 }
