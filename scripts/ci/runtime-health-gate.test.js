@@ -8,7 +8,7 @@ const path = require('node:path');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const test = require('node:test');
-const { healthObservation, verifyRuntimeHealth } = require('./runtime-health-gate');
+const { blockingReasons, healthObservation, verifyRuntimeHealth } = require('./runtime-health-gate');
 
 function gateway() {
   return {
@@ -217,6 +217,47 @@ test('runtime gate report records bounded failure state without arbitrary health
   assert.equal(Object.hasOwn(observed, 'gateway_url'), false);
 });
 
+test('runtime failure reports enumerate bounded blocking categories in one pass', () => {
+  const value = relay();
+  value.status = 'degraded';
+  value.ingest_coverage.status = 'degraded';
+  value.ingest_coverage.required_sources_fresh = false;
+  value.ingest_coverage.stale_sources = ['wire'];
+  value.ingest_coverage.quality_errors = 4;
+  value.ingest_coverage.quality_errors_by_endpoint.otlp_traces = {
+    unknown_events: 0, conversion_errors: 4, total: 4,
+  };
+  Object.assign(value.ingest_coverage.wire_turn_coverage, {
+    successful_turn_scoped_captures: 0,
+    last_successful_at: null,
+    last_successful_age_ms: null,
+    successful_turn_scoped_fresh: false,
+  });
+  const observed = healthObservation(gateway(), value, collector(), {
+    expectedRevision: 'f'.repeat(40),
+    maxQualityErrors: 0,
+    maxHistoricalFailedFiles: 0,
+  });
+  assert.deepEqual(observed.blocking_reasons, [
+    'gateway_historical_failed_files_exceed_max',
+    'relay_not_healthy',
+    'relay_coverage_not_complete',
+    'relay_required_sources_not_fresh',
+    'relay_sources_stale',
+    'relay_quality_errors_exceed_max',
+    'relay_turn_capture_not_ready',
+    'relay_no_successful_turn_scoped_wire',
+    'relay_successful_turn_scoped_wire_not_fresh',
+  ]);
+  assert.deepEqual(blockingReasons(observed, {
+    expectedRevision: 'f'.repeat(40), maxQualityErrors: 0, maxHistoricalFailedFiles: 0,
+  }), observed.blocking_reasons);
+  assert.doesNotMatch(JSON.stringify(observed.blocking_reasons), /PRIVATE|SYNTHETIC/);
+  assert.deepEqual(healthObservation(gateway(), relay(), collector(), {
+    expectedRevision: 'f'.repeat(40), maxQualityErrors: 0, maxHistoricalFailedFiles: 3,
+  }).blocking_reasons, []);
+});
+
 test('runtime health gate requires fresh scoped HTTP success without claiming Session delivery', () => {
   const result = verifyRuntimeHealth(gateway(), relay(), { collectorHealth: collector() });
   assert.equal(result.schema_version, 'chiptrace.runtime-health-gate.v3');
@@ -230,6 +271,7 @@ test('runtime health gate requires fresh scoped HTTP success without claiming Se
   assert.equal(result.relay.wire_turn_coverage.successful_turn_scoped_fresh, true);
   assert.equal(result.collector.captures, 33);
   assert.equal(result.collector.build_revision, relay().build.revision);
+  assert.deepEqual(result.blocking_reasons, []);
 });
 
 test('production gate can refuse retained historical Gateway outbox failures', () => {

@@ -312,7 +312,8 @@ Wire 停止时返回 `freshness_applicable=false`，都会失败；历史失败�
 不会被当作当前失败清理。
 传入 `--report` 时，成功结果写入完整门禁摘要；失败结果写入一次性、0600 的
 `chiptrace.runtime-health-observation.v1` 快照。快照只包含版本、计数、队列、来源新鲜度、
-按端点质量错误分解、Turn Wire 统计和错误类别，不包含健康 URL、Raw、对话正文、工具参数、凭据或任意错误字段；
+按端点质量错误分解、Turn Wire 统计和有界的 `blocking_reasons` 代码（一次列出所有已知阻断类别），
+不包含健康 URL、Raw、对话正文、工具参数、凭据或任意错误字段；
 目标路径必须事先不存在，避免覆盖事故证据。即使 Collector/Relay 探测失败，也会留下
 `failure_kind=fetch_failed` 的最小快照。
 重放失败证据时只能复制到 `pending`（不要移动或删除 `failed` 原件），确认 Relay durable

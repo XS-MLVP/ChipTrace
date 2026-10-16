@@ -88,13 +88,95 @@ function qualityErrorObservation(value) {
   };
 }
 
-function healthObservation(gateway, relay, collector) {
+function blockingReasons(
+  observation,
+  { expectedRevision, maxQualityErrors, maxHistoricalFailedFiles } = {},
+) {
+  const reasons = new Set();
+  const add = reason => reasons.add(reason);
+  const gateway = observation?.gateway || {};
+  const relay = observation?.relay || {};
+  const coverage = relay.coverage || {};
+  const collector = observation?.collector || {};
+  const turns = coverage.wire_turn_coverage || {};
+
+  if (gateway.status !== 'healthy') add('gateway_not_healthy');
+  if (gateway.current_delivery_healthy !== true) add('gateway_delivery_not_healthy');
+  if (gateway.open_capture_healthy !== true) add('gateway_open_capture_not_healthy');
+  if (gateway.pending !== 0) add('gateway_pending_records');
+  if (gateway.inflight !== 0) add('gateway_inflight_records');
+  if (gateway.failed !== 0) add('gateway_failed_records');
+  if (maxHistoricalFailedFiles !== undefined
+    && Number.isSafeInteger(gateway.historical_failed_files)
+    && gateway.historical_failed_files > maxHistoricalFailedFiles) {
+    add('gateway_historical_failed_files_exceed_max');
+  }
+
+  if (relay.status !== 'healthy') add('relay_not_healthy');
+  if (relay.pending !== 0) add('relay_pending_records');
+  if (relay.inflight !== 0) add('relay_inflight_records');
+  if (relay.failed !== 0) add('relay_failed_records');
+  if (relay.conservation_ok !== true) add('relay_delivery_not_conserved');
+  if (coverage.status !== 'complete') add('relay_coverage_not_complete');
+  if (coverage.required_sources_observed !== true) add('relay_required_sources_not_observed');
+  if (coverage.required_sources_fresh !== true) add('relay_required_sources_not_fresh');
+  if (coverage.freshness_applicable !== true) add('relay_freshness_not_applicable');
+  if (Array.isArray(coverage.missing_sources) && coverage.missing_sources.length > 0) {
+    add('relay_sources_missing');
+  }
+  if (Array.isArray(coverage.stale_sources) && coverage.stale_sources.length > 0) {
+    add('relay_sources_stale');
+  }
+  if (maxQualityErrors !== undefined
+    && Number.isSafeInteger(coverage.quality_errors)
+    && coverage.quality_errors > maxQualityErrors) {
+    add('relay_quality_errors_exceed_max');
+  }
+  if (coverage.turn_capture_ready !== true) add('relay_turn_capture_not_ready');
+  if (Number.isSafeInteger(turns.successful_turn_scoped_captures)
+    && turns.successful_turn_scoped_captures === 0) {
+    add('relay_no_successful_turn_scoped_wire');
+  }
+  if (turns.successful_turn_scoped_fresh !== true) {
+    add('relay_successful_turn_scoped_wire_not_fresh');
+  }
+
+  if (collector.ok !== true) add('collector_not_ok');
+  if (collector.ready !== true) add('collector_not_ready');
+  if (collector.queue_depth !== 0) add('collector_queue_not_empty');
+  if (collector.last_error_present === true) add('collector_last_error_present');
+
+  if (gateway.delivered !== null && relay.delivered !== null
+    && gateway.delivered !== relay.delivered) {
+    add('gateway_relay_delivery_totals_mismatch');
+  }
+  if (collector.captures !== null && relay.delivered !== null
+    && collector.captures < relay.delivered) {
+    add('collector_delivery_total_below_relay');
+  }
+  if (expectedRevision !== undefined) {
+    if (relay.revision !== expectedRevision) add('relay_revision_mismatch');
+    if (collector.revision !== expectedRevision) add('collector_revision_mismatch');
+  } else if (relay.revision !== null && collector.revision !== null
+    && relay.revision !== collector.revision) {
+    add('relay_collector_revision_mismatch');
+  }
+  // Keep the report bounded even if a future health payload adds more checks.
+  return [...reasons].slice(0, 32);
+}
+
+function healthObservation(
+  gateway,
+  relay,
+  collector,
+  { expectedRevision, maxQualityErrors, maxHistoricalFailedFiles } = {},
+) {
   const capture = gateway?.fullTraceCapture;
   const gatewayRelay = capture?.rustRelay;
   const coverage = relay?.ingest_coverage;
   const turnCoverage = coverage?.wire_turn_coverage;
   const collectorStore = collector?.collector;
-  return {
+  const observation = {
     schema_version: 'chiptrace.runtime-health-observation.v1',
     observed_at: new Date().toISOString(),
     session_delivery_claimed: false,
@@ -162,6 +244,12 @@ function healthObservation(gateway, relay, collector) {
       last_error_present: collectorStore?.last_error !== null && collectorStore?.last_error !== undefined,
     },
   };
+  observation.blocking_reasons = blockingReasons(observation, {
+    expectedRevision,
+    maxQualityErrors,
+    maxHistoricalFailedFiles,
+  });
+  return observation;
 }
 
 function writeReport(reportPath, value) {
@@ -446,6 +534,7 @@ function verifyRuntimeHealth(
     session_delivery_claimed: false,
     expected_revision: expectedRevision ?? null,
     build_revision: buildRevision,
+    blocking_reasons: [],
     gateway,
     relay,
     collector: { ...collector, build_revision: collectorRevision },
@@ -491,6 +580,7 @@ async function runRemoteHealthGate(
       schema_version: 'chiptrace.runtime-health-observation.v1',
       observed_at: new Date().toISOString(),
       session_delivery_claimed: false,
+      blocking_reasons: ['health_fetch_failed'],
       failure_kind: 'fetch_failed',
     });
     throw error;
@@ -507,7 +597,11 @@ async function runRemoteHealthGate(
   } catch (error) {
     writeReport(reportPath, {
       ok: false,
-      ...healthObservation(gateway, relay, collector),
+      ...healthObservation(gateway, relay, collector, {
+        expectedRevision,
+        maxQualityErrors,
+        maxHistoricalFailedFiles,
+      }),
       failure_kind: 'validation_failed',
     });
     throw error;
@@ -584,5 +678,6 @@ module.exports = {
   verifyCollectorHealth,
   verifyRuntimeHealth,
   healthObservation,
+  blockingReasons,
   runRemoteHealthGate,
 };
