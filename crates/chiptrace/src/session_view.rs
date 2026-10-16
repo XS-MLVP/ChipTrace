@@ -170,6 +170,12 @@ impl SessionView {
                 != Some(self.unscoped_turn_records)
             || scoped_interactions.is_none_or(|total| total > self.model_interactions)
             || scoped_tools.is_none_or(|total| total > self.tool_execution_records)
+            || (self.delivery_ready && scoped_interactions != Some(self.model_interactions))
+            || (self.delivery_ready
+                && self
+                    .turns
+                    .iter()
+                    .any(|turn| turn.source_coverage.wire != turn.model_interactions))
             || self.open_turns != self.turns.iter().filter(|t| t.status == "open").count() as u64
             || self.closed_turns
                 != self
@@ -864,5 +870,69 @@ mod tests {
             incomplete.turns[0].source_coverage.missing_sources,
             ["otlp_logs", "otlp_traces", "hooks"]
         );
+    }
+
+    #[test]
+    fn delivery_ready_requires_exact_wire_and_model_interaction_counts() {
+        let telemetry = |id: &str, endpoint: &str, raw: Value| {
+            json!({
+                "captureId":id,
+                "recordType":"telemetry_batch",
+                "telemetryBatch":{"endpoint":endpoint,"raw_json":serde_json::to_string(&raw).unwrap()}
+            })
+        };
+        let wire = json!({"captureId":"wire","recordType":"api_snapshot",
+            "traceContext":{"session_id":"s","turn_id":"t"}});
+        let logs = telemetry(
+            "logs",
+            "otlp_logs",
+            json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[
+                {"key":"event.name","value":{"stringValue":"codex.tool_result"}},
+                {"key":"conversation.id","value":{"stringValue":"s"}},
+                {"key":"turn.id","value":{"stringValue":"t"}}
+            ]}]}]}]}),
+        );
+        let traces = telemetry(
+            "traces",
+            "otlp_traces",
+            json!({"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"codex.turn","attributes":[
+                {"key":"conversation.id","value":{"stringValue":"s"}},
+                {"key":"turn.id","value":{"stringValue":"t"}}
+            ]}]}]}]}),
+        );
+        let hook = telemetry(
+            "hook",
+            "codex_hook",
+            json!({"hook_event_name":"Stop","session_id":"s","turn_id":"t"}),
+        );
+        let session_start = boundary("session-start", "SessionStart", "startup");
+        let end = json!({"captureId":"end","recordType":"lifecycle_event",
+            "traceContext":{"session_id":"s","turn_id":"t"},
+            "lifecycleEvent":{"type":"turn_end","source_event_name":"Stop"}});
+        let session_end = boundary("session-end", "SessionEnd", "");
+
+        let mut turn_mismatch = summarize_session(
+            &[
+                session_start.clone(),
+                wire.clone(),
+                logs.clone(),
+                traces.clone(),
+                hook.clone(),
+                end.clone(),
+                session_end.clone(),
+            ],
+            "s",
+        )
+        .unwrap();
+        turn_mismatch.turns[0].source_coverage.wire = 2;
+        assert!(turn_mismatch.validate(Some("s"), 1).is_err());
+
+        let mut session_mismatch = summarize_session(
+            &[session_start, wire, logs, traces, hook, end, session_end],
+            "s",
+        )
+        .unwrap();
+        session_mismatch.model_interactions = 2;
+        assert!(session_mismatch.validate(Some("s"), 2).is_err());
     }
 }
