@@ -38,19 +38,26 @@ Wire、OTLP 和 Hook 使用 Stock Codex 自带的 Session、Turn、call ID 和 W
 `audit-session-context` 提供只读的上下文缺口统计和有界定位样本；CI 使用精简的真实
 客户端元数据回归，完整对话和原始取证档保留在运维侧。
 
+2026-10-16 17:48（Asia/Shanghai）的线上快照已将 Collector、Relay 和平台服务升级到维护
+提交 `97e45bd7f1dada45bfc684c10e3c9483bda3c1ef`：三个容器均使用内容摘要镜像、非 root、只读根、
+资源限额和持久 NFS 挂载，18084、3011、3012、18086 均返回 200。Collector/Relay 队列为空且
+计数守恒，平台已通过鉴权健康检查；平台当前实际后端是本地 FS，尚未接入真实 OSS。
+升级后的 runtime gate 仍真实退出 1，因为新 Relay 进程观察到 OTLP 但没有 Wire 和 Hook，
+因此当前部署不能声称已完成任意 Session 的逐 Turn 全量交付。
+
 截至 2026-10-15，最新隔离的 patched Canary 已用真实 `0.163.0-alpha.11` 上游客户端完成
 两个 Native Turn、resume、失败工具进程和延迟 `write_stdin` 场景；四路来源齐全，审计
 计数守恒，仓库门禁输出 `native_turns=2`、`selected_audit_records=3621`、
 `delivery_ready=true`。这是带生产者上下文补丁的隔离证据，不是未修改 Stock Codex 的发布
 证明；脱敏 fixture 只保存元数据，不包含 Raw 或对话正文。
 
-同日复查确认 Collector/Relay 已运行 revision
+此前复查确认 Collector/Relay 曾运行 revision
 `fe9fcf924b226099202cb770b7cf0da29e0c2310`，18084、3011、3012 返回 200；传输队列排空且
 `conservation_ok=true`。新 Relay 进程内仅有 1 条 Wire；只读活动 WAL 快照确认它是没有
 原生 Session/Turn 的 HTTP 403，不能作为真实 Turn 的采集证据。OTLP/Hook 仍有流量，
 随后 Wire 超过 5 分钟未更新，runtime gate 真实退出 1。18084 保留 293 个历史失败文件
 （约 267 MB），trace exporter 未启用，
-watchdog 仍有错误；18086 没有监听。已核验基线 `08cadf5` 的远端 CI 已确认 5/5 作业通过，覆盖
+watchdog 仍有错误；18086 当时没有监听。已核验基线 `08cadf5` 的远端 CI 已确认 5/5 作业通过，覆盖
 原生 Hook 持久化确认、生产者缓存、流式下载及图片/计划/五类真实工具的双轮 resume 采集；
 新增原生协议采集使用带补丁生产者和合成模型，不替代线上验收。
 2026-10-16 新执行的同模型双轮协议联测已贯通 FS 归档、恢复和 Buyer 下载，实际解包
@@ -68,10 +75,12 @@ Stop 和四源存在也拒绝完整交付，原始失败证据保留。验证范
 接入排查还复现了系统默认 Provider 被用户配置覆盖、使 Wire 绕过采集的风险。
 受管 requirements 模板现已强制 Provider 选择和完整网关定义，并增加固定版本未修改
 客户端的断网配置回归；部署方式和能力边界见 [Stock Codex 接入](integrations/codex/README.md)。
-这项模板修复尚未应用到线上主机，不能视为线上 Wire 已恢复。
+线上主机的实际用户级配置仍存在 Provider 覆盖风险，不能视为线上 Wire 已恢复；当前 runtime
+gate 的 Wire/Hook 缺失正是该风险的可观测结果。
 仓库 runtime gate v2 另要求近期有明确 Session/Turn、无上下文冲突的 HTTP 2xx Wire，
 并拒绝缺少该统计的旧 Relay；重复投递不能刷新这类证据。完整评估和发布条件见
-[生产就绪评估](docs/production-readiness.md)。该门禁修复尚未部署到上述线上 revision。
+[生产就绪评估](docs/production-readiness.md)。该门禁已部署到 `97e45bd`，当前真实失败仍须在
+受管 Provider 和完整 Hook 生效后重新验收。
 
 ## 构建
 

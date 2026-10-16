@@ -1,8 +1,21 @@
 # 生产就绪评估
 
-评估日期：2026-10-16。最新线上只读快照为 16:16（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-16。最新线上只读快照为 17:48（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
+
+17:48 的实际部署复核已将 Collector、Relay 和平台服务升级到维护提交
+`97e45bd7f1dada45bfc684c10e3c9483bda3c1ef`。Collector/Relay 使用同一内容摘要镜像
+`sha256:0d468b8241fb262f6cdb873b722f951455b296da448f10e18fefa16e17e79ef3`，平台使用
+`sha256:8c3fd46ba7529cc2c245d8177dcaeb45f89ece97ba6467784191267709b4d9dc`；三者的 OCI
+revision、预期 revision、非 root 用户、只读根、CPU/内存/PID 限额和持久挂载均已通过预检与
+容器 inspect。18084、3011、3012、18086 均返回 200，平台鉴权列表请求返回 200；平台当前
+配置为本地 FS 后端，线上真实 OSS 账号和远端对象校验仍未完成。
+
+同一快照中 Collector capture 与 Relay delivered 均为 `1,160,146`，pending/inflight/failed
+为 0，`conservation_ok=true`，但 runtime gate 实际退出 1：当前 Relay 进程的 OTLP 日志/trace
+在增长，Wire 与 Hook 均为 0，`wire_turn_coverage` 没有成功的 Turn。因此这次升级证明了
+镜像、持久 WAL 和运行隔离已生效，不证明任何新的真实 Session 已通过四源逐 Turn 验收。
 
 16:16 的本机回环只读快照中，18084、3011（Collector）、3012（Relay）均返回 200，
 Collector/Relay 仍为 `fe9fcf9`；Collector Capture 与 Relay 累计投递均为 1,154,949，
@@ -508,15 +521,15 @@ parts，2 Turn、8 模型交互、6 工具记录不变，Raw SHA-256 一致。
 
 | 项目 | 实际观察 | 能证明的范围 |
 | --- | --- | --- |
-| 18084、3011、3012 | HTTP 200 | 入口与采集进程存活 |
-| Collector/Relay | revision `fe9fcf924b226099202cb770b7cf0da29e0c2310` | 运行版本已固定；仓库新增修复尚未部署 |
-| 投递 | 08:01 Collector Capture/Relay 投递均为 1,120,574，pending/inflight/failed 均为 0，计数守恒 | 瞬时传输状态；不是持续 SLO 或完整 Session 数 |
-| Collector 磁盘 | 08:01 有 746 个 sealed Segment，90,032,483,679 bytes | 云端共享 NFS 上的 WAL 持续保存；不能证明 OSS 已提交 |
-| Wire | 当前进程内仅 1 条，最后更新为 10 月 15 日 10:43（Asia/Shanghai） | 无近期真实成功 Turn Wire 的证据 |
-| 来源新鲜度 | 08:01 Wire 约 21.3 小时未更新；覆盖 `degraded`；runtime gate 因 `stale_sources=wire` 退出 1 | 当前采集覆盖降级 |
+| 18084、3011、3012、18086 | HTTP 200 | 入口、采集进程和平台进程存活 |
+| Collector/Relay/平台 | revision `97e45bd7f1dada45bfc684c10e3c9483bda3c1ef`；镜像摘要已固定 | 当前服务运行维护提交；不替代真实 Turn 验收 |
+| 投递 | 17:48 Collector Capture/Relay delivered 均为 1,160,146，pending/inflight/failed 均为 0，计数守恒 | 瞬时传输状态；不是持续 SLO 或完整 Session 数 |
+| Collector 磁盘 | 约 72 GiB sealed Raw，挂载在共享 NFS；重启后继续增长 | WAL 持久保存；不能证明 OSS 已提交 |
+| Wire | 当前进程内 0 条，`wire_turn_coverage` 无成功 Turn | 没有近期真实成功 Turn Wire 的证据 |
+| 来源新鲜度 | OTLP 有新记录，Wire/Hook 均缺失；覆盖 `degraded`；runtime gate 真实退出 1 | 当前采集覆盖降级 |
 | 历史失败 | 293 个文件，267,219,223 bytes | 保留失败取证，不能删除换取健康状态 |
-| 平台 18086 | 无法连接 | 当前无法交接在线管理、导出入口 |
-| 部署隔离 | 本轮只读复查：两容器均为旧镜像、绑定 loopback，有 `unless-stopped` 重启策略，CPU/内存/PID 无上限，根文件系统可写 | 有内部入口保护；尚缺资源配额与只读隔离 |
+| 平台 18086 | FS 后端、鉴权列表请求 HTTP 200，当前无任务 | 在线入口可用；没有真实 OSS 导出证据 |
+| 部署隔离 | 三个容器均为非 root、只读根、2 CPU、256 PID；Collector/Relay 8/12 GiB，平台 4 GiB | 运行边界已生效；尚缺容量、保留周期和告警验收 |
 | GitHub CI | 已核验基线 `4e6c177`：[run 38826013418](https://github.com/XS-MLVP/ChipTrace/actions/runs/38826013418) 已确认成功；6/6 作业、17 份有效报告元数据 | 包括五场景新采集的 FS/S3 贯通、独立 RSS 门禁和官方原版拒绝诊断；使用带补丁生产者和合成模型，未下载报告正文；后续修复仍需对应提交的 CI |
 | GitHub 集成 | 远端 main 仍为 `514d4cf`，公共分支 API 返回 `protected=false`；维护分支修复尚未合并 | 需设置评审和必需检查约束、完成同 SHA 验证及受控发布；分支 CI 不等于部署 |
 
