@@ -1050,6 +1050,10 @@ mod tests {
                     "output",
                     "success",
                     "output_truncated",
+                    // Real 0.157 producer traces emitted contradictory
+                    // `outcome` values on one span. Keep this regression
+                    // fail-closed until the producer emits one terminal fact.
+                    "outcome",
                     "PRIVATE_ATTRIBUTE_KEY",
                 ] {
                     for values in [
