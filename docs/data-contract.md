@@ -249,6 +249,12 @@ Turn 覆盖中的 Wire 是 Capture 数，OTLP logs/traces 是原始记录数，H
 事件数。派生生命周期和工具事件不重复计为 Hook。Session 级 `source_coverage` 的 OTLP
 数仍是批次数，两种统计不能直接相加或比较。
 
+交付门禁还要求 Wire 与模型交互在两个层级精确守恒：每个已归属 Turn 的
+`turn.source_coverage.wire` 必须等于该 Turn 的 `turn.model_interactions`，并且所有 Turn
+的 Wire 总数必须等于 `session_view.model_interactions`。聚合 Session 数正确但某个 Turn
+缺少 Wire 时仍必须保持 `delivery_ready=false`；原始 Capture 保留，不能用 OTLP、Hook 或
+Runtime 计数补写 Wire。
+
 Canonical interaction 投影还必须通过 `metrics.turn_interaction` 门禁。每条
 `ModelInteraction` 和 `span_kind=tool_execution` 的 `RuntimeSpan` 都要带明确的
 `trace_context.session_id` 与 `turn_id`（缺少时才回退到 `root_turn_id`），并至少引用一条
