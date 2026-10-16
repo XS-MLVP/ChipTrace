@@ -250,6 +250,8 @@ jobs:
           git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-session-scope-process.patch"
           git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-config-read-scope.patch"
           git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-config-read-scope.patch"
+          git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-otlp-outcome.patch"
+          git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-otlp-outcome.patch"
           git -C .ci-codex-source diff --check
       - name: Enable the pinned producer's unprivileged Linux sandbox on the isolated runner
         run: |

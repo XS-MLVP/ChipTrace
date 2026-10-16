@@ -28,7 +28,7 @@ HTTP transport：原先 FS 自测可通过，而 OSS/S3 在发送前返回 Confi
 GitHub CI 当前包括 Rust/Node、引擎/平台容器、MinIO S3、未修改客户端受管路由和
 固定生产者上下文，以及官方正式版上下文拒绝诊断，共六个作业。
 受管路由、官方资格诊断和带补丁生产者统一使用 `stock-release.json` 固定的
-`0.163.0`；固定生产者的完整六补丁仍单独声明。官方拒绝诊断绿色只表示复现了
+`0.163.0`；固定生产者的完整七补丁仍单独声明。官方拒绝诊断绿色只表示复现了
 已知缺口，不能作为上线或采购验收通过。
 测试报告作为 Artifact 保留，所有管道启用 `pipefail`。远端状态必须读取对应提交的
 Actions run，不能用本地通过或旧 main 的绿色结果代替。
@@ -160,10 +160,10 @@ CI 的原生字段回归涵盖缺少 Turn 属性、无 Session 属性的 traces�
 这证明隔离补丁链路可通过当前数据治理门禁，但不是未修改 Stock Codex 或线上部署的通过
 证明；正向 fixture 是脱敏元数据，真实 Alibaba OSS 账户验收仍未完成。
 
-本轮同时修正了扩展 producer patch 的 hunk 计数与上下文截断，并在 clean clone 中完成五个
-patch 的顺序 `apply --check`、应用和 `git diff --check`。GitHub CI 会继续固定 upstream
-commit，先应用已有补丁，再应用 Session 扩展和独立的 process 作用域补丁；任何 patch 漂移
-或锁文件依赖变化都应使 job 失败。
+本轮同时修正了扩展 producer patch 的 hunk 计数与上下文截断，并在 clean clone 中完成七个
+patch 的顺序 `apply --check`、应用、逆序撤销和 `git diff --check`。GitHub CI 会继续固定
+upstream commit，严格按策略文件中的顺序应用全部补丁；任何 patch 漂移或锁文件依赖变化都
+应使 job 失败。
 
 生产者编译缓存保存工作区 crate，但缓存身份必须覆盖固定 upstream commit、补丁应用后
 全部已跟踪文件、未跟踪的补丁新增文件、协调后的锁文件、执行位和缓存脚本自身。完整

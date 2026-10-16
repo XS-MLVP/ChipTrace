@@ -52,7 +52,7 @@ function verifyProducerSupport(policy, stock, { patchRoot = PATCH_ROOT } = {}) {
   assert.match(producer.upstream_commit, SHA1, 'producer.upstream_commit must be a full lowercase SHA-1');
   assert.match(producer.source_sha256, SHA256, 'producer.source_sha256 must be a SHA-256');
   assert.match(producer.official_binary_sha256, SHA256, 'producer.official_binary_sha256 must be a SHA-256');
-  assert.ok(Array.isArray(producer.patches) && producer.patches.length === 6, 'exactly six context patches are required');
+  assert.ok(Array.isArray(producer.patches) && producer.patches.length === 7, 'exactly seven producer patches are required');
 
   const files = producer.patches.map((patch, index) => {
     assert.ok(patch && typeof patch === 'object' && !Array.isArray(patch), `producer.patches[${index}] must be an object`);
@@ -72,6 +72,7 @@ function verifyProducerSupport(policy, stock, { patchRoot = PATCH_ROOT } = {}) {
     'upstream-session-scope-extension.patch',
     'upstream-session-scope-process.patch',
     'upstream-config-read-scope.patch',
+    'upstream-otlp-outcome.patch',
   ]);
 
   return {

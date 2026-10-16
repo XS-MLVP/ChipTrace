@@ -47,6 +47,10 @@
       {
         "file": "upstream-config-read-scope.patch",
         "sha256": "a4471cdef83fe0cb8c2dcc2ac3b3bc50ea6bdc30e179cebb1dcf1fd3ea9f63d5"
+      },
+      {
+        "file": "upstream-otlp-outcome.patch",
+        "sha256": "63eb77eca928ec9c0b47303d6399f8b8eec2c60fbc3b793e48abcf70755fb5c2"
       }
     ]
   }

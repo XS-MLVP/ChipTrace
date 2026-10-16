@@ -1,6 +1,6 @@
 # 生产就绪评估
 
-评估日期：2026-10-17。最新线上只读快照为 04:19（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-17。最新线上只读快照为 04:58（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
@@ -9,12 +9,13 @@ failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留�
 `conservation_ok=true`。Collector/Relay 实际 revision 为 `e5237065ff3a48623179c5846ff1916040030c9a`；
 维护分支已加入 Gateway/Platform revision 对齐护栏，但线上未运行这些最新修复。
 
-同一快照的 Relay `ingest_coverage.status=degraded`，`quality_errors=691`（全部来自 `otlp_traces`），
-Wire 已约 57.1 分钟未刷新，`required_sources_fresh=false`、`turn_capture_ready=false`，
+同一快照的 Relay `ingest_coverage.status=degraded`，`quality_errors=848`（全部来自 `otlp_traces`），
+Wire 已约 96 分钟未刷新，`required_sources_fresh=false`、`turn_capture_ready=false`，
 `successful_turn_scoped_captures=279/293`。runtime gate 使用质量错误、新鲜度、历史失败和 revision
 门禁真实退出 1；不能将传输进程健康解释为逐 Session/Turn 交付。
 
-18084 trace exporter 当前关闭；平台 18086 `/health` 返回成功且无排队任务，但这只证明平台进程存活。
+18084 trace exporter 当前关闭；平台 18086 `/health` 返回 200 且无排队任务，但响应没有 `build.revision`，
+这只证明平台进程存活。
 Gateway 容器 OCI revision 为 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`，新的 Gateway preflight
 在传入待发布 SHA 后会拒绝该版本。真实 Alibaba OSS、未修改 Stock Codex 的新鲜多轮 Canary 和
 目标 Session 的 `cloud-acceptance` 仍未完成，因此当前服务不满足真实生产发布标准。
@@ -85,7 +86,7 @@ GitHub Actions API 在本次复核中未认证且连接
 ## 当前发布门槛与迭代顺序
 
 生产者准入现在由 `integrations/codex/producer-support.json` 和
-`scripts/ci/producer-support-gate.js` 固定。当前策略只支持带六个内容寻址补丁的
+`scripts/ci/producer-support-gate.js` 固定。当前策略只支持带七个内容寻址补丁的
 `patched_stock_cli` 作为生产候选；官方未修改 `0.163.0` 的结果必须保持
 `diagnostic_rejection_only`。这条门禁解决了“维护分支 CI 运行修复版、线上却运行官方版”
 的治理错位，但它本身不会升级线上客户端，也不会替代目标环境的真实 Canary。
@@ -172,10 +173,10 @@ Turn 为 422、未知 Session 为 153；初始化 span 数量会变化，不能�
 
 ## 同一正式版的完整修复 CLI
 
-在同一 `0.163.0` 源码应用完整六补丁后，正常 CLI 的 `app-server` 入口完成五项新采集
+在同一 `0.163.0` 源码应用完整七补丁后，正常 CLI 的 `app-server` 入口完成五项新采集
 联测，实际 5/5 通过、无跳过，保留插件启动任务。`patched_stock_cli` 与官方原版使用
 相同的私有 user/PID/mount namespace、只读根及私有 `/etc`、`/tmp`；报告核对完整源码、
-六补丁和实际 CLI ELF 的 SHA-256。五份报告的 OTLP 分类均守恒，未归属 Turn 和未知
+七补丁和实际 CLI ELF 的 SHA-256。五份报告的 OTLP 分类均守恒，未归属 Turn 和未知
 Session 记录均为 0；不能用旧 debug App Server 的结果替代这次启动边界验证。
 
 同模型正向样本保留 2 Native Turn、2 个 epoch、12 次 HTTP 尝试及 10 条工具结果，

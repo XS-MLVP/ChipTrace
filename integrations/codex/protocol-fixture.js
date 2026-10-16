@@ -33,7 +33,8 @@ if (expectedBuildRevision !== undefined) {
 }
 const patches = unmodifiedStock ? [] : ['upstream-sse-context.patch', 'upstream-sse-context-test.patch',
   'upstream-session-scope.patch', 'upstream-session-scope-extension.patch',
-  'upstream-session-scope-process.patch', 'upstream-config-read-scope.patch'];
+  'upstream-session-scope-process.patch', 'upstream-config-read-scope.patch',
+  'upstream-otlp-outcome.patch'];
 const chiptrace = process.env.CHIPTRACE_BIN || path.resolve(__dirname, '../../target/debug/chiptrace');
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));

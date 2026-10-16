@@ -1,0 +1,57 @@
+diff --git a/codex-rs/core/src/tools/code_mode/execute_handler.rs b/codex-rs/core/src/tools/code_mode/execute_handler.rs
+--- a/codex-rs/core/src/tools/code_mode/execute_handler.rs
++++ b/codex-rs/core/src/tools/code_mode/execute_handler.rs
+@@ -202,7 +202,7 @@ impl CodeModeExecuteHandler {
+             turn_id = invocation.turn.sub_id.as_str(),
+             call_id = trace_id(&invocation.call_id),
+             cell.id = tracing::field::Empty,
+-            outcome = "interrupted",
++            outcome = tracing::field::Empty,
+         )
+     )]
+     async fn handle_call(
+diff --git a/codex-rs/core/src/tools/code_mode/telemetry.rs b/codex-rs/core/src/tools/code_mode/telemetry.rs
+--- a/codex-rs/core/src/tools/code_mode/telemetry.rs
++++ b/codex-rs/core/src/tools/code_mode/telemetry.rs
+@@ -19,6 +19,7 @@ pub(super) struct CodeModeToolCallGuard {
+     tool_name: &'static str,
+     started_at_ms: u64,
+     status: CodeModeToolCallStatus,
++    outcome_recorded: bool,
+     handler_span: Span,
+     extensions: Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>>,
+ }
+@@ -42,6 +43,7 @@ impl CodeModeToolCallGuard {
+             tool_name,
+             started_at_ms: codex_analytics::now_unix_millis(),
+             status: CodeModeToolCallStatus::Interrupted,
++            outcome_recorded: false,
+             handler_span,
+             extensions: Arc::clone(&session.services.extensions),
+         }
+@@ -56,4 +58,5 @@ impl CodeModeToolCallGuard {
+             CodeModeToolCallStatus::Failed
+         };
+         self.handler_span.record("outcome", outcome);
++        self.outcome_recorded = true;
+     }
+@@ -94,1 +94,7 @@
++        if !self.outcome_recorded {
++            // A cancelled future never reaches finish; keep its terminal
++            // interruption fact in the declared field without emitting a
++            // conflicting duplicate OTLP attribute.
++            self.handler_span.record("outcome", "interrupted");
++        }
+         self.analytics
+diff --git a/codex-rs/core/src/tools/code_mode/wait_handler.rs b/codex-rs/core/src/tools/code_mode/wait_handler.rs
+--- a/codex-rs/core/src/tools/code_mode/wait_handler.rs
++++ b/codex-rs/core/src/tools/code_mode/wait_handler.rs
+@@ -86,7 +86,7 @@ impl CodeModeWaitHandler {
+             turn_id = invocation.turn.sub_id.as_str(),
+             call_id = trace_id(&invocation.call_id),
+             cell.id = tracing::field::Empty,
+-            outcome = "interrupted",
++            outcome = tracing::field::Empty,
+         )
+     )]
+     async fn handle_call(

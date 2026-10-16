@@ -9,7 +9,7 @@
 `stock-release-context` CI 作业安装
 [stock-release.json](../integrations/codex/stock-release.json) 固定的官方 npm Linux x64 二进制，
 另检出对应 commit 并核对完整源码摘要、干净 Git 状态和 ELF SHA-256。它不会更换
-原有六补丁生产者、终端 CLI 或正向交付门槛。源码 tag 与 npm 包身份分别核验；这不是
+现行七补丁生产者、终端 CLI 或正向交付门槛。源码 tag 与 npm 包身份分别核验；这不是
 下载二进制的可复现构建证明。
 
 `CHIPTRACE_PROTOCOL_MODE=unmodified_stock` 使共享 fixture 通过系统 Bubblewrap 启动
@@ -57,7 +57,7 @@ Session/Turn 不上传。正向的 patched 五场景仍独立执行，原有所�
 当前修复生产者与官方原版诊断统一固定
 [`stock-release.json`](../integrations/codex/stock-release.json) 的正式版 `0.163.0`，
 upstream commit 为 `83086188ae0614bd882818ff1aa23f3194962012`。
-`upstream-context` 在该源码应用完整六补丁并构建 CLI；`stock-release-context` 使用同一
+`upstream-context` 在该源码应用完整七补丁并构建 CLI；`stock-release-context` 使用同一
 源码对应的官方未修改 ELF。修复版的来源报告仍明确保留补丁列表和源码摘要，不能通过
 未修改客户端门禁。受管路由配置回归也使用同一正式版；下文 alpha Canary 是历史证据。
 源码、外部依赖和 API 行为均须重新验证，不能从旧 alpha 的通过结果推导正式版通过。
@@ -82,7 +82,7 @@ Wire 比对，不能在 Lite 请求明确禁用并行时发送并行调用来宣
 边界、失败/异步场景见证及 Wire 请求/响应正文哈希。Relay/Collector 重启后还须得到完全
 相同的 Session 检查结果和原始 Segment 哈希。工作流保留 `native-protocol-ci.tap` 和
 `chiptrace.native-protocol-ci.v1` 元数据报告，不上传 Raw 或对话正文。随后
-`producer-report-gate.js` 对五份报告统一核对支持策略中的上游 revision、六个补丁摘要、
+`producer-report-gate.js` 对五份报告统一核对支持策略中的上游 revision、七个补丁摘要、
 最低 Native Turn、逐 Turn 身份/状态、四源覆盖、Wire/模型交互/工具数守恒和 FS/私有 S3
 逐 Turn 摘要一致性；缺少任一 Turn 的 OTLP 或 Hook 证据会直接拒绝。该报告仍明确标记
 为合成模型/隔离证据，不能宣称真实生产验收。
@@ -164,10 +164,10 @@ Buyer 导出必须真实退出 1，明确拒绝 `protocol_complete=false`。仅�
 生产者和采集链路一起运行时的回归，不能替代未修改客户端、真实模型、阿里 OSS 或
 生产环境的交付验收。原有脱敏真实 Canary fixture 仍用于验证门禁本身。
 
-回归执行前，在源码副本上逆序撤销完整六补丁集，并逐文件核对固定 upstream 原文；
+回归执行前，在源码副本上逆序撤销完整七补丁集，并逐文件核对固定 upstream 原文；
 GitHub 还核对构建前的源码摘要。仅同版本号、补丁文件名或编译成功不能证明实验基线一致。
 
-本地复验需先构建 ChipTrace，以及固定源码、六个补丁和协调锁文件对应的 CLI：
+本地复验需先构建 ChipTrace，以及固定源码、七个补丁和协调锁文件对应的 CLI：
 
 ```bash
 CHIPTRACE_PROTOCOL_MODE=patched_stock_cli \
@@ -227,6 +227,13 @@ CPU 数和 load average，不采集生产者环境值、命令行或对话。监
 `config/read` 和同类 `configRequirements/read` 明确声明 process scope；两种请求均在
 新回归每次连接时实际执行。子文件操作只沿其精确父链继承 scope，不按 span 名称豁免。
 原始五补丁真实 Canary 的历史证据和生产门禁保持原样；新实验仍须使用独立的合成报告。
+
+同一固定版本后续发现 `code_mode.handler.execute` 在取消后完成收尾时可能重复写入
+`outcome`，同时产生 `interrupted` 和 `completed` 两个 OTLP 属性；严格转换器因此拒绝该
+条派生记录，但仍完整保存 Raw。现行策略的[第七个补丁](upstream-otlp-outcome.patch)
+让执行 guard 只记录一次最终 outcome，并在未显式结束时保留 `interrupted` 事实；它不放宽
+转换器，也不覆盖 Raw。CI 会在固定源码上校验该补丁摘要、顺序应用、编译并逆序撤销，避免
+把冲突事件清洗成看似完整的 Turn。
 
 ## 2026-10-14 的真实新版客户端检查
 

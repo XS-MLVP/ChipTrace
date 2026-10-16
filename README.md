@@ -16,16 +16,16 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-当前线上复核（2026-10-17 04:19，Asia/Shanghai）确认传输进程仍存活，但业务门禁未通过：
+当前线上复核（2026-10-17 04:58，Asia/Shanghai）确认传输进程仍存活，但业务门禁未通过：
 Gateway outbox `pending=0`、`processing=0`、`recentFailureCount=0`、
 `unresolvedHistoricalFailedFiles=0`，293 个历史失败原件和 293 个 recovery receipt 均保留；
-Collector/Relay 队列为空且 `conservation_ok=true`，Collector/Relay 实际 revision 都是
-`e5237065ff3a48623179c5846ff1916040030c9a`；维护分支已包含 Gateway/Platform revision
-对齐门禁，但这些修复尚未部署。
-Relay 的 `ingest_coverage` 为 `degraded`：`quality_errors=691`（全部来自 `otlp_traces`）、
-Wire 已约 57.1 分钟未刷新，`required_sources_fresh=false`、`turn_capture_ready=false`，
-279/293 条历史 Wire 有 Turn 身份。带质量、新鲜度和 revision 门禁的 runtime gate 真实退出 1。
-18086 平台 `/health` 当前通过，但这只证明导出进程存活；Gateway OCI revision
+Collector/Relay 队列为空、`conservation_ok=true` 且两者实际 revision 都是
+`e5237065ff3a48623179c5846ff1916040030c9a`；当前 Gateway/Platform 仍未完成同一发布 revision
+的在线验收。
+Relay 的 `ingest_coverage` 为 `degraded`：`quality_errors=848`（全部来自 `otlp_traces`）、
+Wire 已约 96 分钟未刷新，`required_sources_fresh=false`、`turn_capture_ready=false`，
+279/293 条历史 Wire 有 Turn 身份。带质量、新鲜度和 revision 门禁的 runtime gate 对该快照真实退出 1。
+18086 平台 `/health` 当前返回 200，但响应没有 `build.revision`，只证明导出进程存活；Gateway OCI revision
 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5` 与待发布维护 revision 不一致，新的 Gateway preflight 会拒绝它。
 因此当前不能对外承诺真实 Session/Turn 全量采集或生产导出。详见[生产就绪评估](docs/production-readiness.md)。
 
