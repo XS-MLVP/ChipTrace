@@ -148,9 +148,12 @@ test('production deployment templates require an immutable image revision', () =
     /image: \$\{CHIPTRACE_IMAGE:\?set CHIPTRACE_IMAGE to an immutable ChipTrace image\}/,
   );
   assert.doesNotMatch(collectorCompose, /chiptrace:(?:latest|local)\b/);
-  assert.match(platformCompose, /CHIPTRACE_REVISION: \$\{CHIPTRACE_REVISION:-unknown\}/);
-  assert.match(platformCompose, /CHIPTRACE_PLATFORM_IMAGE/);
-  assert.doesNotMatch(platformCompose, /chiptrace-platform:latest\b/);
+  assert.match(platformCompose, /image: \$\{CHIPTRACE_PLATFORM_IMAGE:\?set CHIPTRACE_PLATFORM_IMAGE to an immutable ChipTrace platform image\}/);
+  for (const compose of [collectorCompose, platformCompose]) {
+    assert.match(compose, /CHIPTRACE_REVISION:\?set CHIPTRACE_REVISION to the full Git commit SHA/);
+    assert.doesNotMatch(compose, /^\s+build:/m);
+    assert.doesNotMatch(compose, /chiptrace(?:-platform)?:(?:latest|local)\b/);
+  }
   assert.match(dockerfile, /org\.opencontainers\.image\.revision="\$\{CHIPTRACE_REVISION\}"/);
   assert.match(dockerfile, /ENV CHIPTRACE_BUILD_REVISION=\$\{CHIPTRACE_REVISION\}/);
 });

@@ -1,4 +1,4 @@
-.PHONY: check test gateway-test gateway-receipt-test gateway-host-test codex-config-test managed-route-test protocol-collection-test native-context-test native-canary-gate-test native-canary-evidence-test stock-release-gate-test runtime-health-gate-test audit-memory-test turn-memory-test platform-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
+.PHONY: check test gateway-test gateway-receipt-test gateway-host-test codex-config-test managed-route-test protocol-collection-test native-context-test native-canary-gate-test native-canary-evidence-test stock-release-gate-test runtime-health-gate-test audit-memory-test turn-memory-test platform-test deployment-config-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
 
 CHIPTRACE_VERSION ?= 0.6.0
 CHIPTRACE_REVISION ?= $(shell git rev-parse HEAD)
@@ -58,6 +58,9 @@ turn-memory-test:
 platform-test:
 	cargo build --locked --bin chiptrace
 	node --test integrations/cloud-platform/platform.test.js integrations/cloud-platform/storage-oss.test.js
+
+deployment-config-test:
+	node --test scripts/deploy/preflight.test.js
 
 self-test:
 	cargo run --locked --bin chiptrace -- self-test

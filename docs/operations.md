@@ -16,22 +16,34 @@ make m0-test
 ## 云端服务
 
 ```bash
-export CHIPTRACE_IMAGE='chiptrace:<git-revision>'
+export CHIPTRACE_REVISION="$(git rev-parse HEAD)"
+docker build --build-arg CHIPTRACE_REVISION="$CHIPTRACE_REVISION" \
+  -t "chiptrace:$CHIPTRACE_REVISION" .
+export CHIPTRACE_IMAGE="$(docker image inspect --format '{{.Id}}' "chiptrace:$CHIPTRACE_REVISION")"
 export CHIPTRACE_NETWORK='router-v2-net'
 export CHIPTRACE_CAPTURE_ROOT='/srv/chiptrace/capture'
 export CHIPTRACE_COLLECTOR_STATE_ROOT='/srv/chiptrace/collector-state'
 export CHIPTRACE_RELAY_ROOT='/srv/chiptrace/relay'
 export CHIPTRACE_INGEST_TOKEN='<at-least-32-bytes>'
-docker compose -f deploy/collector-relay.yml up -d
+sudo install -d -o 10001 -g 10001 -m 0700 \
+  /srv/chiptrace/capture /srv/chiptrace/collector-state /srv/chiptrace/relay
+node scripts/deploy/preflight.js --file deploy/collector-relay.yml
+docker compose -f deploy/collector-relay.yml up -d --no-build --pull never
 ```
 
-镜像必须用同一个 Git revision 构建并固定到部署环境；构建参数会写入 Collector/Relay
-健康响应，供升级后的 revision 门禁核对：
+镜像须固定为本机完整 `sha256:<image-id>` 或仓库 `repository@sha256:<digest>`，不能只用
+版本 tag。预检只读解析实际 Compose 配置，拒绝可变 tag、缺失隔离/资源限制及与目标
+完整 Git SHA 不一致的 OCI revision；不会启动或更新服务。跨主机发布时使用仓库 digest。
+构建参数写入 Collector/Relay 的健康响应；启动后还需核对实际编译 revision 和业务门禁。
+预检通过不替代真实 Stock Codex、OSS 账号或目标 Session 验收。
 
-```bash
-docker build --build-arg CHIPTRACE_REVISION="$(git rev-parse HEAD)" \
-  -t "chiptrace:$(git rev-parse HEAD)" .
-```
+模板默认 Collector 8 GiB、Relay 12 GiB、平台 4 GiB 内存上限，均为 2 CPU、256 PID。
+可通过 `CHIPTRACE_COLLECTOR_MEMORY_LIMIT`、`CHIPTRACE_RELAY_MEMORY_LIMIT`、
+`CHIPTRACE_PLATFORM_MEMORY_LIMIT`、`CHIPTRACE_CPU_LIMIT`、`CHIPTRACE_PID_LIMIT` 调整。
+这些是隔离上限，不是实测容量承诺或预留：Collector/Relay 的正文预算为 4 GiB，Relay
+另有 4 GiB 投递预算，解析、队列及索引仍消耗内存。须根据最大正文、并发与任务规模实测
+峰值后配置，监控 OOM 和磁盘余量；不能直接把小样本 CI 的成功当作生产负载验收。
+三个服务均以非 root 用户、只读根运行，仅显式数据挂载和平台 tmpfs 可写。
 
 18084 对外提供 Responses、`/models`、`/otel/v1/logs`、`/otel/v1/traces` 和
 `/hooks/codex`。Responses 与 `/models` 使用 Provider 业务鉴权，网关使用内部采集凭据读取
@@ -147,9 +159,14 @@ export CHIPTRACE_PLATFORM_ROOT=/srv/chiptrace/platform
 export CHIPTRACE_CAPTURE_ROOT=/srv/chiptrace/capture
 export CHIPTRACE_OBJECT_ROOT=/srv/chiptrace/objects
 export CHIPTRACE_BACKEND=fs
+export CHIPTRACE_REVISION="$(git rev-parse HEAD)"
+docker build --target platform --build-arg CHIPTRACE_REVISION="$CHIPTRACE_REVISION" \
+  -t "chiptrace-platform:$CHIPTRACE_REVISION" .
+export CHIPTRACE_PLATFORM_IMAGE="$(docker image inspect --format '{{.Id}}' "chiptrace-platform:$CHIPTRACE_REVISION")"
 sudo install -d -o 10001 -g 10001 -m 0700 \
   /srv/chiptrace/platform /srv/chiptrace/objects
-docker compose -f deploy/cloud-platform.yml up -d --build
+node scripts/deploy/preflight.js --file deploy/cloud-platform.yml
+docker compose -f deploy/cloud-platform.yml up -d --no-build --pull never
 ```
 
 项目 ID、采集路径和存储命名空间由 root 下的 `NAMESPACE.json` 在首次启动时绑定。
@@ -174,6 +191,13 @@ sudo install -d -o 10001 -g 10001 -m 0700 \
 
 CI 使用隔离 MinIO 验证 S3 协议、对象长度和 SHA-256；真实 Alibaba OSS 账号、区域 endpoint
 和 IAM 权限仍需在目标部署账户做一次小数据验收，不能用本地 FS 结果代替。
+
+`make deployment-config-test` 通过真实 `docker compose config` 验证模板及负例。
+容器 CI 另运行 `scripts/ci/deployment-smoke.js`，在随机项目、临时挂载和独立网络中实际
+启动这两个模板的三个服务，核对镜像 ID、OCI/CLI revision、资源限制和健康状态，再验证
+Relay/Collector 的精确 Raw、重复确认、平台归档/恢复、Turn 和采购包下载及重启后字节
+一致性。它只使用合成数据和 FS 后端，精简报告明确不宣称真实上游、OSS 或生产验收；
+失败证据留在临时目录，不上传 Raw。通过后删除本次临时数据及自建容器/网络，不触及热服务。
 
 显式 `--session-id` 投影会顺序扫描两遍全部输入：先建立身份与子会话关系索引，再只保留
 选中 Session 的载荷。跨 Session 的 captureId 冲突、精确请求关联冲突和来源校验仍会拒绝

@@ -5,6 +5,14 @@ x-chiptrace-runtime: &chiptrace-runtime
   init: true
   restart: unless-stopped
   user: ${CHIPTRACE_RUN_AS:-10001:10001}
+  read_only: true
+  cpus: ${CHIPTRACE_CPU_LIMIT:-2}
+  pids_limit: ${CHIPTRACE_PID_LIMIT:-256}
+  labels:
+    io.chiptrace.expected-revision: ${CHIPTRACE_REVISION:?set CHIPTRACE_REVISION to the full Git commit SHA}
+  environment:
+    TOKIO_WORKER_THREADS: "2"
+    RAYON_NUM_THREADS: "2"
   cap_drop:
     - ALL
   security_opt:
@@ -16,6 +24,7 @@ x-chiptrace-runtime: &chiptrace-runtime
 services:
   collector:
     <<: *chiptrace-runtime
+    mem_limit: ${CHIPTRACE_COLLECTOR_MEMORY_LIMIT:-8g}
     container_name: ${CHIPTRACE_COLLECTOR_CONTAINER:-chiptrace-collector}
     command:
       - collector
@@ -63,6 +72,7 @@ services:
 
   relay:
     <<: *chiptrace-runtime
+    mem_limit: ${CHIPTRACE_RELAY_MEMORY_LIMIT:-12g}
     container_name: ${CHIPTRACE_RELAY_CONTAINER:-chiptrace-relay}
     command:
       - relay
@@ -111,6 +121,8 @@ services:
       - --request-timeout-seconds
       - "30"
     environment:
+      TOKIO_WORKER_THREADS: "2"
+      RAYON_NUM_THREADS: "2"
       CHIPTRACE_INGEST_TOKEN: ${CHIPTRACE_INGEST_TOKEN:?set CHIPTRACE_INGEST_TOKEN}
     ports:
       - ${CHIPTRACE_RELAY_BIND:-127.0.0.1:3011}:3012

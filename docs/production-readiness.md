@@ -1,20 +1,20 @@
 # 生产就绪评估
 
-评估日期：2026-10-16。最新线上只读快照为 08:01（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-16。最新线上只读快照为 08:35（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-08:01 的本机回环只读快照中，18084、3011（Collector）、3012（Relay）均返回 200，
-Collector/Relay 仍为 `fe9fcf9`；Collector Capture 与 Relay 累计投递均为 1,120,574，pending/inflight/failed
+08:35 的本机回环只读快照中，18084、3011（Collector）、3012（Relay）均返回 200，
+Collector/Relay 仍为 `fe9fcf9`；Collector Capture 与 Relay 累计投递均为 1,122,802，pending/inflight/failed
 均为 0，计数守恒。
 这只是瞬时队列状态，不构成持续 SLO 或完整 Session 的证明。Wire 仍只有 1 条且已约
-21.3 小时未更新，覆盖为 `degraded`；18086 连接拒绝。使用两个 `/health` URL 的
+21.9 小时未更新，覆盖为 `degraded`；同轮 18086 连接拒绝。使用两个 `/health` URL 的
 runtime gate 真实退出 1，明确
 报告 `stale_sources=wire`。
 网关独立 trace exporter 的 `enabled=false`；Full Trace Raw Capture 仍为启用状态。
 上一轮观察到模型探针最后可用时间为 10 月 8 日，本次未复验模型探针。
-同轮文件元数据统计与 Collector health 一致：746 个 sealed Segment 共 90,032,483,679 bytes
-保存在共享 NFS；此观测不证明已提交目标 OSS。当前状态应区分为传输进程存活、完整
+Collector health 报告 747 个 sealed Segment 共 90,569,096,794 bytes，保存在共享 NFS；
+此观测不证明已提交目标 OSS。当前状态应区分为传输进程存活、完整
 业务链路未验收和在线交付入口不可用。
 
 原生 Raw FS/S3 基线 `4e6c177` 的 [CI run 38826013418](https://github.com/XS-MLVP/ChipTrace/actions/runs/38826013418)
@@ -22,6 +22,30 @@ runtime gate 真实退出 1，明确
 固定正式版的生产者回归、五场景完整 CLI 采集、官方原版拒绝诊断、受管路由、容器
 及存储作业均实际执行；五项新采集的同一 Raw 已分别走 FS 和私有 MinIO S3，报告检查也
 实际执行。它不证明线上已升级，也不能替代后续修复对应提交的远端 CI。
+
+## 实际部署模板的隔离验证
+
+只读配置负对照确认：旧平台模板在未固定镜像和 revision 时，仍生成
+`chiptrace-platform:local` / `unknown`，静态的版本约束测试也通过。新模板要求显式
+镜像及完整 revision，部署前预检进一步拒绝可变 tag，核对本地 image ID/仓库摘要、
+OCI revision、只读根、非 root 和资源限额；平台构建从生产 Compose 中移出。
+
+新的实际配置回归修复前 0/2，修复后 2/2；与现有配置契约一起执行为 10/10、无跳过。
+隔离镜像的 Rust/平台源码与 `1916836` 相同，使用修复中的工作树模板实际启动三个服务，
+核对镜像身份和 CLI 编译 revision，并按原有 Wire/OTLP/Hook 来源边界回放合成数据。
+Collector 的 29 条 Raw 与原始 fixture 字节相同，Relay 保存其应有的 28 条；独立评估
+记录仅进入私有 Collector。归档、恢复、5 原生 Turn 和 score=100 的采购下载通过。
+实际重启三个服务后，Raw、任务、Turn JSONL 与采购包字节均不变，临时容器和网络已清理。
+
+联测最初因混用 Canonical/Raw 计数失败，之后又复现了当前 Docker 的 internal 网络
+不发布回环端口，以及动态端口重启后重新分配的行为；失败证据保留，脚本使用独立临时
+bridge，并从实际容器读取重启后的端口。Compose 内存值的字符串表示也按数值规范化，
+随后实际完整联测退出 0。CI 新增相同模板联测和精简 `deployment-smoke-report`，不上传
+Raw 或对话正文；发布仍须核验本修复对应提交的远端作业。
+
+默认限额为 Collector 8 GiB、Relay 12 GiB、平台 4 GiB，均为 2 CPU 和 256 PID，可显式
+调整。这些是运行边界，不是容量验收。该测试使用合成数据和 FS，未修改线上部署，
+也不证明未修改客户端、真实模型、目标 OSS 或租户授权已验收。
 
 ## 官方正式版 0.163.0 的新采集
 

@@ -2,23 +2,24 @@ name: ${CHIPTRACE_PLATFORM_PROJECT:-chiptrace-platform}
 
 services:
   platform:
-    build:
-      context: ..
-      target: platform
-      args:
-        CHIPTRACE_VERSION: ${CHIPTRACE_VERSION:-0.6.0}
-        CHIPTRACE_REVISION: ${CHIPTRACE_REVISION:-unknown}
-    image: ${CHIPTRACE_PLATFORM_IMAGE:-chiptrace-platform:local}
+    image: ${CHIPTRACE_PLATFORM_IMAGE:?set CHIPTRACE_PLATFORM_IMAGE to an immutable ChipTrace platform image}
     init: true
     restart: unless-stopped
-    user: "10001:10001"
+    user: ${CHIPTRACE_RUN_AS:-10001:10001}
     read_only: true
+    mem_limit: ${CHIPTRACE_PLATFORM_MEMORY_LIMIT:-4g}
+    cpus: ${CHIPTRACE_CPU_LIMIT:-2}
+    pids_limit: ${CHIPTRACE_PID_LIMIT:-256}
+    labels:
+      io.chiptrace.expected-revision: ${CHIPTRACE_REVISION:?set CHIPTRACE_REVISION to the full Git commit SHA}
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     stop_grace_period: 30s
     tmpfs:
       - /tmp:size=2g,mode=1777,uid=10001,gid=10001
     environment:
+      TOKIO_WORKER_THREADS: "2"
+      RAYON_NUM_THREADS: "2"
       CHIPTRACE_PLATFORM_TOKEN: ${CHIPTRACE_PLATFORM_TOKEN:?set CHIPTRACE_PLATFORM_TOKEN}
       CHIPTRACE_PROJECT_ID: ${CHIPTRACE_PROJECT_ID:?set CHIPTRACE_PROJECT_ID}
       CHIPTRACE_BACKEND: ${CHIPTRACE_BACKEND:-fs}
