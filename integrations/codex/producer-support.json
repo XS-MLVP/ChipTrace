@@ -1,0 +1,53 @@
+{
+  "schema_version": "chiptrace.producer-support.v1",
+  "policy": {
+    "production_mode": "patched_stock_cli",
+    "ci_modes": [
+      "patched_stock_cli",
+      "patched_stock_debug_app_server"
+    ],
+    "unmodified_stock_production_acceptance": false,
+    "unmodified_stock_status": "diagnostic_rejection_only",
+    "unmodified_stock_reason": "official Stock Codex does not preserve enough native Session/Turn context for exact four-source attribution",
+    "required_sources": [
+      "wire",
+      "otlp_logs",
+      "otlp_traces",
+      "hooks"
+    ],
+    "minimum_native_turns": 2,
+    "require_delivery_ready": true
+  },
+  "producer": {
+    "version": "0.163.0",
+    "upstream_commit": "83086188ae0614bd882818ff1aa23f3194962012",
+    "source_sha256": "90037d43c7e570ebc72a6d70ad54f470cce1bf1699d4adde4097994b45fcc6ca",
+    "official_binary_sha256": "399ff69c431c066e40de318fba45c2b07f45a76b19939d247ee4828fc70c4215",
+    "patches": [
+      {
+        "file": "upstream-sse-context.patch",
+        "sha256": "11e8b43fc2dda3b304f6251c738df6c081ed5d5437ee7b53c471d66ae10bee50"
+      },
+      {
+        "file": "upstream-sse-context-test.patch",
+        "sha256": "8a55c9b73aed61687645b932e54148a2523d9ea44e99269e6bc67126716bdd60"
+      },
+      {
+        "file": "upstream-session-scope.patch",
+        "sha256": "3f2fe8abe075df4ee4564ea9e44fd54d77b15ce1680639a72dcd9c3666ec2372"
+      },
+      {
+        "file": "upstream-session-scope-extension.patch",
+        "sha256": "806bfa770c3eca5cf86282d8577bbb754a8c39f8d4a16b9108fc45b819b5ead7"
+      },
+      {
+        "file": "upstream-session-scope-process.patch",
+        "sha256": "def2b98c732f352823644efba1e10c347b6258475d7f99b94eb396694a91cf0d"
+      },
+      {
+        "file": "upstream-config-read-scope.patch",
+        "sha256": "a4471cdef83fe0cb8c2dcc2ac3b3bc50ea6bdc30e179cebb1dcf1fd3ea9f63d5"
+      }
+    ]
+  }
+}

@@ -27,6 +27,12 @@ Collector health 报告 750 个 sealed Segment 共 92,061,483,623 bytes，保存
 
 ## 当前发布门槛与迭代顺序
 
+生产者准入现在由 `integrations/codex/producer-support.json` 和
+`scripts/ci/producer-support-gate.js` 固定。当前策略只支持带六个内容寻址补丁的
+`patched_stock_cli` 作为生产候选；官方未修改 `0.163.0` 的结果必须保持
+`diagnostic_rejection_only`。这条门禁解决了“维护分支 CI 运行修复版、线上却运行官方版”
+的治理错位，但它本身不会升级线上客户端，也不会替代目标环境的真实 Canary。
+
 | 优先级 | 当前证据与缺口 | 进入下一阶段的验收条件 |
 | --- | --- | --- |
 | P0 业务采集 | Runtime 持续增长，但 Wire 陈旧；官方原版仍有未归属记录 | 真实业务走采集入口，固定生产者版本；新 Session、resume、失败与异步工具的逐 Turn 四源、身份、正文及终态全部独立通过 |

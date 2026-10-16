@@ -67,6 +67,12 @@ Responses Wire；模型身份以 Wire 与 Sub2API 精确路由为准。
 修复生产者的五项协议联测已迁移到同一正式版源码及完整六补丁；其来源仍为
 `patched_stock_cli`，从正常 CLI 入口启动并保留插件启动任务；不表示官方二进制已包含修复。
 
+生产准入只接受仓库内[生产者支持策略](producer-support.json)声明的固定版本和补丁摘要。
+该策略明确未修改 Stock Codex 只能走 `diagnostic_rejection_only`，不得因为 Wire、OTLP 或
+Hook 的全局计数正常而进入交付。每次 CI 都重新计算六个补丁的 SHA-256，并核对上游提交、
+官方二进制摘要和四路来源要求；部署或升级生产者时必须保留同一份策略报告，不能仅凭
+客户端版本号或“CI 通过”放行。
+
 配置回归不需要 Provider 凭据，不启动 Turn，不调用模型，也不读取宿主用户配置：
 
 ```bash

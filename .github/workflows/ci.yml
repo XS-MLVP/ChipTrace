@@ -479,9 +479,17 @@ jobs:
         with:
           name: producer-ci-regressions-report
           path: producer-ci-regressions.tap
+      - name: Verify the content-addressed producer support policy
+        run: node scripts/ci/producer-support-gate.js | tee producer-support-gate.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: producer-support-gate-report
+          path: producer-support-gate.json
       - run: node --test scripts/ci/native-canary-gate.test.js
       - run: node --test scripts/ci/native-canary-evidence.test.js
       - run: node --test scripts/ci/stock-release-gate.test.js
+      - run: node --test scripts/ci/producer-support-gate.test.js
       - name: Verify runtime delivery, Collector persistence and Turn Wire evidence fails closed
         run: |
           set -euo pipefail

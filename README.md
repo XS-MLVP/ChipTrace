@@ -117,6 +117,7 @@ OTLP 单根且内部父引用全部可解析。
 - [交付格式](docs/delivery.md)
 - [OpenAPI](schemas/openapi.yaml)
 - [云平台嵌入插件](integrations/cloud-platform/README.md)
+- [生产者支持策略](integrations/codex/producer-support.json)
 
 ## 磁盘恢复与平台嵌入
 
