@@ -1,7 +1,8 @@
 use crate::capture::{CaptureRecord, normalize_capture};
 use crate::tool_schema::{canonical_runtime_tool_name, is_stock_unified_exec_tool};
 use crate::turn_identity::{
-    validate_context_attributes, validate_otlp_structure, visit_otlp_envelope,
+    session_attribute, turn_attribute, validate_context_attributes, validate_otlp_identity_layers,
+    validate_otlp_structure, visit_otlp_envelope,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -221,6 +222,17 @@ fn derive_otlp_logs(envelope: &Value, raw_sha256: &str, max_bytes: usize) -> Res
                         continue;
                     }
                 };
+                if let Err(error) = validate_otlp_identity_layers([
+                    resource_log.pointer("/resource/attributes"),
+                    scope_log.pointer("/scope/attributes"),
+                    log_record.get("attributes"),
+                ]) {
+                    // An ambiguous record cannot own a derived tool or even
+                    // an attributed incomplete event. Keep its original Raw
+                    // and other readable records, then fail the quality ACK.
+                    errors.push(format!("logRecords[{ordinal}]: {error}"));
+                    continue;
+                }
                 let mut attributes = resource_attributes.clone();
                 attributes.extend(scope_attributes.clone());
                 attributes.extend(record_attributes);
@@ -863,10 +875,15 @@ fn value_alias(value: &Value, keys: &[&str]) -> Option<Value> {
 
 fn validate_otlp_traces(envelope: &Value) -> Result<(u64, Vec<String>)> {
     let source_records = count_nested_records(envelope, "resourceSpans", "scopeSpans", "spans");
-    let conversion_errors = match visit_otlp_envelope("otlp_traces", envelope, |_, _, _| Ok(())) {
-        Ok(()) => Vec::new(),
-        Err(error) => vec![error.to_string()],
-    };
+    let conversion_errors =
+        match visit_otlp_envelope("otlp_traces", envelope, |_, _, attributes| {
+            session_attribute(&attributes)?;
+            turn_attribute(&attributes)?;
+            Ok(())
+        }) {
+            Ok(()) => Vec::new(),
+            Err(error) => vec![error.to_string()],
+        };
     Ok((source_records, conversion_errors))
 }
 
@@ -1318,6 +1335,86 @@ mod tests {
         let replay = prepare_cloud_ingest(CloudEndpoint::OtlpLogs, &raw, 1024 * 1024).unwrap();
         assert_eq!(batch.summary, replay.summary);
         assert_eq!(batch.records[0].canonical, replay.records[0].canonical);
+    }
+
+    #[test]
+    fn conflicting_log_identity_aliases_preserve_raw_without_deriving_a_tool_owner() {
+        for (key, value) in [
+            ("session.id", "PRIVATE_CONFLICTING_SESSION"),
+            ("thread_id", "11111111-1111-1111-1111-111111111111"),
+            ("turn_id", "PRIVATE_CONFLICTING_TURN"),
+            ("root_turn_id", "PRIVATE_CONFLICTING_ROOT"),
+            ("codex.root_turn_id", "PRIVATE_CONFLICTING_ROOT"),
+        ] {
+            let mut raw: Value = serde_json::from_slice(&stock_logs(false, true)).unwrap();
+            let attributes = raw["resourceLogs"][0]["scopeLogs"][0]["logRecords"][1]["attributes"]
+                .as_array_mut()
+                .unwrap();
+            attributes.extend([
+                attr("turn.id", json!({"stringValue":"native-turn"})),
+                attr("root_turn.id", json!({"stringValue":"root-turn"})),
+                attr(key, json!({"stringValue":value})),
+            ]);
+            let raw = serde_json::to_vec_pretty(&raw).unwrap();
+            let batch = prepare_cloud_ingest(CloudEndpoint::OtlpLogs, &raw, 1024 * 1024).unwrap();
+            assert_eq!(batch.summary.source_records, 2);
+            assert_eq!(batch.summary.conversion_errors.len(), 1);
+            assert_eq!(batch.summary.attributed_quality_errors, 0);
+            assert_eq!(batch.summary.derived_captures, 1);
+            assert!(!batch.summary.conversion_errors[0].contains(value));
+            let captured = values(&batch);
+            assert_eq!(captured.len(), 2);
+            assert_eq!(captured[1]["lifecycleEvent"]["type"], "session_start");
+            assert_eq!(
+                captured[0]["telemetryBatch"]["raw_json"],
+                String::from_utf8(raw.clone()).unwrap()
+            );
+            assert_eq!(captured[0]["telemetryBatch"]["raw_sha256"], sha256(&raw));
+        }
+    }
+
+    #[test]
+    fn conflicting_trace_identity_aliases_are_quality_errors_even_without_projection() {
+        for (key, conflicting, equal) in [
+            ("session.id", "PRIVATE_OTHER_SESSION", "native-session"),
+            ("turn_id", "PRIVATE_OTHER_TURN", "native-turn"),
+            ("root_turn_id", "PRIVATE_OTHER_ROOT", "root-turn"),
+            ("codex.root_turn_id", "PRIVATE_OTHER_ROOT", "root-turn"),
+        ] {
+            for candidate in [conflicting, equal] {
+                let raw = serde_json::to_vec_pretty(&json!({"resourceSpans":[{
+                    "resource":{"attributes":[attr("conversation.id", json!({"stringValue":"native-session"}))]},
+                    "scopeSpans":[{"scope":{"attributes":[
+                        attr("turn.id", json!({"stringValue":"native-turn"})),
+                        attr("root_turn.id", json!({"stringValue":"root-turn"}))
+                    ]}, "spans":[{"name":"codex.turn", "attributes":[
+                        attr(key, json!({"stringValue":candidate}))
+                    ]}]}]
+                }]})).unwrap();
+                let batch =
+                    prepare_cloud_ingest(CloudEndpoint::OtlpTraces, &raw, 1024 * 1024).unwrap();
+                assert_eq!(batch.summary.source_records, 1);
+                assert_eq!(batch.summary.derived_captures, 0);
+                assert_eq!(
+                    batch.summary.conversion_errors.len(),
+                    usize::from(candidate == conflicting)
+                );
+                assert!(
+                    !batch
+                        .summary
+                        .conversion_errors
+                        .join(" ")
+                        .contains("PRIVATE_")
+                );
+                let captured = values(&batch);
+                assert_eq!(captured.len(), 1);
+                assert_eq!(
+                    captured[0]["telemetryBatch"]["raw_json"],
+                    String::from_utf8(raw.clone()).unwrap()
+                );
+                assert_eq!(captured[0]["telemetryBatch"]["raw_sha256"], sha256(&raw));
+            }
+        }
     }
 
     #[test]

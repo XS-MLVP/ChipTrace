@@ -1,23 +1,23 @@
 # 生产就绪评估
 
-评估日期：2026-10-16。最新线上只读快照为 09:17–09:18（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-16。最新线上只读快照为 09:54（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-09:17 的本机回环只读快照中，18084、3011（Collector）、3012（Relay）均返回 200，
-Collector/Relay 仍为 `fe9fcf9`；Collector Capture 与 Relay 累计投递均为 1,125,480，
-pending/failed 为 0、inflight 为 1，计数守恒。
+09:54 的本机回环只读快照中，18084、3011（Collector）、3012（Relay）均返回 200，
+Collector/Relay 仍为 `fe9fcf9`；Collector Capture 与 Relay 累计投递均为 1,127,751，
+pending/inflight/failed 均为 0，计数守恒。
 这只是瞬时队列状态，不构成持续 SLO 或完整 Session 的证明。Wire 仍只有 1 条且已约
-22.6 小时未更新，覆盖为 `degraded`；同轮 18086 连接拒绝。使用三个 `/health` URL 的
+23.2 小时未更新，覆盖为 `degraded`；同轮 18086 连接拒绝。使用三个 `/health` URL 的
 runtime gate v3 真实退出 1，明确
 报告 `stale_sources=wire`。
 网关独立 trace exporter 的 `enabled=false`；Full Trace Raw Capture 仍为启用状态。
 上一轮观察到模型探针最后可用时间为 10 月 8 日，本次未复验模型探针。
-Collector health 报告 747 个 sealed Segment 共 90,569,096,794 bytes，保存在共享 NFS；
+Collector health 报告 748 个 sealed Segment 共 91,084,888,450 bytes，保存在共享 NFS；
 此观测不证明已提交目标 OSS。当前状态应区分为传输进程存活、完整
 业务链路未验收和在线交付入口不可用。
 
-部署模板基线 `b68412b` 的 [CI run 38832266930](https://github.com/XS-MLVP/ChipTrace/actions/runs/38832266930)
+Collector 门禁基线 `88894c4` 的 [CI run 38834669815](https://github.com/XS-MLVP/ChipTrace/actions/runs/38834669815)
 已独立确认 6/6 作业成功，138 个步骤逐项核对，18 个 artifact 元数据有效；未下载正文重新计算哈希。
 固定正式版的生产者回归、五场景完整 CLI 采集、官方原版拒绝诊断、受管路由、容器
 及存储作业均实际执行；五项新采集的同一 Raw 已分别走 FS 和私有 MinIO S3，报告检查也
@@ -61,9 +61,10 @@ Relay 可以贡献额外 Capture；计数下界不证明任何 Session 的逐对
 均真实退出 1。三个服务重启后旧 Raw、Turn 和采购包字节不变，但运行门禁因缺少新的
 进程级来源证据正确拒绝，不能用重复数据刷新成功 Wire 的新鲜度。
 
-本轮未改 Rust 或平台源码，沿用与 `1916836` 相同源码构建的隔离镜像；远端 CI 将按
-本次提交重新构建。报告明确 `session_delivery_claimed=false`、合成网关、非真实上游、
-非真实 OSS 账号、非生产验收。该修复尚未部署，仍须核验对应提交的远端 CI。
+该门禁修复未改 Rust 或平台源码，本地沿用与 `1916836` 相同源码构建的隔离镜像；
+对应 `88894c4` 的远端 CI 已实际按新 SHA 重建，6/6 作业成功。报告明确
+`session_delivery_claimed=false`、合成网关、非真实上游、非真实 OSS 账号、非生产验收。
+该门禁修复尚未部署，后续 Rust 修改仍须核验各自提交的远端 CI。
 
 ## 官方正式版 0.163.0 的新采集
 
@@ -145,6 +146,30 @@ Node 测试通过；三项 RSS 默认忽略，仍须由独立 CI 门禁执行。
 报告检查通过，全部来源分类守恒且未知 Session/未归属 Turn 均为 0。正向 Buyer 下载
 仍为 score=100，FS/S3 与重启后完整 Session JSONL 的字节/SHA 一致；混合模型和取消/
 断流继续拒绝采购，压缩样本不冒称满足采购准入。生产者补丁和合成模型身份均未改变。
+
+## OTLP 身份别名的采集确认
+
+隔离服务实际复现：日志的 `conversation.id` 与 `session.id` 矛盾时仍返回 HTTP 200；
+新增 HTTP 回归真实退出 1，两项 Rust 回归也分别退出 101。离线来源审计原本会拒绝
+这些别名冲突，但入口没有执行相同规则，不能把其持久化确认视为质量成功。
+
+现在 logs 在派生所有者前、traces 在确认质量前复用原生身份规则；矛盾的 Session、
+UUID `thread_id`、Turn 和 root Turn 别名在完整原文落盘后返回 HTTP 400。正常同批
+记录保留，存在身份歧义的工具日志不派生所有者。只读取身份标量进行新增检查，不复制
+工具输出或日志正文；诊断不含身份值和正文。相同别名、层级覆盖和不同的 Turn/root Turn
+仍正常接收。
+
+定向 Rust 转换回归实际 21/21、无跳过。真实临时 Relay/Collector 的 HTTP 联测通过：
+20 份 batch 在两份 WAL 的原始 UTF-8 字节和哈希一致，重复投递及实际重启通过，冲突
+Raw 的来源审计继续真实退出 1。这是合成协议回归，未改线上服务；对应提交的远端 CI、
+未修改生产者、真实 OSS 账号和租户授权交付仍需独立验证。
+
+复核还发现转换器支持 `codex.root_turn_id`，审计的 root Turn 别名表却遗漏它。新增
+Rust/真实 CLI 回归先实际失败，分别退出 101/1。补齐后，只有该字段的记录可精确归属，
+与其他 root Turn 别名冲突时拒绝；普通 Turn 与 root Turn 的值仍可不同。同一份失败
+输入只读回放从 0 条恢复为 1 条归属，原始 SHA-256 不变，未冒称完整 Session 可交付。
+最终源码的完整 `cloud-test` 实际退出 0：fmt/Clippy、319 个 Rust 库测试、1 个 CLI
+测试和 290 个 Node 测试通过；三项 RSS 默认忽略，继续由独立 CI 门禁实际执行。
 
 ## 平台状态验收
 

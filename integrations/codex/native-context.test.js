@@ -24,7 +24,9 @@ function batch(endpoint, raw, records) {
 
 async function input(t, captures) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-context-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  t.after(() => process.env.CHIPTRACE_CONTEXT_KEEP === '1'
+    ? t.diagnostic(`isolated source context evidence retained: ${root}`)
+    : fs.rm(root, { recursive: true, force: true }));
   const file = path.join(root, 'input.ndjson');
   const bytes = Buffer.from(captures.map(c => JSON.stringify(c)).join('\n') + '\n');
   await fs.writeFile(file, bytes, { mode: 0o400 });
@@ -119,6 +121,41 @@ test('conflicting duplicate context attributes fail without choosing a native ow
         assert.deepEqual(await fs.readFile(data.file), data.bytes);
         assert.deepEqual(await fs.readdir(data.root), ['input.ndjson']);
       });
+    }
+  }
+});
+
+test('codex root Turn aliases retain exact attribution and reject contradictions without changing Raw', async t => {
+  const attr = (key, value) => ({ key, value: { stringValue: value } });
+  const marker = 'PRIVATE_ROOT_ALIAS_IDENTITY';
+  for (const endpoint of ['otlp_logs', 'otlp_traces']) {
+    for (const conflict of [false, true]) {
+      const record = { name: 'codex.turn', attributes: [
+        attr('event.name', 'codex.sse_event'), attr('conversation.id', 'selected'),
+        attr('codex.root_turn_id', conflict ? marker : 'native-turn'),
+        ...(conflict ? [attr('turn.id', 'native-turn'), attr('root_turn.id', 'root-turn')] : []),
+      ] };
+      const raw = endpoint === 'otlp_logs'
+        ? { resourceLogs: [{ scopeLogs: [{ logRecords: [record] }] }] }
+        : { resourceSpans: [{ scopeSpans: [{ spans: [record] }] }] };
+      const data = await input(t, [
+        { captureId: 'cap-root-alias-wire', recordType: 'api_snapshot', traceContext: {
+          session_id: 'selected', turn_id: 'native-turn',
+        } },
+        batch(endpoint, raw, 1),
+      ]);
+      const audit = () => run(binary, ['audit-session-context', '--input', data.file,
+        '--session-id', 'selected', '--sample-limit', '0']);
+      if (conflict) {
+        await assert.rejects(audit, error => error.code === 1 && error.stdout === ''
+          && /conflicting explicit identity aliases/.test(error.stderr) && !error.stderr.includes(marker));
+      } else {
+        const result = JSON.parse((await audit()).stdout);
+        assert.equal(result.sources[endpoint].turn_assigned_records, 1);
+        assert.equal(result.unscoped_otlp_records, 0);
+      }
+      assert.deepEqual(await fs.readFile(data.file), data.bytes);
+      assert.deepEqual(await fs.readdir(data.root), ['input.ndjson']);
     }
   }
 });

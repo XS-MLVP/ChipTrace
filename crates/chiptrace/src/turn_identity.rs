@@ -6,6 +6,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) type NativeTurn = (String, String);
 type SpanKey = (String, String);
+const SESSION_ATTRIBUTES: &[&str] = &[
+    "conversation.id",
+    "session.id",
+    "session_id",
+    "conversation_id",
+    "codex.session_id",
+];
+const TURN_ATTRIBUTES: &[&str] = &["turn.id", "turn_id", "codex.turn_id"];
+const ROOT_TURN_ATTRIBUTES: &[&str] = &["root_turn.id", "root_turn_id", "codex.root_turn_id"];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ScopeKind {
@@ -525,16 +534,7 @@ fn unique_attribute(
 
 pub(crate) fn session_attribute(attributes: &BTreeMap<String, String>) -> Result<Option<String>> {
     // thread.id is an OS thread number in native tracing, not a Codex Session.
-    let explicit = unique_attribute(
-        attributes,
-        &[
-            "conversation.id",
-            "session.id",
-            "session_id",
-            "conversation_id",
-            "codex.session_id",
-        ],
-    )?;
+    let explicit = unique_attribute(attributes, SESSION_ATTRIBUTES)?;
     let native_thread = attributes.get("thread_id").filter(|id| {
         id.len() == 36
             && id.bytes().enumerate().all(|(i, b)| {
@@ -556,11 +556,38 @@ pub(crate) fn session_attribute(attributes: &BTreeMap<String, String>) -> Result
 }
 
 pub(crate) fn turn_attribute(attributes: &BTreeMap<String, String>) -> Result<Option<String>> {
-    let native = unique_attribute(attributes, &["turn.id", "turn_id", "codex.turn_id"])?;
-    Ok(native.or(unique_attribute(
-        attributes,
-        &["root_turn.id", "root_turn_id"],
-    )?))
+    let native = unique_attribute(attributes, TURN_ATTRIBUTES)?;
+    Ok(native.or(unique_attribute(attributes, ROOT_TURN_ATTRIBUTES)?))
+}
+
+fn is_identity_attribute(key: &str) -> bool {
+    SESSION_ATTRIBUTES.contains(&key)
+        || TURN_ATTRIBUTES.contains(&key)
+        || ROOT_TURN_ATTRIBUTES.contains(&key)
+        || key == "thread_id"
+}
+
+/// Apply the same native identity rules before deriving a log's owner.
+/// Read only identity scalars, avoiding copies of tool output or log bodies.
+/// Resource/scope/record precedence matches the full OTLP visitor below.
+pub(crate) fn validate_otlp_identity_layers(layers: [Option<&Value>; 3]) -> Result<()> {
+    let mut merged = BTreeMap::new();
+    for layer in layers {
+        validate_context_attributes(layer)?;
+        for attribute in layer.and_then(Value::as_array).into_iter().flatten() {
+            let Some(key) = attribute.get("key").and_then(Value::as_str) else {
+                continue;
+            };
+            if is_identity_attribute(key)
+                && let Some(value) = attribute.get("value").and_then(attribute_text)
+            {
+                merged.insert(key.to_owned(), value);
+            }
+        }
+    }
+    session_attribute(&merged)?;
+    turn_attribute(&merged)?;
+    Ok(())
 }
 
 pub(crate) fn validate_context_attributes(value: Option<&Value>) -> Result<()> {
@@ -576,24 +603,10 @@ pub(crate) fn validate_context_attributes(value: Option<&Value>) -> Result<()> {
         // otherwise a duplicate can erase a native identity, source boundary,
         // or business event name before conflict detection sees it. Resource,
         // scope and record attributes remain separate attribute lists.
-        if matches!(
-            key,
-            "conversation.id"
-                | "session.id"
-                | "session_id"
-                | "conversation_id"
-                | "codex.session_id"
-                | "thread_id"
-                | "turn.id"
-                | "turn_id"
-                | "codex.turn_id"
-                | "root_turn.id"
-                | "root_turn_id"
-                | "codex.context_scope"
-                | "event.name"
-        ) && context_values
-            .insert(key, value)
-            .is_some_and(|previous| previous != value)
+        if (is_identity_attribute(key) || matches!(key, "codex.context_scope" | "event.name"))
+            && context_values
+                .insert(key, value)
+                .is_some_and(|previous| previous != value)
         {
             bail!("OTLP has conflicting duplicate context attribute {key:?}");
         }
@@ -609,15 +622,18 @@ fn attributes(value: Option<&Value>) -> Result<BTreeMap<String, String>> {
         .flatten()
         .filter_map(|attribute| {
             let key = attribute.get("key")?.as_str()?;
-            let value = attribute.get("value")?;
-            let parsed = value.get("stringValue").or_else(|| value.get("intValue"))?;
-            let parsed = parsed
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| parsed.as_i64().map(|n| n.to_string()))?;
+            let parsed = attribute.get("value").and_then(attribute_text)?;
             Some((key.to_owned(), parsed))
         })
         .collect())
+}
+
+fn attribute_text(value: &Value) -> Option<String> {
+    let parsed = value.get("stringValue").or_else(|| value.get("intValue"))?;
+    parsed
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| parsed.as_i64().map(|n| n.to_string()))
 }
 
 fn raw_batch(capture: &Value) -> Result<Value> {
@@ -834,6 +850,27 @@ mod tests {
     }
 
     #[test]
+    fn codex_root_turn_alias_preserves_fallback_and_conflict_checks() {
+        let mut attributes =
+            BTreeMap::from([("codex.root_turn_id".to_owned(), "root-turn".to_owned())]);
+        assert_eq!(
+            turn_attribute(&attributes).unwrap().as_deref(),
+            Some("root-turn")
+        );
+        attributes.insert("turn.id".to_owned(), "native-turn".to_owned());
+        assert_eq!(
+            turn_attribute(&attributes).unwrap().as_deref(),
+            Some("native-turn")
+        );
+        attributes.insert("root_turn.id".to_owned(), "root-turn".to_owned());
+        assert!(turn_attribute(&attributes).is_ok());
+        attributes.insert("root_turn_id".to_owned(), "PRIVATE_OTHER_ROOT".to_owned());
+        let error = turn_attribute(&attributes).unwrap_err().to_string();
+        assert!(error.contains("conflicting explicit identity aliases"));
+        assert!(!error.contains("PRIVATE_"));
+    }
+
+    #[test]
     fn duplicate_context_conflicts_fail_before_attribute_maps_choose_an_owner() {
         let context_keys = [
             "conversation.id",
@@ -847,6 +884,7 @@ mod tests {
             "codex.turn_id",
             "root_turn.id",
             "root_turn_id",
+            "codex.root_turn_id",
             "codex.context_scope",
             "event.name",
         ];

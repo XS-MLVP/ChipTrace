@@ -37,6 +37,123 @@ function start(args) {
   return handle;
 }
 
+test('identity aliases fail cloud quality ACKs while exact Raw and equal aliases survive restart',
+  { timeout: 60000 }, async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-identity-alias-'));
+    let collector;
+    let relay;
+    let passed = false;
+    t.after(async () => {
+      if (relay) await stop(relay);
+      if (collector) await stop(collector);
+      if (passed && process.env.CHIPTRACE_RECEIPT_KEEP !== '1') await fs.rm(root, { recursive: true, force: true });
+      else t.diagnostic(`isolated identity alias evidence retained: ${root}`);
+    });
+    const collectorUrl = `http://127.0.0.1:${await reservePort()}`;
+    const collectorArgs = ['collector', '--host', '127.0.0.1', '--port', new URL(collectorUrl).port,
+      '--root', path.join(root, 'collector'), '--state-root', path.join(root, 'collector-state')];
+    collector = start(collectorArgs);
+    await health(collectorUrl, collector);
+    const relayUrl = `http://127.0.0.1:${await reservePort()}`;
+    const relayArgs = ['relay', '--host', '127.0.0.1', '--port', new URL(relayUrl).port,
+      '--root', path.join(root, 'relay'), '--state-root', path.join(root, 'relay-state'),
+      '--delivery-state-root', path.join(root, 'delivery'), '--collector-url', collectorUrl];
+    relay = start(relayArgs);
+    await health(relayUrl, relay);
+    const expected = new Map();
+    const marker = 'PRIVATE_ALIAS_BODY_MUST_NOT_APPEAR';
+    const session = '11111111-1111-1111-1111-111111111111';
+    const attr = (key, value) => ({ key, value: { stringValue: value } });
+    let first;
+    for (const endpoint of ['logs', 'traces']) {
+      for (const [key, equal, conflict] of [
+        ['session.id', session, marker], ['thread_id', session, '22222222-2222-2222-2222-222222222222'],
+        ['turn_id', 'native-turn', marker], ['root_turn_id', 'root-turn', marker],
+        ['codex.root_turn_id', 'root-turn', marker],
+      ]) {
+        for (const [candidate, invalid] of [[conflict, true], [equal, false]]) {
+          const attributes = [attr('event.name', 'codex.user_prompt'), attr('test.utf8', '中文 🧪'),
+            attr('private.body', marker)];
+          const envelope = { [endpoint === 'logs' ? 'resourceLogs' : 'resourceSpans']: [{
+            resource: { attributes: [attr('conversation.id', session)] },
+            [endpoint === 'logs' ? 'scopeLogs' : 'scopeSpans']: [{
+              scope: { attributes: [attr('turn.id', 'native-turn'), attr('root_turn.id', 'root-turn')] },
+              [endpoint === 'logs' ? 'logRecords' : 'spans']: [
+                { name: 'codex.turn', attributes },
+                { name: 'codex.turn', attributes: [...attributes, attr(key, candidate)] },
+              ],
+            }],
+          }] };
+          const body = JSON.stringify(envelope, null, 2) + '\n';
+          expected.set(digest(Buffer.from(body)), body);
+          first ||= { endpoint, body };
+          for (let attempt = 0; attempt < (invalid ? 2 : 1); attempt++) {
+            const response = await fetch(`${relayUrl}/otel/v1/${endpoint}`, { method: 'POST',
+              headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+              body, signal: AbortSignal.timeout(5000) });
+            const receipt = await response.json();
+            const detail = invalid ? receipt : receipt.chiptrace;
+            assert.equal(response.status, invalid ? 400 : 200, `${endpoint} ${key}: identity aliases must agree`);
+            assert.equal(detail.durable, true);
+            assert.equal(detail.captures, 1);
+            assert.equal(detail.duplicates, attempt);
+            assert.equal(detail.summary.source_records, 2);
+            assert.equal(detail.summary.derived_captures, 0);
+            assert.equal(detail.summary.conversion_errors.length, invalid ? 1 : 0);
+            if (invalid) {
+              assert.equal(receipt.ok, false);
+              assert.equal(receipt.local_durable, true);
+              assert.equal(receipt.reason, 'cloud_ingest_quality_error');
+              assert.equal(receipt.unattributed_quality_errors, 1);
+              assert.match(receipt.detail, /conflict/);
+              assert.ok(!JSON.stringify(receipt).includes(candidate), 'quality errors must omit conflicting identity values');
+            }
+            assert.ok(!JSON.stringify(receipt).includes(marker), 'ACK diagnostics must omit identities and bodies');
+          }
+        }
+      }
+    }
+    const delivered = await health(relayUrl, relay,
+      h => h.delivered === expected.size && h.pending === 0 && h.inflight === 0);
+    assert.equal(delivered.conservation_ok, true);
+    assert.equal(delivered.ingest_coverage.quality_errors, 20);
+    await health(collectorUrl, collector, h => h.collector.captures === expected.size);
+    for (const url of [relayUrl, collectorUrl]) {
+      const response = await fetch(`${url}/flush`, { method: 'POST',
+        headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(5000) });
+      assert.equal(response.ok, true);
+    }
+    const collectorRaw = await sealedRecords(path.join(root, 'collector'));
+    assert.equal(collectorRaw.size, expected.size);
+    assert.deepEqual(await sealedRecords(path.join(root, 'relay')), collectorRaw);
+    for (const { record } of collectorRaw.values()) {
+      const batch = record.telemetryBatch;
+      assert.equal(batch.raw_json, expected.get(batch.raw_sha256));
+      assert.equal(batch.raw_bytes, Buffer.byteLength(batch.raw_json));
+      assert.equal(batch.raw_sha256, digest(Buffer.from(batch.raw_json)));
+    }
+    const audit = () => run(binary, ['audit-session-context', '--input', path.join(root, 'collector'),
+      '--session-id', session, '--sample-limit', '0'], { maxBuffer: 1024 * 1024 });
+    await assert.rejects(audit, error => error.code === 1 && /conflict/.test(error.stderr)
+      && error.stdout === '' && !error.stderr.includes(marker));
+    assert.equal((await stop(relay)).code, 0);
+    assert.equal((await stop(collector)).code, 0);
+    collector = start(collectorArgs);
+    await health(collectorUrl, collector, h => h.collector.captures === expected.size);
+    relay = start(relayArgs);
+    await health(relayUrl, relay, h => h.delivered === expected.size && h.conservation_ok);
+    const replay = await fetch(`${relayUrl}/otel/v1/${first.endpoint}`, { method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: first.body, signal: AbortSignal.timeout(5000) });
+    const receipt = await replay.json();
+    assert.equal(replay.status, 400);
+    assert.equal(receipt.durable, true);
+    assert.equal(receipt.duplicates, 1);
+    await assert.rejects(audit, { code: 1 });
+    assert.deepEqual(await sealedRecords(path.join(root, 'collector')), collectorRaw);
+    passed = true;
+  });
+
 test('malformed OTLP siblings fail HTTP and source auditing without losing either WAL',
   { timeout: 30000 }, async t => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-otlp-shape-'));

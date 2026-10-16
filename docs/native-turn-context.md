@@ -299,6 +299,21 @@ Session、显式 Process 和身份未知的 batch，可能大于投影的 `input
 哈希一致、重启后恢复。logs 派生路径同时保留 scope 身份，record 属性仍有覆盖优先级。
 这些协议负例不表示实际生产者已经发射了同类冲突，也不替代未修改客户端的真实验收。
 
+入口还必须执行与离线审计相同的有效身份别名检查。隔离 HTTP 负对照实际复现：
+`conversation.id` 与 `session.id` 矛盾时，旧入口仍返回 200，尽管后续来源审计会拒绝。
+现在 logs 在派生任何所有者前、traces 在确认采集质量前校验 Session、原生 UUID
+`thread_id`、Turn 和 root Turn 的各自别名；冲突原文先持久化，再返回质量错误。
+不能为存在身份歧义的日志派生工具结果或归属于某个 Session 的 incomplete 事件；
+同批正常记录及原文仍保留。诊断不展开身份值或正文。
+
+一致别名仍正常接收，既有层级覆盖顺序不变；原生 Turn 与 root Turn 的值可以不同。
+真实 Relay/Collector 的合成联测覆盖上述冲突、一致别名、重复投递和实际服务重启，
+20 份 batch 的两份 WAL、原始 UTF-8 字节及哈希一致，冲突 Raw 的来源审计仍退出 1。
+审计的 root Turn 别名表还补入转换器已支持的 `codex.root_turn_id`；其单独存在时保留
+精确归属，与其他 root Turn 别名矛盾时拒绝。同一份先前未归属的合成输入只读回放后
+从 0 条恢复为 1 条 Turn 归属，Raw SHA-256 不变，不新增 Session 交付声明。
+该修复未部署，不说明未修改生产者或真实 OSS 已达到生产条件。
+
 [精简回归 fixture](../fixtures/native-context-README.md) 只保留实际字段和父链，用一致
 别名替换身份。CI 验证缺口、跨 Session 歧义、正文不输出、计数守恒和真实非零退出；
 它不替代完整 Raw 或新的真实客户端 Canary。
