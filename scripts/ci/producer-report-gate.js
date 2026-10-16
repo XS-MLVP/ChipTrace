@@ -45,7 +45,40 @@ function verifySourceCoverage(coverage, modelInteractions) {
   return value;
 }
 
-function verifyTurnCoverage(platform, sourceCoverage, nativeTurns, modelInteractions, toolExecutionRecords) {
+function verifySourceAudit(audit, expectedSessionId) {
+  const value = object(audit, 'report.source_audit');
+  assert.equal(value.schema_version, 'chiptrace.source-context-audit.v2',
+    'report.source_audit.schema_version must be chiptrace.source-context-audit.v2');
+  assert.equal(nonEmptyString(value.session_id, 'report.source_audit.session_id'), expectedSessionId,
+    'report.source_audit.session_id must match the platform Session');
+  const sources = object(value.sources, 'report.source_audit.sources');
+  let unscoped = 0;
+  const turnAssigned = {};
+  for (const source of ['otlp_logs', 'otlp_traces']) {
+    const counts = object(sources[source], `report.source_audit.sources.${source}`);
+    const fields = ['total_records', 'turn_assigned_records', 'session_level_records',
+      'process_level_records', 'unscoped_turn_records', 'other_session_records',
+      'unknown_session_records'];
+    const values = Object.fromEntries(fields.map(field => [field,
+      nonNegativeInteger(counts[field], `report.source_audit.sources.${source}.${field}`)]));
+    const classified = fields.slice(1).reduce((sum, field) => sum + values[field], 0);
+    assert.equal(classified, values.total_records,
+      `report.source_audit.sources.${source} counts do not conserve records`);
+    assert.equal(values.unscoped_turn_records, 0,
+      `report.source_audit.sources.${source}.unscoped_turn_records must be zero`);
+    assert.equal(values.unknown_session_records, 0,
+      `report.source_audit.sources.${source}.unknown_session_records must be zero`);
+    unscoped += values.unscoped_turn_records;
+    turnAssigned[source] = values.turn_assigned_records;
+  }
+  assert.equal(nonNegativeInteger(value.unscoped_otlp_records,
+    'report.source_audit.unscoped_otlp_records'), unscoped,
+  'report.source_audit.unscoped_otlp_records must match source counts');
+  return { turn_assigned_records: turnAssigned };
+}
+
+function verifyTurnCoverage(platform, sourceCoverage, nativeTurns, modelInteractions, toolExecutionRecords,
+  expectedSourceAudit) {
   assert.ok(Array.isArray(platform.turn_coverage), 'platform.turn_coverage must be an array');
   assert.equal(platform.turn_coverage.length, nativeTurns,
     'platform.turn_coverage must contain one entry per native Turn');
@@ -97,9 +130,11 @@ function verifyTurnCoverage(platform, sourceCoverage, nativeTurns, modelInteract
   });
   assert.equal(modelTotal, modelInteractions, 'per-Turn model interactions must conserve the Session total');
   assert.equal(wireTotal, sourceCoverage.wire, 'per-Turn Wire evidence must conserve the Session total');
-  for (const source of Object.keys(sourceTotals)) {
-    assert.ok(sourceTotals[source] <= sourceCoverage[source],
-      `per-Turn ${source} evidence cannot exceed the Session total`);
+  if (expectedSourceAudit) {
+    for (const source of ['otlp_logs', 'otlp_traces']) {
+      assert.equal(sourceTotals[source], expectedSourceAudit.turn_assigned_records[source],
+        `per-Turn ${source} evidence must equal source_audit turn_assigned_records`);
+    }
   }
   if (toolExecutionRecords !== undefined) {
     assert.equal(toolTotal, nonNegativeInteger(toolExecutionRecords, 'report.tool_execution_records'),
@@ -155,10 +190,12 @@ function verifyProducerReport(report, policy, support = verifyProducerSupport(
   const platform = object(report.platform_evidence, 'report.platform_evidence');
   assert.equal(platform.backend, 'fs', 'primary protocol evidence must use the verified FS backend');
   assert.equal(platform.production_acceptance_claimed, false);
+  const platformSessionId = nonEmptyString(platform.session_id, 'report.platform_evidence.session_id');
   assert.equal(platform.native_turns, nativeTurns);
   assert.equal(platform.model_interactions, modelInteractions);
+  const sourceAudit = verifySourceAudit(report.source_audit, platformSessionId);
   const turnCoverage = verifyTurnCoverage(
-    platform, sourceCoverage, nativeTurns, modelInteractions, toolExecutionRecords,
+    platform, sourceCoverage, nativeTurns, modelInteractions, toolExecutionRecords, sourceAudit,
   );
   assert.equal(platform.remote_checkpoint_verified, undefined,
     'primary FS evidence must not masquerade as remote object evidence');
@@ -174,8 +211,10 @@ function verifyProducerReport(report, policy, support = verifyProducerSupport(
     'platform.additional_storage_backends[0].remote_segment_objects_verified') > 0);
   assert.equal(remote.native_turns, nativeTurns);
   assert.equal(remote.model_interactions, modelInteractions);
+  assert.equal(nonEmptyString(remote.session_id, 'platform.additional_storage_backends[0].session_id'),
+    platformSessionId);
   assert.deepEqual(
-    verifyTurnCoverage(remote, sourceCoverage, nativeTurns, modelInteractions, toolExecutionRecords),
+    verifyTurnCoverage(remote, sourceCoverage, nativeTurns, modelInteractions, toolExecutionRecords, sourceAudit),
     turnCoverage,
     'FS and private S3 Turn summaries must match',
   );

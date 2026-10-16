@@ -16,6 +16,7 @@ const { promisify } = require('node:util');
 const { DurableCaptureOutbox } = require('../openai-gateway/durable-outbox');
 const { prepareProducerSourceCache } = require('../../scripts/ci/producer-source-cache');
 const stockRelease = require('./stock-release.json');
+const producerPolicy = require('./producer-support.json').producer;
 const { describePlatformProcessFailure } = require('./protocol-process-error');
 
 const run = promisify(execFile);
@@ -31,10 +32,8 @@ const expectedBuildRevision = process.env.CHIPTRACE_EXPECTED_BUILD_REVISION;
 if (expectedBuildRevision !== undefined) {
   assert.match(expectedBuildRevision, /^[a-f0-9]{40}$/, 'expected ChipTrace build revision must be a full Git SHA');
 }
-const patches = unmodifiedStock ? [] : ['upstream-sse-context.patch', 'upstream-sse-context-test.patch',
-  'upstream-session-scope.patch', 'upstream-session-scope-extension.patch',
-  'upstream-session-scope-process.patch', 'upstream-config-read-scope.patch',
-  'upstream-otlp-outcome.patch'];
+const patches = unmodifiedStock ? [] : producerPolicy.patches.map(patch => patch.file);
+const patchDigests = new Map(producerPolicy.patches.map(patch => [patch.file, patch.sha256]));
 const chiptrace = process.env.CHIPTRACE_BIN || path.resolve(__dirname, '../../target/debug/chiptrace');
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -52,7 +51,9 @@ async function verifyPatchSet(sourceRoot, root) {
   for (const name of patches) {
     const file = path.resolve(__dirname, '../../docs', name);
     const bytes = await fs.readFile(file);
-    reports.push({ file: name, sha256: sha256(bytes) });
+    const digest = sha256(bytes);
+    assert.equal(digest, patchDigests.get(name), `producer patch digest changed: ${name}`);
+    reports.push({ file: name, sha256: digest });
     for (const match of bytes.toString('utf8').matchAll(/^\+\+\+ b\/(.+)$/gm)) touched.add(match[1]);
   }
   for (const relative of touched) {

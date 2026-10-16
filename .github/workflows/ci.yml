@@ -238,20 +238,13 @@ jobs:
           set -euo pipefail
           expected_upstream=$(node -p 'require("./integrations/codex/stock-release.json").upstream_commit')
           test "$(git -C .ci-codex-source rev-parse HEAD)" = "$expected_upstream"
-          git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-sse-context.patch"
-          git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-sse-context.patch"
-          git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-sse-context-test.patch"
-          git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-sse-context-test.patch"
-          git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-session-scope.patch"
-          git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-session-scope.patch"
-          git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-session-scope-extension.patch"
-          git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-session-scope-extension.patch"
-          git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-session-scope-process.patch"
-          git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-session-scope-process.patch"
-          git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-config-read-scope.patch"
-          git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-config-read-scope.patch"
-          git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/upstream-otlp-outcome.patch"
-          git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/upstream-otlp-outcome.patch"
+          node -p 'require("./integrations/codex/producer-support.json").producer.patches.map(p => p.file).join("\n")' \
+            > "$RUNNER_TEMP/producer-patches.list"
+          while IFS= read -r patch; do
+            test -n "$patch"
+            git -C .ci-codex-source apply --check "$GITHUB_WORKSPACE/docs/$patch"
+            git -C .ci-codex-source apply "$GITHUB_WORKSPACE/docs/$patch"
+          done < "$RUNNER_TEMP/producer-patches.list"
           git -C .ci-codex-source diff --check
       - name: Enable the pinned producer's unprivileged Linux sandbox on the isolated runner
         run: |
@@ -469,6 +462,7 @@ jobs:
           name: producer-context-report
           path: |
             ${{ runner.temp }}/producer-lock-check.json
+            ${{ runner.temp }}/producer-patches.list
             ${{ runner.temp }}/producer-cache-identity.json
             ${{ runner.temp }}/producer-cache-prepared.json
             ${{ runner.temp }}/producer-cache-observation.json

@@ -86,6 +86,11 @@ Wire 比对，不能在 Lite 请求明确禁用并行时发送并行调用来宣
 最低 Native Turn、逐 Turn 身份/状态、四源覆盖、Wire/模型交互/工具数守恒和 FS/私有 S3
 逐 Turn 摘要一致性；缺少任一 Turn 的 OTLP 或 Hook 证据会直接拒绝。该报告仍明确标记
 为合成模型/隔离证据，不能宣称真实生产验收。
+其中 `report.source_coverage.otlp_logs` 和 `otlp_traces` 是本次采集的入口批次/捕获覆盖数，
+不能拿来与逐 Turn 的 OTLP 记录数直接比较；逐 Turn logs/traces 必须分别汇总为
+`report.source_audit.sources.*.turn_assigned_records`。门禁还要求审计账本的
+`total_records` 与全部分类守恒、审计 Session 身份与平台 Session 一致，且
+`unscoped_turn_records`、`unknown_session_records` 和 `unscoped_otlp_records` 均为零。
 
 五场景还将各自的同一份 sealed Raw 分别经过 FS 和私有 MinIO S3 的平台 HTTP/SDK。
 S3 路径独立读取远端 Checkpoint、Manifest 和每个 Segment 对象，校验提交状态、原始

@@ -22,14 +22,23 @@ function report() {
     model_interactions: 4,
     tool_execution_records: 2,
     source_coverage: { complete: true, missing_sources: [], wire: 4, otlp_logs: 8, otlp_traces: 8, hooks: 4 },
+    source_audit: {
+      schema_version: 'chiptrace.source-context-audit.v2', session_id: 'session', unscoped_otlp_records: 0,
+      sources: {
+        otlp_logs: { total_records: 6, turn_assigned_records: 6, session_level_records: 0,
+          process_level_records: 0, unscoped_turn_records: 0, other_session_records: 0, unknown_session_records: 0 },
+        otlp_traces: { total_records: 8, turn_assigned_records: 8, session_level_records: 0,
+          process_level_records: 0, unscoped_turn_records: 0, other_session_records: 0, unknown_session_records: 0 },
+      },
+    },
     platform_evidence: {
-      backend: 'fs', production_acceptance_claimed: false, native_turns: 2, model_interactions: 4,
+      backend: 'fs', production_acceptance_claimed: false, session_id: 'session', native_turns: 2, model_interactions: 4,
       turn_coverage: [1, 2].map(index => ({ session_id: 'session', turn_id: `turn-${index}`, status: 'closed',
         model_interactions: 2, tool_execution_records: 1,
         source_coverage: { complete: true, missing_sources: [], wire: 2, otlp_logs: 3, otlp_traces: 4, hooks: 2 } })),
       additional_storage_backends: [{ backend: 's3', real_oss_account: false,
         production_acceptance_claimed: false, remote_checkpoint_verified: true,
-        remote_segment_objects_verified: 3, native_turns: 2, model_interactions: 4,
+        remote_segment_objects_verified: 3, session_id: 'session', native_turns: 2, model_interactions: 4,
         turn_coverage: [1, 2].map(index => ({ session_id: 'session', turn_id: `turn-${index}`, status: 'closed',
           model_interactions: 2, tool_execution_records: 1,
           source_coverage: { complete: true, missing_sources: [], wire: 2, otlp_logs: 3, otlp_traces: 4, hooks: 2 } })),
@@ -91,8 +100,22 @@ test('producer report gate rejects a Turn with missing source evidence or intera
   assert.throws(() => verifyProducerReport(openTurn, policy), /status must be closed or cancelled/);
 
   const inflatedLogs = report();
-  for (const turn of inflatedLogs.platform_evidence.turn_coverage) {
-    turn.source_coverage.otlp_logs = 5;
-  }
-  assert.throws(() => verifyProducerReport(inflatedLogs, policy), /otlp_logs evidence cannot exceed/);
+  inflatedLogs.source_audit.sources.otlp_logs.turn_assigned_records = 10;
+  inflatedLogs.source_audit.sources.otlp_logs.total_records = 10;
+  assert.throws(() => verifyProducerReport(inflatedLogs, policy), /otlp_logs evidence must equal source_audit/);
+});
+
+test('producer report gate rejects source audit identity and conservation errors', () => {
+  const wrongSession = report();
+  wrongSession.source_audit.session_id = 'other-session';
+  assert.throws(() => verifyProducerReport(wrongSession, policy), /session_id must match/);
+
+  const brokenConservation = report();
+  brokenConservation.source_audit.sources.otlp_traces.total_records += 1;
+  assert.throws(() => verifyProducerReport(brokenConservation, policy), /counts do not conserve/);
+
+  const unscoped = report();
+  unscoped.source_audit.sources.otlp_logs.unscoped_turn_records = 1;
+  unscoped.source_audit.sources.otlp_logs.total_records += 1;
+  assert.throws(() => verifyProducerReport(unscoped, policy), /unscoped_turn_records must be zero/);
 });
