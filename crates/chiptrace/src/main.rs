@@ -1900,6 +1900,13 @@ async fn self_test(args: SelfTestArgs) -> Result<Value> {
                         total.checked_add(turn.model_interactions)
                     })
                     == Some(view.model_interactions)
+                && view
+                    .turns
+                    .iter()
+                    .try_fold(0_u64, |total, turn| {
+                        total.checked_add(turn.tool_execution_records)
+                    })
+                    == Some(view.tool_execution_records)
                 && view.turns.iter().all(|turn| {
                     turn.status == "closed"
                         && turn.source_coverage.complete
