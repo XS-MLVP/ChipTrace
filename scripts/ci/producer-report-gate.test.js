@@ -83,6 +83,10 @@ test('producer report gate rejects per-Turn Wire gaps and FS/S3 summary drift', 
   const driftedRemote = report();
   driftedRemote.platform_evidence.additional_storage_backends[0].turn_coverage[1].turn_id = 'different-turn';
   assert.throws(() => verifyProducerReport(driftedRemote, policy), /FS and private S3 Turn summaries/);
+
+  const driftedTurnSession = report();
+  driftedTurnSession.platform_evidence.turn_coverage[0].session_id = 'different-session';
+  assert.throws(() => verifyProducerReport(driftedTurnSession, policy), /must match the platform Session/);
 });
 
 test('producer report gate rejects a Turn with missing source evidence or interaction totals', () => {

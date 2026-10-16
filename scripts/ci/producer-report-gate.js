@@ -80,6 +80,7 @@ function verifySourceAudit(audit, expectedSessionId) {
 function verifyTurnCoverage(platform, sourceCoverage, nativeTurns, modelInteractions, toolExecutionRecords,
   expectedSourceAudit) {
   assert.ok(Array.isArray(platform.turn_coverage), 'platform.turn_coverage must be an array');
+  const platformSessionId = nonEmptyString(platform.session_id, 'platform evidence session_id');
   assert.equal(platform.turn_coverage.length, nativeTurns,
     'platform.turn_coverage must contain one entry per native Turn');
   const identities = new Set();
@@ -92,6 +93,8 @@ function verifyTurnCoverage(platform, sourceCoverage, nativeTurns, modelInteract
     const value = object(turn, `platform.turn_coverage[${index}]`);
     const sessionId = nonEmptyString(value.session_id, `platform.turn_coverage[${index}].session_id`);
     const turnId = nonEmptyString(value.turn_id, `platform.turn_coverage[${index}].turn_id`);
+    assert.equal(sessionId, platformSessionId,
+      `platform.turn_coverage[${index}].session_id must match the platform Session`);
     if (expectedSessionId === undefined) expectedSessionId = sessionId;
     else assert.equal(sessionId, expectedSessionId, 'platform.turn_coverage must contain one Session');
     const identity = `${sessionId}\u0000${turnId}`;
