@@ -361,10 +361,11 @@ function verifyNativeCanaryReport(
     if (captureRefs.size !== turn.raw_capture_refs.length) {
       fail(`session_view.turns[${index}].raw_capture_refs must be unique`);
     }
-    turnInteractionTotals.model_interactions += nonNegativeInteger(
+    const turnModelInteractions = nonNegativeInteger(
       turn.model_interactions,
       `session_view.turns[${index}].model_interactions`,
     );
+    turnInteractionTotals.model_interactions += turnModelInteractions;
     turnInteractionTotals.tool_execution_records += nonNegativeInteger(
       turn.tool_execution_records,
       `session_view.turns[${index}].tool_execution_records`,
@@ -381,6 +382,12 @@ function verifyNativeCanaryReport(
       if (count === 0) {
         fail(`session_view.turns[${index}] has no ${source} evidence`);
       }
+      if (source === 'wire' && count !== turnModelInteractions) {
+        fail(
+          `session_view.turns[${index}].source_coverage.wire must equal `
+          + `model_interactions (wire=${count}, model_interactions=${turnModelInteractions})`,
+        );
+      }
       if (AUDIT_SOURCES.includes(source)) turnAssignedRecords[source] += count;
     }
   }
@@ -392,6 +399,12 @@ function verifyNativeCanaryReport(
     session.tool_execution_records,
     'session_view.tool_execution_records',
   );
+  if (sourceCoverage.wire !== sessionModelInteractions) {
+    fail(
+      'report.source_coverage.wire must equal session_view.model_interactions '
+      + `(wire=${sourceCoverage.wire}, model_interactions=${sessionModelInteractions})`,
+    );
+  }
   if (sessionModelInteractions !== turnInteractionTotals.model_interactions) {
     fail(
       'session_view.model_interactions does not equal the sum of native Turn model_interactions '

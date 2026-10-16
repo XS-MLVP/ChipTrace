@@ -288,6 +288,7 @@ test('per-Turn OTLP totals must match the source audit', () => {
 test('Session interaction totals must equal the native Turn totals', () => {
   const broken = report();
   broken.session_view.model_interactions += 1;
+  broken.source_coverage.wire += 1;
   assert.throws(
     () => verifyNativeCanaryReport(broken, audit()),
     /session_view\.model_interactions does not equal the sum of native Turn/,
@@ -297,6 +298,21 @@ test('Session interaction totals must equal the native Turn totals', () => {
   assert.throws(
     () => verifyNativeCanaryReport(missing, audit()),
     /session_view\.turns\[0\]\.tool_execution_records must be a non-negative integer/,
+  );
+});
+
+test('Wire evidence must account for every model interaction at Session and Turn scope', () => {
+  const turnMismatch = report();
+  turnMismatch.session_view.turns[0].source_coverage.wire = 2;
+  assert.throws(
+    () => verifyNativeCanaryReport(turnMismatch, audit()),
+    /source_coverage\.wire must equal model_interactions/,
+  );
+  const sessionMismatch = report();
+  sessionMismatch.source_coverage.wire = 1;
+  assert.throws(
+    () => verifyNativeCanaryReport(sessionMismatch, audit()),
+    /report\.source_coverage\.wire must equal session_view\.model_interactions/,
   );
 });
 
