@@ -259,6 +259,7 @@ function verifyWireTurnCoverage(coverage) {
     identity_conflict_captures: conflicts,
     last_successful_at: turns.last_successful_at,
     last_successful_age_ms: age,
+    successful_turn_scoped_fresh: turns.successful_turn_scoped_fresh,
   };
 }
 

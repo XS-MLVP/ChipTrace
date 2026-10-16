@@ -104,7 +104,7 @@ Wire 阶段和成对成功 Hook 闭合；内联压缩及缺 Hook 仍拒绝交付
 真实 CLI 探测实际 Collector/Relay，并明确使用合成网关健康 fixture；受控的 503 和版本
 故障必须非零退出。重启后持久数据仍可交付，但来源新鲜度门禁必须等待新真实 Canary。
 它会拒绝旧版本缺少 `openCaptureHealthy` 的响应，以及 `freshness_applicable=false` 的
-Relay 快照，避免把“Runtime 仍在增长、Wire 已断流”误判为完整采集。runtime gate v2
+Relay 快照，避免把“Runtime 仍在增长、Wire 已断流”误判为完整采集。runtime gate v3
 还独立校验 `wire_turn_coverage`：明确 Session/Turn、无上下文冲突的 HTTP 2xx Capture
 必须近期获得新的 durable ACK；403、无身份请求和 duplicate 不刷新该证据。统计只包含
 真实成功 ACK，批量冲突和失败项被排除；CI 保存 `runtime-health-gate-report` TAP artifact。

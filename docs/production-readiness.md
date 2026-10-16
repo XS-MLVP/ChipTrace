@@ -1,21 +1,22 @@
 # 生产就绪评估
 
-评估日期：2026-10-16。最新线上只读快照为 17:48（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-16。最新线上只读快照为 18:42（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-17:48 的实际部署复核已将 Collector、Relay 和平台服务升级到维护提交
-`97e45bd7f1dada45bfc684c10e3c9483bda3c1ef`。Collector/Relay 使用同一内容摘要镜像
-`sha256:0d468b8241fb262f6cdb873b722f951455b296da448f10e18fefa16e17e79ef3`，平台使用
-`sha256:8c3fd46ba7529cc2c245d8177dcaeb45f89ece97ba6467784191267709b4d9dc`；三者的 OCI
+18:42 的实际部署复核已将 Collector、Relay 和平台服务升级到维护提交
+`30f6d243d527732acbfae4970a740ec88c8451cf`。Collector/Relay 使用同一内容摘要镜像
+`sha256:e0c8433fa589627f10386f68f6a8a1d453549ee33d6ecd261c3e655a65af632b`，平台使用
+`sha256:da2d19047b47ea4e3dfc4df7a5b6b5cbd5fbab7178b05ad5e092396ff3dcc4e2`；三者的 OCI
 revision、预期 revision、非 root 用户、只读根、CPU/内存/PID 限额和持久挂载均已通过预检与
 容器 inspect。18084、3011、3012、18086 均返回 200，平台鉴权列表请求返回 200；平台当前
 配置为本地 FS 后端，线上真实 OSS 账号和远端对象校验仍未完成。
 
-同一快照中 Collector capture 与 Relay delivered 均为 `1,160,146`，pending/inflight/failed
-为 0，`conservation_ok=true`，但 runtime gate 实际退出 1：当前 Relay 进程的 OTLP 日志/trace
-在增长，Wire 与 Hook 均为 0，`wire_turn_coverage` 没有成功的 Turn。因此这次升级证明了
-镜像、持久 WAL 和运行隔离已生效，不证明任何新的真实 Session 已通过四源逐 Turn 验收。
+同一快照中 Collector capture 与 Relay delivered 均为 `1,164,002`，pending/inflight/failed
+为 0，`conservation_ok=true`，但 runtime gate 实际退出 1：OTLP logs/traces 仍在增长，Wire
+只有 4 条且最后一条约 31.5 分钟前，`wire_turn_coverage.successful_turn_scoped_captures=0`，
+覆盖为 `degraded`。这次升级证明了镜像、持久 WAL 和运行隔离已生效，不证明任何新的真实
+Session 已通过四源逐 Turn 验收。
 
 16:16 的本机回环只读快照中，18084、3011（Collector）、3012（Relay）均返回 200，
 Collector/Relay 仍为 `fe9fcf9`；Collector Capture 与 Relay 累计投递均为 1,154,949，
@@ -522,11 +523,11 @@ parts，2 Turn、8 模型交互、6 工具记录不变，Raw SHA-256 一致。
 | 项目 | 实际观察 | 能证明的范围 |
 | --- | --- | --- |
 | 18084、3011、3012、18086 | HTTP 200 | 入口、采集进程和平台进程存活 |
-| Collector/Relay/平台 | revision `97e45bd7f1dada45bfc684c10e3c9483bda3c1ef`；镜像摘要已固定 | 当前服务运行维护提交；不替代真实 Turn 验收 |
-| 投递 | 17:48 Collector Capture/Relay delivered 均为 1,160,146，pending/inflight/failed 均为 0，计数守恒 | 瞬时传输状态；不是持续 SLO 或完整 Session 数 |
+| Collector/Relay/平台 | revision `30f6d243d527732acbfae4970a740ec88c8451cf`；镜像摘要已固定 | 当前服务运行维护提交；不替代真实 Turn 验收 |
+| 投递 | 18:42 Collector Capture/Relay delivered 均为 1,164,002，pending/inflight/failed 均为 0，计数守恒 | 瞬时传输状态；不是持续 SLO 或完整 Session 数 |
 | Collector 磁盘 | 约 72 GiB sealed Raw，挂载在共享 NFS；重启后继续增长 | WAL 持久保存；不能证明 OSS 已提交 |
-| Wire | 当前进程内 0 条，`wire_turn_coverage` 无成功 Turn | 没有近期真实成功 Turn Wire 的证据 |
-| 来源新鲜度 | OTLP 有新记录，Wire/Hook 均缺失；覆盖 `degraded`；runtime gate 真实退出 1 | 当前采集覆盖降级 |
+| Wire | 当前进程内 4 条，成功逐 Turn HTTP 2xx 为 0，最后一条约 31.5 分钟前 | 没有近期真实成功 Turn Wire 的证据 |
+| 来源新鲜度 | OTLP logs/traces 仍有新记录，Hook 最后记录约 5.5 分钟前，Wire 已过期约 31.5 分钟；覆盖 `degraded`；runtime gate 真实退出 1 | 当前采集覆盖降级 |
 | 历史失败 | 293 个文件，267,219,223 bytes | 保留失败取证，不能删除换取健康状态 |
 | 平台 18086 | FS 后端、鉴权列表请求 HTTP 200，当前无任务 | 在线入口可用；没有真实 OSS 导出证据 |
 | 部署隔离 | 三个容器均为非 root、只读根、2 CPU、256 PID；Collector/Relay 8/12 GiB，平台 4 GiB | 运行边界已生效；尚缺容量、保留周期和告警验收 |

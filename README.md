@@ -38,12 +38,14 @@ Wire、OTLP 和 Hook 使用 Stock Codex 自带的 Session、Turn、call ID 和 W
 `audit-session-context` 提供只读的上下文缺口统计和有界定位样本；CI 使用精简的真实
 客户端元数据回归，完整对话和原始取证档保留在运维侧。
 
-2026-10-16 17:48（Asia/Shanghai）的线上快照已将 Collector、Relay 和平台服务升级到维护
-提交 `97e45bd7f1dada45bfc684c10e3c9483bda3c1ef`：三个容器均使用内容摘要镜像、非 root、只读根、
+2026-10-16 18:42（Asia/Shanghai）的线上快照已将 Collector、Relay 和平台服务升级到维护
+提交 `30f6d243d527732acbfae4970a740ec88c8451cf`：三个容器均使用内容摘要镜像、非 root、只读根、
 资源限额和持久 NFS 挂载，18084、3011、3012、18086 均返回 200。Collector/Relay 队列为空且
 计数守恒，平台已通过鉴权健康检查；平台当前实际后端是本地 FS，尚未接入真实 OSS。
-升级后的 runtime gate 仍真实退出 1，因为新 Relay 进程观察到 OTLP 但没有 Wire 和 Hook，
-因此当前部署不能声称已完成任意 Session 的逐 Turn 全量交付。
+同一窗口的 runtime gate 真实退出 1：Relay/Collector revision 均为该提交，Collector 与 Relay
+均为 `1,164,002` 条且 pending/inflight/failed 为 0，但 Relay 的 Wire 只有 4 条、成功的
+逐 Turn HTTP 2xx 为 0，Wire 已落后约 31.5 分钟，覆盖为 `degraded`。因此当前部署不能声称
+已完成任意 Session 的逐 Turn 全量交付。
 
 截至 2026-10-15，最新隔离的 patched Canary 已用真实 `0.163.0-alpha.11` 上游客户端完成
 两个 Native Turn、resume、失败工具进程和延迟 `write_stdin` 场景；四路来源齐全，审计
@@ -77,9 +79,9 @@ Stop 和四源存在也拒绝完整交付，原始失败证据保留。验证范
 客户端的断网配置回归；部署方式和能力边界见 [Stock Codex 接入](integrations/codex/README.md)。
 线上主机的实际用户级配置仍存在 Provider 覆盖风险，不能视为线上 Wire 已恢复；当前 runtime
 gate 的 Wire/Hook 缺失正是该风险的可观测结果。
-仓库 runtime gate v2 另要求近期有明确 Session/Turn、无上下文冲突的 HTTP 2xx Wire，
+仓库 runtime gate v3 另要求近期有明确 Session/Turn、无上下文冲突的 HTTP 2xx Wire，
 并拒绝缺少该统计的旧 Relay；重复投递不能刷新这类证据。完整评估和发布条件见
-[生产就绪评估](docs/production-readiness.md)。该门禁已部署到 `97e45bd`，当前真实失败仍须在
+[生产就绪评估](docs/production-readiness.md)。该门禁已部署到 `30f6d243`，当前真实失败仍须在
 受管 Provider 和完整 Hook 生效后重新验收。
 
 ## 构建

@@ -216,6 +216,7 @@ test('runtime health gate requires fresh scoped HTTP success without claiming Se
   assert.equal(result.relay.freshness_applicable, true);
   assert.deepEqual(result.relay.sources, { wire: 8, otlp_logs: 15, otlp_traces: 9, hooks: 8 });
   assert.equal(result.relay.wire_turn_coverage.successful_turn_scoped_captures, 5);
+  assert.equal(result.relay.wire_turn_coverage.successful_turn_scoped_fresh, true);
   assert.equal(result.collector.captures, 33);
   assert.equal(result.collector.build_revision, relay().build.revision);
 });

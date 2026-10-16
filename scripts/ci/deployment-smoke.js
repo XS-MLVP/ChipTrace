@@ -35,6 +35,34 @@ async function json(url, { auth = false, method = 'GET', body } = {}) {
   return response.json();
 }
 
+// Keep the deployment report honest about the evidence that matters for a
+// real conversation. Container health and delivery conservation can both be
+// green while no successful Session/Turn-scoped Wire has arrived. The runtime
+// gate already validates the full shape; this explicit assertion makes the
+// deployment smoke contract visible at its call site and preserves a bounded
+// summary in the CI artifact.
+function requireSuccessfulTurnWireCoverage(liveGate) {
+  const coverage = liveGate?.relay?.wire_turn_coverage;
+  assert.ok(coverage && typeof coverage === 'object' && !Array.isArray(coverage),
+    'runtime gate must return relay.wire_turn_coverage');
+  assert.ok(Number.isSafeInteger(coverage.successful_turn_scoped_captures)
+    && coverage.successful_turn_scoped_captures > 0,
+  'deployment smoke requires a successful Turn-scoped Wire capture');
+  assert.equal(coverage.successful_turn_scoped_fresh, true,
+    'deployment smoke requires fresh successful Turn-scoped Wire evidence');
+  return {
+    success_definition: coverage.success_definition,
+    freshness_definition: coverage.freshness_definition,
+    turn_scoped_captures: coverage.turn_scoped_captures,
+    successful_turn_scoped_captures: coverage.successful_turn_scoped_captures,
+    unscoped_captures: coverage.unscoped_captures,
+    identity_conflict_captures: coverage.identity_conflict_captures,
+    last_successful_at: coverage.last_successful_at,
+    last_successful_age_ms: coverage.last_successful_age_ms,
+    successful_turn_scoped_fresh: coverage.successful_turn_scoped_fresh,
+  };
+}
+
 async function sealed(root) {
   const records = new Map();
   const directory = path.join(root, 'segments');
@@ -233,11 +261,14 @@ async function main({ runtimeImage, platformImage, revision, reportPath }) {
     assert.equal(liveGate.collector.build_revision, revision);
     assert.equal(liveGate.collector.captures, sourceRecords.size);
     assert.equal(liveGate.relay.delivered, expectedRelayRaw.size);
+    const wireTurnCoverage = requireSuccessfulTurnWireCoverage(liveGate);
     report.runtime_gate = { schema_version: liveGate.schema_version, gateway_health_source: 'synthetic_fixture',
       collector_health_source: 'actual_service', relay_health_source: 'actual_service',
       session_delivery_claimed: false, build_revision: liveGate.build_revision,
-      collector_captures: liveGate.collector.captures, relay_delivered: liveGate.relay.delivered };
+      collector_captures: liveGate.collector.captures, relay_delivered: liveGate.relay.delivered,
+      wire_turn_coverage: wireTurnCoverage };
     check('runtime_cli_probes_actual_collector_and_relay');
+    check('runtime_cli_requires_fresh_successful_turn_wire');
     for (const [route, pattern] of [
       ['/collector-unavailable', /HTTP 503/],
       ['/collector-other-revision', /collector health\.build\.revision does not match expected revision/],
@@ -369,4 +400,4 @@ if (require.main === module) {
     .catch(error => { console.error(`deployment smoke failed: ${error.message}`); process.exitCode = 1; });
 }
 
-module.exports = { main };
+module.exports = { main, requireSuccessfulTurnWireCoverage };

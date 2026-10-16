@@ -510,6 +510,13 @@ jobs:
         with:
           name: runtime-health-gate-report
           path: runtime-health-gate.tap
+      - name: Verify deployment smoke requires successful Turn-scoped Wire evidence
+        run: node --test scripts/ci/deployment-smoke.test.js | tee deployment-smoke-contract.tap
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: deployment-smoke-contract-report
+          path: deployment-smoke-contract.tap
       - name: Verify real scenario witnesses and emit the patched multi-turn Canary artifact
         run: |
           set -euo pipefail
