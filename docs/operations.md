@@ -127,7 +127,7 @@ node scripts/ci/provider-response-gate.js \
 Session 交付证据。
 
 GitHub CI 的 `live-provider-runtime-preflight` 只在手工 `workflow_dispatch`、
-`live_preflight=true`、受保护的 `production-canary` Environment 和标签为
+`live_preflight=true`、受保护分支/规则集、受保护的 `production-canary` Environment 和标签为
 `self-hosted, linux, chiptrace-canary` 的内网 Runner 上执行。Environment Secret 必须提供
 `CHIPTRACE_API_KEY`；Environment Variables 必须提供
 `CHIPTRACE_RESPONSES_URL`、`CHIPTRACE_GATEWAY_HEALTH_URL`、`CHIPTRACE_RELAY_HEALTH_URL`

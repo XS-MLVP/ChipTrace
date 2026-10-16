@@ -29,7 +29,7 @@ defaults:
 
 jobs:
   live-provider-runtime-preflight:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.live_preflight == true }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.live_preflight == true && github.ref_protected == true }}
     runs-on: [self-hosted, linux, chiptrace-canary]
     timeout-minutes: 10
     environment: production-canary
