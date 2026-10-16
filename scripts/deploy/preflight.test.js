@@ -17,6 +17,7 @@ const variables = {
   CHIPTRACE_RELAY_ROOT: '/synthetic-preflight/relay',
   CHIPTRACE_PLATFORM_ROOT: '/synthetic-preflight/platform',
   CHIPTRACE_OBJECT_ROOT: '/synthetic-preflight/objects',
+  CHIPTRACE_BACKEND: 'oss',
   CHIPTRACE_PROJECT_ID: 'synthetic-preflight',
   CHIPTRACE_INGEST_TOKEN: 'synthetic-preflight-ingest-token-32-bytes',
   CHIPTRACE_PLATFORM_TOKEN: 'synthetic-preflight-platform-token-32-bytes',
@@ -61,4 +62,7 @@ test('deployment preflight rejects mutable images, unknown revisions and missing
     candidate.services.collector.user = user;
     assert.throws(() => validateConfig(candidate, revision), /non-root/);
   }
+  const invalidBackend = structuredClone(config);
+  invalidBackend.services.platform.environment.CHIPTRACE_BACKEND = 'local';
+  assert.throws(() => validateConfig(invalidBackend, revision), /backend/);
 });

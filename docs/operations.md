@@ -3,6 +3,8 @@
 ## 隔离环境
 
 `deploy/docker-compose.yml` 提供隔离引擎自测，`deploy/cloud-platform.yml` 提供平台插件部署。
+平台模板要求显式设置 `CHIPTRACE_BACKEND`；生产环境应选择 `oss` 或 `s3`，未配置对象存储
+时预检会拒绝启动，避免把完整 Raw 误落到本地对象目录。
 提交前执行：
 
 ```bash

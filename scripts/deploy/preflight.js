@@ -21,6 +21,8 @@ function validateConfig(config, revision) {
   assert.match(revision || '', revisionPattern, 'expected revision must be a full Git commit SHA');
   const services = Object.entries(config.services || {});
   assert.ok(services.length, 'deployment must contain services');
+  const backend = config.services.platform?.environment?.CHIPTRACE_BACKEND;
+  assert.ok(['fs', 'oss', 's3'].includes(backend), 'platform storage backend must be explicitly fs, oss, or s3');
   for (const [name, service] of services) {
     assert.ok(['collector', 'relay', 'platform'].includes(name), 'unexpected deployment service');
     assert.equal(service.build, undefined, `${name}: build images separately before deployment`);

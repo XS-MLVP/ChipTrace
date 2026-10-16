@@ -149,6 +149,8 @@ test('production deployment templates require an immutable image revision', () =
   );
   assert.doesNotMatch(collectorCompose, /chiptrace:(?:latest|local)\b/);
   assert.match(platformCompose, /image: \$\{CHIPTRACE_PLATFORM_IMAGE:\?set CHIPTRACE_PLATFORM_IMAGE to an immutable ChipTrace platform image\}/);
+  assert.match(platformCompose, /CHIPTRACE_BACKEND: \$\{CHIPTRACE_BACKEND:\?set CHIPTRACE_BACKEND to fs, oss, or s3\}/);
+  assert.doesNotMatch(platformCompose, /CHIPTRACE_BACKEND: \$\{CHIPTRACE_BACKEND:-fs\}/);
   for (const compose of [collectorCompose, platformCompose]) {
     assert.match(compose, /CHIPTRACE_REVISION:\?set CHIPTRACE_REVISION to the full Git commit SHA/);
     assert.doesNotMatch(compose, /^\s+build:/m);

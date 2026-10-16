@@ -131,7 +131,9 @@ const job = await client.submit({
 const completed = await client.wait(job.request.id);
 ```
 
-The supported storage backends are `fs`, `oss`, and `s3`. `fs` is useful for a
+The supported storage backends are `fs`, `oss`, and `s3`. Production Compose
+requires the host to choose the backend explicitly; use `oss` or `s3` when the
+local object directory is only scratch space. `fs` is useful for a
 single-node deployment and keeps the committed Raw archive on a mounted disk;
 `oss` and `s3` keep the immutable archive in object storage while the plugin
 still restores it to its private work directory before inspection. Credentials
