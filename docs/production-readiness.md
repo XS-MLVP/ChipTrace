@@ -683,6 +683,23 @@ Rust 1.91 与 Node 22 的最终 `cloud-test` 实际退出 0，包含 281 个 Rus
 这些隔离回归没有升级线上进程、重新认证历史 delivered 账本或替代未修改客户端及真实
 OSS 账号的生产验收；新版网关须在支持 input receipt 的 Relay 部署后启用。
 
+## 2026-10-17 维护分支复查
+
+提交 `1d3c492` 为历史失败 outbox 增加了内容绑定的 recovery receipt，并让重放副本使用
+确定性的 `cap-replay-*` Capture ID；随后提交 `fbc09b5` 让部署预检拒绝跨服务重复的可写
+bind source。两次提交均已推送到 `fix/oss-disk-session-platform`，工作区干净。
+
+在线 18084、3011、3012 和 18086 的进程级健康检查均成功。18084 的历史 293 个失败原件
+仍保留，293 个 receipt 均能按原文件 SHA-256 复核，`pending=0`、`processing=0`、
+`unresolvedHistoricalFailedFiles=0`；这一结果证明传输恢复闭环，不证明新 Session/Turn 已
+完成交付。
+
+同一窗口的 runtime gate 仍真实退出 1：Relay 持久质量错误为 565（全部在 OTLP traces），
+`stale_sources` 包含 `hooks` 和 `wire`，`turn_capture_ready=false`，最新 Wire 证据中只有
+279/293 条具备 Turn 身份且已过新鲜度窗口。trace exporter 仍未配置，watchdog 的上游请求
+仍返回 403；真实 Alibaba OSS、未修改生产者和远端 Actions 结果仍未验收。当前服务可用于
+内部传输和恢复验证，不能据此签发生产交付结论。
+
 ## 已有优势
 
 - Wire、OTLP logs、OTLP traces 和 Hook 按原生身份精确关联，覆盖请求、工具定义、
