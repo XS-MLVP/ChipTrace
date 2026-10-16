@@ -234,6 +234,8 @@ test('runtime health gate requires fresh scoped HTTP success without claiming Se
 test('live quality-error maximum rejects accumulated source conversion errors', () => {
   const value = relay();
   value.ingest_coverage.quality_errors = 1;
+  value.ingest_coverage.quality_errors_by_endpoint.otlp_traces.conversion_errors = 1;
+  value.ingest_coverage.quality_errors_by_endpoint.otlp_traces.total = 1;
   assert.throws(
     () => verifyRuntimeHealth(gateway(), value, { collectorHealth: collector(), maxQualityErrors: 0 }),
     /quality_errors exceeds the configured maximum \(observed=1; maximum=0\)/,
@@ -254,6 +256,34 @@ test('runtime observations preserve endpoint quality-error breakdowns', () => {
   };
   const observed = healthObservation(gateway(), value, collector());
   assert.deepEqual(observed.relay.coverage.quality_errors_by_endpoint, value.ingest_coverage.quality_errors_by_endpoint);
+});
+
+test('runtime gate reconciles endpoint quality errors with the process total', () => {
+  const value = relay();
+  value.ingest_coverage.quality_errors = 3;
+  value.ingest_coverage.quality_errors_by_endpoint = {
+    otlp_logs: { unknown_events: 1, conversion_errors: 0, total: 1 },
+    otlp_traces: { unknown_events: 0, conversion_errors: 2, total: 2 },
+    hooks: { unknown_events: 0, conversion_errors: 0, total: 0 },
+  };
+  const result = verifyRuntimeHealth(gateway(), value, { collectorHealth: collector() });
+  assert.deepEqual(result.relay.quality_errors_by_endpoint, value.ingest_coverage.quality_errors_by_endpoint);
+
+  const endpointMismatch = relay();
+  endpointMismatch.ingest_coverage.quality_errors_by_endpoint.otlp_logs.total = 2;
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), endpointMismatch, { collectorHealth: collector() }),
+    /otlp_logs\.total does not equal unknown_events \+ conversion_errors/,
+  );
+
+  const processMismatch = relay();
+  processMismatch.ingest_coverage.quality_errors = 2;
+  processMismatch.ingest_coverage.quality_errors_by_endpoint.otlp_logs.unknown_events = 1;
+  processMismatch.ingest_coverage.quality_errors_by_endpoint.otlp_logs.total = 1;
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), processMismatch, { collectorHealth: collector() }),
+    /quality_errors_by_endpoint total does not match relay\.ingest_coverage\.quality_errors/,
+  );
 });
 
 test('older health with only global Wire traffic fails closed', () => {

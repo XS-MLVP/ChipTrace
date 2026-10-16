@@ -4,6 +4,7 @@ const fs = require('node:fs');
 
 const DEFAULT_TIMEOUT_MS = 5000;
 const REQUIRED_SOURCES = ['wire', 'otlp_logs', 'otlp_traces', 'hooks'];
+const QUALITY_ENDPOINTS = ['otlp_logs', 'otlp_traces', 'hooks'];
 const REVISION_PATTERN = /^[a-f0-9]{40}$/;
 
 function fail(message) {
@@ -284,6 +285,53 @@ function verifyWireTurnCoverage(coverage) {
   };
 }
 
+function verifyQualityBreakdown(coverage, qualityErrors) {
+  if (coverage.quality_errors_by_endpoint === undefined) return null;
+  const breakdown = object(
+    coverage.quality_errors_by_endpoint,
+    'relay.ingest_coverage.quality_errors_by_endpoint',
+  );
+  let total = 0;
+  const result = {};
+  for (const endpoint of QUALITY_ENDPOINTS) {
+    const value = object(
+      breakdown[endpoint],
+      `relay.ingest_coverage.quality_errors_by_endpoint.${endpoint}`,
+    );
+    const unknown = nonNegativeInteger(
+      value.unknown_events,
+      `relay.ingest_coverage.quality_errors_by_endpoint.${endpoint}.unknown_events`,
+    );
+    const conversion = nonNegativeInteger(
+      value.conversion_errors,
+      `relay.ingest_coverage.quality_errors_by_endpoint.${endpoint}.conversion_errors`,
+    );
+    const endpointTotal = nonNegativeInteger(
+      value.total,
+      `relay.ingest_coverage.quality_errors_by_endpoint.${endpoint}.total`,
+    );
+    if (endpointTotal !== unknown + conversion) {
+      fail(
+        `relay.ingest_coverage.quality_errors_by_endpoint.${endpoint}.total `
+        + `does not equal unknown_events + conversion_errors`,
+      );
+    }
+    total += endpointTotal;
+    result[endpoint] = {
+      unknown_events: unknown,
+      conversion_errors: conversion,
+      total: endpointTotal,
+    };
+  }
+  if (total !== qualityErrors) {
+    fail(
+      'relay.ingest_coverage.quality_errors_by_endpoint total does not match '
+      + `relay.ingest_coverage.quality_errors (observed=${total}; expected=${qualityErrors})`,
+    );
+  }
+  return result;
+}
+
 function verifyRelayHealth(health, { maxQualityErrors } = {}) {
   object(health, 'relay health');
   if (health.status !== 'healthy') fail('relay status must be healthy');
@@ -308,6 +356,7 @@ function verifyRelayHealth(health, { maxQualityErrors } = {}) {
         + `(observed=${qualityErrors}; maximum=${maxQualityErrors})`);
     }
   }
+  const qualityBreakdown = verifyQualityBreakdown(coverage, qualityErrors);
   if (coverage.status !== 'complete') {
     // Keep failure diagnostics bounded and free of arbitrary health response
     // text. Older Relays omitted Wire from missing_sources even at count zero.
@@ -349,6 +398,7 @@ function verifyRelayHealth(health, { maxQualityErrors } = {}) {
     required_sources_fresh: coverage.required_sources_fresh,
     turn_capture_ready: coverage.turn_capture_ready,
     quality_errors: qualityErrors,
+    quality_errors_by_endpoint: qualityBreakdown,
     wire_turn_coverage: wireTurnCoverage,
     sources: REQUIRED_SOURCES.reduce((result, source) => {
       result[source] = coverage[source].source_records;
