@@ -1,19 +1,19 @@
 # 生产就绪评估
 
-评估日期：2026-10-16。最新线上只读快照为 11:34（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-16。最新线上只读快照为 16:16（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠采集与离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-11:34 的本机回环只读快照中，18084、3011（Collector）、3012（Relay）均返回 200，
-Collector/Relay 仍为 `fe9fcf9`；Collector Capture 与 Relay 累计投递均为 1,135,446，
-pending/inflight/failed 均为 0，计数守恒。
+16:16 的本机回环只读快照中，18084、3011（Collector）、3012（Relay）均返回 200，
+Collector/Relay 仍为 `fe9fcf9`；Collector Capture 与 Relay 累计投递均为 1,154,949，
+pending/inflight/failed 均为 0，计数守恒。该 revision 没有本维护分支的新逐 Turn 门禁。
 这只是瞬时队列状态，不构成持续 SLO 或完整 Session 的证明。Wire 仍只有 1 条且已约
-24.8 小时未更新，覆盖为 `degraded`；同轮 18086 连接拒绝。使用三个 `/health` URL 的
-runtime gate v3 真实退出 1，明确
+29.5 小时未更新，覆盖为 `degraded`；Relay health 没有 `wire_turn_coverage`，同轮
+18086 连接拒绝。使用三个 `/health` URL 的 runtime gate v3 真实退出 1，明确
 报告 `stale_sources=wire`。
 网关独立 trace exporter 的 `enabled=false`；Full Trace Raw Capture 仍为启用状态。
 网关 health 仍报告模型探针最后可用时间为 10 月 8 日，最近错误为连续失败；未主动调用模型。
-Collector health 报告 750 个 sealed Segment 共 92,061,483,623 bytes，保存在共享 NFS；
+Collector health 报告 755 个 sealed Segment 共 94,069,563,151 bytes，保存在共享 NFS；
 此观测不证明已提交目标 OSS。当前状态应区分为传输进程存活、完整
 业务链路未验收和在线交付入口不可用。
 
@@ -24,6 +24,16 @@ Collector health 报告 750 个 sealed Segment 共 92,061,483,623 bytes，保存
 固定正式版的生产者回归、五场景完整 CLI 采集、官方原版拒绝诊断、受管路由、容器
 及存储作业均实际执行；五项新采集的同一 Raw 已分别走 FS 和私有 MinIO S3，报告检查也
 实际执行。它不证明线上已升级，也不能替代后续修复对应提交的远端 CI。
+
+本轮维护提交 `2af2ae0` 已推送到 `fix/oss-disk-session-platform`。本地 `make cloud-test`
+实际退出 0；新增报告门禁要求每个 Turn 的唯一身份、闭合/取消终态、模型交互数、工具数和
+四源完整覆盖，并要求 FS/私有 S3 摘要一致。GitHub Actions API 在本次复核中未认证且连接
+超时，故该提交的远端作业状态仍为未核验；本地验证不能替代同 SHA 的远端 CI。
+
+17:05 的 runtime gate 复核再次真实退出 1：网关、Relay、Collector 的 delivered/capture
+均为 1,157,373 且队列为零，但 Relay 覆盖仍为 `degraded`，Wire 年龄约 30.4 小时；
+报告中的 `wire_turn_coverage` 四项计数为空，不能证明任何近期成功的 Turn。该报告只保留
+有限健康摘要，不含对话正文。
 
 ## 当前发布门槛与迭代顺序
 
