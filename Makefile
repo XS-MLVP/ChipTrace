@@ -1,4 +1,4 @@
-.PHONY: check test gateway-test gateway-receipt-test gateway-host-test codex-config-test managed-route-test protocol-collection-test native-context-test native-canary-gate-test native-canary-evidence-test stock-release-gate-test producer-support-gate-test producer-report-gate-test runtime-health-gate-test deployment-smoke-contract-test audit-memory-test turn-memory-test platform-test deployment-config-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
+.PHONY: check test gateway-test gateway-receipt-test gateway-host-test codex-config-test managed-route-test protocol-collection-test native-context-test native-canary-gate-test native-canary-evidence-test stock-release-gate-test producer-support-gate-test producer-report-gate-test provider-response-gate-test runtime-health-gate-test deployment-smoke-contract-test audit-memory-test turn-memory-test platform-test deployment-config-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
 
 CHIPTRACE_VERSION ?= 0.6.0
 CHIPTRACE_REVISION ?= $(shell git rev-parse HEAD)
@@ -52,6 +52,9 @@ producer-support-gate-test:
 producer-report-gate-test:
 	node --test scripts/ci/producer-report-gate.test.js
 
+provider-response-gate-test:
+	node --test scripts/ci/provider-response-gate.test.js
+
 runtime-health-gate-test:
 	node --test scripts/ci/runtime-health-gate.test.js
 
@@ -85,6 +88,7 @@ cloud-test:
 	$(MAKE) stock-release-gate-test
 	$(MAKE) producer-support-gate-test
 	$(MAKE) producer-report-gate-test
+	$(MAKE) provider-response-gate-test
 	$(MAKE) runtime-health-gate-test
 	$(MAKE) deployment-smoke-contract-test
 	$(MAKE) platform-test

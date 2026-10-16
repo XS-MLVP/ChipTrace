@@ -107,6 +107,25 @@ ACK-only 备用服务不保存 Trace，不能作为采集健康或交付证据�
 
 ## 云端验收
 
+### Provider Responses 前置门禁
+
+`/models` 返回 200 只证明业务 Key 能读取模型目录，不能证明实际 Responses 请求能被上游执行。
+发布或真实 Canary 前，使用受管的业务 Key 对同一网关发送一次有界、带 Session/Turn 身份的
+Responses 探针；探针不会把 Key、请求正文或响应正文写入报告：
+
+```bash
+export CHIPTRACE_API_KEY='<provider-key-from-secret-manager>'
+node scripts/ci/provider-response-gate.js \
+  --responses-url http://127.0.0.1:18084/responses \
+  --model gpt-5.6-sol \
+  --report /srv/chiptrace/acceptance/provider-response.json
+```
+
+该命令必须返回 2xx 和有效 Responses `id`。401/403、网关 502、超时或空/错误响应都阻止
+真实 Canary；网关可能把上游余额、权限或路由故障归一化为 502，因此还要同时检查 Sub2API
+日志中的上游错误码。探针通过后仍必须完成真实 Stock Codex 的多轮四源验收，探针本身不构成
+Session 交付证据。
+
 先确认目标 Session 的 `SessionEnd` 已到达 Collector，且该 Session 的 Wire、OTLP 和
 Hook 均已持久化。网关 outbox 和 Relay 的待投递队列需要排空；持续业务流量下，全局
 计数器不能代替目标 Session 的完整性校验。

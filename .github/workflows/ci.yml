@@ -501,6 +501,13 @@ jobs:
       - run: node --test scripts/ci/native-canary-evidence.test.js
       - run: node --test scripts/ci/stock-release-gate.test.js
       - run: node --test scripts/ci/producer-support-gate.test.js
+      - name: Verify the real Responses provider readiness gate
+        run: node --test scripts/ci/provider-response-gate.test.js | tee provider-response-gate.tap
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: provider-response-gate-report
+          path: provider-response-gate.tap
       - name: Verify runtime delivery, Collector persistence and Turn Wire evidence fails closed
         run: |
           set -euo pipefail
