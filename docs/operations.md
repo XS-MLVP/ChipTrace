@@ -57,9 +57,13 @@ node scripts/deploy/gateway-preflight.js --container <gateway-container>
 
 预检只输出镜像摘要、OCI revision、资源限额和挂载/采集开关，不输出环境变量或凭据；失败时
 不得以重启或清理 outbox 绕过。生产 Gateway 还必须通过同一 runtime gate 的历史失败文件、
-质量错误和新鲜 Turn Wire 门禁。当前 router_v2 的 `router-v2-relay-shell` 仍使用
-`weishaw/claude-relay-service:latest`，根可写且没有 CPU/内存/PID 限额，因此该容器级门禁
-在现状下应退出非零；这与 HTTP `/health` 返回 200 是两条独立证据。
+质量错误和新鲜 Turn Wire 门禁。2026-10-17 对实际 `router-v2-relay-shell` 执行该预检已
+返回成功：容器使用只读根、非 root、CPU/内存/PID 限额、`no-new-privileges` 和 durable
+outbox/watchdog 挂载。不过其镜像 OCI revision 仍是
+`e57480eca4fe11769c5fcb8787266ab6b77ce4d5`，而维护分支 HEAD 是 `8ff67da`；本轮 outbox
+修复通过只读工作区 bind mount 注入，尚未形成包含维护分支 SHA 的不可变 Gateway 镜像。
+因此 preflight 通过只证明容器隔离，不能替代发布 revision、runtime gate 和真实
+Session/Turn 验收；这与 HTTP `/health` 返回 200 仍是独立证据。
 
 18084 对外提供 Responses、`/models`、`/otel/v1/logs`、`/otel/v1/traces` 和
 `/hooks/codex`。Responses 与 `/models` 使用 Provider 业务鉴权，网关使用内部采集凭据读取
