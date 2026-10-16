@@ -1,6 +1,6 @@
 # 生产就绪评估
 
-评估日期：2026-10-17。最新线上只读快照为 04:06（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-17。最新线上只读快照为 04:19（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
@@ -9,8 +9,8 @@ failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留�
 `conservation_ok=true`。Collector/Relay 实际 revision 为 `e5237065ff3a48623179c5846ff1916040030c9a`；
 维护分支已加入 Gateway/Platform revision 对齐护栏，但线上未运行这些最新修复。
 
-同一快照的 Relay `ingest_coverage.status=degraded`，`quality_errors=659`（全部来自 `otlp_traces`），
-Wire 已约 44.6 分钟未刷新，`required_sources_fresh=false`、`turn_capture_ready=false`，
+同一快照的 Relay `ingest_coverage.status=degraded`，`quality_errors=691`（全部来自 `otlp_traces`），
+Wire 已约 57.1 分钟未刷新，`required_sources_fresh=false`、`turn_capture_ready=false`，
 `successful_turn_scoped_captures=279/293`。runtime gate 使用质量错误、新鲜度、历史失败和 revision
 门禁真实退出 1；不能将传输进程健康解释为逐 Session/Turn 交付。
 
