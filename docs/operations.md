@@ -126,6 +126,16 @@ node scripts/ci/provider-response-gate.js \
 日志中的上游错误码。探针通过后仍必须完成真实 Stock Codex 的多轮四源验收，探针本身不构成
 Session 交付证据。
 
+GitHub CI 的 `live-provider-runtime-preflight` 只在手工 `workflow_dispatch`、
+`live_preflight=true`、受保护的 `production-canary` Environment 和标签为
+`self-hosted, linux, chiptrace-canary` 的内网 Runner 上执行。Environment Secret 必须提供
+`CHIPTRACE_API_KEY`；Environment Variables 必须提供
+`CHIPTRACE_RESPONSES_URL`、`CHIPTRACE_GATEWAY_HEALTH_URL`、`CHIPTRACE_RELAY_HEALTH_URL`
+和 `CHIPTRACE_COLLECTOR_HEALTH_URL`。手工输入的 `expected_revision` 必须是 Collector/Relay
+实际构建的完整 Git SHA。普通 push/PR 不接触这些 Secret，也不会因为缺少 Runner 或变量而
+跳过真实预检。该作业只确认 Provider 请求和当前进程 readiness，随后仍须用同一 Session
+执行未修改 Stock Codex 的多轮四源 Canary、OSS 验收和 `cloud-acceptance`。
+
 先确认目标 Session 的 `SessionEnd` 已到达 Collector，且该 Session 的 Wire、OTLP 和
 Hook 均已持久化。网关 outbox 和 Relay 的待投递队列需要排空；持续业务流量下，全局
 计数器不能代替目标 Session 的完整性校验。

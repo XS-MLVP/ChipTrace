@@ -1,0 +1,34 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const test = require('node:test');
+
+const workflow = fs.readFileSync('.github/workflows/ci.yml', 'utf8');
+
+test('live provider preflight is manual, protected and isolated from ordinary CI', () => {
+  assert.match(workflow, /workflow_dispatch:/);
+  assert.match(workflow, /live_preflight:[\s\S]*?type: boolean/);
+  assert.match(workflow, /live-provider-runtime-preflight:/);
+  assert.match(workflow, /if: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.live_preflight == true \}\}/);
+  assert.match(workflow, /runs-on: \[self-hosted, linux, chiptrace-canary\]/);
+  assert.match(workflow, /environment: production-canary/);
+});
+
+test('live provider preflight requires protected endpoints and runs both gates', () => {
+  for (const name of [
+    'CHIPTRACE_API_KEY',
+    'CHIPTRACE_RESPONSES_URL',
+    'CHIPTRACE_GATEWAY_HEALTH_URL',
+    'CHIPTRACE_RELAY_HEALTH_URL',
+    'CHIPTRACE_COLLECTOR_HEALTH_URL',
+    'CHIPTRACE_EXPECTED_REVISION',
+  ]) {
+    assert.match(workflow, new RegExp(name));
+  }
+  assert.match(workflow, /node scripts\/ci\/provider-response-gate\.js/);
+  assert.match(workflow, /node scripts\/ci\/runtime-health-gate\.js/);
+  assert.match(workflow, /name: Verify live Collector, Relay and Gateway readiness\n        if: \$\{\{ always\(\) \}\}/);
+  assert.match(workflow, /--expected-revision "\$CHIPTRACE_EXPECTED_REVISION"/);
+  assert.match(workflow, /name: live-provider-runtime-preflight/);
+});

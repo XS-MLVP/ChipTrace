@@ -3,6 +3,22 @@ name: chiptrace-ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      live_preflight:
+        description: Run the protected live Provider and runtime preflight
+        required: true
+        default: false
+        type: boolean
+      expected_revision:
+        description: Full Collector/Relay Git revision expected by the runtime gate
+        required: true
+        type: string
+      model:
+        description: Provider model used for the bounded Responses probe
+        required: true
+        default: gpt-5.6-sol
+        type: string
 
 permissions:
   contents: read
@@ -12,6 +28,70 @@ defaults:
     shell: bash
 
 jobs:
+  live-provider-runtime-preflight:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.live_preflight == true }}
+    runs-on: [self-hosted, linux, chiptrace-canary]
+    timeout-minutes: 10
+    environment: production-canary
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - name: Require protected live preflight configuration
+        env:
+          CHIPTRACE_API_KEY: ${{ secrets.CHIPTRACE_API_KEY }}
+          CHIPTRACE_RESPONSES_URL: ${{ vars.CHIPTRACE_RESPONSES_URL }}
+          CHIPTRACE_GATEWAY_HEALTH_URL: ${{ vars.CHIPTRACE_GATEWAY_HEALTH_URL }}
+          CHIPTRACE_RELAY_HEALTH_URL: ${{ vars.CHIPTRACE_RELAY_HEALTH_URL }}
+          CHIPTRACE_COLLECTOR_HEALTH_URL: ${{ vars.CHIPTRACE_COLLECTOR_HEALTH_URL }}
+          CHIPTRACE_EXPECTED_REVISION: ${{ inputs.expected_revision }}
+        run: |
+          set -euo pipefail
+          test -n "${CHIPTRACE_API_KEY:-}" || { echo 'CHIPTRACE_API_KEY is missing from the protected environment' >&2; exit 1; }
+          for name in CHIPTRACE_RESPONSES_URL CHIPTRACE_GATEWAY_HEALTH_URL CHIPTRACE_RELAY_HEALTH_URL CHIPTRACE_COLLECTOR_HEALTH_URL CHIPTRACE_EXPECTED_REVISION; do
+            test -n "${!name:-}" || { echo "$name is missing from the protected environment or dispatch input" >&2; exit 1; }
+          done
+          echo 'protected live preflight configuration is present'
+      - name: Probe the real Provider Responses endpoint
+        env:
+          CHIPTRACE_API_KEY: ${{ secrets.CHIPTRACE_API_KEY }}
+          CHIPTRACE_RESPONSES_URL: ${{ vars.CHIPTRACE_RESPONSES_URL }}
+          CHIPTRACE_MODEL: ${{ inputs.model }}
+        run: |
+          set -euo pipefail
+          node scripts/ci/provider-response-gate.js \
+            --responses-url "$CHIPTRACE_RESPONSES_URL" \
+            --model "$CHIPTRACE_MODEL" \
+            --report "$RUNNER_TEMP/provider-response.json" \
+            | tee "$RUNNER_TEMP/provider-response.stdout.json"
+      - name: Verify live Collector, Relay and Gateway readiness
+        if: ${{ always() }}
+        env:
+          CHIPTRACE_GATEWAY_HEALTH_URL: ${{ vars.CHIPTRACE_GATEWAY_HEALTH_URL }}
+          CHIPTRACE_RELAY_HEALTH_URL: ${{ vars.CHIPTRACE_RELAY_HEALTH_URL }}
+          CHIPTRACE_COLLECTOR_HEALTH_URL: ${{ vars.CHIPTRACE_COLLECTOR_HEALTH_URL }}
+          CHIPTRACE_EXPECTED_REVISION: ${{ inputs.expected_revision }}
+        run: |
+          set -euo pipefail
+          node scripts/ci/runtime-health-gate.js \
+            --gateway-url "$CHIPTRACE_GATEWAY_HEALTH_URL" \
+            --relay-url "$CHIPTRACE_RELAY_HEALTH_URL" \
+            --collector-url "$CHIPTRACE_COLLECTOR_HEALTH_URL" \
+            --expected-revision "$CHIPTRACE_EXPECTED_REVISION" \
+            --report "$RUNNER_TEMP/runtime-health.json" \
+            | tee "$RUNNER_TEMP/runtime-health.stdout.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: live-provider-runtime-preflight
+          path: |
+            ${{ runner.temp }}/provider-response.json
+            ${{ runner.temp }}/provider-response.stdout.json
+            ${{ runner.temp }}/runtime-health.json
+            ${{ runner.temp }}/runtime-health.stdout.json
+
   stock-managed-route:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -508,6 +588,13 @@ jobs:
         with:
           name: provider-response-gate-report
           path: provider-response-gate.tap
+      - name: Verify the protected live preflight workflow contract
+        run: node --test scripts/ci/live-preflight-contract.test.js | tee live-preflight-contract.tap
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: live-preflight-contract-report
+          path: live-preflight-contract.tap
       - name: Verify runtime delivery, Collector persistence and Turn Wire evidence fails closed
         run: |
           set -euo pipefail
