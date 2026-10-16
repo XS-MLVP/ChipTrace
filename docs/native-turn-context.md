@@ -478,7 +478,8 @@ CLI 均真实退出 1、stdout 为空、诊断不含正文、输入字节和目�
 缺失、被篡改或存在未归属交互时，Canary 会失败；这两个字段不能用 Runtime integrity
 结果代替。对已交付 Session，逐 Turn 的 `source_coverage.wire` 还必须精确等于该 Turn
 的 `model_interactions`，并与 Session 级 Wire 总数相等；单个 Turn 缺 Wire 不能被其他
-Turn 的多余 Wire 抵消。
+Turn 的多余 Wire 抵消。`session_view.tool_execution_records` 也必须等于所有 Turn 的
+工具记录总和，不能用 Runtime Span 或聚合值掩盖缺失的原始工具证据。
 
 CI 现在在固定源码 clean clone 中复验五个补丁的 `apply --check`、顺序应用和
 `git diff --check`，其中进程级后台任务的补丁单独保存为

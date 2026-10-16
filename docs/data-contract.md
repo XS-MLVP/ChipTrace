@@ -253,7 +253,9 @@ Turn 覆盖中的 Wire 是 Capture 数，OTLP logs/traces 是原始记录数，H
 `turn.source_coverage.wire` 必须等于该 Turn 的 `turn.model_interactions`，并且所有 Turn
 的 Wire 总数必须等于 `session_view.model_interactions`。聚合 Session 数正确但某个 Turn
 缺少 Wire 时仍必须保持 `delivery_ready=false`；原始 Capture 保留，不能用 OTLP、Hook 或
-Runtime 计数补写 Wire。
+Runtime 计数补写 Wire。工具证据也必须精确守恒：`session_view.tool_execution_records`
+必须等于所有 Turn 的 `turn.tool_execution_records` 总和；多余或缺失的工具记录同样不能
+通过交付门禁。
 
 Canonical interaction 投影还必须通过 `metrics.turn_interaction` 门禁。每条
 `ModelInteraction` 和 `span_kind=tool_execution` 的 `RuntimeSpan` 都要带明确的
