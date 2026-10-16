@@ -80,6 +80,7 @@ cloud-test:
 	$(MAKE) producer-support-gate-test
 	$(MAKE) runtime-health-gate-test
 	$(MAKE) platform-test
+	$(MAKE) deployment-config-test
 
 m0-test:
 	CHIPTRACE_VERSION=$(CHIPTRACE_VERSION) CHIPTRACE_REVISION=$(CHIPTRACE_REVISION) \
