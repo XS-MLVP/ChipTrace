@@ -16,10 +16,13 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-当前线上复核（2026-10-17 00:03，Asia/Shanghai）仅确认 Collector/Relay 传输闭环健康；
-维护 revision `11ff05c` 的 runtime gate 因 293 个历史失败 outbox 文件、58 个 OTLP trace
-转换错误、过期 Wire 和 0 个成功的 Turn-scoped Wire 而失败。服务尚未达到对外承诺真实
-Session/Turn 全量收集的发布条件，详见[生产就绪评估](docs/production-readiness.md)。
+当前线上复核（2026-10-17 03:46，Asia/Shanghai）确认 Collector/Relay 传输闭环健康：
+Gateway outbox `pending=0`、`processing=0`、`unresolvedHistoricalFailedFiles=0`，293 个
+历史失败原件仍保留并有 293 个可校验 recovery receipt；Collector/Relay 队列为空且计数守恒。
+维护分支 HEAD 为 `391f5b4`，Rust 服务实际 revision 仍为 `e5237065ff3a48623179c5846ff1916040030c9a`。
+runtime gate 仍因 590 个 OTLP trace 转换错误、过期 Wire 和 `turn_capture_ready=false` 失败；
+当前仅有 279/293 条历史 Wire 具备 Turn 身份，不能对外承诺真实 Session/Turn 全量收集。详见
+[生产就绪评估](docs/production-readiness.md)。
 
 ## 主线
 
