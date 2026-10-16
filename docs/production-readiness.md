@@ -245,7 +245,15 @@ revision、原有 120 秒预算和全部门禁；该工作流改动对应的新�
 相等重复、正常同批工具、重复投递与实际重启；30 份 batch 和 18 条合法工具结果在
 Relay/Collector 的两份 WAL 中逐字节一致。36 份离线 CLI 冲突输入均拒绝且文件不变。
 之前误接受的同一 HTTP/CLI 失败输入只读重放现真实退出 1，原始文件 SHA-256 不变。
-完整套件与新提交远端 CI 的终态仍须核验；这是未部署的协议修复，不是线上验收。
+该修复提交 `5369416de1b27b61e71a98c485d25323b3aba5d0` 的
+[CI run 38847565004](https://github.com/XS-MLVP/ChipTrace/actions/runs/38847565004)
+已实际完成并独立核对为 6/6 作业、138 个步骤、18 个 artifact 元数据成功。
+生产者报告 ZIP 为 27,248 bytes，SHA-256
+`6f134fbe84a4d0bbd95f2ec473748d42c25d32bd865a138656f7db03869ff45b`，与 GitHub 元数据匹配。
+五个场景 TAP 为 5/5、无跳过；正向 Buyer 场景为 2 Native Turn、12 次模型交互、10 条
+工具结果、score=100，FS/私有 S3/重启后的下载摘要一致。所有报告仍明确
+`real_upstream=false`、`real_oss_account=false`、`production_acceptance_claimed=false`；
+这是未部署的协议修复和 CI 证据，不是线上验收。
 
 ## 平台状态验收
 
