@@ -81,7 +81,10 @@ Wire 比对，不能在 Lite 请求明确禁用并行时发送并行调用来宣
 检查直接来自本次 Collector Raw：原生 Session/Turn 身份、四源覆盖、来源计数守恒、闭合
 边界、失败/异步场景见证及 Wire 请求/响应正文哈希。Relay/Collector 重启后还须得到完全
 相同的 Session 检查结果和原始 Segment 哈希。工作流保留 `native-protocol-ci.tap` 和
-`chiptrace.native-protocol-ci.v1` 元数据报告，不上传 Raw 或对话正文。
+`chiptrace.native-protocol-ci.v1` 元数据报告，不上传 Raw 或对话正文。随后
+`producer-report-gate.js` 对五份报告统一核对支持策略中的上游 revision、六个补丁摘要、
+最低 Native Turn、四源 Wire 守恒和 FS/私有 S3 远端对象证据；该报告仍明确标记为合成
+模型/隔离证据，不能宣称真实生产验收。
 
 五场景还将各自的同一份 sealed Raw 分别经过 FS 和私有 MinIO S3 的平台 HTTP/SDK。
 S3 路径独立读取远端 Checkpoint、Manifest 和每个 Segment 对象，校验提交状态、原始

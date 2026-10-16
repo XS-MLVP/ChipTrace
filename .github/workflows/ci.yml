@@ -341,6 +341,16 @@ jobs:
               "$RUNNER_TEMP/native-protocol-ci.tap"
             exit "$protocol_status"
           fi
+      - name: Bind native protocol reports to the supported producer and Turn evidence policy
+        run: |
+          set -euo pipefail
+          node scripts/ci/producer-report-gate.js \
+            --report "$RUNNER_TEMP/native-protocol-ci.json" \
+            --report "$RUNNER_TEMP/native-buyer-protocol-ci.json" \
+            --report "$RUNNER_TEMP/native-interruption-ci.json" \
+            --report "$RUNNER_TEMP/native-compaction-ci.json" \
+            --report "$RUNNER_TEMP/native-auto-compaction-ci.json" \
+            | tee "$RUNNER_TEMP/producer-report-gate.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -369,6 +379,7 @@ jobs:
             ${{ runner.temp }}/native-interruption-ci.json
             ${{ runner.temp }}/native-compaction-ci.json
             ${{ runner.temp }}/native-auto-compaction-ci.json
+            ${{ runner.temp }}/producer-report-gate.json
             ${{ runner.temp }}/native-protocol-ci.tap
 
   rust:

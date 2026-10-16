@@ -1,0 +1,157 @@
+'use strict';
+
+// Bind newly executed native protocol evidence to the exact producer policy.
+// This report is a CI/data-governance check, not a production acceptance claim.
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { verifyProducerSupport } = require('./producer-support-gate');
+
+const ROOT = path.resolve(__dirname, '../..');
+const SUPPORT_PATH = path.join(ROOT, 'integrations/codex/producer-support.json');
+const STOCK_RELEASE_PATH = path.join(ROOT, 'integrations/codex/stock-release.json');
+const SHA256 = /^[a-f0-9]{64}$/;
+
+function object(value, label) {
+  assert.ok(value && typeof value === 'object' && !Array.isArray(value), `${label} must be an object`);
+  return value;
+}
+
+function nonEmptyString(value, label) {
+  assert.equal(typeof value, 'string', `${label} must be a string`);
+  assert.notEqual(value.trim(), '', `${label} must not be empty`);
+  return value;
+}
+
+function nonNegativeInteger(value, label) {
+  assert.equal(Number.isSafeInteger(value) && value >= 0, true, `${label} must be a non-negative integer`);
+  return value;
+}
+
+function readJson(file) {
+  return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+function verifySourceCoverage(coverage, modelInteractions) {
+  const value = object(coverage, 'report.source_coverage');
+  assert.equal(value.complete, true, 'report.source_coverage.complete must be true');
+  assert.deepEqual(value.missing_sources, [], 'report.source_coverage.missing_sources must be empty');
+  for (const source of ['wire', 'otlp_logs', 'otlp_traces', 'hooks']) {
+    assert.ok(nonNegativeInteger(value[source], `report.source_coverage.${source}`) > 0,
+      `report.source_coverage.${source} must be positive`);
+  }
+  assert.equal(value.wire, modelInteractions,
+    'report.source_coverage.wire must equal report.model_interactions');
+  return value;
+}
+
+function verifyPatchSet(report, policy) {
+  assert.ok(Array.isArray(report.patch_set), 'report.patch_set must be an array');
+  const patches = report.patch_set.map((patch, index) => {
+    const value = object(patch, `report.patch_set[${index}]`);
+    const file = nonEmptyString(value.file, `report.patch_set[${index}].file`);
+    assert.match(value.sha256, SHA256, `report.patch_set[${index}].sha256 must be a SHA-256`);
+    return { file, sha256: value.sha256 };
+  });
+  assert.deepEqual(patches, policy.producer.patches,
+    'report.patch_set must match the content-addressed producer support policy');
+  return patches;
+}
+
+function verifyProducerReport(report, policy, support = verifyProducerSupport(
+  policy,
+  readJson(STOCK_RELEASE_PATH),
+)) {
+  object(report, 'producer report');
+  assert.equal(report.ok, true, 'producer report must be successful');
+  assert.equal(report.real_upstream, false,
+    'synthetic protocol reports must not claim a real upstream or production canary');
+  assert.equal(report.production_acceptance_claimed, false,
+    'synthetic protocol reports must not claim production acceptance');
+  assert.equal(report.producer_mode, support.production_mode,
+    'report.producer_mode must match the supported production mode');
+  assert.equal(report.client_version, support.client_version,
+    'report.client_version must match the supported producer version');
+
+  const source = object(report.producer_source, 'report.producer_source');
+  assert.equal(source.upstream_commit, support.upstream_commit,
+    'report.producer_source.upstream_commit must match the supported producer');
+  assert.match(source.source_sha256, SHA256, 'report.producer_source.source_sha256 must be a SHA-256');
+  const patchSet = verifyPatchSet(report, policy);
+
+  const modelInteractions = nonNegativeInteger(report.model_interactions, 'report.model_interactions');
+  assert.ok(modelInteractions > 0, 'report.model_interactions must be positive');
+  const nativeTurns = nonNegativeInteger(report.native_turns, 'report.native_turns');
+  assert.ok(nativeTurns >= support.minimum_native_turns,
+    `report.native_turns must be at least ${support.minimum_native_turns}`);
+  const sourceCoverage = verifySourceCoverage(report.source_coverage, modelInteractions);
+
+  const platform = object(report.platform_evidence, 'report.platform_evidence');
+  assert.equal(platform.backend, 'fs', 'primary protocol evidence must use the verified FS backend');
+  assert.equal(platform.production_acceptance_claimed, false);
+  assert.equal(platform.native_turns, nativeTurns);
+  assert.equal(platform.model_interactions, modelInteractions);
+  assert.equal(platform.remote_checkpoint_verified, undefined,
+    'primary FS evidence must not masquerade as remote object evidence');
+  assert.ok(Array.isArray(platform.additional_storage_backends),
+    'protocol evidence must include the additional private object-storage result');
+  assert.equal(platform.additional_storage_backends.length, 1);
+  const remote = object(platform.additional_storage_backends[0], 'platform.additional_storage_backends[0]');
+  assert.equal(remote.backend, 's3');
+  assert.equal(remote.real_oss_account, false);
+  assert.equal(remote.production_acceptance_claimed, false);
+  assert.equal(remote.remote_checkpoint_verified, true);
+  assert.ok(nonNegativeInteger(remote.remote_segment_objects_verified,
+    'platform.additional_storage_backends[0].remote_segment_objects_verified') > 0);
+  assert.equal(remote.native_turns, nativeTurns);
+  assert.equal(remote.model_interactions, modelInteractions);
+
+  return {
+    schema_version: 'chiptrace.producer-report-gate.v1',
+    producer_mode: report.producer_mode,
+    client_version: report.client_version,
+    upstream_commit: source.upstream_commit,
+    patch_set: patchSet,
+    source_sha256: source.source_sha256,
+    native_turns: nativeTurns,
+    model_interactions: modelInteractions,
+    source_coverage: sourceCoverage,
+    storage_backends: ['fs', 's3'],
+    production_acceptance_claimed: false,
+  };
+}
+
+function parseArgs(argv) {
+  const reports = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] !== '--report' || !argv[index + 1]) {
+      throw new Error('usage: producer-report-gate.js --report REPORT.json [--report REPORT.json ...]');
+    }
+    reports.push(argv[++index]);
+  }
+  if (reports.length === 0) {
+    throw new Error('usage: producer-report-gate.js --report REPORT.json [--report REPORT.json ...]');
+  }
+  return reports;
+}
+
+function main(argv = process.argv.slice(2)) {
+  const policy = readJson(SUPPORT_PATH);
+  const stock = readJson(STOCK_RELEASE_PATH);
+  const support = verifyProducerSupport(policy, stock);
+  const reports = parseArgs(argv).map(file => ({ file, ...verifyProducerReport(readJson(file), policy, support) }));
+  const result = { schema_version: 'chiptrace.producer-report-gate.v1', reports };
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  return result;
+}
+
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    process.stderr.write(`producer report gate: ${error.message}\n`);
+    process.exitCode = 1;
+  }
+}
+
+module.exports = { verifyProducerReport, verifySourceCoverage, main };
