@@ -210,6 +210,7 @@ test('runtime gate report records bounded failure state without arbitrary health
   assert.deepEqual(observed.relay.coverage.missing_sources, ['wire']);
   assert.deepEqual(observed.relay.coverage.stale_sources, ['wire']);
   assert.equal(observed.relay.coverage.turn_capture_ready, false);
+  assert.equal(observed.gateway.historical_failed_files, 3);
   assert.equal(observed.relay.coverage.wire.requests, 0);
   assert.equal(Object.hasOwn(observed, 'collector_private'), false);
   assert.doesNotMatch(JSON.stringify(observed), /PRIVATE_/);

@@ -106,6 +106,7 @@ function healthObservation(gateway, relay, collector) {
       pending: safeInteger(gatewayRelay?.pending),
       inflight: safeInteger(gatewayRelay?.inflight),
       failed: safeInteger(gatewayRelay?.failed),
+      historical_failed_files: safeInteger(capture?.outbox?.failedFiles),
     },
     relay: {
       status: typeof relay?.status === 'string' ? relay.status : null,
