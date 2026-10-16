@@ -23,6 +23,7 @@ function validateConfig(config, revision) {
   assert.ok(services.length, 'deployment must contain services');
   const backend = config.services.platform?.environment?.CHIPTRACE_BACKEND;
   assert.ok(['fs', 'oss', 's3'].includes(backend), 'platform storage backend must be explicitly fs, oss, or s3');
+  const writableBindSources = new Map();
   for (const [name, service] of services) {
     assert.ok(['collector', 'relay', 'platform'].includes(name), 'unexpected deployment service');
     assert.equal(service.build, undefined, `${name}: build images separately before deployment`);
@@ -38,6 +39,18 @@ function validateConfig(config, revision) {
     assert.ok(service.cap_drop?.includes('ALL'), `${name}: capabilities must be dropped`);
     assert.ok(service.security_opt?.some(value => /^no-new-privileges(?::true)?$/.test(value)), `${name}: no-new-privileges is required`);
     assert.ok(service.healthcheck?.test?.length, `${name}: a healthcheck is required`);
+    assert.ok(Array.isArray(service.volumes) && service.volumes.length > 0,
+      `${name}: explicit data volumes are required`);
+    for (const volume of service.volumes) {
+      if (volume?.type !== 'bind' || volume.read_only === true) continue;
+      assert.ok(typeof volume.source === 'string' && volume.source.trim() !== '',
+        `${name}: writable data volume must have a host source`);
+      const source = path.resolve(volume.source);
+      const previous = writableBindSources.get(source);
+      assert.equal(previous, undefined,
+        `${name}: writable bind source ${source} is already used by ${previous?.service}`);
+      writableBindSources.set(source, { service: name, target: volume.target });
+    }
   }
   return services.map(([name, service]) => ({ name, image: service.image }));
 }

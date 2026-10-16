@@ -93,6 +93,9 @@ Wire 阶段和成对成功 Hook 闭合；内联压缩及缺 Hook 仍拒绝交付
 2. 等待该提交的 GitHub CI 全部作业（包含固定 Stock Codex 上下文补丁检查）通过，再做 review/合并；镜像记录 Git revision。
 3. 用目标云平台自己的身份授权和项目隔离，配置一个项目一套 plugin root/storage prefix。
    服务令牌只在后端使用；不要把 OSS 密钥下发给插件调用者。
+   部署预检还会拒绝 Collector、Relay 和 Platform 之间重复的可写 bind source；Platform
+   只读共享 Collector 的 capture 目录是允许的，其他 Raw、质量账本、任务状态和对象目录
+   必须保持独立。
 4. 在目标 OSS/S3 账号先验收小 Archive：上传、verify、恢复、离线 verify、Session 检查和
    Buyer 导出下载，保存真实 endpoint、IAM 结果和镜像 ID。
 5. 先隔离 Stock Codex canary，再升级线上镜像。验收目标 Session 的每个 Turn 都有四源和

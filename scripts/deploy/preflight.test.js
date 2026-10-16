@@ -62,6 +62,13 @@ test('deployment preflight rejects mutable images, unknown revisions and missing
     candidate.services.collector.user = user;
     assert.throws(() => validateConfig(candidate, revision), /non-root/);
   }
+  const namespaceCollision = structuredClone(config);
+  const collectorCapture = namespaceCollision.services.collector.volumes
+    .find(volume => volume.target === '/data/capture');
+  const relayData = namespaceCollision.services.relay.volumes
+    .find(volume => volume.target === '/data');
+  relayData.source = collectorCapture.source;
+  assert.throws(() => validateConfig(namespaceCollision, revision), /writable bind source/);
   const invalidBackend = structuredClone(config);
   invalidBackend.services.platform.environment.CHIPTRACE_BACKEND = 'local';
   assert.throws(() => validateConfig(invalidBackend, revision), /backend/);
