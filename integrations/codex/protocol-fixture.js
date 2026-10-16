@@ -27,6 +27,10 @@ const cliProducer = producerMode !== 'patched_stock_debug_app_server';
 // source. Patch provenance still distinguishes the repaired producer.
 const version = stockRelease.version;
 const upstream = stockRelease.upstream_commit;
+const expectedBuildRevision = process.env.CHIPTRACE_EXPECTED_BUILD_REVISION;
+if (expectedBuildRevision !== undefined) {
+  assert.match(expectedBuildRevision, /^[a-f0-9]{40}$/, 'expected ChipTrace build revision must be a full Git SHA');
+}
 const patches = unmodifiedStock ? [] : ['upstream-sse-context.patch', 'upstream-sse-context-test.patch',
   'upstream-session-scope.patch', 'upstream-session-scope-extension.patch',
   'upstream-session-scope-process.patch', 'upstream-config-read-scope.patch'];
@@ -236,9 +240,17 @@ async function protocolFixture(t, prefix) {
     '--root', path.join(root, 'relay'), '--state-root', path.join(root, 'relay-state'),
     '--delivery-state-root', path.join(root, 'delivery'), '--collector-url', collectorUrl];
   const collector = launch(chiptrace, collectorArgs, { CHIPTRACE_INGEST_TOKEN: token });
-  await health(collectorUrl, collector);
+  const collectorHealth = await health(collectorUrl, collector);
+  if (expectedBuildRevision !== undefined) {
+    assert.equal(collectorHealth.build?.revision, expectedBuildRevision,
+      'native collector must run the ChipTrace revision under test');
+  }
   const relay = launch(chiptrace, relayArgs, { CHIPTRACE_INGEST_TOKEN: token });
-  await health(relayUrl, relay);
+  const relayHealth = await health(relayUrl, relay);
+  if (expectedBuildRevision !== undefined) {
+    assert.equal(relayHealth.build?.revision, expectedBuildRevision,
+      'native relay must run the ChipTrace revision under test');
+  }
   outbox = new DurableCaptureOutbox({ root: path.join(root, 'outbox'), relayUrl,
     bearerToken: token, minFreeBytes: 0, minFreeFiles: 0, sanitize: false });
   await outbox.start();

@@ -178,6 +178,12 @@ CHIPTRACE_AUTO_COMPACTION_REPORT=/private/path/native-auto-compaction-ci.json \
   make protocol-collection-test
 ```
 
+GitHub 的原生采集作业还设置 `CHIPTRACE_EXPECTED_BUILD_REVISION=${{ github.sha }}`。
+隔离 fixture 在发送第一条业务数据前读取 Collector 和 Relay 的 `/health`，要求两者的
+`build.revision` 都精确等于本次提交；缺少该字段或运行缓存中的旧二进制都会立即失败。
+本地复验可把它设置为当前编译时的完整 Git SHA，省略时只跳过这项身份断言，不改变其余
+来源、Session、Turn 和存储验收。
+
 `CHIPTRACE_PROTOCOL_MINIO_BINARY` 缺省时只执行 FS 平台联测；CI 必须设置它，并核对
 五份报告的实际 S3 证据。CI 从固定 MinIO commit
 `07c3a429bfed433e49018cb0f78a52145d4bedeb` 以 Go 1.24.2 构建该私有服务。
