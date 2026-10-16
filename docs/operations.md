@@ -239,17 +239,26 @@ open 时间的事务存在时为 false。router_v2 宿主使用 `FULL_TRACE_CAPT
 node scripts/ci/runtime-health-gate.js \
   --gateway-url http://127.0.0.1:18084/health \
   --relay-url http://127.0.0.1:3012/health \
+  --collector-url http://127.0.0.1:3011/health \
   --expected-revision <git-revision>
 ```
 
-该门禁同时要求网关 `openCaptureHealthy`、Relay `freshness_applicable`、四路来源新鲜、
-队列排空、attempt 守恒，并在提供 `--expected-revision` 时确认 Relay 健康响应中的构建
-revision 与待发布镜像一致。v2 还要求 `wire_turn_coverage` 有明确原生 Session/Turn、无
+三个参数都须传完整 `/health` URL；Collector 端口按实际映射调整。v3 要求同时观察
+网关、Relay 和 Collector，缺少探测参数、Collector 不可达、不 ready、有队列或错误时
+均真实退出非零。Relay/Collector 的构建 revision 必须是完整 Git SHA 且相同；提供
+`--expected-revision` 时两者均须匹配待发布版本。Collector 持久 Capture 总数不得低于
+Relay delivered；额外的私有评估或其他 Relay 数据不要求计数相等。计数下界不证明 Raw
+逐对象完整性，仍须对目标 Session 独立验收。预检的 OCI label 不能替代运行版本探测。
+
+门禁继续要求网关 `openCaptureHealthy`、Relay `freshness_applicable`、四路来源新鲜、
+队列排空和 attempt 守恒。保留 v2 的 `wire_turn_coverage` 要求：明确原生 Session/Turn、无
 上下文冲突的 HTTP 2xx Capture，且最近一次新 durable Capture 在五分钟窗口内；旧 Relay
 缺少新统计时失败。统计按真实 durable ACK 逐条累加，包含 duplicate，批量冲突或失败项
 不计入；duplicate 不刷新成功证据的时间。HTTP 2xx 仅指 HTTP 状态，不证明 SSE 模型终态、
 客户端交付或整个 Session 完整。输出固定 `session_delivery_claimed=false`，逐 Session
 交付仍必须通过 `cloud-acceptance`。
+Relay 重启后进程级来源证据重新开始；旧 Raw 和导出仍可验证，但必须让新真实 Canary
+重新产生四源和成功 Wire，才能通过运行门禁。重复回放不能刷新成功 Wire 的新鲜度。
 旧网关缺少 `openCaptureHealthy`，或旧 Relay 在 Runtime 有流量而
 Wire 停止时返回 `freshness_applicable=false`，都会失败；历史失败文件仍保留为审计证据，
 不会被当作当前失败清理。

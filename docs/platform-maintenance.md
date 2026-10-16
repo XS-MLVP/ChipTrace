@@ -98,7 +98,11 @@ Wire 阶段和成对成功 Hook 闭合；内联压缩及缺 Hook 仍拒绝交付
 5. 先隔离 Stock Codex canary，再升级线上镜像。验收目标 Session 的每个 Turn 都有四源和
    显式结束边界，同时检查 outbox/Relay 排空；全局 health 不能证明每个 Session 可交付。
 
-升级完成后还要运行 `node scripts/ci/runtime-health-gate.js` 检查网关和 Relay 的实时门禁。
+升级完成后还要运行 `node scripts/ci/runtime-health-gate.js`，同时传入网关、Relay、Collector
+的完整健康 URL。v3 核对两个 Rust 服务的实际构建版本、Collector ready/队列/错误状态和
+持久化计数下界，拒绝只升级 Relay、Collector 不可达或未完成持久化的快照。模板 CI 通过
+真实 CLI 探测实际 Collector/Relay，并明确使用合成网关健康 fixture；受控的 503 和版本
+故障必须非零退出。重启后持久数据仍可交付，但来源新鲜度门禁必须等待新真实 Canary。
 它会拒绝旧版本缺少 `openCaptureHealthy` 的响应，以及 `freshness_applicable=false` 的
 Relay 快照，避免把“Runtime 仍在增长、Wire 已断流”误判为完整采集。runtime gate v2
 还独立校验 `wire_turn_coverage`：明确 Session/Turn、无上下文冲突的 HTTP 2xx Capture

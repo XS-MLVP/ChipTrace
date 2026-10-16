@@ -2,9 +2,12 @@
 
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
+const http = require('node:http');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
 const { setTimeout: delay } = require('node:timers/promises');
 const { docker, preflight } = require('../deploy/preflight');
 const { ChipTraceClient } = require('../../integrations/cloud-platform/client');
@@ -12,6 +15,7 @@ const { ChipTraceClient } = require('../../integrations/cloud-platform/client');
 const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const files = ['deploy/collector-relay.yml', 'deploy/cloud-platform.yml'];
 const token = 'synthetic-deployment-smoke-credential-at-least-32-bytes';
+const run = promisify(execFile);
 
 async function eventually(action, timeout = 60000) {
   const deadline = Date.now() + timeout;
@@ -79,6 +83,7 @@ async function main({ runtimeImage, platformImage, revision, reportPath }) {
   let networkCreated = false;
   let started = false;
   let passed = false;
+  let healthFixture;
   const check = name => { report.checks[name] = true; console.log(`deployment smoke: ${name}`); };
   try {
     const proof = await preflight({ files, revision, project, env: environment });
@@ -185,6 +190,66 @@ async function main({ runtimeImage, platformImage, revision, reportPath }) {
     report.raw_records = sourceRecords.size;
     check('authenticated_relay_collector_exact_raw_and_duplicates');
 
+    // The public repository does not ship the host's 18084 server. This
+    // explicitly synthetic gateway health fixture reads the real Relay count;
+    // positive Collector/Relay probes below go directly to the real services.
+    // Fault routes are controlled health responses, not claims about a second
+    // actual Collector deployment.
+    healthFixture = http.createServer(async (req, res) => {
+      try {
+        let value;
+        let status = 200;
+        if (req.url === '/gateway') {
+          const relay = await json(`${urls.relay}/health`);
+          value = { status: 'healthy', fullTraceCapture: { enabled: true, currentDeliveryHealthy: true,
+            outbox: { pending: 0, processing: 0, recentFailureCount: 0, openCaptureHealthy: true,
+              openTransactions: 0, failedFiles: 0 },
+            rustRelay: { configured: true, healthy: true, conservationOk: relay.conservation_ok,
+              pending: relay.pending, inflight: relay.inflight, failed: relay.failed, delivered: relay.delivered } } };
+        } else if (req.url === '/collector-other-revision') {
+          value = await json(`${urls.collector}/health`);
+          value.build.revision = otherRevision;
+        } else { status = 503; value = { ok: false }; }
+        res.writeHead(status, { 'content-type': 'application/json', connection: 'close' });
+        res.end(JSON.stringify(value));
+      } catch {
+        res.writeHead(503, { 'content-type': 'application/json', connection: 'close' });
+        res.end('{"ok":false}');
+      }
+    });
+    await new Promise(resolve => healthFixture.listen(0, '127.0.0.1', resolve));
+    const fixtureUrl = `http://127.0.0.1:${healthFixture.address().port}`;
+    const runtimeGate = async (collectorUrl = `${urls.collector}/health`) => {
+      const result = await run(process.execPath, [require.resolve('./runtime-health-gate'),
+        '--gateway-url', `${fixtureUrl}/gateway`, '--relay-url', `${urls.relay}/health`,
+        '--collector-url', collectorUrl, '--expected-revision', revision],
+      { env: environment, timeout: 10000, maxBuffer: 128 * 1024 });
+      return JSON.parse(result.stdout);
+    };
+    const liveGate = await runtimeGate();
+    assert.equal(liveGate.schema_version, 'chiptrace.runtime-health-gate.v3');
+    assert.equal(liveGate.session_delivery_claimed, false);
+    assert.equal(liveGate.build_revision, revision);
+    assert.equal(liveGate.collector.build_revision, revision);
+    assert.equal(liveGate.collector.captures, sourceRecords.size);
+    assert.equal(liveGate.relay.delivered, expectedRelayRaw.size);
+    report.runtime_gate = { schema_version: liveGate.schema_version, gateway_health_source: 'synthetic_fixture',
+      collector_health_source: 'actual_service', relay_health_source: 'actual_service',
+      session_delivery_claimed: false, build_revision: liveGate.build_revision,
+      collector_captures: liveGate.collector.captures, relay_delivered: liveGate.relay.delivered };
+    check('runtime_cli_probes_actual_collector_and_relay');
+    for (const [route, pattern] of [
+      ['/collector-unavailable', /HTTP 503/],
+      ['/collector-other-revision', /collector health\.build\.revision does not match expected revision/],
+    ]) {
+      await assert.rejects(runtimeGate(`${fixtureUrl}${route}`), error => {
+        assert.equal(error.code, 1); assert.equal(error.stdout, '');
+        assert.match(error.stderr, pattern);
+        return true;
+      });
+    }
+    check('runtime_cli_refuses_collector_probe_and_revision_faults');
+
     let client = new ChipTraceClient({ baseUrl: urls.platform, token });
     const unauthenticated = await fetch(`${urls.platform}/v1/jobs`, { signal: AbortSignal.timeout(5000) });
     assert.equal(unauthenticated.status, 401);
@@ -250,9 +315,21 @@ async function main({ runtimeImage, platformImage, revision, reportPath }) {
     assert.ok(Buffer.from(await (await client.downloadTurns('inspect')).arrayBuffer()).equals(turns), 'Turn download bytes changed after restart');
     assert.ok(Buffer.from(await (await client.download('export', artifact.file)).arrayBuffer()).equals(packageBytes), 'package download bytes changed after restart');
     check('restart_preserves_raw_jobs_turns_and_package_bytes');
+    // Persisted Raw does not refresh process-scoped source evidence. Require
+    // a new real canary after restart; duplicates cannot manufacture freshness.
+    await assert.rejects(runtimeGate(), error => {
+      assert.equal(error.code, 1); assert.equal(error.stdout, '');
+      assert.match(error.stderr, /ingest_coverage.status must be complete/);
+      return true;
+    });
+    check('restarted_runtime_requires_new_source_evidence');
     passed = true;
   } finally {
     let cleanupError;
+    if (healthFixture) {
+      try { healthFixture.closeAllConnections(); await new Promise((resolve, reject) => healthFixture.close(error => error ? reject(error) : resolve())); }
+      catch (error) { cleanupError = error; }
+    }
     if (started) {
       if (!passed) {
         try { console.error((await command(['logs', '--no-color', '--tail', '20'])).slice(-12000)); }

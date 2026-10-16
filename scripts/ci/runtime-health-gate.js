@@ -2,6 +2,7 @@
 
 const DEFAULT_TIMEOUT_MS = 5000;
 const REQUIRED_SOURCES = ['wire', 'otlp_logs', 'otlp_traces', 'hooks'];
+const REVISION_PATTERN = /^[a-f0-9]{40}$/;
 
 function fail(message) {
   throw new Error(`runtime health gate: ${message}`);
@@ -37,14 +38,29 @@ function nonEmptyString(value, label) {
 }
 
 function verifyBuildRevision(health, expectedRevision, label) {
-  if (expectedRevision === undefined) return null;
+  if (expectedRevision !== undefined && (typeof expectedRevision !== 'string' || !REVISION_PATTERN.test(expectedRevision))) {
+    fail('expected revision must be a full Git commit SHA');
+  }
   const build = object(health.build, `${label}.build`);
   const revision = nonEmptyString(build.revision, `${label}.build.revision`);
-  if (revision !== expectedRevision) {
+  if (!REVISION_PATTERN.test(revision)) fail(`${label}.build.revision must be a full Git commit SHA`);
+  if (expectedRevision !== undefined && revision !== expectedRevision) {
     fail(`${label}.build.revision does not match expected revision `
       + `(expected=${expectedRevision}, observed=${revision})`);
   }
   return revision;
+}
+
+function verifyCollectorHealth(health) {
+  object(health, 'collector health');
+  requireTrue(health.ok, 'collector health.ok');
+  const store = object(health.collector, 'collector health.collector');
+  requireTrue(store.ok, 'collector health.collector.ok');
+  requireTrue(store.ready, 'collector health.collector.ready');
+  const captures = nonNegativeInteger(store.captures, 'collector health.collector.captures');
+  requireZero(nonNegativeInteger(store.queue_depth, 'collector health.collector.queue_depth'), 'collector health.collector.queue_depth');
+  if (store.last_error !== null) fail('collector health.collector.last_error must be null');
+  return { ok: true, ready: true, captures, queue_depth: store.queue_depth };
 }
 
 function verifyGatewayHealth(health) {
@@ -194,7 +210,7 @@ function verifyRelayHealth(health) {
   };
 }
 
-function verifyRuntimeHealth(gatewayHealth, relayHealth, { expectedRevision } = {}) {
+function verifyRuntimeHealth(gatewayHealth, relayHealth, { expectedRevision, collectorHealth } = {}) {
   const gateway = verifyGatewayHealth(gatewayHealth);
   const relay = verifyRelayHealth(relayHealth);
   const buildRevision = verifyBuildRevision(relayHealth, expectedRevision, 'relay health');
@@ -204,14 +220,24 @@ function verifyRuntimeHealth(gatewayHealth, relayHealth, { expectedRevision } = 
       + `(gateway=${gateway.delivered}, relay=${relay.delivered})`,
     );
   }
+  const collector = verifyCollectorHealth(collectorHealth);
+  const collectorRevision = verifyBuildRevision(collectorHealth, expectedRevision ?? buildRevision, 'collector health');
+  // The private Collector may also receive evaluator data or other Relays.
+  // It must contain at least the Relay's durable delivery total, not exactly
+  // that total. These counters do not prove any Session's Raw completeness.
+  if (collector.captures < relay.delivered) {
+    fail('collector durable capture total is below Relay delivered total '
+      + `(collector=${collector.captures}, relay=${relay.delivered})`);
+  }
   return {
-    schema_version: 'chiptrace.runtime-health-gate.v2',
+    schema_version: 'chiptrace.runtime-health-gate.v3',
     // This process-wide health gate cannot prove any Session's full delivery.
     session_delivery_claimed: false,
     expected_revision: expectedRevision ?? null,
     build_revision: buildRevision,
     gateway,
     relay,
+    collector: { ...collector, build_revision: collectorRevision },
   };
 }
 
@@ -233,20 +259,23 @@ async function fetchJson(url, timeoutMs = DEFAULT_TIMEOUT_MS) {
 async function runRemoteHealthGate(
   gatewayUrl,
   relayUrl,
+  collectorUrl,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   expectedRevision,
 ) {
-  if (!gatewayUrl || !relayUrl) fail('gateway and relay health URLs are required');
-  const [gateway, relay] = await Promise.all([
+  if (!gatewayUrl || !relayUrl || !collectorUrl) fail('gateway, relay and collector health URLs are required');
+  const [gateway, relay, collector] = await Promise.all([
     fetchJson(gatewayUrl, timeoutMs),
     fetchJson(relayUrl, timeoutMs),
+    fetchJson(collectorUrl, timeoutMs),
   ]);
-  return verifyRuntimeHealth(gateway, relay, { expectedRevision });
+  return verifyRuntimeHealth(gateway, relay, { expectedRevision, collectorHealth: collector });
 }
 
 function parseArgs(argv) {
   let gateway;
   let relay;
+  let collector;
   let timeout = DEFAULT_TIMEOUT_MS;
   let expectedRevision;
   for (let index = 0; index < argv.length; index += 1) {
@@ -254,19 +283,20 @@ function parseArgs(argv) {
     const value = argv[index + 1];
     if (flag === '--gateway-url' && value) { gateway = value; index += 1; }
     else if (flag === '--relay-url' && value) { relay = value; index += 1; }
+    else if (flag === '--collector-url' && value) { collector = value; index += 1; }
     else if (flag === '--timeout-ms' && value) { timeout = Number(value); index += 1; }
     else if (flag === '--expected-revision' && value) { expectedRevision = value; index += 1; }
-    else fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL [--timeout-ms N] [--expected-revision REVISION]');
+    else fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION]');
   }
-  if (!gateway || !relay || !Number.isSafeInteger(timeout) || timeout < 100) {
-    fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL [--timeout-ms N] [--expected-revision REVISION]');
+  if (!gateway || !relay || !collector || !Number.isSafeInteger(timeout) || timeout < 100) {
+    fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION]');
   }
-  return { gateway, relay, timeout, expectedRevision };
+  return { gateway, relay, collector, timeout, expectedRevision };
 }
 
 if (require.main === module) {
   const args = parseArgs(process.argv.slice(2));
-  runRemoteHealthGate(args.gateway, args.relay, args.timeout, args.expectedRevision)
+  runRemoteHealthGate(args.gateway, args.relay, args.collector, args.timeout, args.expectedRevision)
     .then(result => process.stdout.write(`${JSON.stringify(result, null, 2)}\n`))
     .catch(error => {
       process.stderr.write(`${error.message || String(error)}\n`);
@@ -279,6 +309,7 @@ module.exports = {
   REQUIRED_SOURCES,
   verifyGatewayHealth,
   verifyRelayHealth,
+  verifyCollectorHealth,
   verifyRuntimeHealth,
   runRemoteHealthGate,
 };

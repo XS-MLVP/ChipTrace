@@ -78,14 +78,98 @@ function relay() {
   };
 }
 
+function collector() {
+  return { ok: true, build: { version: '0.6.0', revision: 'f'.repeat(40) },
+    collector: { ok: true, ready: true, captures: 33, queue_depth: 0, last_error: null } };
+}
+
+test('runtime gate rejects an unobserved or unhealthy Collector despite healthy gateway and Relay', () => {
+  assert.throws(() => verifyRuntimeHealth(gateway(), relay()), /collector health/);
+  const unavailable = collector(); unavailable.ok = false;
+  assert.throws(() => verifyRuntimeHealth(gateway(), relay(), { collectorHealth: unavailable }), /collector health.ok/);
+  for (const changes of [
+    { ok: false }, { ready: false }, { captures: 31 }, { captures: -1 },
+    { queue_depth: 1 }, { last_error: 'PRIVATE_COLLECTOR_ERROR_BODY' },
+  ]) {
+    const value = collector();
+    Object.assign(value.collector, changes);
+    assert.throws(() => verifyRuntimeHealth(gateway(), relay(), { collectorHealth: value }), error => {
+      assert.match(error.message, /collector/);
+      assert.doesNotMatch(error.message, /PRIVATE_COLLECTOR_ERROR_BODY/);
+      return true;
+    });
+  }
+});
+
+test('runtime gate rejects a different Collector build and unknown deployment revisions', () => {
+  const value = collector();
+  value.build.revision = 'e'.repeat(40);
+  assert.throws(() => verifyRuntimeHealth(gateway(), relay(), { collectorHealth: value,
+    expectedRevision: 'f'.repeat(40) }), /collector health\.build\.revision/);
+  assert.throws(() => verifyRuntimeHealth(gateway(), relay(), { collectorHealth: value }), /collector health\.build\.revision/);
+  assert.throws(() => verifyRuntimeHealth(gateway(), relay(), { collectorHealth: collector(), expectedRevision: 'unknown' }), /full Git commit SHA/);
+  const old = collector(); delete old.build;
+  assert.throws(() => verifyRuntimeHealth(gateway(), relay(), { collectorHealth: old }), /collector health\.build must be an object/);
+  for (const revision of ['unknown', 'b68412b', 'PRIVATE_REVISION_MUST_NOT_LEAK']) {
+    const current = relay(); current.build.revision = revision;
+    assert.throws(() => verifyRuntimeHealth(gateway(), current, { collectorHealth: collector() }), error => {
+      assert.match(error.message, /full Git commit SHA/);
+      assert.doesNotMatch(error.message, /PRIVATE_REVISION_MUST_NOT_LEAK/);
+      return true;
+    });
+  }
+});
+
+test('runtime CLI observes all three endpoints and refuses Collector faults or missing probes', async t => {
+  let mode = 'healthy';
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    requests.push(req.url);
+    const value = req.url === '/gateway' ? gateway() : req.url === '/relay' ? relay() : collector();
+    const isCollector = req.url === '/collector';
+    if (isCollector && mode === 'old') value.build.revision = 'e'.repeat(40);
+    if (isCollector && mode === 'short') value.collector.captures = 31;
+    res.writeHead(isCollector && mode === 'unavailable' ? 503 : 200,
+      { 'content-type': 'application/json', connection: 'close' });
+    res.end(JSON.stringify(value));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const flags = ['--gateway-url', `${url}/gateway`, '--relay-url', `${url}/relay`];
+  const invoke = args => promisify(execFile)(process.execPath, [require.resolve('./runtime-health-gate'), ...args], { timeout: 10000 });
+  const complete = [...flags, '--collector-url', `${url}/collector`, '--expected-revision', 'f'.repeat(40)];
+  const result = JSON.parse((await invoke(complete)).stdout);
+  assert.equal(result.schema_version, 'chiptrace.runtime-health-gate.v3');
+  assert.equal(result.session_delivery_claimed, false);
+  assert.equal(result.collector.captures, 33);
+  assert.deepEqual(requests.sort(), ['/collector', '/gateway', '/relay']);
+  for (const [fault, pattern] of [
+    ['old', /collector health\.build\.revision does not match expected revision/],
+    ['short', /collector durable capture total is below Relay delivered total/],
+    ['unavailable', /HTTP 503/],
+  ]) {
+    mode = fault;
+    await assert.rejects(invoke(complete), error => {
+      assert.equal(error.code, 1); assert.equal(error.stdout, ''); assert.match(error.stderr, pattern);
+      return true;
+    });
+  }
+  const missing = await invoke(flags).then(() => null, error => error);
+  assert.equal(missing.code, 1);
+  assert.match(missing.stderr, /--collector-url URL/);
+});
+
 test('runtime health gate requires fresh scoped HTTP success without claiming Session delivery', () => {
-  const result = verifyRuntimeHealth(gateway(), relay());
-  assert.equal(result.schema_version, 'chiptrace.runtime-health-gate.v2');
+  const result = verifyRuntimeHealth(gateway(), relay(), { collectorHealth: collector() });
+  assert.equal(result.schema_version, 'chiptrace.runtime-health-gate.v3');
   assert.equal(result.session_delivery_claimed, false);
   assert.equal(result.gateway.open_capture_healthy, true);
   assert.equal(result.relay.freshness_applicable, true);
   assert.deepEqual(result.relay.sources, { wire: 8, otlp_logs: 15, otlp_traces: 9, hooks: 8 });
   assert.equal(result.relay.wire_turn_coverage.successful_turn_scoped_captures, 5);
+  assert.equal(result.collector.captures, 33);
+  assert.equal(result.collector.build_revision, relay().build.revision);
 });
 
 test('older health with only global Wire traffic fails closed', () => {
@@ -167,9 +251,9 @@ test('gateway and Relay delivery totals must agree', () => {
   );
 });
 
-test('deployment gate can require the running Relay revision', () => {
+test('deployment gate requires matching Collector and Relay revisions', () => {
   const expectedRevision = 'f'.repeat(40);
-  const result = verifyRuntimeHealth(gateway(), relay(), { expectedRevision });
+  const result = verifyRuntimeHealth(gateway(), relay(), { expectedRevision, collectorHealth: collector() });
   assert.equal(result.expected_revision, expectedRevision);
   assert.equal(result.build_revision, expectedRevision);
   assert.throws(
@@ -193,13 +277,14 @@ test('runtime gate CLI preserves a real failure and diagnoses Wire missing from 
   current.ingest_coverage.stale_sources = ['wire', 'private-untrusted-source'];
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json', connection: 'close' });
-    res.end(JSON.stringify(req.url === '/gateway' ? gateway() : current));
+    res.end(JSON.stringify(req.url === '/gateway' ? gateway() : req.url === '/collector' ? collector() : current));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
   const url = `http://127.0.0.1:${server.address().port}`;
   await assert.rejects(promisify(execFile)(process.execPath, [require.resolve('./runtime-health-gate'),
     '--gateway-url', `${url}/gateway`, '--relay-url', `${url}/relay`,
+    '--collector-url', `${url}/collector`,
     '--expected-revision', current.build.revision], { timeout: 10000 }), error => {
     assert.equal(error.code, 1);
     assert.equal(error.stdout, '');
@@ -222,13 +307,14 @@ test('runtime gate CLI returns nonzero for an unscoped 403 despite fresh four-so
   });
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json', connection: 'close' });
-    res.end(JSON.stringify(req.url === '/gateway' ? gateway() : current));
+    res.end(JSON.stringify(req.url === '/gateway' ? gateway() : req.url === '/collector' ? collector() : current));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
   const url = `http://127.0.0.1:${server.address().port}`;
   await assert.rejects(promisify(execFile)(process.execPath, [require.resolve('./runtime-health-gate'),
-    '--gateway-url', `${url}/gateway`, '--relay-url', `${url}/relay`], { timeout: 10000 }), error => {
+    '--gateway-url', `${url}/gateway`, '--relay-url', `${url}/relay`,
+    '--collector-url', `${url}/collector`], { timeout: 10000 }), error => {
     assert.equal(error.code, 1);
     assert.equal(error.stdout, '');
     assert.match(error.stderr, /successful_turn_scoped_captures must be positive/);

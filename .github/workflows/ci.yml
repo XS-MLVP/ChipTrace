@@ -478,7 +478,7 @@ jobs:
       - run: node --test scripts/ci/native-canary-gate.test.js
       - run: node --test scripts/ci/native-canary-evidence.test.js
       - run: node --test scripts/ci/stock-release-gate.test.js
-      - name: Verify runtime delivery and Turn Wire evidence fails closed
+      - name: Verify runtime delivery, Collector persistence and Turn Wire evidence fails closed
         run: |
           set -euo pipefail
           node --test scripts/ci/runtime-health-gate.test.js | tee runtime-health-gate.tap
@@ -646,7 +646,7 @@ jobs:
         run: |
           set -euo pipefail
           node --test scripts/deploy/preflight.test.js 2>&1 | tee deployment-preflight.tap
-      - name: Verify template deployment, Raw delivery, platform export and restart
+      - name: Verify template deployment, Collector runtime gate, Raw delivery, export and restart
         timeout-minutes: 8
         run: |
           set -euo pipefail
