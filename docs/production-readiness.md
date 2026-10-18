@@ -1,14 +1,14 @@
 # 生产就绪评估
 
-评估日期：2026-10-18。最新线上只读快照为 23:49（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-19。最新线上只读快照为 00:06（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-最新快照中 Collector 与 Relay 的传输计数仍守恒：Relay delivered 为 `1,247,500`，队列和失败均为 0，
+最新快照中 Collector 与 Relay 的传输计数仍守恒：Relay delivered 为 `1,248,887`，队列和失败均为 0，
 Collector ready；18084、3011、3012、18086 均返回 HTTP 200。
-业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=3304`，其中
-`otlp_traces.identity_conflict=182`、`invalid_lifecycle=1157`、`legacy_unclassified=1965`；当前
-进程新增质量错误为 1058，原因标签已按固定分类计数并保留 Raw。Wire 未观察到，
+业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=3393`，其中
+`otlp_traces.identity_conflict=182`、`invalid_lifecycle=1246`、`legacy_unclassified=1965`；当前
+进程新增质量错误为 1147，原因标签已按固定分类计数并保留 Raw。Wire 未观察到，
 `missing_sources=["wire"]`、`stale_sources=["wire"]`、`successful_turn_scoped_captures=0`、
 `turn_capture_ready=false`，runtime gate 以质量、新鲜度、历史失败、原因分解和 revision 门禁真实退出 1。
 18086 的 platform health gate 以 `7f5abad42fff171fd80f024bb0f03c2ae6de52b6` 真实通过，平台后端仍为
@@ -798,6 +798,24 @@ revision `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`，捕获/投递计数均为 
 重启后的任务和包哈希恢复，以及重启后要求新的来源证据均通过，临时服务和网络已清理。报告的
 `synthetic=true`、`real_upstream=false`、`real_oss_account=false` 和
 `production_acceptance_claimed=false` 保留了证据边界。
+
+## 2026-10-19 00:06 性能与容量复核
+
+同一 release 构建在本机重新执行了带 `fsync` 的 64 KiB 基准：单 shard Collector WAL 为
+`3,283 records/s`（`205.2 MiB/s`，100,000 条）；loopback HTTP 入口（并发 16、每批 64 条）为
+`3,747 records/s`（`234.2 MiB/s`），批延迟 p95 `279.0 ms`、p99 `329.1 ms`；四路 zstd level 1
+为 `442.1 MiB/s` 未压缩输入、`337.1 MiB/s` 压缩输出，压缩比 `1.312`。这些数字只覆盖本地
+WAL、HTTP 和压缩路径。
+
+带 Relay 的同一 HTTP 压测入口为 `895 records/s`（`55.9 MiB/s`）端到端，入口确认仍为
+`3,508 records/s`，异步排空耗时 `8.32 s`，重试 `0`；排空期间有 `613/695` 次健康轮询处于
+背压 `503`，最终 `delivered=10,000`、`pending/inflight/failed=0` 且计数守恒。压测载荷没有原生
+Session/Turn 身份，不能用于业务就绪或生产 SLO；它说明 Relay 背压会保留 Raw 并最终排空，但
+真实对象存储上传和多租户并发仍需单独测量。
+
+线上 Collector 在同一只读窗口报告 `sealed_bytes=109,736,469,031`（约 102.2 GiB）、827 个
+sealed Segment；宿主根分区约 91% 使用率，NFS 约 58%。当前没有达到可长期运行的容量证明，必须
+先建立保留/归档策略、磁盘余量告警和对象存储提交，再增加采集流量。
 
 ## 2026-10-18 22:14 质量标签根因抽样
 
