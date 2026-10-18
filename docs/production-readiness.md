@@ -31,6 +31,21 @@ exporter 仍关闭。Platform health gate 以同一 revision 退出 0，但当�
 Wire、版本不一致和存储失败不会被重试掩盖。新增回归实际验证了首个快照 inflight 后第二次稳定
 快照可以通过，持续业务质量缺口仍保持真实非零退出。
 
+## 2026-10-19 06:53（Asia/Shanghai）当前 release 性能复核
+
+在当前工作树的 release binary 上串行执行了相同 10,000 条、64 KiB、`fsync` 对照，避免并行
+构建竞争。Collector WAL 单 shard 为 `3,282.2 records/s`、`205.1 MiB/s`，四 shard 为
+`4,676.4 records/s`、`292.3 MiB/s`；loopback HTTP 入口单 shard 为 `3,640.9 records/s`
+（P95 `287.6 ms`、P99 `360.6 ms`），四 shard 为 `5,083.7 records/s`（P95 `251.3 ms`、
+P99 `275.1 ms`）。
+
+Relay 四 shard、批量 64、并发 16 的端到端吞吐为 `1,384.0 records/s`，入口确认吞吐为
+`3,923.4 records/s`，10,000/10,000 delivered、零重试，排空耗时 `4.68 s`；排空期间有
+`265/347` 次健康轮询处于背压 503。结果再次说明 Relay 交付和背压是热路径瓶颈，四 shard
+有明显收益，但不包含真实 Session/Turn、OSS 上传、多租户竞争或长期 NFS 负载，因此没有把
+Compose 默认从单 shard 直接改成四 shard。已初始化的数据目录拓扑不能在线修改，生产切换仍需
+独立归档、恢复和目标 OSS 压测证据。
+
 评估日期：2026-10-19。最新线上只读快照为 06:07:26（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
