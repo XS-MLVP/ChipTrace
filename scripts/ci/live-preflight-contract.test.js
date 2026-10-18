@@ -49,6 +49,7 @@ test('live provider preflight requires protected endpoints and runs both gates',
   assert.match(workflow, /--platform-url "\$CHIPTRACE_PLATFORM_HEALTH_URL"/);
   assert.match(workflow, /--expected-revision "\$CHIPTRACE_EXPECTED_REVISION"/);
   assert.match(workflow, /--expected-backend "\$CHIPTRACE_PLATFORM_BACKEND"/);
+  assert.match(workflow, /CHIPTRACE_PLATFORM_BACKEND must be oss or s3 for protected live preflight/);
   assert.match(workflow, /node --test scripts\/ci\/platform-health-gate\.test\.js/);
   assert.match(workflow, /--max-quality-errors 0/);
   assert.match(workflow, /--max-historical-failed-files 0/);

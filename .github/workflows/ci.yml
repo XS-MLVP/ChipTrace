@@ -68,6 +68,10 @@ jobs:
           for name in CHIPTRACE_CODEX_CONFIG CHIPTRACE_CODEX_USER_CONFIG CHIPTRACE_CODEX_BASE_URL CHIPTRACE_RESPONSES_URL CHIPTRACE_GATEWAY_HEALTH_URL CHIPTRACE_RELAY_HEALTH_URL CHIPTRACE_COLLECTOR_HEALTH_URL CHIPTRACE_PLATFORM_HEALTH_URL CHIPTRACE_PLATFORM_BACKEND CHIPTRACE_GATEWAY_CONTAINER CHIPTRACE_EXPECTED_REVISION CHIPTRACE_GATEWAY_EXPECTED_REVISION; do
             test -n "${!name:-}" || { echo "$name is missing from the protected environment or dispatch input" >&2; exit 1; }
           done
+          case "$CHIPTRACE_PLATFORM_BACKEND" in
+            oss|s3) ;;
+            *) echo 'CHIPTRACE_PLATFORM_BACKEND must be oss or s3 for protected live preflight' >&2; exit 1 ;;
+          esac
           echo 'protected live preflight configuration is present'
       - name: Verify the actual Codex configuration targets the managed Gateway
         env:
