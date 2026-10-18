@@ -86,6 +86,12 @@ pub fn quality_error_reasons(summary: &CloudIngestSummary) -> BTreeMap<String, u
 
 fn classify_quality_error(error: &str) -> &'static str {
     let normalized = error.to_ascii_lowercase();
+    if normalized.contains("lifecycle")
+        || normalized.contains("conflicting duplicate outcome")
+        || normalized.contains("conflicting duplicate status")
+    {
+        return "invalid_lifecycle";
+    }
     if normalized.contains("conflicting")
         || normalized.contains("identity conflict")
         || normalized.contains("duplicate context")
@@ -2076,6 +2082,27 @@ mod tests {
             values[0]["telemetryBatch"]["quality_error_reasons"],
             json!({})
         );
+    }
+
+    #[test]
+    fn conflicting_outcome_is_labeled_as_lifecycle_quality_error() {
+        let mut raw: Value = serde_json::from_slice(&stock_logs(false, true)).unwrap();
+        let attributes = raw["resourceLogs"][0]["scopeLogs"][0]["logRecords"][1]["attributes"]
+            .as_array_mut()
+            .unwrap();
+        attributes.extend([
+            attr("outcome", json!({"stringValue":"interrupted"})),
+            attr("outcome", json!({"stringValue":"completed"})),
+        ]);
+        let raw = serde_json::to_vec(&raw).unwrap();
+        let batch = prepare_cloud_ingest(CloudEndpoint::OtlpLogs, &raw, 1024 * 1024).unwrap();
+        assert_eq!(batch.summary.source_records, 2);
+        assert_eq!(batch.summary.derived_captures, 1);
+        assert_eq!(
+            quality_error_reasons(&batch.summary),
+            BTreeMap::from([(String::from("invalid_lifecycle"), 1)])
+        );
+        assert!(batch.summary.conversion_errors[0].contains("lifecycle"));
     }
 
     #[test]

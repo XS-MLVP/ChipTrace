@@ -567,6 +567,10 @@ fn is_identity_attribute(key: &str) -> bool {
         || key == "thread_id"
 }
 
+fn is_lifecycle_attribute(key: &str) -> bool {
+    matches!(key, "outcome" | "status" | "tool_status" | "toolStatus")
+}
+
 /// Apply the same native identity rules before deriving a log's owner.
 /// Read only identity scalars, avoiding copies of tool output or log bodies.
 /// Resource/scope/record precedence matches the full OTLP visitor below.
@@ -645,6 +649,12 @@ fn validate_otlp_attributes_mode(
             // identity, tool, and unknown attribute conflicts remain strict.
             if allow_trace_code_metadata_duplicates && key.starts_with("code.") {
                 continue;
+            }
+            // A repeated terminal outcome/status is a lifecycle conflict, not
+            // an identity conflict. Keep the Raw span and reject derivation,
+            // while exposing the distinction to the durable quality ledger.
+            if is_lifecycle_attribute(key) {
+                bail!("OTLP has conflicting duplicate lifecycle attribute {key:?}");
             }
             if is_identity_attribute(key) || matches!(key, "codex.context_scope" | "event.name") {
                 bail!("OTLP has conflicting duplicate context attribute {key:?}");
@@ -1133,7 +1143,11 @@ mod tests {
                         })
                         .unwrap_err()
                         .to_string();
-                        assert!(error.contains("conflicting duplicate OTLP attribute"));
+                        if key == "outcome" {
+                            assert!(error.contains("conflicting duplicate lifecycle attribute"));
+                        } else {
+                            assert!(error.contains("conflicting duplicate OTLP attribute"));
+                        }
                         assert!(
                             !error.contains("PRIVATE_"),
                             "only attribute positions may leave the validator"

@@ -1,21 +1,21 @@
 # 生产就绪评估
 
-评估日期：2026-10-18。最新线上只读快照为 18:44（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-18。最新线上只读快照为 19:36（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-最新快照中 Gateway/Collector/Relay 的传输计数仍守恒：Gateway、Relay 和 Collector 的已投递/捕获均为
-`1,223,359`，队列和失败均为 0，Collector ready。业务覆盖仍拒绝：Relay 持久
-`quality_errors=1841`，全部是 `otlp_traces` conversion errors，且质量原因分解缺失；成功且有 Turn 身份的 Wire 为
-`279/293`，最后一条距观测约 39.4 小时，`status=degraded`、`required_sources_fresh=false`、
-`turn_capture_ready=false`，且仍运行旧 revision。runtime gate 以质量错误、新鲜度、历史失败、原因分解
-和 revision 为门禁时真实退出 1。
-平台 18086 返回 HTTP 200，但没有 `build.revision`；以当前部署 revision 检查 platform health gate 也真实退出 1。
-线上平台容器尚未注入本分支新增的 `CHIPTRACE_BUILD_REVISION`，Collector/Relay 仍运行旧的
-`e5237065ff3a48623179c5846ff1916040030c9a`。最新维护分支提交为
-`d57a0d829e31bac6b2271b4d60ee2f38c15d600f`；Gateway preflight 对该 SHA 真实退出 1，
-因为线上 Gateway 仍是 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`。GitHub Actions 结果因当前
-CLI 未认证且网络超时尚未核验。
+最新快照中 Collector 与 Relay 的传输计数仍守恒：Collector 捕获、Relay 已投递均为
+`1,226,196`，队列和失败均为 0，Collector ready；18084、3011、3012、18086 均返回 HTTP 200。
+业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2040`，其中
+`otlp_traces.identity_conflict=75`、`legacy_unclassified=1965`；当前进程新增质量错误为 24。
+Wire 和 required Hook 没有新鲜观测，`stale_sources=["wire"]`、`turn_capture_ready=false`，runtime
+gate 以质量、新鲜度、历史失败、原因分解和 revision 门禁真实退出 1。
+18086 的 platform health gate 以 `6df2c1718f27d7c09094a768713120c82370bc17` 真实通过，平台后端
+仍为 `fs`。Gateway `router-v2-relay-shell` 的隔离预检不带预期 revision 时通过，但其 OCI revision
+仍为外部镜像的 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`；带维护 SHA 的 Gateway preflight
+真实退出 1，因此当前不能声称入口镜像与维护提交一致。真实 Alibaba OSS 提交、恢复、远端对象
+哈希、未修改 Stock Codex 新鲜多轮 Canary 和目标租户导出仍未完成。GitHub Actions 远端运行结果本轮
+仍未能通过 API/CLI 核验；`git ls-remote` 已确认维护分支远端指向 `6df2c17`。
 
 本次复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
 failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留，Collector/Relay 队列为空且

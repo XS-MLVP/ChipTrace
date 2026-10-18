@@ -92,7 +92,9 @@ Relay 目录；OTLP 与 Hook 使用独立采集凭据。Wire Capture 使用网�
 
 OTLP 上下文重复属性或有效身份别名冲突会先保留 Raw，再返回 `HTTP 400` 和
 `reason=cloud_ingest_quality_error`，即使响应包含 `durable/local_durable=true` 也不是质量
-成功。应修复来源端冲突，保留原失败及质量计数。旧版本已落盘 Capture 的派生元数据可能
+成功。生命周期字段（例如同一 Span 重复的 `outcome`/`status`）会单独记为
+`invalid_lifecycle`；身份别名冲突仍记为 `identity_conflict`。两类都应修复来源端，保留原失败
+及质量计数。旧版本已落盘 Capture 的派生元数据可能
 与新版不同，同一 ID 重投可能返回 409；升级不能自动重新认证历史 delivered 账本或改写 Raw。
 入口与离线审计共用 Session/Turn 身份规则，包括 UUID 形式的原生 `thread_id`；冲突记录
 不能派生出工具所有者或带归属的不完整事件。同批正常记录继续保留。相同别名合法，
