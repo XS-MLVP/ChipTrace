@@ -1,18 +1,18 @@
 # 生产就绪评估
 
-评估日期：2026-10-19。最新线上只读快照为 01:38（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-19。最新线上只读快照为 01:47（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-最新快照中 Collector 与 Relay 的传输计数仍守恒：01:38 健康观测到 Relay delivered 为
-`1,256,567`，队列和失败均为 0，Collector ready；18084、3011、3012、18086 均返回 HTTP 200，
+最新快照中 Collector 与 Relay 的传输计数仍守恒：01:47 健康观测到 Relay delivered 为
+`1,257,250`，队列和失败均为 0，Collector ready；18084、3011、3012、18086 均返回 HTTP 200，
 Collector、Relay 和平台的实际 build revision 均为
-`f8a96ffc66b211eebb9100950f659add758f526f`。业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，
-持久 `quality_errors=3912`（`otlp_traces.identity_conflict=182`、`invalid_lifecycle=1765`、
-`legacy_unclassified=1965`），本次进程新增质量错误为 24；原因标签按固定分类计数并保留 Raw。Wire
+`80d61aa136ea31dceaf3d0ac51392ce239ed894e`。业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，
+持久 `quality_errors=3965`（`otlp_traces.identity_conflict=182`、`invalid_lifecycle=1818`、
+`legacy_unclassified=1965`），本次进程新增质量错误为 7；原因标签按固定分类计数并保留 Raw。Wire
 和 Hook 均未观察到，`stale_sources=["wire"]`、`successful_turn_scoped_captures=0`、
 `turn_capture_ready=false`，runtime gate 以质量、新鲜度、历史失败、原因分解和 revision 门禁真实退出 1。
-18086 的 platform health gate 以 `f8a96ffc66b211eebb9100950f659add758f526f` 真实通过，平台后端仍为
+18086 的 platform health gate 以 `80d61aa136ea31dceaf3d0ac51392ce239ed894e` 真实通过，平台后端仍为
 `fs`。Gateway `router-v2-relay-shell` 的隔离预检不带预期 revision 时通过，但其 OCI revision 仍为外部镜像的
 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`；带维护 SHA 的 Gateway preflight 真实退出 1，因此入口镜像尚未
 与维护提交对齐。当前 relay-shell 的 `fullTraceCapture.stats.acceptedCount=0`，本机用户级 Codex 配置仍指向
@@ -22,7 +22,7 @@ Canary 和目标租户导出仍未完成。GitHub API/CLI 当前无法核验远�
 
 当前复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
 failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留，Collector/Relay 队列为空且
-`conservation_ok=true`。Collector/Relay 实际 revision 为 `f8a96ffc66b211eebb9100950f659add758f526f`；
+`conservation_ok=true`。Collector/Relay 实际 revision 为 `80d61aa136ea31dceaf3d0ac51392ce239ed894e`；
 平台与它们的 OCI/Compose revision 已对齐，Gateway 入口仍需单独升级到同一维护 revision。
 
 本轮还将 Gateway outbox 的可用余量接入 runtime gate：受保护 live preflight 要求
