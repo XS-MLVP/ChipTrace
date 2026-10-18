@@ -1,16 +1,16 @@
 # 生产就绪评估
 
-评估日期：2026-10-19。最新线上只读快照为 05:32（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-19。最新线上只读快照为 05:58:34（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-最新快照中 Collector 与 Relay 的传输计数仍守恒：05:32 健康观测到两者均为
-`1,274,911`，`pending=0`、`failed=0`、`inflight=0`，Collector ready；18084、3011、3012、
+最新快照中 Collector 与 Relay 的传输计数仍守恒：05:58:34 健康观测到两者均为
+`1,277,888`，`pending=0`、`failed=0`，`inflight` 随持续流量瞬时变化，Collector ready；18084、3011、3012、
 18086 的 `/health` 均返回 HTTP 200，但 Relay `/ready` 为 HTTP 503。Collector/Relay/Platform
-实际 build revision 均为 `2480641eeff970baf3284a6f17ee7bae6dd6c313`，已完成受控滚动更新。
-业务覆盖仍拒绝：`ingest_coverage.status=degraded`，持久 `quality_errors=5216`
-（全部来自 `otlp_traces`，其中 `identity_conflict=182`、`invalid_lifecycle=3069`、
-`legacy_unclassified=1965`），本次进程质量错误为 187。原因标签按固定分类计数并保留 Raw；
+实际 build revision 均为 `3492bfee498ee05d30064ac8ca59fdb6d6f35e74`，已完成受控滚动更新。
+业务覆盖仍拒绝：`ingest_coverage.status=degraded`，持久 `quality_errors=5471`
+（全部来自 `otlp_traces`，其中 `identity_conflict=182`、`invalid_lifecycle=3324`、
+`legacy_unclassified=1965`），本次进程质量错误为 21。原因标签按固定分类计数并保留 Raw；
 当前缺少且过期的来源为 `wire`，`successful_turn_scoped_captures=0`、
 `turn_capture_ready=false`，runtime gate 仍以质量、新鲜度、来源和 revision 门禁真实退出 1。
 18086 的平台后端仍为 `fs`；Gateway outbox 当前 pending/processing/recent failure 均为 0，
