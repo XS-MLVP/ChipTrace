@@ -125,7 +125,8 @@ paths:
         的采集就绪证据；它不代表任何特定 Session 已完整。HTTP 2xx 不证明 SSE 终态。
         ingest_coverage.quality_errors 从持久 Delivery ledger 恢复，必须带有
         quality_errors_scope=durable_relay_state；quality_errors_current_process 只表示本次
-        进程新增质量错误，不能用重启掩盖历史错误。
+        进程新增质量错误，不能用重启掩盖历史错误。质量原因按固定 endpoint 分解且总数必须
+        守恒；缺少或冲突的质量标签只能保持未就绪。
         runtime health gate v3 要求该证据近期有效，
         并固定声明 session_delivery_claimed=false。
       responses:
@@ -135,9 +136,10 @@ paths:
     get:
       summary: 严格的业务采集就绪门禁
       description: >-
-        仅当 Relay 传输守恒、四路来源已观察且新鲜、持久质量错误为零，并且存在新的有归属
-        HTTP 2xx Turn Wire 时返回 200。该状态仍不代表任何特定 Session 已完整；失败响应保留
-        blocking_reasons，便于发布门禁和编排系统区分存活与业务就绪。
+        仅当 Relay 传输守恒、四路来源已观察且新鲜、持久质量错误为零、质量账本作用域为
+        durable_relay_state 且原因分解总数守恒，并且存在新的有归属 HTTP 2xx Turn Wire 时返回
+        200。该状态仍不代表任何特定 Session 已完整；失败响应保留 blocking_reasons，便于发布
+        门禁和编排系统区分存活与业务就绪。
       responses:
         "200": {description: Relay 已满足当前业务采集就绪条件}
         "503": {description: 传输或四路业务采集尚未就绪}

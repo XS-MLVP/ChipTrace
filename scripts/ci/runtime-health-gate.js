@@ -110,6 +110,42 @@ function qualityErrorObservation(value) {
   };
 }
 
+function hasCompleteQualityBreakdown(coverage, qualityErrors) {
+  if (!Number.isSafeInteger(qualityErrors) || qualityErrors < 0) return false;
+  const breakdown = coverage?.quality_errors_by_endpoint;
+  if (!breakdown || typeof breakdown !== 'object' || Array.isArray(breakdown)) return false;
+  let total = 0;
+  for (const endpoint of QUALITY_ENDPOINTS) {
+    const value = breakdown[endpoint];
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const unknown = value.unknown_events;
+    const conversion = value.conversion_errors;
+    const endpointTotal = value.total;
+    if (![unknown, conversion, endpointTotal].every(number => (
+      Number.isSafeInteger(number) && number >= 0
+    ))) return false;
+    if (unknown > Number.MAX_SAFE_INTEGER - conversion || endpointTotal !== unknown + conversion) {
+      return false;
+    }
+    const reasons = value.reasons;
+    if (!reasons || typeof reasons !== 'object' || Array.isArray(reasons)) return false;
+    let reasonTotal = 0;
+    for (const [code, count] of Object.entries(reasons)) {
+      if (!QUALITY_REASON_CODES.includes(code)
+        || !Number.isSafeInteger(count) || count < 0
+        || reasonTotal > Number.MAX_SAFE_INTEGER - count) {
+        return false;
+      }
+      reasonTotal += count;
+    }
+    if (reasonTotal !== endpointTotal || total > Number.MAX_SAFE_INTEGER - endpointTotal) {
+      return false;
+    }
+    total += endpointTotal;
+  }
+  return total === qualityErrors;
+}
+
 function blockingReasons(
   observation,
   {
@@ -287,11 +323,10 @@ function healthObservation(
           otlp_traces: qualityErrorObservation(coverage?.quality_errors_by_endpoint?.otlp_traces),
           hooks: qualityErrorObservation(coverage?.quality_errors_by_endpoint?.hooks),
         },
-        quality_reason_breakdown_complete: QUALITY_ENDPOINTS.every(endpoint => (
-          coverage?.quality_errors_by_endpoint?.[endpoint]?.reasons
-          && typeof coverage.quality_errors_by_endpoint[endpoint].reasons === 'object'
-          && !Array.isArray(coverage.quality_errors_by_endpoint[endpoint].reasons)
-        )),
+        quality_reason_breakdown_complete: hasCompleteQualityBreakdown(
+          coverage,
+          safeInteger(coverage?.quality_errors),
+        ),
         wire_turn_coverage: {
           turn_scoped_captures: safeInteger(turnCoverage?.turn_scoped_captures),
           successful_turn_scoped_captures: safeInteger(turnCoverage?.successful_turn_scoped_captures),
@@ -578,6 +613,10 @@ function verifyRelayHealth(health, { maxQualityErrors } = {}) {
   if (coverage.quality_errors_scope !== QUALITY_ERRORS_SCOPE) {
     fail('relay.ingest_coverage.quality_errors_scope must be durable_relay_state');
   }
+  requireTrue(
+    coverage.quality_reason_breakdown_complete,
+    'relay.ingest_coverage.quality_reason_breakdown_complete',
+  );
   nonNegativeInteger(
     coverage.quality_errors_current_process,
     'relay.ingest_coverage.quality_errors_current_process',

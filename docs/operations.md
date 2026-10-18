@@ -80,7 +80,8 @@ Relay `/health` 的 `delivery_retries` 是持久账本中的 `delivery_attempts 
 
 Relay 的 `/health` 只表示进程、WAL 和传输层存活，即使四路来源缺失也可能返回 200。发布门禁
 和需要业务采集就绪语义的编排系统应使用 `/ready`：它要求四路来源已观察且新鲜、持久质量错误为
-零、存在新的有归属 HTTP 2xx Turn Wire，并在 503 响应中返回固定 `blocking_reasons`。`/ready=200`
+零、质量账本作用域为 `durable_relay_state` 且三路原因分解总数守恒、存在新的有归属 HTTP 2xx
+Turn Wire，并在 503 响应中返回固定 `blocking_reasons`。`/ready=200`
 仍不代表某个具体 Session 已完整，Session/Turn 交付必须继续运行 runtime gate 和 cloud acceptance。
 
 `benchmark-http --relay` 会在入口压测结束后轮询 Relay `/health`，直到 `delivered` 与入口
@@ -374,7 +375,8 @@ Relay/Collector 的精确 Raw、重复确认、平台归档/恢复、Turn 和采
   `unsupported_event`、`invalid_structure`、`invalid_attributes`、`identity_conflict`、
   `missing_identity`、`invalid_tool`、`invalid_lifecycle`、`invalid_timestamp`、
   `conversion_error` 或历史迁移专用的 `legacy_unclassified`，每个端点的原因计数必须和
-  端点总数一致，总数必须和持久化的 `quality_errors` 对账。`quality_errors_current_process`
+  端点总数一致，总数必须和持久化的 `quality_errors` 对账，并且
+  `quality_reason_breakdown_complete=true`。`quality_errors_current_process`
   仅表示本次进程增量，运行门禁还必须拒绝缺少原因分解的旧 Relay。旧 ledger 无法回溯原因时
   只能归入 `legacy_unclassified`，不能按正文或时间猜测更具体标签。先保留失败快照，再
   修正生产者或采集配置。

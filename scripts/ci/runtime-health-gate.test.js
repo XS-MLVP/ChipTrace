@@ -86,6 +86,7 @@ function relay() {
       quality_errors: 0,
       quality_errors_current_process: 0,
       quality_errors_scope: 'durable_relay_state',
+      quality_reason_breakdown_complete: true,
       quality_errors_by_endpoint: {
         otlp_logs: { unknown_events: 0, conversion_errors: 0, total: 0, reasons: {} },
         otlp_traces: { unknown_events: 0, conversion_errors: 0, total: 0, reasons: {} },
@@ -382,6 +383,31 @@ test('runtime gate rejects quality counters that are only process-local', () => 
   const observed = healthObservation(gateway(), value, collector());
   assert.deepEqual(observed.blocking_reasons, ['relay_quality_history_not_durable']);
   assert.equal(observed.relay.coverage.quality_errors_scope, null);
+});
+
+test('runtime gate requires an exact quality reason completeness marker', () => {
+  const missing = relay();
+  delete missing.ingest_coverage.quality_reason_breakdown_complete;
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), missing, { collectorHealth: collector() }),
+    /quality_reason_breakdown_complete must be true/,
+  );
+
+  const malformed = relay();
+  malformed.ingest_coverage.quality_errors = 1;
+  malformed.ingest_coverage.quality_errors_by_endpoint.otlp_traces = {
+    unknown_events: 1,
+    conversion_errors: 0,
+    total: 1,
+    reasons: { PRIVATE_REASON_MUST_NOT_LEAK: 1 },
+  };
+  const observed = healthObservation(gateway(), malformed, collector());
+  assert.equal(observed.relay.coverage.quality_reason_breakdown_complete, false);
+  assert.equal(observed.blocking_reasons.includes('relay_quality_reason_breakdown_missing'), true);
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), malformed, { collectorHealth: collector() }),
+    /reasons contains an unsupported code/,
+  );
 });
 
 test('runtime observations preserve endpoint quality-error breakdowns', () => {

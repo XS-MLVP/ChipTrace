@@ -1950,6 +1950,10 @@ impl IngestCoverageState {
         };
         let successful_turn_scoped_fresh = successful_turn_scoped_age_ms
             .is_some_and(|age| age <= INGEST_COVERAGE_FRESHNESS_WINDOW_MS);
+        let quality_breakdown_complete = quality_reason_breakdown_complete(
+            self.quality_errors,
+            [&self.otlp_logs, &self.otlp_traces, &self.hooks],
+        );
         // This is a process-level canary signal. It proves that the Relay has
         // recently received at least one fresh, identity-scoped successful
         // Turn Wire alongside synchronized source routes; it never claims
@@ -2000,6 +2004,7 @@ impl IngestCoverageState {
                 "otlp_traces":route_quality_value(&self.otlp_traces),
                 "hooks":route_quality_value(&self.hooks),
             },
+            "quality_reason_breakdown_complete":quality_breakdown_complete,
             "derived":{
                 "lifecycle_events":self.lifecycle_events,
                 "tool_executions":self.tool_executions,
@@ -2029,6 +2034,35 @@ fn route_quality_value(route: &RouteCoverage) -> Value {
             .saturating_add(route.quality_conversion_errors),
         "reasons":route.quality_reasons,
     })
+}
+
+fn quality_reason_breakdown_complete(total: u64, routes: [&RouteCoverage; 3]) -> bool {
+    let mut sum = 0_u64;
+    for route in routes {
+        let Some(route_total) = route
+            .quality_unknown_events
+            .checked_add(route.quality_conversion_errors)
+        else {
+            return false;
+        };
+        let Some(next_sum) = sum.checked_add(route_total) else {
+            return false;
+        };
+        let reason_total = route
+            .quality_reasons
+            .values()
+            .try_fold(0_u64, |sum, count| sum.checked_add(*count));
+        if route
+            .quality_reasons
+            .keys()
+            .any(|reason| !is_quality_reason(reason))
+            || reason_total != Some(route_total)
+        {
+            return false;
+        }
+        sum = next_sum;
+    }
+    sum == total
 }
 
 fn source_lag_ms(wire: &RouteCoverage, source: &RouteCoverage) -> Option<u64> {
@@ -2601,6 +2635,16 @@ fn readiness_blocking_reasons(health: &RelayHealth, coverage: &Value) -> Vec<&'s
     }
     if coverage.get("quality_errors").and_then(Value::as_u64) != Some(0) {
         reasons.push("relay_quality_errors_nonzero");
+    }
+    if coverage.get("quality_errors_scope").and_then(Value::as_str) != Some("durable_relay_state") {
+        reasons.push("relay_quality_history_not_durable");
+    }
+    if coverage
+        .get("quality_reason_breakdown_complete")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        reasons.push("relay_quality_reason_breakdown_missing");
     }
     if coverage.get("turn_capture_ready").and_then(Value::as_bool) != Some(true) {
         reasons.push("relay_turn_capture_not_ready");
@@ -3394,7 +3438,63 @@ mod tests {
         assert_eq!(ready_body["ok"], true);
         assert_eq!(ready_body["ready"], true);
         assert_eq!(ready_body["blocking_reasons"], json!([]));
+        assert_eq!(
+            ready_body["ingest_coverage"]["quality_reason_breakdown_complete"],
+            true
+        );
+
+        let health = relay.health().await.unwrap();
+        let mut malformed = ready_body["ingest_coverage"].clone();
+        malformed
+            .as_object_mut()
+            .unwrap()
+            .remove("quality_reason_breakdown_complete");
+        malformed
+            .as_object_mut()
+            .unwrap()
+            .remove("quality_errors_scope");
+        let reasons = readiness_blocking_reasons(&health, &malformed);
+        assert!(reasons.contains(&"relay_quality_reason_breakdown_missing"));
+        assert!(reasons.contains(&"relay_quality_history_not_durable"));
         relay.close().await.unwrap();
+    }
+
+    #[test]
+    fn quality_reason_breakdown_requires_exact_durable_totals() {
+        let mut coverage = IngestCoverageState::new();
+        assert_eq!(
+            coverage.snapshot()["quality_reason_breakdown_complete"],
+            true
+        );
+
+        coverage.otlp_traces.quality_conversion_errors = 1;
+        assert_eq!(
+            coverage.snapshot()["quality_reason_breakdown_complete"],
+            false
+        );
+
+        coverage
+            .otlp_traces
+            .quality_reasons
+            .insert("conversion_error".to_owned(), 1);
+        coverage.quality_errors = 1;
+        assert_eq!(
+            coverage.snapshot()["quality_reason_breakdown_complete"],
+            true
+        );
+        coverage
+            .otlp_traces
+            .quality_reasons
+            .insert("unknown_private_reason".to_owned(), 0);
+        assert_eq!(
+            coverage.snapshot()["quality_reason_breakdown_complete"],
+            false
+        );
+        coverage.quality_errors = 0;
+        assert_eq!(
+            coverage.snapshot()["quality_reason_breakdown_complete"],
+            false
+        );
     }
 
     #[tokio::test]
