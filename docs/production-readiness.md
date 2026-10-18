@@ -5,14 +5,15 @@
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
 最新快照中 Gateway/Collector/Relay 的传输计数仍守恒：Gateway、Relay 和 Collector 的已投递/捕获均为
-`1,215,204`，队列和失败均为 0，Collector ready。业务覆盖仍拒绝：Relay 持久
-`quality_errors=1337`，全部是 `otlp_traces` conversion errors；成功且有 Turn 身份的 Wire 为
-`279/293`，最后一条距观测约 37.7 小时，`status=degraded`、`required_sources_fresh=false`、
-`turn_capture_ready=false`。runtime gate 以质量错误、新鲜度、历史失败和 revision 为门禁时真实退出 1。
+`1,218,862`，队列和失败均为 0，Collector ready。业务覆盖仍拒绝：Relay 持久
+`quality_errors=1581`，全部是 `otlp_traces` conversion errors；成功且有 Turn 身份的 Wire 为
+`279/293`，最后一条距观测约 38.4 小时，`status=degraded`、`required_sources_fresh=false`、
+`turn_capture_ready=false`，且仍运行旧 revision、没有质量原因分解。runtime gate 以质量错误、新鲜度、
+历史失败、原因分解和 revision 为门禁时真实退出 1。
 平台 18086 返回 HTTP 200，但没有 `build.revision`；以当前部署 revision 检查 platform health gate 也真实退出 1。
 线上平台容器尚未注入本分支新增的 `CHIPTRACE_BUILD_REVISION`，Collector/Relay 仍运行旧的
 `e5237065ff3a48623179c5846ff1916040030c9a`。维护分支修复已推送为
-`84bbabb6fb25c49c2f4fabb6db4e194afcc50585`；Gateway preflight 对该 SHA 真实退出 1，
+`b3696d2f0c0994ed887e89a0a59694e3b251e3f3`；Gateway preflight 对该 SHA 真实退出 1，
 因为线上 Gateway 仍是 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`。GitHub Actions 结果因当前
 CLI 未认证且网络超时尚未核验。
 
@@ -714,6 +715,25 @@ bind source。两次提交均已推送到 `fix/oss-disk-session-platform`，工�
 279/293 条具备 Turn 身份且已过新鲜度窗口。trace exporter 仍未配置，watchdog 的上游请求
 仍返回 403；真实 Alibaba OSS、未修改生产者和远端 Actions 结果仍未验收。当前服务可用于
 内部传输和恢复验证，不能据此签发生产交付结论。
+
+## 2026-10-18 质量标签与 CI 启动修复
+
+提交 `b3696d2f0c0994ed887e89a0a59694e3b251e3f3` 已推送到
+`fix/oss-disk-session-platform`，工作区保持干净。它为 OTLP/Hook 质量错误增加固定、脱敏的
+原因码（`unsupported_event`、`invalid_structure`、`invalid_attributes`、`identity_conflict`、
+`missing_identity`、`invalid_tool`、`invalid_lifecycle`、`invalid_timestamp`、`conversion_error`），
+并把端点原因计数持久化到 Relay 账本；旧账本无法回溯时只归入
+`legacy_unclassified`。原始 telemetry 重验会重新计算原因码，原因总数必须与端点和全局质量错误
+守恒，运行门禁会拒绝缺失、未知或不一致的原因分解。GitHub Actions 的普通手工启动不再要求
+生产 `expected_revision`；启用受保护 live preflight 时仍强制完整 SHA。该提交的本地
+`make cloud-test` 真实退出 0，Rust 格式、检查和 Clippy 也通过。
+
+同日 17:48（Asia/Shanghai）对热服务的只读门禁仍真实退出 1：18084、3011、3012、18086 均返回
+HTTP 200，但 Relay/Collector 仍为旧 revision `e5237065ff3a48623179c5846ff1916040030c9a`，
+`quality_errors=1581`、`quality_errors_by_endpoint.*.reasons` 缺失，Wire `279/293` 条具备 Turn
+身份但已约 38.4 小时未刷新，`turn_capture_ready=false`；平台 `/health` 没有
+`build.revision`。因此本提交尚未在线生效，服务仍未达到真实生产发布标准。远端 Actions API
+本次连接超时、CLI 未认证，不能把本地绿色结果当作同 SHA 的远端 CI 结论。
 
 ## 已有优势
 
