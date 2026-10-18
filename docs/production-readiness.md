@@ -1,5 +1,31 @@
 # 生产就绪评估
 
+## 2026-10-19 06:41（Asia/Shanghai）最新只读复核
+
+本次复核未重启服务、未改动主机配置。18084 Gateway、3011 Collector、3012 Relay 和 18086
+Platform 的 `/health` 均返回 HTTP 200；Collector 与 Relay 使用 revision
+`db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，两者的累计 Capture/Delivered 均为
+`1,281,084`，队列、pending、inflight 和 failed 均为 0，Collector ready 且无错误。Collector
+当前 sealed Segment 为 846 个、`117,669,720,704` bytes，仍落在 NFS，不能当作远端归档证据。
+
+业务门禁仍未通过：runtime gate 真实退出 1；Relay 持久 `quality_errors=5,714`，全部来自
+`otlp_traces`，原因分解为 `identity_conflict=182`、`invalid_lifecycle=3,567`、
+`legacy_unclassified=1,965`。`wire` 同时缺失且过期，`successful_turn_scoped_captures=0`、
+`turn_capture_ready=false`。其中 `invalid_lifecycle` 继续对应上游同一 Span 重复声明终态；
+Raw 和质量账本均保留，不能通过选择某一个终态来清零。Gateway outbox 当前 pending、processing
+和 recent failure 均为 0，293 个历史失败文件均有 recovery receipt 且未解决数为 0；独立 trace
+exporter 仍关闭。Platform health gate 以同一 revision 退出 0，但当前后端仍为本地 FS。
+
+路由预检以实际运行 Codex 的 user 配置执行时真实退出 1：受管 `/etc/codex` 指向 18084，user
+配置覆盖为外部 Provider，因此只能观察到 OTLP/Hook 流量，不能把当前线上状态解释为完整 Wire
+采集。真实 Alibaba OSS、未修改 Stock Codex 新鲜多轮 Canary、主平台鉴权导出和远端 Actions
+结论仍未验收。
+
+本轮还修复了 GitHub live preflight 的启动阻断：工作流的“Verify the actual Codex configuration”
+步骤现在显式注入 `CHIPTRACE_CODEX_USER_CONFIG`，并由契约测试锁定同一步的变量作用域；此前该变量
+只存在于前一步，在 `set -u` 下会在路由检查前直接失败。当前工作树的 `make cloud-test` 已真实
+退出 0；该本地结果仍不替代对应提交的远端 Actions 证据。
+
 评估日期：2026-10-19。最新线上只读快照为 06:07:26（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。

@@ -71,6 +71,7 @@ jobs:
       - name: Verify the actual Codex configuration targets the managed Gateway
         env:
           CHIPTRACE_CODEX_CONFIG: ${{ vars.CHIPTRACE_CODEX_CONFIG }}
+          CHIPTRACE_CODEX_USER_CONFIG: ${{ vars.CHIPTRACE_CODEX_USER_CONFIG }}
           CHIPTRACE_CODEX_BASE_URL: ${{ vars.CHIPTRACE_CODEX_BASE_URL }}
         run: |
           set -euo pipefail

@@ -35,6 +35,7 @@ test('live provider preflight requires protected endpoints and runs both gates',
     assert.match(workflow, new RegExp(name));
   }
   assert.match(workflow, /node scripts\/deploy\/codex-route-preflight\.js/);
+  assert.match(workflow, /- name: Verify the actual Codex configuration targets the managed Gateway\n        env:\n          CHIPTRACE_CODEX_CONFIG: \$\{\{ vars\.CHIPTRACE_CODEX_CONFIG \}\}\n          CHIPTRACE_CODEX_USER_CONFIG: \$\{\{ vars\.CHIPTRACE_CODEX_USER_CONFIG \}\}\n          CHIPTRACE_CODEX_BASE_URL: \$\{\{ vars\.CHIPTRACE_CODEX_BASE_URL \}\}/);
   assert.match(workflow, /--config "\$CHIPTRACE_CODEX_CONFIG"/);
   assert.match(workflow, /--user-config "\$CHIPTRACE_CODEX_USER_CONFIG"/);
   assert.match(workflow, /--expected-base-url "\$CHIPTRACE_CODEX_BASE_URL"/);
