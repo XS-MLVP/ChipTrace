@@ -1,25 +1,24 @@
 # 生产就绪评估
 
-评估日期：2026-10-19。最新线上只读快照为 02:54（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-19。最新线上只读快照为 03:32（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-最新快照中 Collector 与 Relay 的传输计数仍守恒：02:54 健康观测到两者均为
-`1,262,557`，`pending=0`、`failed=0`、`inflight=0`，Collector ready；四个服务的 `/health` 均返回 HTTP 200，
-Collector、Relay 和平台的实际 build revision 均为
-`e9cc4569d25db87636aa74099dc80095ac59485e`。业务覆盖仍拒绝：Relay `/ready` 为 HTTP 503，
-`ingest_coverage.status=degraded`，健康快照中的持久 `quality_errors=4339`
-（`otlp_traces.identity_conflict=182`、`invalid_lifecycle=2192`、`legacy_unclassified=1965`），
-本次进程质量错误为 285。
-原因标签按固定分类计数并保留 Raw。Wire 未观察到，Hook 仅有少量旧记录，未形成完整四源，`stale_sources=["wire"]`、
-`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，runtime gate 以质量、新鲜度、来源和 revision 门禁真实退出 1。
-18086 的 platform health gate 以 `e9cc4569d25db87636aa74099dc80095ac59485e` 真实通过，平台后端仍为
-`fs`。Gateway `router-v2-relay-shell` 的隔离预检不带预期 revision 时通过，但其 OCI revision 仍为外部镜像的
-`e57480eca4fe11769c5fcb8787266ab6b77ce4d5`；错误地复用 Collector/Relay 维护 SHA 的 Gateway preflight 真实退出 1，因此入口镜像尚未
-与受管 Gateway 发布 revision 对齐。当前 relay-shell 的 `fullTraceCapture.stats.acceptedCount=0`，本机用户级 Codex 配置仍指向
-外部 Provider，尚未经过 18084。真实 Alibaba OSS 提交、恢复、远端对象哈希、未修改 Stock Codex 新鲜多轮
-Canary 和目标租户导出仍未完成。GitHub API/CLI 当前无法核验远端 Actions 结论；维护分支已推送，当前仅以
-`git ls-remote` 证明远端 ref 已更新。
+最新快照中 Collector 与 Relay 的传输计数仍守恒：03:32 健康观测到两者均为
+`1,265,565`，`pending=0`、`failed=0`、`inflight=0`，Collector ready；18084、3011、3012、
+18086 的 `/health` 均返回 HTTP 200，但 Relay `/ready` 为 HTTP 503。Collector/Relay/Platform
+实际 build revision 仍为 `e9cc4569d25db87636aa74099dc80095ac59485e`，而仓库 HEAD 已为
+`4d370aa42ea8615a1d24c2612bdb39e622dd1ce7`，发布 revision 尚未对齐。
+业务覆盖仍拒绝：`ingest_coverage.status=degraded`，持久 `quality_errors=4545`
+（全部来自 `otlp_traces`，其中 `identity_conflict=182`、`invalid_lifecycle=2398`、
+`legacy_unclassified=1965`），本次进程质量错误为 491。原因标签按固定分类计数并保留 Raw；
+Wire 只有 2 条且最后一次记录已过新鲜度窗口，`successful_turn_scoped_captures=0`、
+`turn_capture_ready=false`，runtime gate 仍以质量、新鲜度、来源和 revision 门禁真实退出 1。
+18086 的平台后端仍为 `fs`；Gateway outbox 当前 pending/processing/recent failure 均为 0，
+293 个历史失败原件和 recovery receipt 保留且未解决数为 0，但 watchdog 最近仍报告上游 403，
+真实 Alibaba OSS 提交、恢复、远端对象哈希、未修改 Stock Codex 新鲜多轮 Canary 和目标租户导出
+仍未完成。GitHub API/CLI 当前无法核验远端 Actions 结论；维护分支与 `main` 的远端 ref 已更新，
+当前仅以 `git ls-remote` 证明远端 ref 存在。
 
 当前复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
 failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留，Collector/Relay 队列为空且
