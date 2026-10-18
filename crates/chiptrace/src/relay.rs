@@ -49,6 +49,8 @@ const INGEST_QUALITY_SEED_FILE: &str = "ingest-quality-seed.json";
 const MAX_INGEST_QUALITY_SEED_BYTES: u64 = 64 * 1024;
 const INGEST_COVERAGE_FRESHNESS_WINDOW_MS: u64 = 5 * 60 * 1_000;
 const LEGACY_UNCLASSIFIED_QUALITY_REASON: &str = "legacy_unclassified";
+const MIN_DELIVERY_READ_CONCURRENCY: usize = 4;
+const MAX_DELIVERY_READ_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
@@ -1318,6 +1320,12 @@ async fn collect_delivery_batch(
     batch
 }
 
+fn delivery_read_concurrency(config: &RelayConfig) -> usize {
+    config
+        .delivery_concurrency
+        .clamp(MIN_DELIVERY_READ_CONCURRENCY, MAX_DELIVERY_READ_CONCURRENCY)
+}
+
 async fn deliver_many(inner: &RelayInner, capture_ids: &[String]) -> Result<()> {
     let lease_duration = inner
         .config
@@ -1337,7 +1345,10 @@ async fn deliver_many(inner: &RelayInner, capture_ids: &[String]) -> Result<()> 
         let retry_record = record.clone();
         async move { (retry_record, load_delivery_payload(inner, record).await) }
     }));
-    let mut reads = reads.buffer_unordered(4);
+    // Keep body reads proportional to the worker pool while bounding the
+    // number of concurrent filesystem reads. The byte semaphore below still
+    // limits aggregate resident delivery bodies, including very large ones.
+    let mut reads = reads.buffer_unordered(delivery_read_concurrency(&inner.config));
     let mut batch: Vec<DeliveryPayload> = Vec::new();
     let mut batch_bytes = 0_usize;
     while let Some((record, loaded)) = reads.next().await {
@@ -2997,6 +3008,29 @@ mod tests {
             max_batch_records: 64,
             ingest_bearer_token: Some("test-cloud-token-at-least-32-bytes".to_owned()),
         }
+    }
+
+    #[test]
+    fn delivery_reads_follow_workers_with_a_bounded_parallelism() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut config = test_config(&temporary);
+        config.delivery_concurrency = 1;
+        assert_eq!(
+            delivery_read_concurrency(&config),
+            MIN_DELIVERY_READ_CONCURRENCY
+        );
+        config.delivery_concurrency = MIN_DELIVERY_READ_CONCURRENCY;
+        assert_eq!(
+            delivery_read_concurrency(&config),
+            MIN_DELIVERY_READ_CONCURRENCY
+        );
+        config.delivery_concurrency = 8;
+        assert_eq!(delivery_read_concurrency(&config), 8);
+        config.delivery_concurrency = 64;
+        assert_eq!(
+            delivery_read_concurrency(&config),
+            MAX_DELIVERY_READ_CONCURRENCY
+        );
     }
 
     #[tokio::test]
