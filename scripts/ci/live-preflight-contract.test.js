@@ -45,6 +45,8 @@ test('live provider preflight requires protected endpoints and runs both gates',
   assert.match(workflow, /node --test scripts\/ci\/platform-health-gate\.test\.js/);
   assert.match(workflow, /--max-quality-errors 0/);
   assert.match(workflow, /--max-historical-failed-files 0/);
+  assert.match(workflow, /--min-gateway-free-bytes 10737418240/);
+  assert.match(workflow, /--min-gateway-free-files 10000/);
   assert.match(workflow, /node scripts\/deploy\/gateway-preflight\.js/);
   assert.match(workflow, /--container "\$CHIPTRACE_GATEWAY_CONTAINER"/);
   assert.match(workflow, /--expected-revision "\$CHIPTRACE_EXPECTED_REVISION"/);

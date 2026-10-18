@@ -24,6 +24,8 @@ function gateway() {
         openTransactions: 0,
         failedFiles: 3,
         unresolvedHistoricalFailedFiles: 3,
+        filesystemFreeBytes: 20 * 1024 * 1024 * 1024,
+        filesystemFreeFiles: 1000000,
       },
       rustRelay: {
         configured: true,
@@ -156,11 +158,13 @@ test('runtime CLI observes all three endpoints and refuses Collector faults or m
   const flags = ['--gateway-url', `${url}/gateway`, '--relay-url', `${url}/relay`];
   const invoke = args => promisify(execFile)(process.execPath, [require.resolve('./runtime-health-gate'), ...args], { timeout: 10000 });
   const report = path.join(root, 'healthy.json');
-  const complete = [...flags, '--collector-url', `${url}/collector`, '--expected-revision', 'f'.repeat(40)];
+  const complete = [...flags, '--collector-url', `${url}/collector`, '--expected-revision', 'f'.repeat(40),
+    '--min-gateway-free-bytes', String(10 * 1024 * 1024 * 1024), '--min-gateway-free-files', '10000'];
   const result = JSON.parse((await invoke([...complete, '--report', report])).stdout);
   assert.equal(result.schema_version, 'chiptrace.runtime-health-gate.v3');
   assert.equal(result.session_delivery_claimed, false);
   assert.equal(result.collector.captures, 33);
+  assert.equal(result.gateway.filesystem_free_files, 1000000);
   const healthyReport = JSON.parse(await fs.readFile(report, 'utf8'));
   assert.equal(healthyReport.ok, true);
   assert.equal(healthyReport.schema_version, 'chiptrace.runtime-health-gate.v3');
@@ -315,6 +319,41 @@ test('production gate can refuse retained historical Gateway outbox failures', (
     }),
     /max historical failed files must be a non-negative integer/,
   );
+});
+
+test('production gate refuses missing or low Gateway filesystem headroom', () => {
+  const minimumBytes = 10 * 1024 * 1024 * 1024;
+  const result = verifyRuntimeHealth(gateway(), relay(), {
+    collectorHealth: collector(),
+    minGatewayFreeBytes: minimumBytes,
+    minGatewayFreeFiles: 10000,
+  });
+  assert.equal(result.gateway.filesystem_free_bytes, 20 * 1024 * 1024 * 1024);
+  assert.equal(result.gateway.filesystem_free_files, 1000000);
+
+  const lowBytes = gateway();
+  lowBytes.fullTraceCapture.outbox.filesystemFreeBytes = minimumBytes - 1;
+  assert.throws(
+    () => verifyRuntimeHealth(lowBytes, relay(), {
+      collectorHealth: collector(), minGatewayFreeBytes: minimumBytes,
+    }),
+    /filesystem free bytes are below the configured minimum/,
+  );
+
+  const unreportedFiles = gateway();
+  delete unreportedFiles.fullTraceCapture.outbox.filesystemFreeFiles;
+  assert.throws(
+    () => verifyRuntimeHealth(unreportedFiles, relay(), {
+      collectorHealth: collector(), minGatewayFreeFiles: 10000,
+    }),
+    /filesystem free files are below the configured minimum/,
+  );
+
+  const observed = healthObservation(lowBytes, relay(), collector(), {
+    minGatewayFreeBytes: minimumBytes,
+    minGatewayFreeFiles: 10000,
+  });
+  assert.deepEqual(observed.blocking_reasons, ['gateway_free_bytes_below_minimum']);
 });
 
 test('live quality-error maximum rejects accumulated source conversion errors', () => {

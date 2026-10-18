@@ -197,6 +197,21 @@ Live preflight 同时调用 `scripts/ci/platform-health-gate.js` 检查 18086 �
 revision、持久任务计数和存储失败状态。平台健康只证明导出服务进程可用；它不替代目标 Session 的
 `cloud-acceptance`、真实 OSS 上传/下载和 SHA-256 复验。
 
+受保护的 runtime gate 还要求 Gateway outbox 报告至少 `10 GiB` 可用磁盘和 `10,000` 个可用 inode：
+
+```bash
+node scripts/ci/runtime-health-gate.js \
+  --gateway-url http://127.0.0.1:18084/health \
+  --relay-url http://127.0.0.1:3012/health \
+  --collector-url http://127.0.0.1:3011/health \
+  --min-gateway-free-bytes 10737418240 \
+  --min-gateway-free-files 10000
+```
+
+阈值是 Gateway outbox 的入口保护，不是 Collector sealed WAL 的容量证明；Collector/NFS 仍需单独
+监控余量、保留周期和归档提交。缺少或低于阈值的余量会以固定 `blocking_reasons` 失败，不能通过
+重启清除。
+
 从旧 Relay 升级时，旧 Delivery ledger 没有质量历史字段。若账本已有投递记录，新版本会拒绝
 启动，直到把升级前的 gate 报告转换为一次性迁移文件；这一步防止升级把已知错误变成零。报告
 必须先用旧进程生成并保留：
@@ -326,6 +341,8 @@ Relay/Collector 的精确 Raw、重复确认、平台归档/恢复、Turn 和采
   应按 `missing_sources`、`stale_sources`、`source_lag_ms`、`runtime_age_ms` 和 `wire_lag_ms`
   检查 Stock Codex 受管配置；不能用 Runtime 来源的增长把 Wire 断流解释为 complete。
 - Relay `pending`、`inflight`、最老队列时间、磁盘空间和 attempt 守恒。
+- Gateway `/health` 的 `outbox.filesystemFreeBytes` 与 `outbox.filesystemFreeFiles`；生产门禁至少保持
+  10 GiB 和 10,000 inode，低于阈值时先归档/扩容，再增加采集流量。
 - `ingest_coverage.wire_turn_coverage` 的成功 Turn Wire 数及新鲜度。无身份、上下文冲突、
   非 2xx 请求和重复投递均不能刷新 `last_successful_at`；它们仍计入各自真实 ACK 统计。
 - `ingest_coverage.turn_capture_ready` 必须为 `true` 才能把进程交给新的真实 Canary；

@@ -24,6 +24,10 @@ failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留�
 `conservation_ok=true`。Collector/Relay 实际 revision 为 `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`；
 平台与它们的 OCI/Compose revision 已对齐，Gateway 入口仍需单独升级到同一维护 revision。
 
+本轮还将 Gateway outbox 的可用余量接入 runtime gate：受保护 live preflight 要求
+`filesystemFreeBytes >= 10 GiB`、`filesystemFreeFiles >= 10,000`，缺失或低于阈值会以固定阻断原因失败。
+该门禁只保护 Gateway outbox；Collector sealed WAL 的 NFS 容量、归档和保留周期仍需独立验收。
+
 较早快照的 Relay `ingest_coverage.status=degraded`，`quality_errors=848`（全部来自 `otlp_traces`），
 Wire 已约 96 分钟未刷新，`required_sources_fresh=false`、`turn_capture_ready=false`，
 `successful_turn_scoped_captures=279/293`。runtime gate 使用质量错误、新鲜度、历史失败和 revision
