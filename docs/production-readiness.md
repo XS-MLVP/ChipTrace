@@ -49,6 +49,12 @@ Gateway 容器 OCI revision 为 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`，新
 本轮维护新增 Gateway revision 对齐护栏和 Platform health gate；本地 `make cloud-test` 已真实退出 0，
 但本地绿色测试不能替代待发布 SHA 的 GitHub Actions、真实 OSS 和生产 Canary 证据。
 
+提交 `d794700` 修复了维护分支远端 CI 的一个启动阻断：工作流原先把
+`Swatinem/rust-cache` 指向 annotated tag 对象 `49a0bdc...`，GitHub Actions 无法从该对象加载
+`action.yml`。现在固定到 `v2` 解引用后的可执行 commit
+`6323deb102c322ba6fcbdcafc7e3dddab59af2b6`，并由契约测试锁定旧对象不得回归。SSH ref 与工作流
+内容已推送并核对；由于当前 Actions API/CLI 仍不可用，尚不能声称该 SHA 的远端作业已经通过。
+
 ## 2026-10-18 23:49 维护分支 CI 启动护栏
 
 提交 `b6d7635` 将正式版 Producer 的 Bubblewrap 参数集中到可测试的构造函数，固定只读根、私有
