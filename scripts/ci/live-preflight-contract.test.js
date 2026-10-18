@@ -63,6 +63,10 @@ test('CI actions are immutable and the MinIO job verifies its Go toolchain befor
   assert.match(workflow, /actions\/setup-go@44694675825211faa026b3c33043df3e48a5fa00/);
   assert.match(workflow, /go-version: "1\.24\.2"/);
   assert.match(workflow, /name: Select and verify the pinned Go toolchain/);
+  // v2 is an annotated tag. Pin the dereferenced commit so the Actions
+  // runner can load action.yml instead of trying to execute the tag object.
+  assert.doesNotMatch(workflow, /Swatinem\/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c/);
+  assert.match(workflow, /Swatinem\/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6/);
 });
 
 test('hosted sandbox startup tolerates optional sysctl writes but requires a real namespace probe', () => {

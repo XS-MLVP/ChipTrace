@@ -187,7 +187,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action revision
         with:
           toolchain: "1.91.0"
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      # Pin the dereferenced v2 commit. 49a0bdc... is the annotated tag object,
+      # which GitHub Actions cannot load as an action revision.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install the official release without changing the runner's CLI
         run: |
           stock_spec=$(node -p 'require("./integrations/codex/stock-release.json").npm_spec')
@@ -314,7 +316,7 @@ jobs:
             | tee "$RUNNER_TEMP/producer-cache-identity.json"
           digest=$(node -p 'require(process.argv[1]).source_sha256' "$RUNNER_TEMP/producer-cache-identity.json")
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         id: producer-cache
         with:
           workspaces: |
@@ -522,7 +524,7 @@ jobs:
         with:
           toolchain: "1.91"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
@@ -932,7 +934,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action revision
         with:
           toolchain: "1.91"
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
