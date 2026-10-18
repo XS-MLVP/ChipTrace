@@ -4,20 +4,20 @@
 一次请求只确认磁盘中已保存的任务，随后由独立 CLI 子进程执行归档、恢复、检查或采购验收。
 业务采集入口仍是网关、Relay 和 Collector；平台插件提供异步管理与交付 API。
 
-## 2026-10-19 05:55 维护提交滚动更新
+## 2026-10-19 06:06 维护提交滚动更新
 
 维护分支 `fix/oss-disk-session-platform` 的提交
-`3492bfee498ee05d30064ac8ca59fdb6d6f35e74` 已在本机受控部署。Runtime 镜像摘要为
-`sha256:b220a18f4dff4d62056f856e339991a048b009d00425ee8918d445f53d73309f`，Platform
-镜像摘要为 `sha256:e156c647ddc13d3735a4478a563e153a982eb2bd43d65ec808b34ea302fe9be4`；
+`db0294ecb4e5bb9e4d5877ebf659e53926c3a13d` 已在本机受控部署。Runtime 镜像摘要为
+`sha256:73e70606961dbe287738412029a48fee35b21a7ed441c1e3d8c48289fa6206fb`，Platform
+镜像摘要为 `sha256:e63a06a78415cebc0cb6008584e6c02c0cd1e85159d23d6ee26d219707bd86b5`；
 三容器实际报告相同 revision，运行用户为 `1267:1001`，只读根、资源限制和持久挂载均保留。
 Collector、Relay、Platform 的健康检查均为 HTTP 200，队列无积压且传输计数守恒；Relay `/ready`
 按业务门禁返回 503，因为线上 Wire 尚未出现且持久质量错误仍存在。部署预检和镜像 self-test
 均通过，平台项目更新时显式使用 `router-v2-platform`，避免 Compose 默认项目名造成
 `18086` 端口冲突。部署环境文件已同步到上述镜像摘要和 revision，后续重启不会回退到旧版本。
 
-该更新只证明维护代码已进入运行实例，不等于完整生产交付：05:58:34 的真实快照仍为
-`quality_errors=5471`、`missing_sources=["wire"]`、`successful_turn_scoped_captures=0`、
+该更新只证明维护代码已进入运行实例，不等于完整生产交付：06:07:26 的真实快照仍为
+`quality_errors=5525`、`missing_sources=["wire","hooks"]`、`successful_turn_scoped_captures=0`、
 `turn_capture_ready=false`。必须先修复受管 Stock Codex Provider 路由并完成真实多轮四源 Canary，
 再验收目标 Alibaba OSS、租户授权和对应 SHA 的远程 Actions。
 
