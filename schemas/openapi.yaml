@@ -131,6 +131,16 @@ paths:
       responses:
         "200": {description: Relay 进程和传输层存活；Turn 采集就绪需检查 ingest_coverage.turn_capture_ready}
         "503": {description: 未就绪}
+  /ready:
+    get:
+      summary: 严格的业务采集就绪门禁
+      description: >-
+        仅当 Relay 传输守恒、四路来源已观察且新鲜、持久质量错误为零，并且存在新的有归属
+        HTTP 2xx Turn Wire 时返回 200。该状态仍不代表任何特定 Session 已完整；失败响应保留
+        blocking_reasons，便于发布门禁和编排系统区分存活与业务就绪。
+      responses:
+        "200": {description: Relay 已满足当前业务采集就绪条件}
+        "503": {description: 传输或四路业务采集尚未就绪}
   /flush:
     post:
       summary: 封存当前 WAL Segment

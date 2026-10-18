@@ -73,6 +73,11 @@ Relay `/health` 的 `delivery_retries` 是持久账本中的 `delivery_attempts 
 （下限为零），用于区分可恢复的 Collector 背压和最终失败。它本身不构成交付成功证明；
 生产监控应同时观察重试速率、`pending`、`inflight`、`failed` 和 `conservation_ok`。
 
+Relay 的 `/health` 只表示进程、WAL 和传输层存活，即使四路来源缺失也可能返回 200。发布门禁
+和需要业务采集就绪语义的编排系统应使用 `/ready`：它要求四路来源已观察且新鲜、持久质量错误为
+零、存在新的有归属 HTTP 2xx Turn Wire，并在 503 响应中返回固定 `blocking_reasons`。`/ready=200`
+仍不代表某个具体 Session 已完整，Session/Turn 交付必须继续运行 runtime gate 和 cloud acceptance。
+
 `benchmark-http --relay` 会在入口压测结束后轮询 Relay `/health`，直到 `delivered` 与入口
 记录数相等且 `pending/inflight` 均为零。排空期间 Relay 处于 `degraded` 时按设计返回 HTTP
 503；这类响应现在单独计入 `drain_health_degraded_polls`，不会被误报为入口拒绝。压测结果同时

@@ -2073,6 +2073,7 @@ pub async fn serve_relay(
         .route("/models", get(relay_models))
         .route("/v1/models", get(relay_models))
         .route("/health", get(relay_health))
+        .route("/ready", get(relay_ready))
         .route("/flush", post(relay_flush))
         .fallback(relay_not_found)
         .layer(DefaultBodyLimit::max(max_envelope_bytes))
@@ -2548,6 +2549,123 @@ async fn relay_health(State(state): State<RelayAppState>) -> Response {
             json!({"ok":false,"reason":"health_failed","detail":error.to_string()}),
         ),
     }
+}
+
+fn readiness_blocking_reasons(health: &RelayHealth, coverage: &Value) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if !health.ok {
+        reasons.push("relay_not_healthy");
+    }
+    if health.pending != 0 {
+        reasons.push("relay_pending_records");
+    }
+    if health.inflight != 0 {
+        reasons.push("relay_inflight_records");
+    }
+    if health.failed != 0 {
+        reasons.push("relay_failed_records");
+    }
+    if !health.conservation_ok {
+        reasons.push("relay_delivery_not_conserved");
+    }
+    if coverage.get("status").and_then(Value::as_str) != Some("complete") {
+        reasons.push("relay_coverage_not_complete");
+    }
+    if coverage
+        .get("required_sources_observed")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        reasons.push("relay_required_sources_not_observed");
+    }
+    if coverage
+        .get("required_sources_fresh")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        reasons.push("relay_required_sources_not_fresh");
+    }
+    if !coverage
+        .get("missing_sources")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        reasons.push("relay_sources_missing");
+    }
+    if !coverage
+        .get("stale_sources")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        reasons.push("relay_sources_stale");
+    }
+    if coverage.get("quality_errors").and_then(Value::as_u64) != Some(0) {
+        reasons.push("relay_quality_errors_nonzero");
+    }
+    if coverage.get("turn_capture_ready").and_then(Value::as_bool) != Some(true) {
+        reasons.push("relay_turn_capture_not_ready");
+    }
+    if coverage
+        .pointer("/wire_turn_coverage/successful_turn_scoped_captures")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        == 0
+    {
+        reasons.push("relay_no_successful_turn_scoped_wire");
+    }
+    if coverage
+        .pointer("/wire_turn_coverage/successful_turn_scoped_fresh")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        reasons.push("relay_successful_turn_scoped_wire_not_fresh");
+    }
+    reasons
+}
+
+async fn relay_ready(State(state): State<RelayAppState>) -> Response {
+    let health = match state.relay.health().await {
+        Ok(health) => health,
+        Err(error) => {
+            return relay_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({
+                    "ok": false,
+                    "ready": false,
+                    "status": "error",
+                    "blocking_reasons": ["relay_health_failed"],
+                    "detail": error.to_string(),
+                }),
+            );
+        }
+    };
+    let coverage = state
+        .ingest_coverage
+        .lock()
+        .expect("ingest coverage poisoned")
+        .snapshot();
+    let blocking_reasons = readiness_blocking_reasons(&health, &coverage);
+    let ready = blocking_reasons.is_empty();
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    relay_response(
+        status,
+        json!({
+            "ok": ready,
+            "ready": ready,
+            "status": if ready { "ready" } else { "not_ready" },
+            "blocking_reasons": blocking_reasons,
+            "build": {
+                "version": crate::VERSION,
+                "revision": crate::BUILD_REVISION,
+            },
+            "relay": health,
+            "ingest_coverage": coverage,
+        }),
+    )
 }
 
 async fn relay_flush(State(state): State<RelayAppState>, request: Request) -> Response {
@@ -3207,6 +3325,76 @@ mod tests {
         let reopened = DurableRelay::open(test_config(&temporary)).await.unwrap();
         assert_eq!(reopened.ingest_quality_counters().unwrap().total(), 1);
         reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ready_endpoint_fails_closed_until_fresh_turn_sources_are_complete() {
+        let temporary = tempfile::tempdir().unwrap();
+        let relay = DurableRelay::open(test_config(&temporary)).await.unwrap();
+        let state = RelayAppState {
+            relay: relay.clone(),
+            body_budget: InflightBodyBudget::new(4 * 1024 * 1024, 1024 * 1024).unwrap(),
+            max_batch_records: 64,
+            ingest_coverage: Arc::new(Mutex::new(IngestCoverageState::new())),
+        };
+
+        let cold = relay_ready(State(state.clone())).await;
+        assert_eq!(cold.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let cold_body: Value =
+            serde_json::from_slice(&to_bytes(cold.into_body(), 4 * 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(cold_body["ready"], false);
+        assert!(
+            cold_body["blocking_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == "relay_required_sources_not_observed")
+        );
+
+        let mut coverage = IngestCoverageState::new();
+        coverage.observe_wire(&[(
+            WireCaptureEvidence {
+                turn_scoped: true,
+                http_success: true,
+                identity_conflict: false,
+            },
+            false,
+        )]);
+        for endpoint in [
+            CloudEndpoint::OtlpLogs,
+            CloudEndpoint::OtlpTraces,
+            CloudEndpoint::CodexHook,
+        ] {
+            coverage.observe_cloud(
+                endpoint,
+                &crate::cloud_ingest::CloudIngestSummary {
+                    endpoint: endpoint.as_str().to_owned(),
+                    source_records: 1,
+                    derived_captures: 1,
+                    unknown_events: 0,
+                    attributed_quality_errors: 0,
+                    conversion_errors: Vec::new(),
+                },
+                1,
+                0,
+                0,
+                0,
+            );
+        }
+        let ready_state = RelayAppState {
+            ingest_coverage: Arc::new(Mutex::new(coverage)),
+            ..state
+        };
+        let ready = relay_ready(State(ready_state)).await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        let ready_body: Value =
+            serde_json::from_slice(&to_bytes(ready.into_body(), 4 * 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(ready_body["ok"], true);
+        assert_eq!(ready_body["ready"], true);
+        assert_eq!(ready_body["blocking_reasons"], json!([]));
+        relay.close().await.unwrap();
     }
 
     #[tokio::test]
