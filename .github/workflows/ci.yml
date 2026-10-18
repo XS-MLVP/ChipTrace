@@ -684,6 +684,13 @@ jobs:
         with:
           name: runtime-health-gate-report
           path: runtime-health-gate.tap
+      - name: Verify the approved quality-baseline contract
+        run: node --test scripts/ci/quality-baseline.test.js | tee quality-baseline.tap
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: quality-baseline-report
+          path: quality-baseline.tap
       - name: Verify Platform export health gate fails closed
         run: node --test scripts/ci/platform-health-gate.test.js | tee platform-health-gate.tap
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

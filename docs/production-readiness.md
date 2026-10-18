@@ -1,5 +1,57 @@
 # 生产就绪评估
 
+## 2026-10-19 07:23（Asia/Shanghai）线上只读复核与生产结论
+
+本次只读复核没有重启容器、修改配置或清理证据。18084 Gateway、3011 Collector、3012 Relay 和
+18086 Platform 的 `/health` 均返回 HTTP 200；Collector/Relay 实际运行 revision
+`db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，Collector Capture 与 Relay Delivered 均为
+`1,284,184`，`pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`，Collector
+ready 且队列深度为 0。Gateway full-trace outbox 当前 `pending=0`、`processing=0`、最近失败为 0，
+293 个历史失败文件和 293 个 recovery receipt 仍保留，未解决数为 0。上述证据证明 Raw/WAL、
+durable receipt、重试和守恒链路在运行。
+
+业务交付门禁仍真实失败：runtime gate 退出 1，Relay `/ready` 返回 503。该快照的持久质量账本为
+`quality_errors=5,944`（`identity_conflict=182`、`invalid_lifecycle=3,797`、
+`legacy_unclassified=1,965`），本进程新增 422；Wire `requests=0`、
+`successful_turn_scoped_captures=0`，因此 `turn_capture_ready=false`，缺失且过期来源为 `wire`。
+对最新 3.76 GB WAL 片段的流式只读复核发现新增错误均为固定的
+`conflicting duplicate lifecycle attribute "outcome"`；这与
+`docs/upstream-otlp-outcome.patch` 描述的生产者修复一致。Relay 正确保留 Raw 并标记
+`invalid_lifecycle`，不能通过选择一个终态或重启清零。
+
+当前实际运行的 Stock Codex 用户配置把 Provider 指向外部地址，受管 `/etc/codex` 虽指向
+18084；这解释了 OTLP/Hook 持续增长而 Wire 为零。没有把该配置静默改写，因为它属于用户级运行时
+授权。要达到发布标准，必须先用受管配置和已应用生产者补丁的新进程产生至少两个新鲜、带 Session/Turn
+身份的 HTTP 2xx Wire，再通过四源 runtime gate、真实 Alibaba OSS 提交/恢复/哈希校验、目标租户
+Platform 导出和同一发布 SHA 的 GitHub Actions。
+
+本仓库的优势已经由本地 `make cloud-test` 的真实退出码 0 覆盖：磁盘 Raw/WAL 和 redb 账本可恢复，
+质量原因码有界且守恒，Session/Turn 分页不把大正文装入内存，FS/私有 S3/OSS 协议有重启与哈希回归，
+容器和 CI 使用不可变 revision、只读根、非 root 及资源上限。它们是可靠性基础，不等同于当前线上
+生产就绪。
+
+后续迭代按以下顺序执行：
+
+1. **P0 来源与交付**：修正实际用户 Provider/OTLP 路由，部署包含 outcome/context 补丁的受管
+   Producer，观察新错误增量为零并完成真实多轮四源 Canary；任何质量错误、缺 Wire 或 stale Wire
+   都继续阻断发布。
+2. **P0 远端与对象存储**：用待发布 SHA 核验 GitHub Actions；将 Platform 从 FS 切到目标 OSS，
+   完成提交、恢复、远端 SHA-256 和鉴权导出，保留 FS 作为回滚验证而不是生产后端。
+3. **P1 性能与容量**：在目标 NFS/OSS 上按现有目录拓扑做迁移前压测，比较 1/4 shard、16/32
+   delivery concurrency、批量和 P95/P99；用 `pending/inflight/retries/failed`、磁盘余量和
+   `conservation_ok` 建立持续 SLO，再决定是否新建四 shard 数据目录。
+4. **P1 GitHub 维护**：合并维护分支前完成同 SHA 远端 run、保护分支和必需检查；本地绿色测试、
+   公开 ref 或历史 run 均不能替代新提交的远端证据。
+
+## 2026-10-19 质量账本基线机制（代码变更）
+
+维护分支新增 `chiptrace.quality-baseline.v1`：基线保存完整端点/原因计数、源报告 SHA-256、
+审批元数据和自身内容摘要；runtime gate 只有显式传入基线与 `--max-new-quality-errors` 时才按
+基线后的增量门禁。计数回退、未知原因、篡改或缺少审批信息均失败，原始质量账本和 Raw 不会被
+清零。默认 live preflight 仍使用 `--max-quality-errors 0`，因此本机制没有放宽当前线上门槛。
+新增质量基线测试已纳入本地 Makefile 和 GitHub CI；它解决的是历史账本治理，不能替代实际
+Producer 路由、四源 Turn、真实 OSS 或目标租户验收。
+
 ## 2026-10-19 06:41（Asia/Shanghai）最新只读复核
 
 本次复核未重启服务、未改动主机配置。18084 Gateway、3011 Collector、3012 Relay 和 18086

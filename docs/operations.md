@@ -229,6 +229,37 @@ Delivery ledger 恢复，`quality_errors_scope` 必须为 `durable_relay_state`�
 重启不能把历史错误静默归零；
 若历史错误已存在，应先保留其报告并修复生产者或采集配置，再开始新的 Canary。
 
+### 已审计质量基线
+
+历史质量错误需要保留，但长期运行的账本不能因为历史计数永久阻断所有后续检查。仓库提供
+`scripts/ci/quality-baseline.js` 生成一次性、内容寻址的基线工件。基线只能从已经人工审计的
+runtime gate 报告创建，并且必须写入审批人、审批时间、原因说明和源报告 SHA-256：
+
+```bash
+node scripts/ci/quality-baseline.js \
+  --input /var/tmp/chiptrace-runtime-health.json \
+  --output /srv/chiptrace/relay-state/quality-baseline.json \
+  --approved-by '<operator-or-change-id>' \
+  --approved-at '<ISO-8601 timestamp>' \
+  --approval-note 'Historical ledger audited; producer repair starts after this point.'
+```
+
+运行门禁显式传入基线和基线后的新增错误上限，才会按每个端点、每个原因码计算增量：
+
+```bash
+node scripts/ci/runtime-health-gate.js \
+  --gateway-url http://127.0.0.1:18084/health \
+  --relay-url http://127.0.0.1:3012/health \
+  --collector-url http://127.0.0.1:3011/health \
+  --quality-baseline /srv/chiptrace/relay-state/quality-baseline.json \
+  --max-new-quality-errors 0
+```
+
+基线文件大小、类型、schema、原因守恒和自身 SHA-256 都会校验；输出使用独占创建，不能被
+覆盖。当前任一端点或原因计数低于基线都会失败，防止重启、换账本或手工清零伪造“新增为零”。
+`--max-quality-errors` 仍可同时使用，继续提供绝对上限。基线不会删除 Raw、修改 Relay 账本，
+也不能替代四源 Turn、Producer、OSS 或 Buyer 验收；生产者缺陷修复后应重新人工审计并创建新基线。
+
 Live preflight 同时调用 `scripts/ci/platform-health-gate.js` 检查 18086 的平台版本、运行
 revision、持久任务计数和存储失败状态。平台健康只证明导出服务进程可用；它不替代目标 Session 的
 `cloud-acceptance`、真实 OSS 上传/下载和 SHA-256 复验。
