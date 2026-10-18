@@ -16,23 +16,21 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新线上复核（2026-10-18 19:54，Asia/Shanghai）确认 Collector、Relay 和平台已升级到维护
-提交 `433c70f22cf9d2036ab8300f5487866c31892e6e`；三个容器的 OCI/Compose revision、非 root、
-只读根、资源限额和持久挂载一致，18084、3011、3012、18086 均返回 HTTP 200。Collector
-捕获 `1,227,852` 条，Relay 投递 `1,227,852` 条，`pending=0`、`inflight=0`、`failed=0`、
-`conservation_ok=true`；Gateway outbox 的 pending/processing/failed/recent failure 均为 0，
-历史失败原件和 recovery receipt 仍保留。新 Relay 的正常重启使用持久索引快路径，实际升级在
-几秒内恢复健康，不再重复扫描完整 NFS delivery ledger。
+最新线上复核（2026-10-18 20:14，Asia/Shanghai）确认 Collector、Relay 和平台已升级到维护
+提交 `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`；三个容器使用对应 OCI digest、非 root、只读根、
+资源限额和持久挂载，18084、3011、3012、18086 均返回 HTTP 200。Collector 捕获 `1,229,615` 条，
+Relay 投递 `1,229,615` 条，`pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`；
+Gateway outbox 当前 pending/processing/recent failure 均为 0，293 个历史失败原件和 recovery receipt
+仍保留。Relay 重启实际走持久索引快路径并在健康等待内恢复。
 
-业务门禁仍未通过：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2167`（其中
-`otlp_traces` 的 `identity_conflict=182`、`invalid_lifecycle=20`、旧账本无法回溯的
-`legacy_unclassified=1965`）；当前进程的新增冲突来自上游同一 Span 重复且矛盾的 `outcome` 标签，
-现在已单独标为 `invalid_lifecycle`。Wire 和 required Hook 当前
-均未观察到，`turn_capture_ready=false`。带质量、新鲜度和 revision 门禁的 runtime gate 在该
-窗口真实退出 1。18086 的 platform health gate 已以同一 revision 真实通过，但 Gateway
-`router-v2-relay-shell` 仍使用外部旧 OCI revision，带维护 SHA 的 Gateway preflight 会拒绝；平台
-后端仍配置为本地 FS，尚无真实 Alibaba OSS 提交、恢复和远端对象哈希证据。因此可以交付内部
-传输/恢复验证，仍不能对外承诺真实 Session/Turn 全量采集或生产 OSS 导出。详见[生产就绪评估](docs/production-readiness.md)。
+业务门禁仍未通过：该快照的 Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2283`，其中
+`otlp_traces.identity_conflict=182`、`invalid_lifecycle=136`、旧账本无法回溯的
+`legacy_unclassified=1965`；当前进程错误持续来自上游同一 Span 重复且矛盾的 `outcome` 标签，已正确
+单独标为 `invalid_lifecycle`，Raw 仍保留。Wire 仍未观察到，`missing_sources=["wire"]`、
+`turn_capture_ready=false`，带质量、新鲜度和 revision 门禁的 runtime gate 真实退出 1。18086 的
+platform health gate 以该 revision 真实通过，但平台后端仍是本地 FS；Gateway 仍使用外部旧 OCI revision，
+真实 Alibaba OSS 提交/恢复/远端对象哈希及未修改 Stock Codex 多轮 Canary 尚未完成。因此可用于内部
+传输与恢复验证，不能对外承诺完整 Session/Turn 采集或生产 OSS 导出。详见[生产就绪评估](docs/production-readiness.md)。
 
 ## 主线
 

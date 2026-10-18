@@ -1,22 +1,22 @@
 # 生产就绪评估
 
-评估日期：2026-10-18。最新线上只读快照为 19:54（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-18。最新线上只读快照为 20:14（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
 最新快照中 Collector 与 Relay 的传输计数仍守恒：Collector 捕获、Relay 已投递均为
-`1,227,852`，队列和失败均为 0，Collector ready；18084、3011、3012、18086 均返回 HTTP 200。
-业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2167`，其中
-`otlp_traces.identity_conflict=182`、`invalid_lifecycle=20`、`legacy_unclassified=1965`；当前
-进程新增质量错误为 20，`outcome` 冲突已按生命周期原因单独计数。
-Wire 和 required Hook 没有新鲜观测，`stale_sources=["wire"]`、`turn_capture_ready=false`，runtime
-gate 以质量、新鲜度、历史失败、原因分解和 revision 门禁真实退出 1。
-18086 的 platform health gate 以 `433c70f22cf9d2036ab8300f5487866c31892e6e` 真实通过，平台后端
-仍为 `fs`。Gateway `router-v2-relay-shell` 的隔离预检不带预期 revision 时通过，但其 OCI revision
-仍为外部镜像的 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`；带维护 SHA 的 Gateway preflight
-真实退出 1，因此当前不能声称入口镜像与维护提交一致。真实 Alibaba OSS 提交、恢复、远端对象
-哈希、未修改 Stock Codex 新鲜多轮 Canary 和目标租户导出仍未完成。GitHub Actions 远端运行结果本轮
-仍未能通过 API/CLI 核验；`git ls-remote` 已确认维护分支远端指向 `6df2c17`。
+`1,229,615`，队列和失败均为 0，Collector ready；18084、3011、3012、18086 均返回 HTTP 200。
+业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2283`，其中
+`otlp_traces.identity_conflict=182`、`invalid_lifecycle=136`、`legacy_unclassified=1965`；当前
+进程新增错误仍来自上游同一 Span 的矛盾 `outcome` 标签，已按生命周期原因单独计数并保留 Raw。
+Wire 未观察到，`missing_sources=["wire"]`、`stale_sources=["wire"]`、`turn_capture_ready=false`，
+runtime gate 以质量、新鲜度、历史失败、原因分解和 revision 门禁真实退出 1。
+18086 的 platform health gate 以 `7f5abad42fff171fd80f024bb0f03c2ae6de52b6` 真实通过，平台后端仍为
+`fs`。Gateway `router-v2-relay-shell` 的隔离预检不带预期 revision 时通过，但其 OCI revision 仍为
+外部镜像的 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`；带维护 SHA 的 Gateway preflight 真实退出 1，
+因此入口镜像尚未与维护提交对齐。真实 Alibaba OSS 提交、恢复、远端对象哈希、未修改 Stock Codex
+新鲜多轮 Canary 和目标租户导出仍未完成。GitHub API/CLI 当前无法核验远端 Actions 结论；本轮已将
+维护分支推到 `6678963523ebc97315dbd898342d225d70e2a4f6`，仅 `git ls-remote` 证明远端 ref 已更新。
 
 本次复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
 failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留，Collector/Relay 队列为空且
