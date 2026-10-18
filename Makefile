@@ -1,4 +1,4 @@
-.PHONY: check test gateway-test gateway-receipt-test gateway-host-test failed-outbox-replay-test codex-config-test codex-route-preflight-test managed-route-test protocol-collection-test native-context-test native-canary-gate-test native-canary-evidence-test stock-release-gate-test producer-support-gate-test producer-report-gate-test provider-response-gate-test live-preflight-contract-test runtime-health-gate-test platform-health-gate-test relay-quality-seed-test deployment-smoke-contract-test audit-memory-test turn-memory-test platform-test deployment-config-test gateway-preflight-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
+.PHONY: check test gateway-test gateway-receipt-test gateway-host-test failed-outbox-replay-test codex-config-test codex-route-preflight-test managed-route-test protocol-collection-test protocol-sandbox-contract-test native-context-test native-canary-gate-test native-canary-evidence-test stock-release-gate-test producer-support-gate-test producer-report-gate-test provider-response-gate-test live-preflight-contract-test runtime-health-gate-test platform-health-gate-test relay-quality-seed-test deployment-smoke-contract-test audit-memory-test turn-memory-test platform-test deployment-config-test gateway-preflight-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
 
 CHIPTRACE_VERSION ?= 0.6.0
 CHIPTRACE_REVISION ?= $(shell git rev-parse HEAD)
@@ -39,9 +39,12 @@ managed-route-test:
 protocol-collection-test:
 	node --test --test-concurrency=1 integrations/codex/protocol-collection.test.js integrations/codex/protocol-interruption.test.js integrations/codex/protocol-compaction.test.js integrations/codex/protocol-auto-compaction.test.js
 
+protocol-sandbox-contract-test:
+	node --test integrations/codex/protocol-fixture.test.js
+
 native-context-test:
 	cargo build --locked --bin chiptrace
-	node --test integrations/codex/native-context.test.js
+	node --test integrations/codex/native-context.test.js integrations/codex/protocol-fixture.test.js
 
 native-canary-gate-test:
 	node --test scripts/ci/native-canary-gate.test.js

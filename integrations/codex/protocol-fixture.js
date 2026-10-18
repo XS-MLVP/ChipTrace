@@ -190,6 +190,26 @@ function rpc(handle, externalFailure) {
   };
 }
 
+// The released CLI creates its protected daemon socket below /tmp even when
+// every requested tool uses a read-only sandbox. Keep that directory private
+// and writable inside the producer namespace; binding the host /tmp or making
+// the isolated root writable would hide startup failures and weaken the test.
+function buildProducerSandboxArgs({ producer, root, sandboxTmp, home, managed }) {
+  assert.ok(producer && root && sandboxTmp && home && managed,
+    'producer sandbox paths are required');
+  const publicEtc = ['passwd', 'group', 'hosts', 'resolv.conf', 'nsswitch.conf', 'os-release', 'ssl/certs'];
+  return [
+    '--unshare-user', '--unshare-pid', '--die-with-parent',
+    '--ro-bind', '/', '/', '--proc', '/proc', '--dev', '/dev',
+    '--bind', sandboxTmp, '/tmp', '--bind', root, root,
+    '--ro-bind', producer, producer, '--tmpfs', '/etc',
+    ...publicEtc.flatMap(name => ['--ro-bind-try', `/etc/${name}`, `/etc/${name}`]),
+    '--ro-bind', path.join(home, 'config.toml'), '/etc/codex/config.toml',
+    '--ro-bind', path.join(managed, 'requirements.toml'), '/etc/codex/requirements.toml',
+    '--remount-ro', '/etc', '--chdir', root, '--', producer, '--strict-config', 'app-server',
+  ];
+}
+
 async function protocolFixture(t, prefix) {
   assert.ok(process.env.CHIPTRACE_PROTOCOL_PRODUCER, 'set CHIPTRACE_PROTOCOL_PRODUCER to the selected pinned producer');
   assert.ok(process.env.CHIPTRACE_PROTOCOL_SOURCE, 'set CHIPTRACE_PROTOCOL_SOURCE to its pinned checkout');
@@ -317,19 +337,8 @@ async function protocolFixture(t, prefix) {
         // The release CLI has no debug managed-config/startup-task switches.
         // Build a private /etc even when the host has no /etc/codex. Only known
         // public OS files and this fixture's config are visible in that mount.
-        const publicEtc = ['passwd', 'group', 'hosts', 'resolv.conf', 'nsswitch.conf', 'os-release', 'ssl/certs'];
         const args = cliProducer ? [
-          '--unshare-user', '--unshare-pid', '--die-with-parent',
-          '--ro-bind', '/', '/', '--proc', '/proc', '--dev', '/dev',
-          // The released sandbox prepares /tmp/codex-daemon-<uid> even for
-          // read-only tools. Do not depend on or expose a host's existing socket
-          // directory. This writable /tmp maps only to the private fixture.
-          '--bind', sandboxTmp, '/tmp', '--bind', root, root,
-          '--ro-bind', producer, producer, '--tmpfs', '/etc',
-          ...publicEtc.flatMap(name => ['--ro-bind-try', `/etc/${name}`, `/etc/${name}`]),
-          '--ro-bind', path.join(home, 'config.toml'), '/etc/codex/config.toml',
-          '--ro-bind', path.join(managed, 'requirements.toml'), '/etc/codex/requirements.toml',
-          '--remount-ro', '/etc', '--chdir', root, '--', producer, '--strict-config', 'app-server',
+          ...buildProducerSandboxArgs({ producer, root, sandboxTmp, home, managed }),
         ] : ['--strict-config', '--disable-plugin-startup-tasks-for-tests'];
         const handle = launch(cliProducer ? 'bwrap' : producer, args, producerEnv);
         const client = rpc(handle, () => failure);
@@ -348,4 +357,7 @@ async function protocolFixture(t, prefix) {
   };
 }
 
-module.exports = { run, version, chiptrace, sha256, delay, fileDigest, stop, health, protocolFixture };
+module.exports = {
+  run, version, chiptrace, sha256, delay, fileDigest, stop, health, protocolFixture,
+  buildProducerSandboxArgs,
+};
