@@ -78,4 +78,14 @@ test('deployment preflight rejects mutable images, unknown revisions and missing
   const stalePlatformRevision = structuredClone(config);
   stalePlatformRevision.services.platform.environment.CHIPTRACE_BUILD_REVISION = 'e'.repeat(40);
   assert.throws(() => validateConfig(stalePlatformRevision, revision), /platform health revision/);
+  for (const name of ['collector', 'relay']) {
+    const missingShards = structuredClone(config);
+    const missingShardIndex = missingShards.services[name].command.indexOf('--store-shards');
+    missingShards.services[name].command.splice(missingShardIndex, 2);
+    assert.throws(() => validateConfig(missingShards, revision), /--store-shards/);
+    const invalidShards = structuredClone(config);
+    const shardIndex = invalidShards.services[name].command.indexOf('--store-shards');
+    invalidShards.services[name].command[shardIndex + 1] = '0';
+    assert.throws(() => validateConfig(invalidShards, revision), /--store-shards must be/);
+  }
 });

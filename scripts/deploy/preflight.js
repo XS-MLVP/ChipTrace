@@ -44,6 +44,15 @@ function validateConfig(config, revision) {
     assert.ok(service.healthcheck?.test?.length, `${name}: a healthcheck is required`);
     assert.ok(Array.isArray(service.volumes) && service.volumes.length > 0,
       `${name}: explicit data volumes are required`);
+    if (name === 'collector' || name === 'relay') {
+      const command = Array.isArray(service.command) ? service.command : [];
+      const optionIndex = command.indexOf('--store-shards');
+      assert.ok(optionIndex >= 0 && optionIndex + 1 < command.length,
+        `${name}: --store-shards is required`);
+      const shardCount = Number(command[optionIndex + 1]);
+      assert.ok(Number.isInteger(shardCount) && shardCount >= 1 && shardCount <= 1024,
+        `${name}: --store-shards must be an integer between 1 and 1024`);
+    }
     for (const volume of service.volumes) {
       if (volume?.type !== 'bind' || volume.read_only === true) continue;
       assert.ok(typeof volume.source === 'string' && volume.source.trim() !== '',

@@ -48,6 +48,12 @@ docker compose -f deploy/collector-relay.yml up -d --no-build --pull never
 峰值后配置，监控 OOM 和磁盘余量；不能直接把小样本 CI 的成功当作生产负载验收。
 三个服务均以非 root 用户、只读根运行，仅显式数据挂载和平台 tmpfs 可写。
 
+Collector 与 Relay 的存储拓扑可通过 `CHIPTRACE_STORE_SHARDS` 配置，默认值为 `1`，
+以保持现有单 shard 数据目录兼容。新实例可以在压测后提高该值；当前基准中 4 个 shard
+将本地 WAL 吞吐从约 3,874 提升到 5,146 records/s，但这不是生产 SLO。已初始化的
+数据目录会在 `sharding.json` 中固定拓扑，运行中改变 shard 数会被拒绝；迁移必须先
+完成独立的数据归档、恢复和字节校验，不能只修改环境变量。
+
 18084 网关也必须通过容器级隔离预检。它拥有原始 Wire 的 durable outbox，不能继续使用
 可变镜像 tag、可写根文件系统或无资源上限的容器：
 

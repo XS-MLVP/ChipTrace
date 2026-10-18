@@ -51,7 +51,7 @@ services:
       - --batch-wait-ms
       - "10"
       - --store-shards
-      - "1"
+      - "${CHIPTRACE_STORE_SHARDS:-1}"
       - --max-batch-records
       - "4096"
     ports:
@@ -103,7 +103,7 @@ services:
       - --batch-wait-ms
       - "10"
       - --store-shards
-      - "1"
+      - "${CHIPTRACE_STORE_SHARDS:-1}"
       - --max-batch-records
       - "4096"
       - --delivery-concurrency
