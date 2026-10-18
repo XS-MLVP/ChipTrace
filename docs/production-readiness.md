@@ -1,14 +1,14 @@
 # 生产就绪评估
 
-评估日期：2026-10-18。最新线上只读快照为 22:03（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-18。最新线上只读快照为 22:14（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-最新快照中 Collector 与 Relay 的传输计数仍守恒：两者捕获/投递均为 `1,239,130`，队列和失败均为 0，
+最新快照中 Collector 与 Relay 的传输计数仍守恒：两者捕获/投递均为 `1,239,955`，队列和失败均为 0，
 Collector ready；18084、3011、3012、18086 均返回 HTTP 200。
-业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2852`，其中
-`otlp_traces.identity_conflict=182`、`invalid_lifecycle=705`、`legacy_unclassified=1965`；当前
-进程新增错误为 606，原因标签已按固定分类计数并保留 Raw。Wire 未观察到，
+业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2905`，其中
+`otlp_traces.identity_conflict=182`、`invalid_lifecycle=758`、`legacy_unclassified=1965`；当前
+进程新增错误为 659，原因标签已按固定分类计数并保留 Raw。Wire 未观察到，
 `missing_sources=["wire"]`、`stale_sources=["wire"]`、`successful_turn_scoped_captures=0`、
 `turn_capture_ready=false`，runtime gate 以质量、新鲜度、历史失败、原因分解和 revision 门禁真实退出 1。
 18086 的 platform health gate 以 `7f5abad42fff171fd80f024bb0f03c2ae6de52b6` 真实通过，平台后端仍为
@@ -752,16 +752,16 @@ HTTP 200，但 Relay/Collector 仍为旧 revision `e5237065ff3a48623179c5846ff19
 提交 `ba0600a` 修正 hosted Runner 的原生沙箱启动流程：内核 sysctl 写入失败只产生明确警告，
 真正的 user namespace 探针仍是硬门禁，避免平台权限差异把 CI 误报为启动失败，也不会把不可用沙箱放行。
 
-## 2026-10-18 22:03 线上只读复核
+## 2026-10-18 22:14 线上只读复核
 
 最新只读快照中 18084、3011、3012 和 18086 均返回 HTTP 200。Collector 与 Relay 使用同一
-revision `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`，捕获/投递计数均为 `1,239,130`，队列为 0，
+revision `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`，捕获/投递计数均为 `1,239,955`，队列为 0，
 `conservation_ok=true`；Platform 也报告同一 revision，队列和运行任务均为 0。18084 的完整正文捕获
 仍启用，Gateway outbox 当前 pending/processing/recent failure 均为 0，293 个历史失败原件和
 293 个恢复回执仍保留，未解决历史失败为 0；这证明传输与恢复闭环，不证明业务 Turn 已采集。
 
-业务覆盖仍为 `degraded`：Relay 持久 `quality_errors=2852`（当前进程新增 606），全部来自
-`otlp_traces`，原因是 `identity_conflict=182`、`invalid_lifecycle=705`、
+业务覆盖仍为 `degraded`：Relay 持久 `quality_errors=2905`（当前进程新增 659），全部来自
+`otlp_traces`，原因是 `identity_conflict=182`、`invalid_lifecycle=758`、
 `legacy_unclassified=1965`；`wire` 同时列入 `missing_sources` 和 `stale_sources`，
 `successful_turn_scoped_captures=0`，`turn_capture_ready=false`。Gateway 的
 `fullTraceCapture.stats.acceptedCount=0`，其 OCI revision `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`
@@ -789,12 +789,12 @@ revision `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`，捕获/投递计数均为 
 `synthetic=true`、`real_upstream=false`、`real_oss_account=false` 和
 `production_acceptance_claimed=false` 保留了证据边界。
 
-## 2026-10-18 22:13 质量标签根因抽样
+## 2026-10-18 22:14 质量标签根因抽样
 
 对最新活动 Segment 尾部最多 200 条记录做了有界脱敏摘要：共看到 162 个 telemetry batch，
 其中 77 个来自 `otlp_traces`；12 条转换错误具有相同的固定诊断，均为同一 OTLP span 重复声明
 冲突的 `outcome` 属性。该批次的取样值类别为 `completed`、`exited` 和 `interrupted`。这与
-`invalid_lifecycle` 的 705 条线上计数相符，且与仓库第七个生产者补丁
+`invalid_lifecycle` 的 758 条线上计数相符，且与仓库第七个生产者补丁
 `docs/upstream-otlp-outcome.patch` 的修复目标一致：声明字段先为空，终态只记录一次，取消路径
 才补写 `interrupted`。因此当前解析器保持冲突即拒绝是数据正确性要求；放宽重复属性校验会把
 不确定的终态伪装成有效标签。生产修复应部署包含该补丁的受管 Producer，并重新通过逐 Turn 四源门禁。
