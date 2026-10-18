@@ -17,6 +17,11 @@ on:
         required: false
         default: ""
         type: string
+      gateway_revision:
+        description: Full OCI revision of the independently released Gateway image
+        required: false
+        default: ""
+        type: string
       model:
         description: Provider model used for the bounded Responses probe
         required: true
@@ -54,10 +59,11 @@ jobs:
           CHIPTRACE_PLATFORM_HEALTH_URL: ${{ vars.CHIPTRACE_PLATFORM_HEALTH_URL }}
           CHIPTRACE_GATEWAY_CONTAINER: ${{ vars.CHIPTRACE_GATEWAY_CONTAINER }}
           CHIPTRACE_EXPECTED_REVISION: ${{ inputs.expected_revision }}
+          CHIPTRACE_GATEWAY_EXPECTED_REVISION: ${{ inputs.gateway_revision }}
         run: |
           set -euo pipefail
           test -n "${CHIPTRACE_API_KEY:-}" || { echo 'CHIPTRACE_API_KEY is missing from the protected environment' >&2; exit 1; }
-          for name in CHIPTRACE_CODEX_CONFIG CHIPTRACE_CODEX_BASE_URL CHIPTRACE_RESPONSES_URL CHIPTRACE_GATEWAY_HEALTH_URL CHIPTRACE_RELAY_HEALTH_URL CHIPTRACE_COLLECTOR_HEALTH_URL CHIPTRACE_PLATFORM_HEALTH_URL CHIPTRACE_GATEWAY_CONTAINER CHIPTRACE_EXPECTED_REVISION; do
+          for name in CHIPTRACE_CODEX_CONFIG CHIPTRACE_CODEX_BASE_URL CHIPTRACE_RESPONSES_URL CHIPTRACE_GATEWAY_HEALTH_URL CHIPTRACE_RELAY_HEALTH_URL CHIPTRACE_COLLECTOR_HEALTH_URL CHIPTRACE_PLATFORM_HEALTH_URL CHIPTRACE_GATEWAY_CONTAINER CHIPTRACE_EXPECTED_REVISION CHIPTRACE_GATEWAY_EXPECTED_REVISION; do
             test -n "${!name:-}" || { echo "$name is missing from the protected environment or dispatch input" >&2; exit 1; }
           done
           echo 'protected live preflight configuration is present'
@@ -107,12 +113,12 @@ jobs:
         if: ${{ always() }}
         env:
           CHIPTRACE_GATEWAY_CONTAINER: ${{ vars.CHIPTRACE_GATEWAY_CONTAINER }}
-          CHIPTRACE_EXPECTED_REVISION: ${{ inputs.expected_revision }}
+          CHIPTRACE_GATEWAY_EXPECTED_REVISION: ${{ inputs.gateway_revision }}
         run: |
           set -euo pipefail
           node scripts/deploy/gateway-preflight.js \
             --container "$CHIPTRACE_GATEWAY_CONTAINER" \
-            --expected-revision "$CHIPTRACE_EXPECTED_REVISION" \
+            --expected-gateway-revision "$CHIPTRACE_GATEWAY_EXPECTED_REVISION" \
             | tee "$RUNNER_TEMP/gateway-preflight.json"
       - name: Verify live Platform export service health
         if: ${{ always() }}
@@ -529,6 +535,8 @@ jobs:
         with:
           node-version: "22"
           package-manager-cache: false
+      - name: Verify immutable GitHub Action pins
+        run: node scripts/ci/action-pin-gate.js
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build workspace regression executables

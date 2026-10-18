@@ -14,8 +14,8 @@ Collector、Relay 和平台的实际 build revision 均为
 `turn_capture_ready=false`，runtime gate 以质量、新鲜度、历史失败、原因分解和 revision 门禁真实退出 1。
 18086 的 platform health gate 以 `80d61aa136ea31dceaf3d0ac51392ce239ed894e` 真实通过，平台后端仍为
 `fs`。Gateway `router-v2-relay-shell` 的隔离预检不带预期 revision 时通过，但其 OCI revision 仍为外部镜像的
-`e57480eca4fe11769c5fcb8787266ab6b77ce4d5`；带维护 SHA 的 Gateway preflight 真实退出 1，因此入口镜像尚未
-与维护提交对齐。当前 relay-shell 的 `fullTraceCapture.stats.acceptedCount=0`，本机用户级 Codex 配置仍指向
+`e57480eca4fe11769c5fcb8787266ab6b77ce4d5`；错误地复用 Collector/Relay 维护 SHA 的 Gateway preflight 真实退出 1，因此入口镜像尚未
+与受管 Gateway 发布 revision 对齐。当前 relay-shell 的 `fullTraceCapture.stats.acceptedCount=0`，本机用户级 Codex 配置仍指向
 外部 Provider，尚未经过 18084。真实 Alibaba OSS 提交、恢复、远端对象哈希、未修改 Stock Codex 新鲜多轮
 Canary 和目标租户导出仍未完成。GitHub API/CLI 当前无法核验远端 Actions 结论；维护分支已推送，当前仅以
 `git ls-remote` 证明远端 ref 已更新。
@@ -23,7 +23,8 @@ Canary 和目标租户导出仍未完成。GitHub API/CLI 当前无法核验远�
 当前复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
 failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留，Collector/Relay 队列为空且
 `conservation_ok=true`。Collector/Relay 实际 revision 为 `80d61aa136ea31dceaf3d0ac51392ce239ed894e`；
-平台与它们的 OCI/Compose revision 已对齐，Gateway 入口仍需单独升级到同一维护 revision。
+平台与它们的 OCI/Compose revision 已对齐，Gateway 入口仍需单独升级到受管 Gateway 发布 revision，
+并在 live preflight 中使用 `gateway_revision` 独立核对。
 
 本轮还将 Gateway outbox 的可用余量接入 runtime gate：受保护 live preflight 要求
 `filesystemFreeBytes >= 10 GiB`、`filesystemFreeFiles >= 10,000`，缺失或低于阈值会以固定阻断原因失败。
@@ -47,7 +48,7 @@ Gateway 容器 OCI revision 为 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`，新
 在传入待发布 SHA 后会拒绝该版本。真实 Alibaba OSS、未修改 Stock Codex 的新鲜多轮 Canary 和
 目标 Session 的 `cloud-acceptance` 仍未完成，因此当前服务不满足真实生产发布标准。
 
-本轮维护新增 Gateway revision 对齐护栏和 Platform health gate；本地 `make cloud-test` 已真实退出 0，
+本轮维护新增独立 Gateway revision 护栏和 Platform health gate；本地 `make cloud-test` 已真实退出 0，
 但本地绿色测试不能替代待发布 SHA 的 GitHub Actions、真实 OSS 和生产 Canary 证据。
 
 提交 `d794700` 修复了维护分支远端 CI 的一个启动阻断：工作流原先把

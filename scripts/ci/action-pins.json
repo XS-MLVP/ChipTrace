@@ -1,0 +1,30 @@
+{
+  "schema_version": "chiptrace.github-action-pins.v1",
+  "workflow": ".github/workflows/ci.yml",
+  "actions": {
+    "actions/checkout": {
+      "sha": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+      "version": "v7.0.1"
+    },
+    "actions/setup-go": {
+      "sha": "44694675825211faa026b3c33043df3e48a5fa00",
+      "version": "v6.0.0"
+    },
+    "actions/setup-node": {
+      "sha": "949feb2413d6458794dcd2491c4babbbce0c15c1",
+      "version": "v7.1.0"
+    },
+    "actions/upload-artifact": {
+      "sha": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+      "version": "v7.0.2"
+    },
+    "dtolnay/rust-toolchain": {
+      "sha": "683b588c487a69d01f6c6ddf40f036ff682cc2c8",
+      "version": "stable"
+    },
+    "Swatinem/rust-cache": {
+      "sha": "6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+      "version": "v2"
+    }
+  }
+}

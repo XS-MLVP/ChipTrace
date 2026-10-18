@@ -39,10 +39,11 @@ function inspect() {
 }
 
 test('Gateway preflight accepts immutable isolated full-trace configuration', () => {
-  const result = validateGatewayInspect(inspect(), { expectedRevision: 'f'.repeat(40) });
+  const result = validateGatewayInspect(inspect(), { expectedGatewayRevision: 'f'.repeat(40) });
   assert.equal(result.schema_version, 'chiptrace.gateway-preflight.v1');
   assert.equal(result.ok, true);
   assert.equal(result.expected_revision, 'f'.repeat(40));
+  assert.equal(result.expected_gateway_revision, 'f'.repeat(40));
   assert.equal(result.full_trace_capture_enabled, true);
   assert.equal(result.body_capture_enabled, true);
   assert.equal(Object.hasOwn(result, 'ingest_token'), false);
@@ -50,13 +51,30 @@ test('Gateway preflight accepts immutable isolated full-trace configuration', ()
 
 test('Gateway preflight rejects a revision that is not the release revision', () => {
   assert.throws(
-    () => validateGatewayInspect(inspect(), { expectedRevision: 'e'.repeat(40) }),
+    () => validateGatewayInspect(inspect(), { expectedGatewayRevision: 'e'.repeat(40) }),
     /Gateway OCI revision must equal/,
   );
   assert.throws(
-    () => validateGatewayInspect(inspect(), { expectedRevision: 'short' }),
+    () => validateGatewayInspect(inspect(), { expectedGatewayRevision: 'short' }),
     /expected Gateway revision must be a full Git SHA/,
   );
+});
+
+test('Gateway revision is independently gated from the Collector/Relay revision', () => {
+  const gatewayRevision = 'f'.repeat(40);
+  const chiptraceRevision = 'e'.repeat(40);
+  const result = validateGatewayInspect(inspect(), {
+    expectedGatewayRevision: gatewayRevision,
+  });
+  assert.equal(result.revision, gatewayRevision);
+  assert.doesNotThrow(() => validateGatewayInspect(inspect(), {
+    expectedRevision: gatewayRevision,
+    expectedGatewayRevision: gatewayRevision,
+  }));
+  assert.throws(() => validateGatewayInspect(inspect(), {
+    expectedRevision: chiptraceRevision,
+    expectedGatewayRevision: gatewayRevision,
+  }), /expected Gateway revisions must agree/);
 });
 
 test('Gateway preflight rejects mutable images and missing isolation', () => {

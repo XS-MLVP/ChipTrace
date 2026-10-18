@@ -14,6 +14,7 @@ test('live provider preflight is manual, protected and isolated from ordinary CI
   assert.match(workflow, /runs-on: \[self-hosted, linux, chiptrace-canary\]/);
   assert.match(workflow, /environment: production-canary/);
   assert.match(workflow, /expected_revision:[\s\S]*?required: false[\s\S]*?default: ""/);
+  assert.match(workflow, /gateway_revision:[\s\S]*?description: Full OCI revision of the independently released Gateway image[\s\S]*?required: false[\s\S]*?default: ""/);
 });
 
 test('live provider preflight requires protected endpoints and runs both gates', () => {
@@ -28,6 +29,7 @@ test('live provider preflight requires protected endpoints and runs both gates',
     'CHIPTRACE_PLATFORM_HEALTH_URL',
     'CHIPTRACE_GATEWAY_CONTAINER',
     'CHIPTRACE_EXPECTED_REVISION',
+    'CHIPTRACE_GATEWAY_EXPECTED_REVISION',
   ]) {
     assert.match(workflow, new RegExp(name));
   }
@@ -49,7 +51,7 @@ test('live provider preflight requires protected endpoints and runs both gates',
   assert.match(workflow, /--min-gateway-free-files 10000/);
   assert.match(workflow, /node scripts\/deploy\/gateway-preflight\.js/);
   assert.match(workflow, /--container "\$CHIPTRACE_GATEWAY_CONTAINER"/);
-  assert.match(workflow, /--expected-revision "\$CHIPTRACE_EXPECTED_REVISION"/);
+  assert.match(workflow, /--expected-gateway-revision "\$CHIPTRACE_GATEWAY_EXPECTED_REVISION"/);
   assert.match(workflow, /name: live-provider-runtime-preflight/);
 });
 

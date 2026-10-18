@@ -90,18 +90,20 @@ Relay 的 `/health` 只表示进程、WAL 和传输层存活，即使四路来�
 ```bash
 node scripts/deploy/gateway-preflight.js \
   --container <gateway-container> \
-  --expected-revision "$(git rev-parse HEAD)"
+  --expected-gateway-revision <gateway-oci-revision>
 ```
 
 预检只输出镜像摘要、OCI revision、资源限额和挂载/采集开关，不输出环境变量或凭据；传入
-`--expected-revision` 时还会拒绝 OCI revision 与待发布 Git SHA 不一致的 Gateway。失败时
+`--expected-gateway-revision` 时还会拒绝 OCI revision 与受管 Gateway 发布 SHA 不一致的容器。
+Gateway 是独立发布组件，该值不应复用 Collector/Relay 的 ChipTrace SHA；旧的
+`--expected-revision` 仍作为兼容别名接受，但新部署必须使用显式 Gateway 参数。失败时
 不得以重启或清理 outbox 绕过。生产 Gateway 还必须通过同一 runtime gate 的历史失败文件、
 质量错误和新鲜 Turn Wire 门禁。2026-10-17 对实际 `router-v2-relay-shell` 执行该预检已
 返回成功：容器使用只读根、非 root、CPU/内存/PID 限额、`no-new-privileges` 和 durable
 outbox/watchdog 挂载。不过其镜像 OCI revision 仍是
-`e57480eca4fe11769c5fcb8787266ab6b77ce4d5`，与待发布维护 revision 不一致；不传预期值的旧预检可以
-证明隔离，传入维护分支 SHA 的新预检会真实拒绝该容器。本轮 outbox 修复通过只读工作区 bind mount
-注入，尚未形成包含维护分支 SHA 的不可变 Gateway 镜像。因此 preflight 通过只证明容器隔离，不能替代发布 revision、
+`e57480eca4fe11769c5fcb8787266ab6b77ce4d5`。它仍需在受管环境中作为独立 Gateway revision
+显式核对；本轮 outbox 修复通过只读工作区 bind mount 注入，尚未形成可复现的 Gateway 发布镜像。
+因此 preflight 通过只证明容器隔离和版本身份，不能替代发布兼容性、
 runtime gate 和真实 Session/Turn 验收；这与 HTTP `/health` 返回 200 仍是独立证据。
 
 18084 对外提供 Responses、`/models`、`/otel/v1/logs`、`/otel/v1/traces` 和

@@ -1,4 +1,4 @@
-.PHONY: check test gateway-test gateway-receipt-test gateway-host-test failed-outbox-replay-test codex-config-test codex-route-preflight-test managed-route-test protocol-collection-test protocol-sandbox-contract-test native-context-test native-canary-gate-test native-canary-evidence-test stock-release-gate-test producer-support-gate-test producer-report-gate-test provider-response-gate-test live-preflight-contract-test runtime-health-gate-test platform-health-gate-test relay-quality-seed-test deployment-smoke-contract-test audit-memory-test turn-memory-test platform-test deployment-config-test gateway-preflight-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
+.PHONY: check test gateway-test gateway-receipt-test gateway-host-test failed-outbox-replay-test codex-config-test codex-route-preflight-test managed-route-test protocol-collection-test protocol-sandbox-contract-test native-context-test native-canary-gate-test native-canary-evidence-test stock-release-gate-test producer-support-gate-test producer-report-gate-test provider-response-gate-test live-preflight-contract-test action-pin-gate-test runtime-health-gate-test platform-health-gate-test relay-quality-seed-test deployment-smoke-contract-test audit-memory-test turn-memory-test platform-test deployment-config-test gateway-preflight-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
 
 CHIPTRACE_VERSION ?= 0.6.0
 CHIPTRACE_REVISION ?= $(shell git rev-parse HEAD)
@@ -67,6 +67,9 @@ provider-response-gate-test:
 live-preflight-contract-test:
 	node --test scripts/ci/live-preflight-contract.test.js
 
+action-pin-gate-test:
+	node --test scripts/ci/action-pin-gate.test.js
+
 runtime-health-gate-test:
 	node --test scripts/ci/runtime-health-gate.test.js
 
@@ -114,6 +117,7 @@ cloud-test:
 	$(MAKE) producer-report-gate-test
 	$(MAKE) provider-response-gate-test
 	$(MAKE) live-preflight-contract-test
+	$(MAKE) action-pin-gate-test
 	$(MAKE) runtime-health-gate-test
 	$(MAKE) platform-health-gate-test
 	$(MAKE) relay-quality-seed-test

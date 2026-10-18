@@ -31,7 +31,7 @@ function requireEnvironment(values, name, expected) {
   if (expected !== undefined) assert.equal(value, expected, `${name} must equal ${expected}`);
 }
 
-function validateGatewayInspect(info, { expectedRevision } = {}) {
+function validateGatewayInspect(info, { expectedRevision, expectedGatewayRevision } = {}) {
   assert.ok(info && typeof info === 'object' && !Array.isArray(info), 'docker inspect result must be an object');
   const config = info.Config;
   const host = info.HostConfig;
@@ -73,11 +73,16 @@ function validateGatewayInspect(info, { expectedRevision } = {}) {
 
   const revision = config.Labels?.['org.opencontainers.image.revision'];
   assert.match(revision || '', REVISION_PATTERN, 'Gateway OCI revision must be a full Git SHA');
-  if (expectedRevision !== undefined) {
-    assert.match(expectedRevision, REVISION_PATTERN,
+  const expected = expectedGatewayRevision ?? expectedRevision;
+  if (expectedGatewayRevision !== undefined && expectedRevision !== undefined) {
+    assert.equal(expectedGatewayRevision, expectedRevision,
+      'expected Gateway revisions must agree when both compatibility aliases are supplied');
+  }
+  if (expected !== undefined) {
+    assert.match(expected, REVISION_PATTERN,
       'expected Gateway revision must be a full Git SHA');
-    assert.equal(revision, expectedRevision,
-      `Gateway OCI revision must equal ${expectedRevision}`);
+    assert.equal(revision, expected,
+      `Gateway OCI revision must equal ${expected}`);
   }
   return {
     schema_version: 'chiptrace.gateway-preflight.v1',
@@ -85,7 +90,10 @@ function validateGatewayInspect(info, { expectedRevision } = {}) {
     image: config.Image,
     image_id: info.Image,
     revision,
-    expected_revision: expectedRevision ?? null,
+    // Keep the v1 field for existing report readers while making the
+    // independently released Gateway revision explicit for new consumers.
+    expected_revision: expected ?? null,
+    expected_gateway_revision: expected ?? null,
     user: config.User,
     read_only: host.ReadonlyRootfs,
     nano_cpus: host.NanoCpus,
@@ -111,25 +119,31 @@ async function inspectContainer(name, options = {}) {
 async function main(argv = process.argv.slice(2)) {
   let name;
   let expectedRevision;
+  let expectedGatewayRevision;
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     const value = argv[index + 1];
-    if (!value || (flag !== '--container' && flag !== '--expected-revision')) {
-      throw new Error('usage: gateway-preflight.js --container CONTAINER [--expected-revision SHA]');
+    if (!value || (flag !== '--container'
+      && flag !== '--expected-revision'
+      && flag !== '--expected-gateway-revision')) {
+      throw new Error('usage: gateway-preflight.js --container CONTAINER [--expected-gateway-revision SHA]');
     }
     if (flag === '--container') {
-      if (name !== undefined) throw new Error('usage: gateway-preflight.js --container CONTAINER [--expected-revision SHA]');
+      if (name !== undefined) throw new Error('usage: gateway-preflight.js --container CONTAINER [--expected-gateway-revision SHA]');
       name = value;
-    } else {
-      if (expectedRevision !== undefined) throw new Error('usage: gateway-preflight.js --container CONTAINER [--expected-revision SHA]');
+    } else if (flag === '--expected-revision') {
+      if (expectedRevision !== undefined) throw new Error('usage: gateway-preflight.js --container CONTAINER [--expected-gateway-revision SHA]');
       expectedRevision = value;
+    } else {
+      if (expectedGatewayRevision !== undefined) throw new Error('usage: gateway-preflight.js --container CONTAINER [--expected-gateway-revision SHA]');
+      expectedGatewayRevision = value;
     }
     index += 1;
   }
   if (name === undefined) {
-    throw new Error('usage: gateway-preflight.js --container CONTAINER [--expected-revision SHA]');
+    throw new Error('usage: gateway-preflight.js --container CONTAINER [--expected-gateway-revision SHA]');
   }
-  const result = await inspectContainer(name, { expectedRevision });
+  const result = await inspectContainer(name, { expectedRevision, expectedGatewayRevision });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   return result;
 }
