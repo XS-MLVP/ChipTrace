@@ -64,6 +64,12 @@ Relay `/health` 的 `delivery_retries` 是持久账本中的 `delivery_attempts 
 （下限为零），用于区分可恢复的 Collector 背压和最终失败。它本身不构成交付成功证明；
 生产监控应同时观察重试速率、`pending`、`inflight`、`failed` 和 `conservation_ok`。
 
+`benchmark-http --relay` 会在入口压测结束后轮询 Relay `/health`，直到 `delivered` 与入口
+记录数相等且 `pending/inflight` 均为零。排空期间 Relay 处于 `degraded` 时按设计返回 HTTP
+503；这类响应现在单独计入 `drain_health_degraded_polls`，不会被误报为入口拒绝。压测结果同时
+输出 `delivery_attempts`、`delivery_retries` 和 `delivery_retry_rate`；需要把可恢复背压纳入
+门禁时可传 `--max-delivery-retries N`，超过上限会返回非零，未传时只报告不阻断。
+
 18084 网关也必须通过容器级隔离预检。它拥有原始 Wire 的 durable outbox，不能继续使用
 可变镜像 tag、可写根文件系统或无资源上限的容器：
 

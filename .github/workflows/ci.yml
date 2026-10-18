@@ -768,6 +768,11 @@ jobs:
           assert result["relay"] is True
           assert result["relay_health"]["delivered"] == 32
           assert result["relay_health"]["conservation_ok"] is True
+          assert isinstance(result["drain_health_polls"], int)
+          assert isinstance(result["drain_health_degraded_polls"], int)
+          assert result["drain_health_polls"] >= result["drain_health_degraded_polls"]
+          assert result["delivery_attempts"] == result["relay_health"]["delivery_attempts"]
+          assert result["delivery_retries"] == result["relay_health"]["delivery_retries"]
           '
       - run: cargo build --release --locked --bin chiptrace
       - run: target/release/chiptrace --help

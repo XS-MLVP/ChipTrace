@@ -713,6 +713,9 @@ struct BenchmarkHttpArgs {
     /// 经 Relay 本地 outbox 续投 Collector，并等待最终守恒。
     #[arg(long)]
     relay: bool,
+    /// Relay 模式下允许的最大持久交付重试次数；未设置时仅报告重试，不因背压失败。
+    #[arg(long, requires = "relay")]
+    max_delivery_retries: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -2772,26 +2775,40 @@ async fn benchmark_http(args: BenchmarkHttpArgs) -> Result<Value> {
     }
     let ingress_elapsed = started.elapsed().as_secs_f64();
     let mut relay_health = Value::Null;
+    let mut drain_health_polls = 0_u64;
+    let mut drain_health_degraded_polls = 0_u64;
     if benchmark_error.is_none() && args.relay {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         loop {
-            let health = match client
+            let response = match client
                 .get(format!("http://{ingest_bind}/health"))
                 .send()
                 .await
             {
-                Ok(response) => match response.json::<Value>().await {
-                    Ok(health) => health,
-                    Err(error) => {
-                        benchmark_error = Some(error.into());
-                        break;
-                    }
-                },
+                Ok(response) => response,
                 Err(error) => {
                     benchmark_error = Some(error.into());
                     break;
                 }
             };
+            let status = response.status();
+            let health = match response.json::<Value>().await {
+                Ok(health) => health,
+                Err(error) => {
+                    benchmark_error = Some(error.into());
+                    break;
+                }
+            };
+            drain_health_polls = drain_health_polls.saturating_add(1);
+            if !status.is_success()
+                || health.get("status").and_then(Value::as_str) != Some("healthy")
+            {
+                // Relay intentionally exposes HTTP 503 while a non-empty
+                // backlog is degraded. This is a transient drain observation,
+                // not an ingress rejection; expose it separately in the
+                // benchmark result so operators can distinguish the two.
+                drain_health_degraded_polls = drain_health_degraded_polls.saturating_add(1);
+            }
             if health.get("delivered").and_then(Value::as_u64) == Some(observed_records)
                 && health.get("pending").and_then(Value::as_u64) == Some(0)
                 && health.get("inflight").and_then(Value::as_u64) == Some(0)
@@ -2808,6 +2825,21 @@ async fn benchmark_http(args: BenchmarkHttpArgs) -> Result<Value> {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+    if benchmark_error.is_none()
+        && let Some(max_retries) = args.max_delivery_retries
+    {
+        let retries = relay_health
+            .get("delivery_retries")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                anyhow::anyhow!("HTTP benchmark did not receive Relay retry counters")
+            })?;
+        if retries > max_retries {
+            benchmark_error = Some(anyhow::anyhow!(
+                "HTTP benchmark delivery retries {retries} exceed configured maximum {max_retries}"
+            ));
+        }
+    }
     let end_to_end_elapsed = started.elapsed().as_secs_f64();
     if let Some(shutdown_tx) = relay_shutdown_tx {
         let _ = shutdown_tx.send(());
@@ -2822,6 +2854,14 @@ async fn benchmark_http(args: BenchmarkHttpArgs) -> Result<Value> {
     }
     latency_ms.sort_by(f64::total_cmp);
     let payload_bytes = observed_records as f64 * args.payload_kib as f64 * 1024.0;
+    let delivery_attempts = relay_health
+        .get("delivery_attempts")
+        .and_then(Value::as_u64);
+    let delivery_retries = relay_health.get("delivery_retries").and_then(Value::as_u64);
+    let delivery_retry_rate = delivery_attempts
+        .filter(|attempts| *attempts > 0)
+        .zip(delivery_retries)
+        .map(|(attempts, retries)| retries as f64 / attempts as f64);
     Ok(json!({
         "records": observed_records,
         "payload_kib": args.payload_kib,
@@ -2839,6 +2879,11 @@ async fn benchmark_http(args: BenchmarkHttpArgs) -> Result<Value> {
         "ingress_payload_mib_per_second": payload_bytes / ingress_elapsed / 1024.0 / 1024.0,
         "end_to_end_payload_mib_per_second":payload_bytes / end_to_end_elapsed / 1024.0 / 1024.0,
         "ingress_wire_mib_per_second": wire_bytes as f64 / ingress_elapsed / 1024.0 / 1024.0,
+        "delivery_attempts": delivery_attempts,
+        "delivery_retries": delivery_retries,
+        "delivery_retry_rate": delivery_retry_rate,
+        "drain_health_polls": drain_health_polls,
+        "drain_health_degraded_polls": drain_health_degraded_polls,
         "relay_health":relay_health,
         "batch_latency_ms": {
             "p50": percentile(&latency_ms, 0.50),
