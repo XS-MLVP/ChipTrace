@@ -170,12 +170,15 @@ Session 交付证据。
 GitHub CI 的 `live-provider-runtime-preflight` 只在手工 `workflow_dispatch`、
 `live_preflight=true`、受保护分支/规则集、受保护的 `production-canary` Environment 和标签为
 `self-hosted, linux, chiptrace-canary` 的内网 Runner 上执行。Environment Secret 必须提供
-`CHIPTRACE_API_KEY`；Environment Variables 必须提供
+`CHIPTRACE_API_KEY`；Environment Variables 必须提供实际 Canary 配置文件路径
+`CHIPTRACE_CODEX_CONFIG`、对应网关地址 `CHIPTRACE_CODEX_BASE_URL`，以及
 `CHIPTRACE_RESPONSES_URL`、`CHIPTRACE_GATEWAY_HEALTH_URL`、`CHIPTRACE_RELAY_HEALTH_URL`、
 `CHIPTRACE_COLLECTOR_HEALTH_URL` 和 `CHIPTRACE_PLATFORM_HEALTH_URL`。启用真实预检时，手工输入的
 `expected_revision` 必须是 Collector/Relay 实际构建的完整 Git SHA；普通手工 CI 可以留空。
-普通 push/PR 不接触这些 Secret，也不会因为缺少 Runner 或变量而
-跳过真实预检。该作业只确认 Provider 请求和当前进程 readiness，随后仍须用同一 Session
+普通 push/PR 不接触这些 Secret，也不会因为缺少 Runner 或变量而跳过真实预检。作业首先读取
+`CHIPTRACE_CODEX_CONFIG` 中的路由字段，要求 Responses、OTLP logs 和 OTLP traces 都指向
+`CHIPTRACE_CODEX_BASE_URL`；该步骤不输出配置正文、凭据或请求内容。随后才确认 Provider 请求和当前进程 readiness，
+仍须用同一 Session
 执行未修改 Stock Codex 的多轮四源 Canary、OSS 验收和 `cloud-acceptance`。
 Live preflight 还要求 Relay 的 `ingest_coverage.quality_errors` 为 0；该计数从持久
 Delivery ledger 恢复，`quality_errors_scope` 必须为 `durable_relay_state`，而

@@ -19,6 +19,8 @@ test('live provider preflight is manual, protected and isolated from ordinary CI
 test('live provider preflight requires protected endpoints and runs both gates', () => {
   for (const name of [
     'CHIPTRACE_API_KEY',
+    'CHIPTRACE_CODEX_CONFIG',
+    'CHIPTRACE_CODEX_BASE_URL',
     'CHIPTRACE_RESPONSES_URL',
     'CHIPTRACE_GATEWAY_HEALTH_URL',
     'CHIPTRACE_RELAY_HEALTH_URL',
@@ -29,6 +31,10 @@ test('live provider preflight requires protected endpoints and runs both gates',
   ]) {
     assert.match(workflow, new RegExp(name));
   }
+  assert.match(workflow, /node scripts\/deploy\/codex-route-preflight\.js/);
+  assert.match(workflow, /--config "\$CHIPTRACE_CODEX_CONFIG"/);
+  assert.match(workflow, /--expected-base-url "\$CHIPTRACE_CODEX_BASE_URL"/);
+  assert.match(workflow, /codex-route-preflight\.json/);
   assert.match(workflow, /node scripts\/ci\/provider-response-gate\.js/);
   assert.match(workflow, /node scripts\/ci\/runtime-health-gate\.js/);
   assert.match(workflow, /name: Verify live Collector, Relay and Gateway readiness\n        if: \$\{\{ always\(\) \}\}/);

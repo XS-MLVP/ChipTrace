@@ -45,6 +45,8 @@ jobs:
       - name: Require protected live preflight configuration
         env:
           CHIPTRACE_API_KEY: ${{ secrets.CHIPTRACE_API_KEY }}
+          CHIPTRACE_CODEX_CONFIG: ${{ vars.CHIPTRACE_CODEX_CONFIG }}
+          CHIPTRACE_CODEX_BASE_URL: ${{ vars.CHIPTRACE_CODEX_BASE_URL }}
           CHIPTRACE_RESPONSES_URL: ${{ vars.CHIPTRACE_RESPONSES_URL }}
           CHIPTRACE_GATEWAY_HEALTH_URL: ${{ vars.CHIPTRACE_GATEWAY_HEALTH_URL }}
           CHIPTRACE_RELAY_HEALTH_URL: ${{ vars.CHIPTRACE_RELAY_HEALTH_URL }}
@@ -55,10 +57,20 @@ jobs:
         run: |
           set -euo pipefail
           test -n "${CHIPTRACE_API_KEY:-}" || { echo 'CHIPTRACE_API_KEY is missing from the protected environment' >&2; exit 1; }
-          for name in CHIPTRACE_RESPONSES_URL CHIPTRACE_GATEWAY_HEALTH_URL CHIPTRACE_RELAY_HEALTH_URL CHIPTRACE_COLLECTOR_HEALTH_URL CHIPTRACE_PLATFORM_HEALTH_URL CHIPTRACE_GATEWAY_CONTAINER CHIPTRACE_EXPECTED_REVISION; do
+          for name in CHIPTRACE_CODEX_CONFIG CHIPTRACE_CODEX_BASE_URL CHIPTRACE_RESPONSES_URL CHIPTRACE_GATEWAY_HEALTH_URL CHIPTRACE_RELAY_HEALTH_URL CHIPTRACE_COLLECTOR_HEALTH_URL CHIPTRACE_PLATFORM_HEALTH_URL CHIPTRACE_GATEWAY_CONTAINER CHIPTRACE_EXPECTED_REVISION; do
             test -n "${!name:-}" || { echo "$name is missing from the protected environment or dispatch input" >&2; exit 1; }
           done
           echo 'protected live preflight configuration is present'
+      - name: Verify the actual Codex configuration targets the managed Gateway
+        env:
+          CHIPTRACE_CODEX_CONFIG: ${{ vars.CHIPTRACE_CODEX_CONFIG }}
+          CHIPTRACE_CODEX_BASE_URL: ${{ vars.CHIPTRACE_CODEX_BASE_URL }}
+        run: |
+          set -euo pipefail
+          node scripts/deploy/codex-route-preflight.js \
+            --config "$CHIPTRACE_CODEX_CONFIG" \
+            --expected-base-url "$CHIPTRACE_CODEX_BASE_URL" \
+            | tee "$RUNNER_TEMP/codex-route-preflight.json"
       - name: Probe the real Provider Responses endpoint
         env:
           CHIPTRACE_API_KEY: ${{ secrets.CHIPTRACE_API_KEY }}
@@ -119,6 +131,7 @@ jobs:
           path: |
             ${{ runner.temp }}/provider-response.json
             ${{ runner.temp }}/provider-response.stdout.json
+            ${{ runner.temp }}/codex-route-preflight.json
             ${{ runner.temp }}/runtime-health.json
             ${{ runner.temp }}/runtime-health.stdout.json
             ${{ runner.temp }}/gateway-preflight.json
