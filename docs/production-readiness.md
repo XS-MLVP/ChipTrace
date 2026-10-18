@@ -783,6 +783,12 @@ revision `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`，捕获/投递计数均为 
 镜像在只读根文件系统、非 root `10001:10001`、独立 tmpfs 数据目录下启动，`/health` 返回 200，
 并报告同一 revision。该证据覆盖镜像入口和启动契约，不代表现有线上 Gateway 已升级。
 
+同一组镜像运行 `scripts/ci/deployment-smoke.js` 也通过：三容器 Compose 的镜像/资源/隔离约束、
+鉴权、Raw/WAL 精确字节与重复投递、实际 Collector/Relay runtime gate、Session/Turn 分页与导出、
+重启后的任务和包哈希恢复，以及重启后要求新的来源证据均通过，临时服务和网络已清理。报告的
+`synthetic=true`、`real_upstream=false`、`real_oss_account=false` 和
+`production_acceptance_claimed=false` 保留了证据边界。
+
 ## 已有优势
 
 - Wire、OTLP logs、OTLP traces 和 Hook 按原生身份精确关联，覆盖请求、工具定义、
