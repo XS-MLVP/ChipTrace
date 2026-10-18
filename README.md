@@ -16,14 +16,14 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新线上只读复核（2026-10-19 07:23，Asia/Shanghai）确认四个服务 `/health` 均返回 HTTP 200，
+最新线上只读复核（2026-10-19 07:52，Asia/Shanghai）确认四个服务 `/health` 均返回 HTTP 200，
 Collector/Relay revision 为 `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，累计 Capture/Delivered
-为 `1,284,184`，队列和失败均为 0 且计数守恒；Gateway outbox 最近失败为 0，历史失败原件与恢复凭据
-仍保留。业务 `/ready` 和 runtime gate 仍失败：Relay 持久质量账本为 `5,944`（182 个身份冲突、
-3,797 个生命周期冲突、1,965 个旧账本未分类），本进程新增 422，Wire 为 0，
-`successful_turn_scoped_captures=0`。最新 WAL 复核确认新增错误是上游重复 `outcome` 属性；实际用户
-Provider 配置绕过了 18084，因此 OTLP/Hook 有流量而 Wire 没有。当前适合内部 Raw/恢复验证，尚未达到
-对外承诺完整 Session/Turn 采集、真实 OSS 和在线导出的生产标准。
+为 `1,286,211`，队列和失败均为 0 且计数守恒；Gateway outbox 最近失败为 0，历史失败原件与恢复凭据
+仍保留。Relay `/ready` 和 runtime gate 仍失败：持久质量账本为 `6,105`（182 个身份冲突、
+3,958 个生命周期冲突、1,965 个旧账本未分类），本进程新增 583，Wire 为 0，
+`successful_turn_scoped_captures=0`。新增错误仍是上游重复 `outcome` 属性；实际 Platform 容器明确
+使用本地 `fs` 后端，维护分支的新后端健康字段和 `oss/s3` 生产门禁尚未部署。当前适合内部 Raw/恢复
+验证，尚未达到对外承诺完整 Session/Turn 采集、真实 OSS 和在线导出的生产标准。
 
 最新线上只读复核（2026-10-19 06:07:26，Asia/Shanghai）确认 18084、3011、3012、18086 的 `/health` 均返回
 HTTP 200，但 Relay `/ready` 返回 HTTP 503；Collector、Relay 和平台实际已运行维护提交
