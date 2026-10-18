@@ -68,7 +68,11 @@ services:
       interval: 20s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      # A recovery/reconciliation path can legitimately read a large NFS WAL
+      # after an unclean stop.  The Relay now skips this scan when its durable
+      # indexes are consistent, while this window keeps a repair start from
+      # being marked unhealthy before it can bind its HTTP listener.
+      start_period: 5m
 
   relay:
     <<: *chiptrace-runtime
@@ -140,7 +144,7 @@ services:
       interval: 20s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 5m
 
 networks:
   data-plane:

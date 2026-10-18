@@ -364,6 +364,116 @@ impl DeliveryLedger {
                 write_ingest_quality_counters(&mut meta, &quality_seed.unwrap_or_default())?;
                 drop(meta);
             }
+
+            // Delivery and index updates are committed in one redb
+            // transaction.  Once the durable counters and index lengths agree,
+            // rebuilding every delivery row on each restart only turns a
+            // bounded recovery check into an O(total-records) NFS scan.  Keep
+            // the old full rebuild as a repair path for old/corrupt ledgers,
+            // and only inspect the small inflight index when a lease needs to
+            // be returned to pending.
+            let fast_startup = {
+                let meta = transaction.open_table(META)?;
+                let counters = meta
+                    .get(DELIVERY_COUNTERS_KEY)?
+                    .map(|value| serde_json::from_slice::<DeliveryCounters>(value.value()))
+                    .transpose()?;
+                drop(meta);
+                let lengths = {
+                    let deliveries = transaction.open_table(DELIVERIES)?;
+                    let pending = transaction.open_table(PENDING_DELIVERIES)?;
+                    let inflight = transaction.open_table(INFLIGHT_DELIVERIES)?;
+                    (deliveries.len()?, pending.len()?, inflight.len()?)
+                };
+                match counters {
+                    None => false,
+                    Some(counters)
+                        if counters.total != lengths.0
+                            || counters.pending != lengths.1
+                            || counters.inflight != lengths.2 =>
+                    {
+                        false
+                    }
+                    Some(counters) if counters.inflight == 0 => true,
+                    Some(counters) => {
+                        // Validate all indexed inflight rows before mutating the
+                        // transaction.  Any stale index falls through to the
+                        // existing full rebuild path without partial changes.
+                        let inflight_rows: Vec<(String, String)> = {
+                            let inflight = transaction.open_table(INFLIGHT_DELIVERIES)?;
+                            inflight
+                                .iter()?
+                                .map(|row| {
+                                    let (key, value) = row?;
+                                    Ok((
+                                        key.value().to_owned(),
+                                        std::str::from_utf8(value.value())?.to_owned(),
+                                    ))
+                                })
+                                .collect::<Result<Vec<_>>>()?
+                        };
+                        let valid = {
+                            let deliveries = transaction.open_table(DELIVERIES)?;
+                            inflight_rows.iter().try_fold(
+                                true,
+                                |valid, (key, capture_id)| -> Result<bool> {
+                                    if !valid {
+                                        return Ok(false);
+                                    }
+                                    let Some(value) = deliveries.get(capture_id.as_str())? else {
+                                        return Ok(false);
+                                    };
+                                    let record: DeliveryRecord =
+                                        serde_json::from_slice(value.value())?;
+                                    Ok(record.state == "inflight"
+                                        && record.capture_id == *capture_id
+                                        && delivery_index_due(key)
+                                            == Some(record.lease_until_unix_ms))
+                                },
+                            )?
+                        };
+                        if !valid {
+                            false
+                        } else {
+                            let mut deliveries = transaction.open_table(DELIVERIES)?;
+                            let mut pending = transaction.open_table(PENDING_DELIVERIES)?;
+                            let mut inflight = transaction.open_table(INFLIGHT_DELIVERIES)?;
+                            let mut meta = transaction.open_table(META)?;
+                            let mut counters = counters;
+                            for (key, capture_id) in inflight_rows {
+                                inflight.remove(key.as_str())?;
+                                let mut record: DeliveryRecord = serde_json::from_slice(
+                                    deliveries
+                                        .get(capture_id.as_str())?
+                                        .context("inflight delivery row disappeared")?
+                                        .value(),
+                                )?;
+                                counters.inflight = counters.inflight.saturating_sub(1);
+                                counters.pending = counters.pending.saturating_add(1);
+                                record.state = "pending".to_owned();
+                                record.next_attempt_unix_ms = 0;
+                                record.lease_until_unix_ms = 0;
+                                record.last_error =
+                                    Some("delivery lease recovered during startup".to_owned());
+                                pending.insert(
+                                    delivery_index_key(0, &record.capture_id).as_str(),
+                                    record.capture_id.as_bytes(),
+                                )?;
+                                deliveries.insert(
+                                    record.capture_id.as_str(),
+                                    serde_json::to_vec(&record)?.as_slice(),
+                                )?;
+                            }
+                            write_delivery_counters(&mut meta, &counters)?;
+                            true
+                        }
+                    }
+                }
+            };
+            if fast_startup {
+                transaction.commit()?;
+                return Ok(Self { database });
+            }
             let mut deliveries = transaction.open_table(DELIVERIES)?;
             let keys: Vec<String> = deliveries
                 .iter()?
@@ -885,12 +995,20 @@ impl DurableRelay {
         let store = ShardedCaptureStore::open(config.store.clone(), config.store_shards).await?;
         let ledger_path = config.delivery_state_root.join("delivery-ledger.redb");
         let ledger = Arc::new(Mutex::new(DeliveryLedger::open(&ledger_path)?));
-        let locators = store.list_captures().await?;
-        for batch in locators.chunks(4096) {
-            ledger
-                .lock()
-                .expect("delivery ledger poisoned")
-                .ensure_many(batch)?;
+        // `ensure_many` is transactional with every new Capture write.  The
+        // monotonic Capture count and delivery-ledger total therefore provide
+        // a safe normal-start check; only a mismatch needs the expensive full
+        // WAL/index reconciliation (for example after an interrupted old
+        // release or a manual repair).
+        let delivery_total = ledger.lock().expect("delivery ledger poisoned").health()?.0;
+        if delivery_total != store.health().captures {
+            let locators = store.list_captures().await?;
+            for batch in locators.chunks(4096) {
+                ledger
+                    .lock()
+                    .expect("delivery ledger poisoned")
+                    .ensure_many(batch)?;
+            }
         }
         let (sender, receiver) = flume::bounded(config.delivery_queue_items);
         let (shutdown, _) = watch::channel(false);
@@ -3692,6 +3810,39 @@ mod tests {
         assert_eq!(ledger.pending_ids(8).unwrap(), vec![locator.capture_id]);
         let (_, pending, inflight, _, _, _, _) = ledger.health().unwrap();
         assert_eq!((pending, inflight), (1, 0));
+    }
+
+    #[test]
+    fn startup_fast_path_recovers_indexed_inflight_without_full_rebuild() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("delivery.redb");
+        let locator = CaptureLocator {
+            capture_id: "cap-startup-recovery".to_owned(),
+            raw_sha256: "1".repeat(64),
+            segment_id: 1,
+            offset: 0,
+            length: 128,
+            received_at: None,
+            model: None,
+        };
+        {
+            let ledger = DeliveryLedger::open(&path).unwrap();
+            ledger.ensure(&locator).unwrap();
+            assert_eq!(
+                ledger
+                    .claim_many(
+                        std::slice::from_ref(&locator.capture_id),
+                        Duration::from_secs(60)
+                    )
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let reopened = DeliveryLedger::open(&path).unwrap();
+        let (_, pending, inflight, _, _, _, _) = reopened.health().unwrap();
+        assert_eq!((pending, inflight), (1, 0));
+        assert_eq!(reopened.pending_ids(8).unwrap(), vec![locator.capture_id]);
     }
 
     #[test]

@@ -31,7 +31,7 @@ export CHIPTRACE_INGEST_TOKEN='<at-least-32-bytes>'
 sudo install -d -o 10001 -g 10001 -m 0700 \
   /srv/chiptrace/capture /srv/chiptrace/collector-state /srv/chiptrace/relay
 node scripts/deploy/preflight.js --file deploy/collector-relay.yml
-docker compose -f deploy/collector-relay.yml up -d --no-build --pull never
+docker compose -f deploy/collector-relay.yml up -d --no-build --pull never --wait --wait-timeout 600
 ```
 
 镜像须固定为本机完整 `sha256:<image-id>` 或仓库 `repository@sha256:<digest>`，不能只用
@@ -47,6 +47,12 @@ docker compose -f deploy/collector-relay.yml up -d --no-build --pull never
 另有 4 GiB 投递预算，解析、队列及索引仍消耗内存。须根据最大正文、并发与任务规模实测
 峰值后配置，监控 OOM 和磁盘余量；不能直接把小样本 CI 的成功当作生产负载验收。
 三个服务均以非 root 用户、只读根运行，仅显式数据挂载和平台 tmpfs 可写。
+
+Relay 启动时会先校验 delivery ledger 的持久计数和 pending/inflight 索引长度；一致时跳过
+全量 WAL 扫描，只有检测到缺失索引、计数不一致或旧版修复状态才回退到全量重建。若有未完成
+lease，只读取 inflight 索引并原子地恢复到 pending。生产 NFS 仍可能因历史损坏需要全量修复，
+因此 Compose 健康检查为 Collector/Relay 预留 5 分钟启动窗口，发布命令的 `--wait-timeout`
+应至少设为 600 秒；健康检查变绿前不得接收生产 Canary。
 
 Collector 与 Relay 的存储拓扑可通过 `CHIPTRACE_STORE_SHARDS` 配置，默认值为 `1`，
 以保持现有单 shard 数据目录兼容。新实例可以在压测后提高该值；当前基准中 4 个 shard
