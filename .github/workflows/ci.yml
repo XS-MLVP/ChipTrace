@@ -753,6 +753,7 @@ jobs:
           path: audit-memory.json
   container:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -902,13 +903,17 @@ jobs:
         with:
           node-version: "22"
           package-manager-cache: false
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: "1.24.2"
+          cache: false
       - name: Check out pinned MinIO source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: minio/minio
           ref: 07c3a429bfed433e49018cb0f78a52145d4bedeb
           path: .ci-minio-source
-      - name: Select and verify the pinned Go toolchain using the runner's Go bootstrap
+      - name: Select and verify the pinned Go toolchain
         working-directory: .ci-minio-source
         run: |
           go version 2>&1 | tee "$RUNNER_TEMP/chiptrace-go-version.log"

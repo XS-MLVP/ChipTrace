@@ -52,5 +52,7 @@ test('CI actions are immutable and the MinIO job verifies its Go toolchain befor
     `all third-party Actions must be pinned by commit: ${actions.filter(action => !/@[a-f0-9]{40}$/.test(action)).join(', ')}`);
   assert.match(workflow, /GOTOOLCHAIN: go1\.24\.2/);
   assert.match(workflow, /test "\$\(go env GOVERSION\)" = "go1\.24\.2"/);
-  assert.match(workflow, /name: Select and verify the pinned Go toolchain using the runner's Go bootstrap/);
+  assert.match(workflow, /actions\/setup-go@44694675825211faa026b3c33043df3e48a5fa00/);
+  assert.match(workflow, /go-version: "1\.24\.2"/);
+  assert.match(workflow, /name: Select and verify the pinned Go toolchain/);
 });
