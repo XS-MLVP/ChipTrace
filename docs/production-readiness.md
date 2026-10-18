@@ -778,6 +778,11 @@ revision `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`，捕获/投递计数均为 
 `477.3 MiB/s` 未压缩输入、`363.9 MiB/s` 压缩输出。以上基准明确排除 Relay、Session 组装、OSS
 上传和对象存储，不能直接换算成生产容量；后续容量门禁应在目标硬件、真实 Relay 和对象存储路径上重测。
 
+当前提交 `5038dd7` 还按 CI 的容器路径完成了本机启动烟测：runtime 镜像构建后在隔离网络中运行
+`self-test`，返回 `ok=true`、`delivery_ready=true`、Buyer 分数 `100` 且所有检查通过；platform
+镜像在只读根文件系统、非 root `10001:10001`、独立 tmpfs 数据目录下启动，`/health` 返回 200，
+并报告同一 revision。该证据覆盖镜像入口和启动契约，不代表现有线上 Gateway 已升级。
+
 ## 已有优势
 
 - Wire、OTLP logs、OTLP traces 和 Hook 按原生身份精确关联，覆盖请求、工具定义、
