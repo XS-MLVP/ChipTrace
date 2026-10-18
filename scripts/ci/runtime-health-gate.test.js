@@ -625,6 +625,38 @@ test('runtime gate CLI preserves a real failure and diagnoses Wire missing from 
   });
 });
 
+test('runtime gate retries only a transient drain before accepting a stable snapshot', async t => {
+  let gatewayAttempts = 0;
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    requests.push(req.url);
+    const value = req.url === '/gateway' ? gateway() : req.url === '/collector' ? collector() : relay();
+    if (req.url === '/gateway') {
+      gatewayAttempts += 1;
+      if (gatewayAttempts === 1) value.fullTraceCapture.rustRelay.inflight = 1;
+    }
+    res.writeHead(200, { 'content-type': 'application/json', connection: 'close' });
+    res.end(JSON.stringify(value));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-runtime-retry-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const report = path.join(root, 'healthy.json');
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const result = JSON.parse((await promisify(execFile)(process.execPath, [require.resolve('./runtime-health-gate'),
+    '--gateway-url', `${url}/gateway`, '--relay-url', `${url}/relay`,
+    '--collector-url', `${url}/collector`, '--expected-revision', 'f'.repeat(40),
+    '--transient-retries', '1', '--transient-retry-delay-ms', '1', '--report', report],
+  { timeout: 10000 })).stdout);
+  assert.equal(result.schema_version, 'chiptrace.runtime-health-gate.v3');
+  assert.equal(gatewayAttempts, 2);
+  assert.deepEqual(requests.sort(), [
+    '/collector', '/collector', '/gateway', '/gateway', '/relay', '/relay',
+  ]);
+  assert.equal(JSON.parse(await fs.readFile(report, 'utf8')).ok, true);
+});
+
 test('runtime gate CLI returns nonzero for an unscoped 403 despite fresh four-source health', async t => {
   const current = relay();
   Object.assign(current.ingest_coverage.wire_turn_coverage, {

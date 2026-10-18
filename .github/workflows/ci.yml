@@ -110,6 +110,8 @@ jobs:
             --max-historical-failed-files 0 \
             --min-gateway-free-bytes 10737418240 \
             --min-gateway-free-files 10000 \
+            --transient-retries 4 \
+            --transient-retry-delay-ms 250 \
             --report "$RUNNER_TEMP/runtime-health.json" \
             | tee "$RUNNER_TEMP/runtime-health.stdout.json"
       - name: Verify live Gateway container isolation and capture contract

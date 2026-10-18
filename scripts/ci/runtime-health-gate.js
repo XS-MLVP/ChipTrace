@@ -3,6 +3,8 @@
 const fs = require('node:fs');
 
 const DEFAULT_TIMEOUT_MS = 5000;
+const DEFAULT_TRANSIENT_RETRIES = 0;
+const DEFAULT_TRANSIENT_RETRY_DELAY_MS = 250;
 const REQUIRED_SOURCES = ['wire', 'otlp_logs', 'otlp_traces', 'hooks'];
 const QUALITY_ENDPOINTS = ['otlp_logs', 'otlp_traces', 'hooks'];
 const QUALITY_REASON_CODES = [
@@ -19,6 +21,13 @@ const QUALITY_REASON_CODES = [
 ];
 const QUALITY_ERRORS_SCOPE = 'durable_relay_state';
 const REVISION_PATTERN = /^[a-f0-9]{40}$/;
+const TRANSIENT_BLOCKING_REASONS = new Set([
+  'gateway_pending_records',
+  'gateway_inflight_records',
+  'relay_pending_records',
+  'relay_inflight_records',
+  'collector_queue_not_empty',
+]);
 
 function fail(message) {
   throw new Error(`runtime health gate: ${message}`);
@@ -247,6 +256,10 @@ function blockingReasons(
   }
   // Keep the report bounded even if a future health payload adds more checks.
   return [...reasons].slice(0, 32);
+}
+
+function onlyTransientBlockingReasons(reasons) {
+  return reasons.length > 0 && reasons.every(reason => TRANSIENT_BLOCKING_REASONS.has(reason));
 }
 
 function healthObservation(
@@ -769,58 +782,76 @@ async function runRemoteHealthGate(
   maxHistoricalFailedFiles,
   minGatewayFreeBytes,
   minGatewayFreeFiles,
+  transientRetries = DEFAULT_TRANSIENT_RETRIES,
+  transientRetryDelayMs = DEFAULT_TRANSIENT_RETRY_DELAY_MS,
 ) {
   if (!gatewayUrl || !relayUrl || !collectorUrl) fail('gateway, relay and collector health URLs are required');
-  let health;
-  try {
-    health = await Promise.all([
-      fetchJson(gatewayUrl, timeoutMs),
-      fetchJson(relayUrl, timeoutMs),
-      fetchJson(collectorUrl, timeoutMs),
-    ]);
-  } catch (error) {
-    writeReport(reportPath, {
-      ok: false,
-      schema_version: 'chiptrace.runtime-health-observation.v1',
-      observed_at: new Date().toISOString(),
-      session_delivery_claimed: false,
-      blocking_reasons: ['health_fetch_failed'],
-      failure_kind: 'fetch_failed',
-    });
-    throw error;
+  if (!Number.isSafeInteger(transientRetries) || transientRetries < 0) {
+    fail('transient retries must be a non-negative integer');
   }
-  const [gateway, relay, collector] = health;
-  let result;
-  try {
-    result = verifyRuntimeHealth(gateway, relay, {
-      expectedRevision,
-      collectorHealth: collector,
-      maxQualityErrors,
-      maxHistoricalFailedFiles,
-      minGatewayFreeBytes,
-      minGatewayFreeFiles,
-    });
-  } catch (error) {
-    const observed = healthObservation(gateway, relay, collector, {
-      expectedRevision,
-      maxQualityErrors,
-      maxHistoricalFailedFiles,
-      minGatewayFreeBytes,
-      minGatewayFreeFiles,
-    });
-    writeReport(reportPath, {
-      ok: false,
-      ...observed,
-      failure_kind: 'validation_failed',
-    });
-    const reasons = observed.blocking_reasons.join(',');
-    if (reasons) {
-      throw new Error(`${error.message}; blocking_reasons=${reasons}`);
+  if (!Number.isSafeInteger(transientRetryDelayMs) || transientRetryDelayMs < 0) {
+    fail('transient retry delay must be a non-negative integer');
+  }
+
+  for (let attempt = 0; ; attempt += 1) {
+    let health;
+    try {
+      health = await Promise.all([
+        fetchJson(gatewayUrl, timeoutMs),
+        fetchJson(relayUrl, timeoutMs),
+        fetchJson(collectorUrl, timeoutMs),
+      ]);
+    } catch (error) {
+      writeReport(reportPath, {
+        ok: false,
+        schema_version: 'chiptrace.runtime-health-observation.v1',
+        observed_at: new Date().toISOString(),
+        session_delivery_claimed: false,
+        blocking_reasons: ['health_fetch_failed'],
+        failure_kind: 'fetch_failed',
+      });
+      throw error;
     }
-    throw error;
+    const [gateway, relay, collector] = health;
+    let result;
+    try {
+      result = verifyRuntimeHealth(gateway, relay, {
+        expectedRevision,
+        collectorHealth: collector,
+        maxQualityErrors,
+        maxHistoricalFailedFiles,
+        minGatewayFreeBytes,
+        minGatewayFreeFiles,
+      });
+    } catch (error) {
+      const observed = healthObservation(gateway, relay, collector, {
+        expectedRevision,
+        maxQualityErrors,
+        maxHistoricalFailedFiles,
+        minGatewayFreeBytes,
+        minGatewayFreeFiles,
+      });
+      const reasons = observed.blocking_reasons;
+      if (attempt < transientRetries && onlyTransientBlockingReasons(reasons)) {
+        if (transientRetryDelayMs > 0) {
+          await new Promise(resolve => setTimeout(resolve, transientRetryDelayMs));
+        }
+        continue;
+      }
+      writeReport(reportPath, {
+        ok: false,
+        ...observed,
+        failure_kind: 'validation_failed',
+      });
+      const reasonText = reasons.join(',');
+      if (reasonText) {
+        throw new Error(`${error.message}; blocking_reasons=${reasonText}`);
+      }
+      throw error;
+    }
+    writeReport(reportPath, { ok: true, ...result });
+    return result;
   }
-  writeReport(reportPath, { ok: true, ...result });
-  return result;
 }
 
 function parseArgs(argv) {
@@ -834,6 +865,8 @@ function parseArgs(argv) {
   let maxHistoricalFailedFiles;
   let minGatewayFreeBytes;
   let minGatewayFreeFiles;
+  let transientRetries = DEFAULT_TRANSIENT_RETRIES;
+  let transientRetryDelayMs = DEFAULT_TRANSIENT_RETRY_DELAY_MS;
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     const value = argv[index + 1];
@@ -855,8 +888,16 @@ function parseArgs(argv) {
       minGatewayFreeFiles = Number(value);
       index += 1;
     }
+    else if (flag === '--transient-retries' && value) {
+      transientRetries = Number(value);
+      index += 1;
+    }
+    else if (flag === '--transient-retry-delay-ms' && value) {
+      transientRetryDelayMs = Number(value);
+      index += 1;
+    }
     else if (flag === '--report' && value) { report = value; index += 1; }
-    else fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--max-quality-errors N] [--max-historical-failed-files N] [--min-gateway-free-bytes N] [--min-gateway-free-files N] [--report PATH]');
+    else fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--max-quality-errors N] [--max-historical-failed-files N] [--min-gateway-free-bytes N] [--min-gateway-free-files N] [--transient-retries N] [--transient-retry-delay-ms N] [--report PATH]');
   }
   if (!gateway || !relay || !collector || !Number.isSafeInteger(timeout) || timeout < 100
     || (maxQualityErrors !== undefined
@@ -864,8 +905,10 @@ function parseArgs(argv) {
     || (minGatewayFreeBytes !== undefined
       && (!Number.isSafeInteger(minGatewayFreeBytes) || minGatewayFreeBytes < 0))
     || (minGatewayFreeFiles !== undefined
-      && (!Number.isSafeInteger(minGatewayFreeFiles) || minGatewayFreeFiles < 0))) {
-    fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--max-quality-errors N] [--max-historical-failed-files N] [--min-gateway-free-bytes N] [--min-gateway-free-files N] [--report PATH]');
+      && (!Number.isSafeInteger(minGatewayFreeFiles) || minGatewayFreeFiles < 0))
+    || !Number.isSafeInteger(transientRetries) || transientRetries < 0
+    || !Number.isSafeInteger(transientRetryDelayMs) || transientRetryDelayMs < 0) {
+    fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--max-quality-errors N] [--max-historical-failed-files N] [--min-gateway-free-bytes N] [--min-gateway-free-files N] [--transient-retries N] [--transient-retry-delay-ms N] [--report PATH]');
   }
   if (maxHistoricalFailedFiles !== undefined
     && (!Number.isSafeInteger(maxHistoricalFailedFiles) || maxHistoricalFailedFiles < 0)) {
@@ -881,6 +924,8 @@ function parseArgs(argv) {
     maxHistoricalFailedFiles,
     minGatewayFreeBytes,
     minGatewayFreeFiles,
+    transientRetries,
+    transientRetryDelayMs,
     report,
   };
 }
@@ -893,7 +938,9 @@ if (require.main === module) {
     args.maxQualityErrors,
     args.maxHistoricalFailedFiles,
     args.minGatewayFreeBytes,
-    args.minGatewayFreeFiles)
+    args.minGatewayFreeFiles,
+    args.transientRetries,
+    args.transientRetryDelayMs)
     .then(result => process.stdout.write(`${JSON.stringify(result, null, 2)}\n`))
     .catch(error => {
       process.stderr.write(`${error.message || String(error)}\n`);
@@ -903,6 +950,8 @@ if (require.main === module) {
 
 module.exports = {
   DEFAULT_TIMEOUT_MS,
+  DEFAULT_TRANSIENT_RETRIES,
+  DEFAULT_TRANSIENT_RETRY_DELAY_MS,
   REQUIRED_SOURCES,
   QUALITY_REASON_CODES,
   verifyGatewayHealth,
@@ -911,5 +960,6 @@ module.exports = {
   verifyRuntimeHealth,
   healthObservation,
   blockingReasons,
+  onlyTransientBlockingReasons,
   runRemoteHealthGate,
 };

@@ -26,6 +26,11 @@ exporter 仍关闭。Platform health gate 以同一 revision 退出 0，但当�
 只存在于前一步，在 `set -u` 下会在路由检查前直接失败。当前工作树的 `make cloud-test` 已真实
 退出 0；该本地结果仍不替代对应提交的远端 Actions 证据。
 
+同轮还为 runtime gate 增加了受限排空重试：受控 live preflight 使用 4 次、每次 250 ms，
+只对 Gateway/Relay 的 pending/inflight 和 Collector 短暂队列进行重采样；质量错误、缺失或过期
+Wire、版本不一致和存储失败不会被重试掩盖。新增回归实际验证了首个快照 inflight 后第二次稳定
+快照可以通过，持续业务质量缺口仍保持真实非零退出。
+
 评估日期：2026-10-19。最新线上只读快照为 06:07:26（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。

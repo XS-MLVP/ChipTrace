@@ -240,6 +240,8 @@ node scripts/ci/runtime-health-gate.js \
   --gateway-url http://127.0.0.1:18084/health \
   --relay-url http://127.0.0.1:3012/health \
   --collector-url http://127.0.0.1:3011/health \
+  --transient-retries 4 \
+  --transient-retry-delay-ms 250 \
   --min-gateway-free-bytes 10737418240 \
   --min-gateway-free-files 10000
 ```
@@ -423,6 +425,8 @@ node scripts/ci/runtime-health-gate.js \
   --expected-revision <git-revision> \
   --max-quality-errors 0 \
   --max-historical-failed-files 0 \
+  --transient-retries 4 \
+  --transient-retry-delay-ms 250 \
   --report /var/tmp/chiptrace-runtime-health.json
 ```
 
@@ -432,6 +436,11 @@ node scripts/ci/runtime-health-gate.js \
 `--expected-revision` 时两者均须匹配待发布版本。Collector 持久 Capture 总数不得低于
 Relay delivered；额外的私有评估或其他 Relay 数据不要求计数相等。计数下界不证明 Raw
 逐对象完整性，仍须对目标 Session 独立验收。预检的 OCI label 不能替代运行版本探测。
+
+持续流量可能使一次健康采样短暂看到 Gateway/Relay 的 `pending` 或 `inflight`，或者
+Collector 仍有少量队列。受控发布预检可以用 `--transient-retries` 和
+`--transient-retry-delay-ms` 做有限排空重试；只有这些固定的短暂原因会重试，质量错误、
+缺失或过期 Wire、版本不一致和存储失败仍立即失败。重试耗尽后报告保留最后一次真实快照。
 
 门禁继续要求网关 `openCaptureHealthy`、Relay `freshness_applicable`、四路来源新鲜、
 队列排空和 attempt 守恒。保留 v2 的 `wire_turn_coverage` 要求：明确原生 Session/Turn、无

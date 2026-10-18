@@ -52,6 +52,8 @@ test('live provider preflight requires protected endpoints and runs both gates',
   assert.match(workflow, /--max-historical-failed-files 0/);
   assert.match(workflow, /--min-gateway-free-bytes 10737418240/);
   assert.match(workflow, /--min-gateway-free-files 10000/);
+  assert.match(workflow, /--transient-retries 4/);
+  assert.match(workflow, /--transient-retry-delay-ms 250/);
   assert.match(workflow, /node scripts\/deploy\/gateway-preflight\.js/);
   assert.match(workflow, /--container "\$CHIPTRACE_GATEWAY_CONTAINER"/);
   assert.match(workflow, /--expected-gateway-revision "\$CHIPTRACE_GATEWAY_EXPECTED_REVISION"/);
