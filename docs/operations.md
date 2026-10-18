@@ -261,8 +261,10 @@ node scripts/ci/runtime-health-gate.js \
 也不能替代四源 Turn、Producer、OSS 或 Buyer 验收；生产者缺陷修复后应重新人工审计并创建新基线。
 
 Live preflight 同时调用 `scripts/ci/platform-health-gate.js` 检查 18086 的平台版本、运行
-revision、持久任务计数和存储失败状态。平台健康只证明导出服务进程可用；它不替代目标 Session 的
-`cloud-acceptance`、真实 OSS 上传/下载和 SHA-256 复验。
+revision、实际存储后端、持久任务计数和存储失败状态。受保护环境必须设置
+`CHIPTRACE_PLATFORM_BACKEND=oss`（或明确批准的 `s3`）；门禁会拒绝服务实际使用 `fs` 的情况。
+平台健康只证明导出服务进程和后端配置可用；它不替代目标 Session 的 `cloud-acceptance`、真实
+OSS 上传/下载和 SHA-256 复验。
 
 受保护的 runtime gate 还要求 Gateway outbox 报告至少 `10 GiB` 可用磁盘和 `10,000` 个可用 inode：
 

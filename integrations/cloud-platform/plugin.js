@@ -1105,6 +1105,10 @@ class ChipTracePlugin {
   }
 
   health() { return { ok: this.started && !this.closing && !this.failure, version: 'chiptrace.platform.v1',
+    // Keep endpoint, bucket, prefix and credentials private while exposing
+    // the selected backend to deployment gates. This prevents a local FS
+    // scratch deployment from being mistaken for an OSS/S3 production one.
+    backend: this.backend,
     build: { revision: process.env.CHIPTRACE_BUILD_REVISION || null },
     queued: this.queue.length, running: this.running.size, active_reads: this.activeReads,
     jobs: this.jobs.size, failure: this.failure || null }; }
