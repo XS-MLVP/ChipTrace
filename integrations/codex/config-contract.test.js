@@ -167,7 +167,7 @@ test('production deployment templates require an immutable image revision', () =
 
 test('standalone platform server refuses an implicit or invalid storage backend', async () => {
   for (const backend of [undefined, 'local']) {
-    const env = { ...process.env };
+    const env = { ...process.env, CHIPTRACE_BUILD_REVISION: 'f'.repeat(40) };
     if (backend === undefined) delete env.CHIPTRACE_BACKEND;
     else env.CHIPTRACE_BACKEND = backend;
     const child = spawn(process.execPath, [platformServerPath], {

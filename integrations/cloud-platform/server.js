@@ -5,6 +5,15 @@ const crypto = require('node:crypto');
 const { pipeline } = require('node:stream/promises');
 const { ChipTracePlugin, PlatformError, decodeUtf8 } = require('./plugin');
 
+const BUILD_REVISION_PATTERN = /^[a-f0-9]{40}$/;
+
+function validateBuildRevision(value) {
+  if (typeof value !== 'string' || !BUILD_REVISION_PATTERN.test(value)) {
+    throw new Error('CHIPTRACE_BUILD_REVISION must be a full 40-character Git SHA');
+  }
+  return value;
+}
+
 function json(res, status, value) {
   const body = Buffer.from(JSON.stringify(value));
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': body.length });
@@ -128,7 +137,10 @@ async function createPlatformServer(options) {
 
 if (require.main === module) {
   const backend = process.env.CHIPTRACE_BACKEND;
-  if (!['fs', 'oss', 's3'].includes(backend)) {
+  if (!BUILD_REVISION_PATTERN.test(process.env.CHIPTRACE_BUILD_REVISION || '')) {
+    process.stderr.write('CHIPTRACE_BUILD_REVISION must be a full 40-character Git SHA\n');
+    process.exitCode = 1;
+  } else if (!['fs', 'oss', 's3'].includes(backend)) {
     process.stderr.write('CHIPTRACE_BACKEND must be explicitly set to fs, oss, or s3\n');
     process.exitCode = 1;
   } else {
@@ -160,4 +172,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { createPlatformHandler, createPlatformServer };
+module.exports = { BUILD_REVISION_PATTERN, createPlatformHandler, createPlatformServer, validateBuildRevision };

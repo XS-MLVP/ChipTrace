@@ -912,7 +912,7 @@ jobs:
             --cap-drop ALL --security-opt no-new-privileges \
             --tmpfs /tmp:size=1g,mode=1777 \
             -v "$PWD/integrations/cloud-platform:/tests:ro" \
-            chiptrace-platform:ci --test /tests/platform.test.js /tests/storage-oss.test.js \
+            chiptrace-platform:ci --test /tests/platform.test.js /tests/server.test.js /tests/storage-oss.test.js \
             2>&1 | tee container-platform.tap
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()

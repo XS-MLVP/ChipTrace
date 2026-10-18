@@ -76,17 +76,18 @@ function observedMissingSources(coverage) {
   return [...new Set([...listed, ...derived])];
 }
 
-function routeObservation(route) {
+function routeObservation(route, qualityErrors) {
   if (!route || typeof route !== 'object' || Array.isArray(route)) return null;
+  const quality = qualityErrorObservation(qualityErrors) || qualityErrorObservation(route.quality);
   return {
     requests: safeInteger(route.requests),
     source_records: safeInteger(route.source_records),
     durable_captures: safeInteger(route.durable_captures),
     duplicates: safeInteger(route.duplicates),
     quality: {
-      unknown_events: safeInteger(route.quality?.unknown_events),
-      conversion_errors: safeInteger(route.quality?.conversion_errors),
-      total: safeInteger(route.quality?.total),
+      unknown_events: quality?.unknown_events ?? null,
+      conversion_errors: quality?.conversion_errors ?? null,
+      total: quality?.total ?? null,
     },
     last_at: safeTimestamp(route.last_at),
   };
@@ -311,9 +312,15 @@ function healthObservation(
           hooks: safeInteger(coverage?.source_lag_ms?.hooks),
         },
         wire: routeObservation(coverage?.wire),
-        otlp_logs: routeObservation(coverage?.otlp_logs),
-        otlp_traces: routeObservation(coverage?.otlp_traces),
-        hooks: routeObservation(coverage?.hooks),
+        otlp_logs: routeObservation(
+          coverage?.otlp_logs,
+          coverage?.quality_errors_by_endpoint?.otlp_logs,
+        ),
+        otlp_traces: routeObservation(
+          coverage?.otlp_traces,
+          coverage?.quality_errors_by_endpoint?.otlp_traces,
+        ),
+        hooks: routeObservation(coverage?.hooks, coverage?.quality_errors_by_endpoint?.hooks),
         quality_errors: safeInteger(coverage?.quality_errors),
         quality_errors_current_process: safeInteger(coverage?.quality_errors_current_process),
         quality_errors_scope: typeof coverage?.quality_errors_scope === 'string'

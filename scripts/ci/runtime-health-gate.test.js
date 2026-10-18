@@ -422,6 +422,23 @@ test('runtime observations preserve endpoint quality-error breakdowns', () => {
   assert.deepEqual(observed.relay.coverage.quality_errors_by_endpoint, value.ingest_coverage.quality_errors_by_endpoint);
 });
 
+test('runtime observations expose endpoint quality counters on their source routes', () => {
+  const value = relay();
+  value.ingest_coverage.quality_errors = 2;
+  value.ingest_coverage.quality_errors_by_endpoint.otlp_traces = {
+    unknown_events: 0,
+    conversion_errors: 2,
+    total: 2,
+    reasons: { conversion_error: 2 },
+  };
+  const observed = healthObservation(gateway(), value, collector());
+  assert.deepEqual(observed.relay.coverage.otlp_traces.quality, {
+    unknown_events: 0,
+    conversion_errors: 2,
+    total: 2,
+  });
+});
+
 test('runtime gate reconciles endpoint quality errors with the process total', () => {
   const value = relay();
   value.ingest_coverage.quality_errors = 3;

@@ -10,6 +10,8 @@
 部署预检和平台健康门禁都会拒绝缺失或不匹配的 revision，避免平台进程虽然返回
 `200` 却导出另一份源码的结果。运行时升级必须先构建并核对该 SHA 的镜像摘要，再
 执行健康、归档/恢复、分页和重启验收。
+独立 Platform 入口也在绑定端口前拒绝缺失、短或非十六进制 40 位的
+`CHIPTRACE_BUILD_REVISION`；不能通过只返回健康响应的旧进程绕过版本门禁。
 
 已发现并修复的具体故障是 OpenDAL 0.58 在显式 `rustls-no-provider` feature 下未注册
 HTTP transport：原先 FS 自测可通过，而 OSS/S3 在发送前返回 ConfigInvalid。网络存储

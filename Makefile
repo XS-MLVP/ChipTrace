@@ -90,7 +90,7 @@ turn-memory-test:
 
 platform-test:
 	cargo build --locked --bin chiptrace
-	node --test integrations/cloud-platform/platform.test.js integrations/cloud-platform/storage-oss.test.js
+	node --test integrations/cloud-platform/platform.test.js integrations/cloud-platform/server.test.js integrations/cloud-platform/storage-oss.test.js
 
 deployment-config-test:
 	node --test scripts/deploy/preflight.test.js
