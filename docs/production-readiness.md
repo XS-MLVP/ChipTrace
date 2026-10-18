@@ -740,6 +740,11 @@ HTTP 200，但 Relay/Collector 仍为旧 revision `e5237065ff3a48623179c5846ff19
 `build.revision`。因此本提交尚未在线生效，服务仍未达到真实生产发布标准。远端 Actions API
 本次连接超时、CLI 未认证，不能把本地绿色结果当作同 SHA 的远端 CI 结论。
 
+随后提交 `73f75b9c6d4d615c524970560310f5a58b9746a7` 将实际 Codex 路由检查加入受保护的
+`live-provider-runtime-preflight`：作业现在必须读取指定 Canary 配置文件，并在 Provider 探针前
+确认 Responses、OTLP logs 和 OTLP traces 同时指向受管 Gateway；路由诊断不输出配置正文或凭据。
+相关契约测试通过并已推送，但尚未替代管理员对现有用户级配置的切换，也没有改变当前线上 Wire 缺失的事实。
+
 ## 已有优势
 
 - Wire、OTLP logs、OTLP traces 和 Hook 按原生身份精确关联，覆盖请求、工具定义、
