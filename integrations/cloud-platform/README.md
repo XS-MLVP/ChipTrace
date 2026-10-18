@@ -214,14 +214,17 @@ keys. It then hashes the requested regular file and streams from that same
 open handle. Original Manifest bytes and part hashes remain unchanged.
 Each download uses a CLI process under the existing timeout/output limits and
 holds a read slot until its stream closes. Plugin and CLI builds must match.
-Turn pages still hash and count the whole
-sidecar, including records outside the requested page. These paths need
+Turn pages still validate and count the whole
+sidecar, including records outside the requested page. The page path reuses
+the Rust-produced digest and the descriptor opened before validation, so it
+does not perform a second Node full-file digest; the object API and full-file
+download retain their complete Node-side checksum pass. These paths need
 separate scale measurements and a persistent index before capacity claims.
 One selected Turn can itself contain a large set of Raw references; a page's
 Turn count does not impose a byte limit on its streamed response. HTTP pages
-perform a full Rust validation pass and a full Node digest pass before sending
-bytes; they do not use a persistent index or reduce total file I/O. Both page
-and full-file streams consume a read slot until their file handle closes,
+perform one full Rust validation pass before sending bytes and reuse its
+verified descriptor; they do not use a persistent index, so each page remains
+O(file size). Both page and full-file streams consume a read slot until their file handle closes,
 including cancellation before the first byte. Page JSON framing is generated
 by the server; selected row bytes, including any legal whitespace, come from
 the verified sidecar. No Raw reference is truncated or dropped.

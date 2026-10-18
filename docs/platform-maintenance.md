@@ -124,9 +124,9 @@ HTTP 2xx 不证明协议终态，门禁始终输出 `session_delivery_claimed=fa
 
 后续优先迭代：基于 Session/Turn 索引减少两遍全量扫描；按项目设置磁盘配额和确认后的保留周期；
 在主平台完成多租户授权、计费与审计；扩大到真实并发与较大 Archive 的压力测试。
-HTTP Turn 分页现先流式验证全部 JSONL/UTF-8，再复核下载句柄的全文件哈希，保持原
-JSON 格式并分段返回完整选中记录。`streamTurns` 返回 Response；`getTurns` 对象 API
-仍由调用者容纳选中数据。每页仍扫描整份 sidecar，尚无持久索引；任务历史有上限，
+HTTP Turn 分页现由 Rust 先校验全部 JSONL/UTF-8，并复用校验前打开的安全文件描述符返回
+完整选中记录，不再做第二次 Node 全文件摘要；`getTurns` 对象 API 和全文件下载仍保留
+完整摘要校验，并由调用者容纳选中数据。每页仍扫描整份 sidecar，尚无持久索引；任务历史有上限，
 导出目录独立保留 Raw，因此上线前仍需安排磁盘容量和保留策略。
 
 2026-10-15 的接入复查发现系统配置和用户配置的同名 Provider 指向不同入口。现有 required
