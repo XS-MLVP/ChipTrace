@@ -25,7 +25,7 @@ Relay 的 `ingest_coverage` 为 `degraded`：持久 `quality_errors=1337` 且全
 `required_sources_fresh=false`、`turn_capture_ready=false`，279/293 条历史 Wire 有 Turn 身份。
 带质量、新鲜度和 revision 门禁的 runtime gate 在 2026-10-18 17:05 真实退出 1。
 18086 平台 `/health` 返回 200，但响应没有 `build.revision`；以当前服务 revision 检查时平台
-health gate 真实退出 1。维护分支修复已推送为 `b3696d2f0c0994ed887e89a0a59694e3b251e3f3`，尚未部署。
+health gate 真实退出 1。维护分支修复已推送为 `f3b5459531683e72046f5f4a07965ceaf0059af8`，尚未部署。
 因此当前不能对外承诺真实 Session/Turn 全量采集或生产导出。详见[生产就绪评估](docs/production-readiness.md)。
 
 ## 主线

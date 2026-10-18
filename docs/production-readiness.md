@@ -718,7 +718,7 @@ bind source。两次提交均已推送到 `fix/oss-disk-session-platform`，工�
 
 ## 2026-10-18 质量标签与 CI 启动修复
 
-提交 `b3696d2f0c0994ed887e89a0a59694e3b251e3f3` 已推送到
+提交 `f3b5459531683e72046f5f4a07965ceaf0059af8` 已推送到
 `fix/oss-disk-session-platform`，工作区保持干净。它为 OTLP/Hook 质量错误增加固定、脱敏的
 原因码（`unsupported_event`、`invalid_structure`、`invalid_attributes`、`identity_conflict`、
 `missing_identity`、`invalid_tool`、`invalid_lifecycle`、`invalid_timestamp`、`conversion_error`），
@@ -726,7 +726,10 @@ bind source。两次提交均已推送到 `fix/oss-disk-session-platform`，工�
 `legacy_unclassified`。原始 telemetry 重验会重新计算原因码，原因总数必须与端点和全局质量错误
 守恒，运行门禁会拒绝缺失、未知或不一致的原因分解。GitHub Actions 的普通手工启动不再要求
 生产 `expected_revision`；启用受保护 live preflight 时仍强制完整 SHA。该提交的本地
-`make cloud-test` 真实退出 0，Rust 格式、检查和 Clippy 也通过。
+`make cloud-test` 真实退出 0，Rust 格式、检查和 Clippy 也通过。随后对线上 sealed Raw 的有界抽样
+确认样本中的 traces 质量错误全部来自重复 `code.file.path` / `code.line.number` 源码定位元数据；维护提交
+`f3b5459531683e72046f5f4a07965ceaf0059af8` 仅放行这类不参与身份解释的 trace 属性，身份、工具和未知
+字段仍 fail-closed，并增加 Rust 回归覆盖。
 
 同日 17:48（Asia/Shanghai）对热服务的只读门禁仍真实退出 1：18084、3011、3012、18086 均返回
 HTTP 200，但 Relay/Collector 仍为旧 revision `e5237065ff3a48623179c5846ff1916040030c9a`，
