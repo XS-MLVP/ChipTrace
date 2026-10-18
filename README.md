@@ -16,15 +16,15 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新线上复核（2026-10-18 20:14，Asia/Shanghai）确认 Collector、Relay 和平台已升级到维护
+最新线上复核（2026-10-18 20:32，Asia/Shanghai）确认 Collector、Relay 和平台已升级到运行
 提交 `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`；三个容器使用对应 OCI digest、非 root、只读根、
-资源限额和持久挂载，18084、3011、3012、18086 均返回 HTTP 200。Collector 捕获 `1,229,615` 条，
-Relay 投递 `1,229,615` 条，`pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`；
+资源限额和持久挂载，18084、3011、3012、18086 均返回 HTTP 200。Collector 捕获 `1,231,652` 条，
+Relay 投递 `1,231,652` 条，`pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`；
 Gateway outbox 当前 pending/processing/recent failure 均为 0，293 个历史失败原件和 recovery receipt
 仍保留。Relay 重启实际走持久索引快路径并在健康等待内恢复。
 
-业务门禁仍未通过：该快照的 Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2283`，其中
-`otlp_traces.identity_conflict=182`、`invalid_lifecycle=136`、旧账本无法回溯的
+业务门禁仍未通过：该快照的 Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2416`，其中
+`otlp_traces.identity_conflict=182`、`invalid_lifecycle=269`、旧账本无法回溯的
 `legacy_unclassified=1965`；当前进程错误持续来自上游同一 Span 重复且矛盾的 `outcome` 标签，已正确
 单独标为 `invalid_lifecycle`，Raw 仍保留。Wire 仍未观察到，`missing_sources=["wire"]`、
 `turn_capture_ready=false`，带质量、新鲜度和 revision 门禁的 runtime gate 真实退出 1。18086 的
