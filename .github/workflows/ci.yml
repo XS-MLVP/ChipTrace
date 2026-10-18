@@ -596,6 +596,13 @@ jobs:
         with:
           name: native-hook-ack-report
           path: native-hook-ack.tap
+      - name: Verify managed Codex route cannot bypass the 18084 capture Gateway
+        run: node --test scripts/deploy/codex-route-preflight.test.js | tee codex-route-preflight.tap
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: codex-route-preflight-report
+          path: codex-route-preflight.tap
       - name: Verify producer lock, regressions and actual Cargo cache invalidation
         run: |
           node --test scripts/ci/upstream-context.test.js scripts/ci/producer-source-cache.test.js \

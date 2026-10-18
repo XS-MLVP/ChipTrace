@@ -79,6 +79,18 @@ Hook 的全局计数正常而进入交付。每次 CI 都重新计算七个补�
 CHIPTRACE_STOCK_CODEX_MODULES=/path/to/pinned-install/node_modules make managed-route-test
 ```
 
+部署前还应检查实际下发的 `config.toml`：Responses、OTLP logs 和 OTLP traces 必须同时指向
+同一个 `18084` Gateway。该检查只读取路由字段，不读取或输出凭据，也不会调用模型：
+
+```bash
+node scripts/deploy/codex-route-preflight.js \
+  --config /etc/codex/config.toml \
+  --expected-base-url http://172.28.11.121:18084/
+```
+
+用户级配置仍可能覆盖系统默认 Provider；如果检查发现外部入口，不能把 Collector/Relay 的健康
+解释为 Wire 已采集，必须先修正受管配置并重新执行真实 Session/Turn Canary。
+
 它先验证旧的 Hook-only requirements 会让用户 Provider 绕过系统默认路由，再通过实际
 `config/read` 和 `configRequirements/read` 验证新模板能抵御用户选择、同名 Provider 定义和
 命令行覆盖，并移除用户注入的鉴权/HTTP header 设置。GitHub CI 单独安装固定版本客户端，
