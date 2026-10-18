@@ -772,6 +772,12 @@ revision `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`，捕获/投递计数均为 
 标签质量、平台 FS/OSS 适配、大对象内存和部署配置回归。该结果证明代码和离线契约稳定，不能替代
 受管 Provider 路由、未修改 Stock Codex 多轮 Canary、真实 OSS 账号和远端 Actions 结果。
 
+同日 release 构建的本地性能基线为：Collector WAL 在 `fsync=true`、64 KiB 记录下约
+`3,629 records/s`（`226.8 MiB/s`）；loopback HTTP 批量入口（并发 16、每批 64 条）约
+`3,690 records/s`（`230.6 MiB/s`），批延迟 p95 `297.8 ms`；四路 zstd level 1 输出约
+`477.3 MiB/s` 未压缩输入、`363.9 MiB/s` 压缩输出。以上基准明确排除 Relay、Session 组装、OSS
+上传和对象存储，不能直接换算成生产容量；后续容量门禁应在目标硬件、真实 Relay 和对象存储路径上重测。
+
 ## 已有优势
 
 - Wire、OTLP logs、OTLP traces 和 Hook 按原生身份精确关联，覆盖请求、工具定义、
