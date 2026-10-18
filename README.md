@@ -29,7 +29,8 @@ Gateway outbox 当前 pending/processing/recent failure 均为 0，293 个历史
 单独标为 `invalid_lifecycle`，Raw 仍保留。Wire 仍未观察到，`missing_sources=["wire"]`、
 `turn_capture_ready=false`，带质量、新鲜度和 revision 门禁的 runtime gate 真实退出 1。18086 的
 platform health gate 以该 revision 真实通过，但平台后端仍是本地 FS；Gateway 仍使用外部旧 OCI revision，
-真实 Alibaba OSS 提交/恢复/远端对象哈希及未修改 Stock Codex 多轮 Canary 尚未完成。因此可用于内部
+当前 relay-shell 进程的 `fullTraceCapture.stats.acceptedCount=0`，本机用户级 Codex 配置仍指向外部
+Provider，尚未经过 18084；真实 Alibaba OSS 提交/恢复/远端对象哈希及未修改 Stock Codex 多轮 Canary 尚未完成。因此可用于内部
 传输与恢复验证，不能对外承诺完整 Session/Turn 采集或生产 OSS 导出。详见[生产就绪评估](docs/production-readiness.md)。
 
 ## 主线

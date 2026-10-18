@@ -15,9 +15,10 @@ runtime gate 以质量、新鲜度、历史失败、原因分解和 revision 门
 18086 的 platform health gate 以 `7f5abad42fff171fd80f024bb0f03c2ae6de52b6` 真实通过，平台后端仍为
 `fs`。Gateway `router-v2-relay-shell` 的隔离预检不带预期 revision 时通过，但其 OCI revision 仍为
 外部镜像的 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`；带维护 SHA 的 Gateway preflight 真实退出 1，
-因此入口镜像尚未与维护提交对齐。真实 Alibaba OSS 提交、恢复、远端对象哈希、未修改 Stock Codex
+因此入口镜像尚未与维护提交对齐。当前 relay-shell 的 `fullTraceCapture.stats.acceptedCount=0`，本机用户级
+Codex 配置仍指向外部 Provider，尚未经过 18084。真实 Alibaba OSS 提交、恢复、远端对象哈希、未修改 Stock Codex
 新鲜多轮 Canary 和目标租户导出仍未完成。GitHub API/CLI 当前无法核验远端 Actions 结论；当前维护分支
-HEAD 为 `e654944590797534701e4d0a9c0b32e43a05562f`，仅 `git ls-remote` 证明远端 ref 已更新。
+维护分支已推送，当前仅以 `git ls-remote` 证明远端 ref 已更新。
 
 当前复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
 failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留，Collector/Relay 队列为空且
