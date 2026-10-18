@@ -749,6 +749,9 @@ HTTP 200，但 Relay/Collector 仍为旧 revision `e5237065ff3a48623179c5846ff19
 `blocking_reasons` 追加到标准错误；当前线上复核因此可以一次看到质量、来源新鲜度和 Turn 证据的全部阻断项，
 而不是只看到第一个失败检查。24 个 Runtime gate 回归通过；真实线上 gate 仍按预期非零退出并输出完整诊断。
 
+提交 `ba0600a` 修正 hosted Runner 的原生沙箱启动流程：内核 sysctl 写入失败只产生明确警告，
+真正的 user namespace 探针仍是硬门禁，避免平台权限差异把 CI 误报为启动失败，也不会把不可用沙箱放行。
+
 ## 已有优势
 
 - Wire、OTLP logs、OTLP traces 和 Hook 按原生身份精确关联，覆盖请求、工具定义、
