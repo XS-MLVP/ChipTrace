@@ -197,10 +197,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends bubblewrap
           if test -f /proc/sys/kernel/unprivileged_userns_clone; then
-            sudo sysctl -w kernel.unprivileged_userns_clone=1
+            sudo sysctl -w kernel.unprivileged_userns_clone=1 \
+              || echo '::warning title=Native sandbox sysctl::Could not enable kernel.unprivileged_userns_clone; continuing to the real namespace probe.'
           fi
           if test -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 \
+              || echo '::warning title=Native sandbox sysctl::Could not disable AppArmor unprivileged-userns restriction; continuing to the real namespace probe.'
           fi
           bash scripts/ci/check-native-sandbox.sh
       - name: Build the current Collector and Relay
@@ -267,12 +269,17 @@ jobs:
           set -euo pipefail
           # Match the pinned producer's .github/actions/setup-ci/action.yml.
           if test -f /proc/sys/kernel/unprivileged_userns_clone; then
-            sudo sysctl -w kernel.unprivileged_userns_clone=1
+            sudo sysctl -w kernel.unprivileged_userns_clone=1 \
+              || echo '::warning title=Native sandbox sysctl::Could not enable kernel.unprivileged_userns_clone; continuing to the real namespace probe.'
           fi
           if test -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 \
+              || echo '::warning title=Native sandbox sysctl::Could not disable AppArmor unprivileged-userns restriction; continuing to the real namespace probe.'
           fi
-          unshare --user --map-root-user true
+          if ! unshare --user --map-root-user /bin/true; then
+            echo 'native producer sandbox namespace is unavailable on this runner' >&2
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action revision
         with:
           toolchain: "1.95.0"

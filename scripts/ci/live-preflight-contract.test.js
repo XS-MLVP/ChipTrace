@@ -62,3 +62,10 @@ test('CI actions are immutable and the MinIO job verifies its Go toolchain befor
   assert.match(workflow, /go-version: "1\.24\.2"/);
   assert.match(workflow, /name: Select and verify the pinned Go toolchain/);
 });
+
+test('hosted sandbox startup tolerates optional sysctl writes but requires a real namespace probe', () => {
+  assert.match(workflow, /Could not enable kernel\.unprivileged_userns_clone; continuing to the real namespace probe/);
+  assert.match(workflow, /Could not disable AppArmor unprivileged-userns restriction; continuing to the real namespace probe/);
+  assert.match(workflow, /if ! unshare --user --map-root-user \/bin\/true; then/);
+  assert.match(workflow, /native producer sandbox namespace is unavailable on this runner/);
+});
