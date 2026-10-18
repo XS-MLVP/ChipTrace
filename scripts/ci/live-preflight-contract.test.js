@@ -54,8 +54,10 @@ test('live provider preflight requires protected endpoints and runs both gates',
 });
 
 test('CI actions are immutable and the MinIO job verifies its Go toolchain before compiling', () => {
-  const actions = [...workflow.matchAll(/^\s*- uses:\s+([^\s#]+)/gm)].map(match => match[1]);
-  assert.ok(actions.length > 0);
+  // Match both the compact `- uses:` form and a named step's indented
+  // `uses:` field. The latter is easy to miss when checking only list items.
+  const actions = [...workflow.matchAll(/^\s*(?:-\s+)?uses:\s+([^\s#]+)/gm)].map(match => match[1]);
+  assert.ok(actions.length >= 10);
   assert.ok(actions.every(action => /@[a-f0-9]{40}$/.test(action)),
     `all third-party Actions must be pinned by commit: ${actions.filter(action => !/@[a-f0-9]{40}$/.test(action)).join(', ')}`);
   assert.match(workflow, /GOTOOLCHAIN: go1\.24\.2/);
