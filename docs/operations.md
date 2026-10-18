@@ -90,6 +90,10 @@ Turn Wire，并在 503 响应中返回固定 `blocking_reasons`。`/ready=200`
 输出 `delivery_attempts`、`delivery_retries` 和 `delivery_retry_rate`；需要把可恢复背压纳入
 门禁时可传 `--max-delivery-retries N`，超过上限会返回非零，未传时只报告不阻断。
 
+Collector 和 Relay 的 HTTP TraceLayer 将 429/503 作为可恢复背压以 `DEBUG` 记录，并附带
+`backpressure=true`；真正的 5xx 和传输错误仍为 `ERROR`。因此生产日志不会因正常排空产生
+错误洪泛，但监控仍应以 `delivery_retries`、`pending`、`failed` 和 `conservation_ok` 判定交付状态。
+
 18084 网关也必须通过容器级隔离预检。它拥有原始 Wire 的 durable outbox，不能继续使用
 可变镜像 tag、可写根文件系统或无资源上限的容器：
 

@@ -2117,7 +2117,7 @@ pub async fn serve_relay(
             Duration::from_secs(120),
         ))
         .layer(CatchPanicLayer::new())
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().on_failure(crate::http_trace::on_failure))
         .with_state(RelayAppState {
             max_batch_records: relay.inner.config.max_batch_records,
             relay: relay.clone(),

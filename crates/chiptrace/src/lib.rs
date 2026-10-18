@@ -6,6 +6,7 @@ pub mod cloud_acceptance;
 pub mod cloud_ingest;
 pub mod collector;
 pub mod enrich;
+mod http_trace;
 pub mod ingest;
 pub mod jsonl;
 mod lifecycle;
