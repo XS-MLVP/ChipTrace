@@ -1,8 +1,18 @@
 # 生产就绪评估
 
-评估日期：2026-10-17。最新线上只读快照为 04:58（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-18。最新线上只读快照为 17:05（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
+
+最新快照中 Gateway/Collector/Relay 的传输计数仍守恒：Gateway、Relay 和 Collector 的已投递/捕获均为
+`1,215,204`，队列和失败均为 0，Collector ready。业务覆盖仍拒绝：Relay 持久
+`quality_errors=1337`，全部是 `otlp_traces` conversion errors；成功且有 Turn 身份的 Wire 为
+`279/293`，最后一条距观测约 37.7 小时，`status=degraded`、`required_sources_fresh=false`、
+`turn_capture_ready=false`。runtime gate 以质量错误、新鲜度、历史失败和 revision 为门禁时真实退出 1。
+平台 18086 返回 HTTP 200，但没有 `build.revision`；以当前部署 revision 检查 platform health gate 也真实退出 1。
+线上平台容器尚未注入本分支新增的 `CHIPTRACE_BUILD_REVISION`，Collector/Relay 仍运行旧的
+`e5237065ff3a48623179c5846ff1916040030c9a`。维护分支修复已推送为
+`ef040c1562880641d47705999fd7426bcf58bb52`，GitHub Actions 结果因当前 CLI 未认证且网络超时尚未核验。
 
 本次复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
 failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留，Collector/Relay 队列为空且
