@@ -18,12 +18,12 @@ runtime gate 以质量、新鲜度、历史失败、原因分解和 revision 门
 新鲜多轮 Canary 和目标租户导出仍未完成。GitHub API/CLI 当前无法核验远端 Actions 结论；本轮已将
 维护分支推到 `6678963523ebc97315dbd898342d225d70e2a4f6`，仅 `git ls-remote` 证明远端 ref 已更新。
 
-本次复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
+当前复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
 failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留，Collector/Relay 队列为空且
-`conservation_ok=true`。Collector/Relay 实际 revision 为 `e5237065ff3a48623179c5846ff1916040030c9a`；
-维护分支已加入 Gateway/Platform revision 对齐护栏，但线上未运行这些最新修复。
+`conservation_ok=true`。Collector/Relay 实际 revision 为 `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`；
+平台与它们的 OCI/Compose revision 已对齐，Gateway 入口仍需单独升级到同一维护 revision。
 
-同一快照的 Relay `ingest_coverage.status=degraded`，`quality_errors=848`（全部来自 `otlp_traces`），
+较早快照的 Relay `ingest_coverage.status=degraded`，`quality_errors=848`（全部来自 `otlp_traces`），
 Wire 已约 96 分钟未刷新，`required_sources_fresh=false`、`turn_capture_ready=false`，
 `successful_turn_scoped_captures=279/293`。runtime gate 使用质量错误、新鲜度、历史失败和 revision
 门禁真实退出 1；不能将传输进程健康解释为逐 Session/Turn 交付。
