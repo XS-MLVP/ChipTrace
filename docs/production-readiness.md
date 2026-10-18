@@ -745,6 +745,10 @@ HTTP 200，但 Relay/Collector 仍为旧 revision `e5237065ff3a48623179c5846ff19
 确认 Responses、OTLP logs 和 OTLP traces 同时指向受管 Gateway；路由诊断不输出配置正文或凭据。
 相关契约测试通过并已推送，但尚未替代管理员对现有用户级配置的切换，也没有改变当前线上 Wire 缺失的事实。
 
+提交 `785e582` 进一步让 Runtime gate 在保持真实非零退出的同时，把所有固定、脱敏的
+`blocking_reasons` 追加到标准错误；当前线上复核因此可以一次看到质量、来源新鲜度和 Turn 证据的全部阻断项，
+而不是只看到第一个失败检查。24 个 Runtime gate 回归通过；真实线上 gate 仍按预期非零退出并输出完整诊断。
+
 ## 已有优势
 
 - Wire、OTLP logs、OTLP traces 和 Hook 按原生身份精确关联，覆盖请求、工具定义、

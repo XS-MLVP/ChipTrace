@@ -182,7 +182,9 @@ GitHub CI 的 `live-provider-runtime-preflight` 只在手工 `workflow_dispatch`
 执行未修改 Stock Codex 的多轮四源 Canary、OSS 验收和 `cloud-acceptance`。
 Live preflight 还要求 Relay 的 `ingest_coverage.quality_errors` 为 0；该计数从持久
 Delivery ledger 恢复，`quality_errors_scope` 必须为 `durable_relay_state`，而
-`quality_errors_current_process` 仅用于区分本次进程新增错误。重启不能把历史错误静默归零；
+`quality_errors_current_process` 仅用于区分本次进程新增错误。Runtime gate 失败时会在标准错误中
+同时列出固定的 `blocking_reasons`，便于 CI 直接定位缺失来源、质量错误和 Turn 新鲜度问题；
+重启不能把历史错误静默归零；
 若历史错误已存在，应先保留其报告并修复生产者或采集配置，再开始新的 Canary。
 
 Live preflight 同时调用 `scripts/ci/platform-health-gate.js` 检查 18086 的平台版本、运行
