@@ -16,18 +16,17 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新线上只读复核（2026-10-19 03:41，Asia/Shanghai）确认 18084、3011、3012、18086 的 `/health` 均返回
-HTTP 200，但 Relay `/ready` 返回 HTTP 503；Collector、Relay 和平台实际仍运行
-`e9cc4569d25db87636aa74099dc80095ac59485e`，仓库 HEAD 已更新到
-`fc4e0869df383d7c329dafc3ead335bfc9601bbb`，使用内容寻址镜像、非 root、只读根和持久目录。
-Relay 与 Collector 均为 `1,266,420` 条，`pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`；
+最新线上只读复核（2026-10-19 03:50，Asia/Shanghai）确认 18084、3011、3012、18086 的 `/health` 均返回
+HTTP 200，但 Relay `/ready` 返回 HTTP 503；Collector、Relay 和平台实际已运行
+`bd2bf5cb54fe5fab4161f37bff5294eff0ebcffb`，与本次部署的可执行代码基线一致，使用内容寻址镜像、非 root、只读根和持久目录。
+Relay 与 Collector 均为 `1,267,147` 条，`pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`；
 Collector 队列深度为 0、ready。Gateway outbox 当前 pending/processing/recent failure 均为 0，293 个历史失败原件
 和 recovery receipt 仍保留且未解决数为 0。
 
 业务门禁仍未通过：Relay `/ready` 返回 HTTP 503，`ingest_coverage.status=degraded`，持久
-`quality_errors=4600`，全部来自 `otlp_traces`，其中 `identity_conflict=182`、`invalid_lifecycle=2453`、
-旧账本无法回溯的 `legacy_unclassified=1965`；本次进程质量错误为 546，Raw 仍保留。Wire 仅有 2 条且已过期，
-Hook 只有少量旧记录，`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，带质量、新鲜度
+`quality_errors=4658`，全部来自 `otlp_traces`，其中 `identity_conflict=182`、`invalid_lifecycle=2511`、
+旧账本无法回溯的 `legacy_unclassified=1965`；重启后本次进程质量错误为 12，Raw 仍保留。新进程尚未观察到 Wire 或 Hook，
+`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，带质量、新鲜度
 和来源门禁的 runtime gate 真实退出 1。平台 health gate 以该 revision 真实通过，但平台后端
 仍是本地 FS；18084 trace exporter 关闭，Gateway 的 `fullTraceCapture.stats.acceptedCount=2`，其
 OCI revision 仍为 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`，本机用户级 Codex 配置仍指向外部
