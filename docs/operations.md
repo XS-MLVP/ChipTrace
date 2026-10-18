@@ -266,7 +266,8 @@ export CHIPTRACE_PLATFORM_IMAGE="$(docker image inspect --format '{{.Id}}' "chip
 sudo install -d -o 10001 -g 10001 -m 0700 \
   /srv/chiptrace/platform /srv/chiptrace/objects
 node scripts/deploy/preflight.js --file deploy/cloud-platform.yml
-docker compose -f deploy/cloud-platform.yml up -d --no-build --pull never
+docker compose --project-name "${CHIPTRACE_PLATFORM_PROJECT:-chiptrace-platform}" \
+  -f deploy/cloud-platform.yml up -d --no-build --pull never --wait --wait-timeout 600
 ```
 
 项目 ID、采集路径和存储命名空间由 root 下的 `NAMESPACE.json` 在首次启动时绑定。

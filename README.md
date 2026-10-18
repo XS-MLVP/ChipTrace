@@ -16,17 +16,18 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新线上复核（2026-10-18 19:36，Asia/Shanghai）确认 Collector、Relay 和平台已升级到维护
-提交 `6df2c1718f27d7c09094a768713120c82370bc17`；三个容器的 OCI/Compose revision、非 root、
+最新线上复核（2026-10-18 19:54，Asia/Shanghai）确认 Collector、Relay 和平台已升级到维护
+提交 `433c70f22cf9d2036ab8300f5487866c31892e6e`；三个容器的 OCI/Compose revision、非 root、
 只读根、资源限额和持久挂载一致，18084、3011、3012、18086 均返回 HTTP 200。Collector
-捕获 `1,226,196` 条，Relay 投递 `1,226,196` 条，`pending=0`、`inflight=0`、`failed=0`、
+捕获 `1,227,852` 条，Relay 投递 `1,227,852` 条，`pending=0`、`inflight=0`、`failed=0`、
 `conservation_ok=true`；Gateway outbox 的 pending/processing/failed/recent failure 均为 0，
 历史失败原件和 recovery receipt 仍保留。新 Relay 的正常重启使用持久索引快路径，实际升级在
 几秒内恢复健康，不再重复扫描完整 NFS delivery ledger。
 
-业务门禁仍未通过：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2040`（其中
-`otlp_traces` 的 `identity_conflict=75`、旧账本无法回溯的 `legacy_unclassified=1965`），当前
-进程的新增冲突来自上游同一 Span 重复且矛盾的 `outcome` 标签；Wire 和 required Hook 当前
+业务门禁仍未通过：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2167`（其中
+`otlp_traces` 的 `identity_conflict=182`、`invalid_lifecycle=20`、旧账本无法回溯的
+`legacy_unclassified=1965`）；当前进程的新增冲突来自上游同一 Span 重复且矛盾的 `outcome` 标签，
+现在已单独标为 `invalid_lifecycle`。Wire 和 required Hook 当前
 均未观察到，`turn_capture_ready=false`。带质量、新鲜度和 revision 门禁的 runtime gate 在该
 窗口真实退出 1。18086 的 platform health gate 已以同一 revision 真实通过，但 Gateway
 `router-v2-relay-shell` 仍使用外部旧 OCI revision，带维护 SHA 的 Gateway preflight 会拒绝；平台
