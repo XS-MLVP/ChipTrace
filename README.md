@@ -16,22 +16,22 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新线上复核（2026-10-18 20:48，Asia/Shanghai）确认 Collector、Relay 和平台已升级到运行
-提交 `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`；三个容器使用对应 OCI digest、非 root、只读根、
-资源限额和持久挂载，18084、3011、3012、18086 均返回 HTTP 200。Collector 捕获 `1,233,021` 条，
-Relay 投递 `1,233,020` 条，`pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`；
-Gateway outbox 当前 pending/processing/recent failure 均为 0，293 个历史失败原件和 recovery receipt
-仍保留。Relay 重启实际走持久索引快路径并在健康等待内恢复。
+最新线上只读复核（2026-10-18 21:24，Asia/Shanghai）确认 Collector、Relay 和平台运行提交均为
+`7f5abad42fff171fd80f024bb0f03c2ae6de52b6`；18084、3011、3012、18086 均返回 HTTP 200。Collector
+捕获与 Relay 投递均为 `1,235,929` 条，`pending=0`、`inflight=0`、`failed=0`、
+`conservation_ok=true`；Gateway outbox 当前 pending/processing/recent failure 均为 0，293 个历史失败
+原件和 recovery receipt 仍保留。
 
-业务门禁仍未通过：该快照的 Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2512`，其中
-`otlp_traces.identity_conflict=182`、`invalid_lifecycle=365`、旧账本无法回溯的
-`legacy_unclassified=1965`；当前进程错误持续来自上游同一 Span 重复且矛盾的 `outcome` 标签，已正确
-单独标为 `invalid_lifecycle`，Raw 仍保留。Wire 仍未观察到，`missing_sources=["wire"]`、
+业务门禁仍未通过：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2670`，其中
+`otlp_traces.identity_conflict=182`、`invalid_lifecycle=523`、旧账本无法回溯的
+`legacy_unclassified=1965`；当前进程新增质量错误为 424，Raw 仍保留。Wire 仍未观察到，
+`missing_sources=["wire"]`、`stale_sources=["wire"]`、`successful_turn_scoped_captures=0`、
 `turn_capture_ready=false`，带质量、新鲜度和 revision 门禁的 runtime gate 真实退出 1。18086 的
-platform health gate 以该 revision 真实通过，但平台后端仍是本地 FS；Gateway 仍使用外部旧 OCI revision，
-当前 relay-shell 进程的 `fullTraceCapture.stats.acceptedCount=0`，本机用户级 Codex 配置仍指向外部
-Provider，尚未经过 18084；真实 Alibaba OSS 提交/恢复/远端对象哈希及未修改 Stock Codex 多轮 Canary 尚未完成。因此可用于内部
-传输与恢复验证，不能对外承诺完整 Session/Turn 采集或生产 OSS 导出。详见[生产就绪评估](docs/production-readiness.md)。
+platform health gate 以该 revision 真实通过，但平台后端仍是本地 FS；Gateway 的
+`fullTraceCapture.stats.acceptedCount=0`，其 OCI revision 与维护提交不一致，本机用户级 Codex 配置仍
+指向外部 Provider，尚未经过 18084；真实 Alibaba OSS 提交/恢复/远端对象哈希及未修改 Stock Codex
+多轮 Canary 尚未完成。因此可用于内部传输与恢复验证，不能对外承诺完整 Session/Turn 采集或生产 OSS
+导出。详见[生产就绪评估](docs/production-readiness.md)。
 
 ## 主线
 
