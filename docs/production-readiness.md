@@ -36,6 +36,13 @@ failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留�
 使端到端吞吐提升约 13.6%，说明交付链路仍是主要瓶颈。该基准不含真实 Session/Turn、OSS 上传或
 多租户竞争，不能替代目标硬件上的容量和 SLO 验收。
 
+04:59（Asia/Shanghai）在同一 10,000 条、64 KiB、`fsync`、Relay 回环条件下补测了配置敏感性：
+`batch=128`、并发 16、1 shard 的端到端吞吐为 `1,572.3 records/s`，4 shard 为
+`1,893.1 records/s`（约提升 20.4%），两次均为 10,000/10,000 delivered、零交付重试；
+并发 32、4 shard 可达到 `2,530.6 records/s`，但 P99 批延迟升至约 `1.29 s`，并发 16 的
+P99 约为 `0.52 s`。这支持在真实 NFS/OSS 压测后优先评估四 shard，不能据此直接把并发 32
+作为生产默认值；测试仍不包含对象上传、跨租户竞争和长期负载。
+
 较早快照的 Relay `ingest_coverage.status=degraded`，`quality_errors=848`（全部来自 `otlp_traces`），
 Wire 已约 96 分钟未刷新，`required_sources_fresh=false`、`turn_capture_ready=false`，
 `successful_turn_scoped_captures=279/293`。runtime gate 使用质量错误、新鲜度、历史失败和 revision
