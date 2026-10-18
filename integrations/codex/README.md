@@ -87,11 +87,16 @@ CHIPTRACE_STOCK_CODEX_MODULES=/path/to/pinned-install/node_modules make managed-
 ```bash
 node scripts/deploy/codex-route-preflight.js \
   --config /etc/codex/config.toml \
+  --user-config /path/to/actual/CODEX_HOME/config.toml \
   --expected-base-url http://172.28.11.121:18084/
 ```
 
-用户级配置仍可能覆盖系统默认 Provider；如果检查发现外部入口，不能把 Collector/Relay 的健康
-解释为 Wire 已采集，必须先修正受管配置并重新执行真实 Session/Turn Canary。
+`--user-config` 必须指向实际运行 Stock Codex 的 `CODEX_HOME/config.toml`，而不是另一个
+用户或系统目录。预检会拒绝用户 Provider 指向外部入口、选择其他 Provider、覆盖鉴权或关闭
+OTLP；省略的字段可以继承系统配置。用户级配置仍可能覆盖系统默认 Provider；如果检查发现
+外部入口，不能把 Collector/Relay 的健康解释为 Wire 已采集，必须先修正受管配置并重新执行
+真实 Session/Turn Canary。受保护的 GitHub live-preflight 将该路径作为
+`CHIPTRACE_CODEX_USER_CONFIG` 强制提供。
 
 它先验证旧的 Hook-only requirements 会让用户 Provider 绕过系统默认路由，再通过实际
 `config/read` 和 `configRequirements/read` 验证新模板能抵御用户选择、同名 Provider 定义和

@@ -146,9 +146,19 @@ trace exporter 未启用，watchdog 最近报告重试失败；18086 没有监�
 
 读取到的系统和用户配置存在同名 Provider 的不同 `base_url`。离线原生客户端回归确认，
 系统 `config.toml` 的默认路由可以被用户配置覆盖；仅有 OTLP/Hook 流量不能证明 Wire
-经过 18084。新 requirements 模板通过原生 exact Provider 约束修复这个接入风险，但本次
-没有改动线上 `/etc/codex` 或用户配置。更新受管配置后必须从新客户端进程获取真实 Wire，
-再复验 runtime gate 和目标 Session 的四源关联；不能用合成 Capture 把线上计数补成通过。
+经过 18084。部署前必须同时检查系统配置和实际运行进程的用户配置：
+
+```bash
+node scripts/deploy/codex-route-preflight.js \
+  --config /etc/codex/config.toml \
+  --user-config /path/to/actual/CODEX_HOME/config.toml \
+  --expected-base-url http://172.28.11.121:18084/
+```
+
+预检会拒绝用户 Provider 绕过 Gateway、关闭 OTLP 或覆盖受管鉴权。新 requirements 模板
+通过原生 exact Provider 约束进一步修复这个接入风险，但本次没有改动线上 `/etc/codex`
+或用户配置。更新受管配置后必须从新客户端进程获取真实 Wire，再复验 runtime gate 和目标
+Session 的四源关联；不能用合成 Capture 把线上计数补成通过。
 
 隔离 patched Canary 已通过仓库门禁，但不证明线上未修改客户端已经通过。提交
 `13164883972a33634e4c420d532e612c666edfad` 的

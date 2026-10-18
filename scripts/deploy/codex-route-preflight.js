@@ -50,6 +50,13 @@ function endpointFromLine(text, key) {
   return match?.[1] ?? null;
 }
 
+function assertManagedRoute(value, expectedRoute, label) {
+  if (!value) return;
+  if (routeIdentity(value, label) !== expectedRoute) {
+    fail(`${label} must target the managed Gateway (${expectedRoute})`);
+  }
+}
+
 function validateCodexRoute(configText, expectedBaseUrl) {
   if (typeof configText !== 'string' || configText.length === 0) fail('configuration is empty');
   const provider = tomlString(configText, 'model_provider');
@@ -82,18 +89,63 @@ function validateCodexRoute(configText, expectedBaseUrl) {
   };
 }
 
+// A user/node config is layered over the managed system config by Stock Codex.
+// It may omit inherited fields, but it must not replace the selected Provider,
+// disable OTLP, or install a second route. This check is intentionally static:
+// it never reads credentials or starts a model request.
+function validateCodexUserOverrides(configText, expectedBaseUrl) {
+  if (typeof configText !== 'string' || configText.length === 0) fail('user configuration is empty');
+  const expectedRoute = routeIdentity(expectedBaseUrl, 'expected base URL');
+  const selectedProvider = tomlString(configText, 'model_provider');
+  if (selectedProvider && selectedProvider !== 'OpenAI') {
+    fail('user configuration must not select a different model_provider');
+  }
+  const providerSection = tomlSection(configText, 'model_providers.OpenAI');
+  if (providerSection) {
+    assertManagedRoute(tomlString(providerSection, 'base_url'), expectedRoute, 'user OpenAI base_url');
+    const wireApi = tomlString(providerSection, 'wire_api');
+    if (wireApi && wireApi !== 'responses') fail('user OpenAI wire_api must be responses');
+    if (/^\s*(?:http_headers|env_key)\s*=/m.test(providerSection)) {
+      fail('user OpenAI provider must not override managed HTTP authentication');
+    }
+  }
+  const otel = tomlSection(configText, 'otel');
+  if (otel) {
+    for (const [key, suffix] of [['exporter', '/otel/v1/logs'], ['trace_exporter', '/otel/v1/traces']]) {
+      const scalar = tomlString(otel, key);
+      if (scalar === 'none') fail(`user ${key} must not disable managed OTLP`);
+      if (scalar && scalar !== 'otlp-http') fail(`user ${key} must use managed OTLP`);
+      const endpoint = endpointFromLine(otel, key);
+      if (endpoint) assertManagedRoute(endpoint, `${expectedRoute.replace(/\/$/, '')}${suffix}`, `user ${key} endpoint`);
+      if (!scalar && /^(?:exporter|trace_exporter)\s*=\s*\{/m.test(otel) && !endpoint) {
+        fail(`user ${key} must include a managed OTLP endpoint`);
+      }
+    }
+  }
+  return {
+    schema_version: SCHEMA_VERSION,
+    ok: true,
+    checked: true,
+    inherited_system_route: true,
+  };
+}
+
 function parseArgs(argv) {
   let config;
+  let userConfig;
   let expectedBaseUrl;
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     const value = argv[index + 1];
-    if (!value || (flag !== '--config' && flag !== '--expected-base-url')) {
-      fail('usage: codex-route-preflight.js --config PATH --expected-base-url URL');
+    if (!value || (flag !== '--config' && flag !== '--user-config' && flag !== '--expected-base-url')) {
+      fail('usage: codex-route-preflight.js --config PATH [--user-config PATH] --expected-base-url URL');
     }
     if (flag === '--config') {
       if (config !== undefined) fail('duplicate --config');
       config = value;
+    } else if (flag === '--user-config') {
+      if (userConfig !== undefined) fail('duplicate --user-config');
+      userConfig = value;
     } else {
       if (expectedBaseUrl !== undefined) fail('duplicate --expected-base-url');
       expectedBaseUrl = value;
@@ -101,9 +153,9 @@ function parseArgs(argv) {
     index += 1;
   }
   if (!config || !expectedBaseUrl) {
-    fail('usage: codex-route-preflight.js --config PATH --expected-base-url URL');
+    fail('usage: codex-route-preflight.js --config PATH [--user-config PATH] --expected-base-url URL');
   }
-  return { config, expectedBaseUrl };
+  return { config, userConfig, expectedBaseUrl };
 }
 
 function main(argv = process.argv.slice(2)) {
@@ -115,6 +167,15 @@ function main(argv = process.argv.slice(2)) {
     fail(`cannot read configuration: ${error.code || 'read_error'}`);
   }
   const result = validateCodexRoute(text, args.expectedBaseUrl);
+  if (args.userConfig) {
+    let userText;
+    try {
+      userText = fs.readFileSync(args.userConfig, 'utf8');
+    } catch (error) {
+      fail(`cannot read user configuration: ${error.code || 'read_error'}`);
+    }
+    result.user_config = validateCodexUserOverrides(userText, args.expectedBaseUrl);
+  }
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   return result;
 }
@@ -128,4 +189,6 @@ if (require.main === module) {
   }
 }
 
-module.exports = { SCHEMA_VERSION, validateCodexRoute, parseArgs, main };
+module.exports = {
+  SCHEMA_VERSION, validateCodexRoute, validateCodexUserOverrides, parseArgs, main,
+};

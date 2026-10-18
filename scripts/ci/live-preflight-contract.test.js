@@ -21,6 +21,7 @@ test('live provider preflight requires protected endpoints and runs both gates',
   for (const name of [
     'CHIPTRACE_API_KEY',
     'CHIPTRACE_CODEX_CONFIG',
+    'CHIPTRACE_CODEX_USER_CONFIG',
     'CHIPTRACE_CODEX_BASE_URL',
     'CHIPTRACE_RESPONSES_URL',
     'CHIPTRACE_GATEWAY_HEALTH_URL',
@@ -35,6 +36,7 @@ test('live provider preflight requires protected endpoints and runs both gates',
   }
   assert.match(workflow, /node scripts\/deploy\/codex-route-preflight\.js/);
   assert.match(workflow, /--config "\$CHIPTRACE_CODEX_CONFIG"/);
+  assert.match(workflow, /--user-config "\$CHIPTRACE_CODEX_USER_CONFIG"/);
   assert.match(workflow, /--expected-base-url "\$CHIPTRACE_CODEX_BASE_URL"/);
   assert.match(workflow, /codex-route-preflight\.json/);
   assert.match(workflow, /node scripts\/ci\/provider-response-gate\.js/);

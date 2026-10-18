@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
-const { validateCodexRoute } = require('./codex-route-preflight');
+const { validateCodexRoute, validateCodexUserOverrides } = require('./codex-route-preflight');
 
 const config = fs.readFileSync(path.join(__dirname, '../../integrations/codex/config.toml.example'), 'utf8');
 const gateway = 'http://172.28.11.121:18084/';
@@ -36,4 +36,31 @@ test('preflight diagnostics never include configuration body or credentials', ()
   const privateConfig = `${config}\napi_key = "do-not-print"\n`;
   const result = validateCodexRoute(privateConfig, gateway);
   assert.doesNotMatch(JSON.stringify(result), /do-not-print|api_key/);
+});
+
+test('user or node overrides cannot bypass the managed Provider or disable OTLP', () => {
+  assert.doesNotThrow(() => validateCodexUserOverrides('model = "gpt-5.6-sol"\n', gateway));
+  const external = `model_provider = "OpenAI"\n[model_providers.OpenAI]\nbase_url = "https://provider.example/v1"\n`;
+  assert.throws(() => validateCodexUserOverrides(external, gateway), /user OpenAI base_url/);
+  const disabled = '[otel]\nexporter = "none"\ntrace_exporter = "none"\n';
+  assert.throws(() => validateCodexUserOverrides(disabled, gateway), /must not disable managed OTLP/);
+  const alternate = 'model_provider = "Bypass"\n';
+  assert.throws(() => validateCodexUserOverrides(alternate, gateway), /different model_provider/);
+});
+
+test('a user config may repeat the managed route while inheriting omitted fields', () => {
+  const user = `model_provider = "OpenAI"
+[model_providers.OpenAI]
+base_url = "${gateway}"
+wire_api = "responses"
+[otel]
+exporter = { otlp-http = { endpoint = "${gateway}otel/v1/logs" } }
+trace_exporter = { otlp-http = { endpoint = "${gateway}otel/v1/traces" } }
+`;
+  assert.deepEqual(validateCodexUserOverrides(user, gateway), {
+    schema_version: 'chiptrace.codex-route-preflight.v1',
+    ok: true,
+    checked: true,
+    inherited_system_route: true,
+  });
 });
