@@ -34,9 +34,6 @@ test('missing or redirected OTLP routes are refused', () => {
 
 test('preflight diagnostics never include configuration body or credentials', () => {
   const privateConfig = `${config}\napi_key = "do-not-print"\n`;
-  try {
-    validateCodexRoute(privateConfig, gateway);
-  } catch (error) {
-    assert.doesNotMatch(String(error), /do-not-print|api_key/);
-  }
+  const result = validateCodexRoute(privateConfig, gateway);
+  assert.doesNotMatch(JSON.stringify(result), /do-not-print|api_key/);
 });
