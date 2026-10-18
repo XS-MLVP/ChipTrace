@@ -789,6 +789,16 @@ revision `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`，捕获/投递计数均为 
 `synthetic=true`、`real_upstream=false`、`real_oss_account=false` 和
 `production_acceptance_claimed=false` 保留了证据边界。
 
+## 2026-10-18 22:13 质量标签根因抽样
+
+对最新活动 Segment 尾部最多 200 条记录做了有界脱敏摘要：共看到 162 个 telemetry batch，
+其中 77 个来自 `otlp_traces`；12 条转换错误具有相同的固定诊断，均为同一 OTLP span 重复声明
+冲突的 `outcome` 属性。该批次的取样值类别为 `completed`、`exited` 和 `interrupted`。这与
+`invalid_lifecycle` 的 705 条线上计数相符，且与仓库第七个生产者补丁
+`docs/upstream-otlp-outcome.patch` 的修复目标一致：声明字段先为空，终态只记录一次，取消路径
+才补写 `interrupted`。因此当前解析器保持冲突即拒绝是数据正确性要求；放宽重复属性校验会把
+不确定的终态伪装成有效标签。生产修复应部署包含该补丁的受管 Producer，并重新通过逐 Turn 四源门禁。
+
 ## 已有优势
 
 - Wire、OTLP logs、OTLP traces 和 Hook 按原生身份精确关联，覆盖请求、工具定义、
