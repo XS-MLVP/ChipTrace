@@ -1,14 +1,14 @@
 # 生产就绪评估
 
-评估日期：2026-10-18。最新线上只读快照为 21:24（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-18。最新线上只读快照为 22:03（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-最新快照中 Collector 与 Relay 的传输计数仍守恒：两者捕获/投递均为 `1,235,929`，队列和失败均为 0，
+最新快照中 Collector 与 Relay 的传输计数仍守恒：两者捕获/投递均为 `1,239,130`，队列和失败均为 0，
 Collector ready；18084、3011、3012、18086 均返回 HTTP 200。
-业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2670`，其中
-`otlp_traces.identity_conflict=182`、`invalid_lifecycle=523`、`legacy_unclassified=1965`；当前
-进程新增错误为 424，原因标签已按固定分类计数并保留 Raw。Wire 未观察到，
+业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2852`，其中
+`otlp_traces.identity_conflict=182`、`invalid_lifecycle=705`、`legacy_unclassified=1965`；当前
+进程新增错误为 606，原因标签已按固定分类计数并保留 Raw。Wire 未观察到，
 `missing_sources=["wire"]`、`stale_sources=["wire"]`、`successful_turn_scoped_captures=0`、
 `turn_capture_ready=false`，runtime gate 以质量、新鲜度、历史失败、原因分解和 revision 门禁真实退出 1。
 18086 的 platform health gate 以 `7f5abad42fff171fd80f024bb0f03c2ae6de52b6` 真实通过，平台后端仍为
@@ -752,16 +752,16 @@ HTTP 200，但 Relay/Collector 仍为旧 revision `e5237065ff3a48623179c5846ff19
 提交 `ba0600a` 修正 hosted Runner 的原生沙箱启动流程：内核 sysctl 写入失败只产生明确警告，
 真正的 user namespace 探针仍是硬门禁，避免平台权限差异把 CI 误报为启动失败，也不会把不可用沙箱放行。
 
-## 2026-10-18 21:50 线上只读复核
+## 2026-10-18 22:03 线上只读复核
 
 最新只读快照中 18084、3011、3012 和 18086 均返回 HTTP 200。Collector 与 Relay 使用同一
-revision `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`，捕获/投递计数均为 `1,238,018`，队列为 0，
+revision `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`，捕获/投递计数均为 `1,239,130`，队列为 0，
 `conservation_ok=true`；Platform 也报告同一 revision，队列和运行任务均为 0。18084 的完整正文捕获
 仍启用，Gateway outbox 当前 pending/processing/recent failure 均为 0，293 个历史失败原件和
 293 个恢复回执仍保留，未解决历史失败为 0；这证明传输与恢复闭环，不证明业务 Turn 已采集。
 
-业务覆盖仍为 `degraded`：Relay 持久 `quality_errors=2785`（当前进程新增 539），全部来自
-`otlp_traces`，原因是 `identity_conflict=182`、`invalid_lifecycle=638`、
+业务覆盖仍为 `degraded`：Relay 持久 `quality_errors=2852`（当前进程新增 606），全部来自
+`otlp_traces`，原因是 `identity_conflict=182`、`invalid_lifecycle=705`、
 `legacy_unclassified=1965`；`wire` 同时列入 `missing_sources` 和 `stale_sources`，
 `successful_turn_scoped_captures=0`，`turn_capture_ready=false`。Gateway 的
 `fullTraceCapture.stats.acceptedCount=0`，其 OCI revision `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`
