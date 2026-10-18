@@ -60,7 +60,13 @@ async function verifyHostHealth(mode) {
   try {
     let initial;
     for (let i = 0; i < 100; i++) {
-      try { initial = await health(); break; } catch { await new Promise(resolve => setTimeout(resolve, 10)); }
+      try {
+        initial = await health();
+        if (initial?.status === 'healthy') break;
+      } catch {
+        // The child may still be binding its listener or starting the outbox.
+      }
+      await new Promise(resolve => setTimeout(resolve, 10));
     }
     assert.equal(initial?.status, 'healthy', stderr);
     request = http.request(`http://127.0.0.1:${port}/responses`, {
