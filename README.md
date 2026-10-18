@@ -16,15 +16,15 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新线上只读复核（2026-10-19 01:02，Asia/Shanghai）确认 18084、3011、3012、18086 均返回
+最新线上只读复核（2026-10-19 01:11，Asia/Shanghai）确认 18084、3011、3012、18086 均返回
 HTTP 200；Collector、Relay 和平台运行提交均为 `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`。
-在 01:01 的 runtime gate 观测中 Relay 投递为 `1,253,413` 条，`pending=0`、`inflight=0`、
+在 01:11 的健康观测中 Relay 投递为 `1,254,255` 条，`pending=0`、`inflight=0`、
 `failed=0`、`conservation_ok=true`；Gateway outbox 当前 pending/processing/recent failure 均为 0，
 293 个历史失败原件和 recovery receipt 仍保留。
 
-业务门禁仍未通过：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=3676`，全部来自
-`otlp_traces`，其中 `identity_conflict=182`、`invalid_lifecycle=1529`、旧账本无法回溯的
-`legacy_unclassified=1965`；当前进程质量错误为 1430，Raw 仍保留。Wire 同时列入
+业务门禁仍未通过：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=3742`，全部来自
+`otlp_traces`，其中 `identity_conflict=182`、`invalid_lifecycle=1595`、旧账本无法回溯的
+`legacy_unclassified=1965`；当前进程质量错误为 1496，Raw 仍保留。Wire 同时列入
 `missing_sources=["wire"]` 和 `stale_sources=["wire"]`，`successful_turn_scoped_captures=0`、
 `turn_capture_ready=false`，带质量、新鲜度和 revision 门禁的 runtime gate 真实退出 1。18086 的
 platform health gate 以该 revision 真实通过，但平台后端仍是本地 FS；18084 trace exporter 关闭，

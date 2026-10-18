@@ -1,14 +1,14 @@
 # 生产就绪评估
 
-评估日期：2026-10-19。最新线上只读快照为 01:02（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-19。最新线上只读快照为 01:11（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-最新快照中 Collector 与 Relay 的传输计数仍守恒：runtime gate 在 01:01 观测到 Relay delivered 为
-`1,253,413`，队列和失败均为 0，Collector ready；18084、3011、3012、18086 均返回 HTTP 200。
-业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=3676`，其中
-`otlp_traces.identity_conflict=182`、`invalid_lifecycle=1529`、`legacy_unclassified=1965`；当前
-进程质量错误为 1430，原因标签已按固定分类计数并保留 Raw。Wire 未观察到，
+最新快照中 Collector 与 Relay 的传输计数仍守恒：01:11 健康观测到 Relay delivered 为
+`1,254,255`，队列和失败均为 0，Collector ready；18084、3011、3012、18086 均返回 HTTP 200。
+业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=3742`，其中
+`otlp_traces.identity_conflict=182`、`invalid_lifecycle=1595`、`legacy_unclassified=1965`；当前
+进程质量错误为 1496，原因标签已按固定分类计数并保留 Raw。Wire 未观察到，
 `missing_sources=["wire"]`、`stale_sources=["wire"]`、`successful_turn_scoped_captures=0`、
 `turn_capture_ready=false`，runtime gate 以质量、新鲜度、历史失败、原因分解和 revision 门禁真实退出 1。
 18086 的 platform health gate 以 `7f5abad42fff171fd80f024bb0f03c2ae6de52b6` 真实通过，平台后端仍为
