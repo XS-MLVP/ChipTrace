@@ -55,8 +55,11 @@ lease，只读取 inflight 索引并原子地恢复到 pending。生产 NFS 仍�
 应至少设为 600 秒；健康检查变绿前不得接收生产 Canary。
 
 Collector 与 Relay 的存储拓扑可通过 `CHIPTRACE_STORE_SHARDS` 配置，默认值为 `1`，
-以保持现有单 shard 数据目录兼容。新实例可以在压测后提高该值；当前基准中 4 个 shard
-将本地 WAL 吞吐从约 3,874 提升到 5,146 records/s，但这不是生产 SLO。已初始化的
+以保持现有单 shard 数据目录兼容。新实例可以在压测后提高该值；最近同一 release 的
+Relay 对照（10,000 条、64 KiB、批量 64、并发 16、带 `fsync`）中，4 个 shard 的入口确认
+吞吐为 `4,650.8 records/s`、端到端为 `995.4 records/s`，1 个 shard 分别为 `3,154.1`
+和 `890.7 records/s`。这不是生产 SLO，且端到端提升有限，仍需在目标硬件和对象存储链路上
+单独测量。已初始化的
 数据目录会在 `sharding.json` 中固定拓扑，运行中改变 shard 数会被拒绝；迁移必须先
 完成独立的数据归档、恢复和字节校验，不能只修改环境变量。
 
