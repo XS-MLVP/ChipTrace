@@ -614,6 +614,13 @@ pub(crate) fn otlp_attribute_key(attribute: &Value) -> Option<&str> {
 }
 
 pub(crate) fn validate_otlp_attributes(value: Option<&Value>) -> Result<()> {
+    validate_otlp_attributes_mode(value, false)
+}
+
+fn validate_otlp_attributes_mode(
+    value: Option<&Value>,
+    allow_trace_code_metadata_duplicates: bool,
+) -> Result<()> {
     let mut attribute_values = BTreeMap::new();
     for (index, attribute) in optional_otlp_array(value, "attributes")?.iter().enumerate() {
         if !attribute.is_object() {
@@ -631,6 +638,14 @@ pub(crate) fn validate_otlp_attributes(value: Option<&Value>) -> Result<()> {
         if let Some((previous_index, previous)) = attribute_values.insert(key, (index, value))
             && previous != value
         {
+            // Some OTLP trace exporters repeat source-code location metadata
+            // while merging instrumentation scopes. These fields cannot
+            // establish a Session, Turn, tool owner, or lifecycle fact. Keep
+            // the exact Raw, but ignore only this bounded trace-only case;
+            // identity, tool, and unknown attribute conflicts remain strict.
+            if allow_trace_code_metadata_duplicates && key.starts_with("code.") {
+                continue;
+            }
             if is_identity_attribute(key) || matches!(key, "codex.context_scope" | "event.name") {
                 bail!("OTLP has conflicting duplicate context attribute {key:?}");
             }
@@ -643,8 +658,11 @@ pub(crate) fn validate_otlp_attributes(value: Option<&Value>) -> Result<()> {
     Ok(())
 }
 
-fn attributes(value: Option<&Value>) -> Result<BTreeMap<String, String>> {
-    validate_otlp_attributes(value)?;
+fn attributes_for_endpoint(
+    endpoint: &str,
+    value: Option<&Value>,
+) -> Result<BTreeMap<String, String>> {
+    validate_otlp_attributes_mode(value, endpoint == "otlp_traces")?;
     Ok(value
         .and_then(Value::as_array)
         .into_iter()
@@ -706,10 +724,10 @@ pub(crate) fn visit_otlp_envelope(
         .into_iter()
         .flatten()
     {
-        let resource_attributes = attributes(otlp_message_attributes(
-            resource.get("resource"),
-            "resource",
-        )?)?;
+        let resource_attributes = attributes_for_endpoint(
+            endpoint,
+            otlp_message_attributes(resource.get("resource"), "resource")?,
+        )?;
         for scope in resource
             .get(scopes)
             .and_then(Value::as_array)
@@ -717,10 +735,10 @@ pub(crate) fn visit_otlp_envelope(
             .flatten()
         {
             let mut scoped = resource_attributes.clone();
-            scoped.extend(attributes(otlp_message_attributes(
-                scope.get("scope"),
-                "scope",
-            )?)?);
+            scoped.extend(attributes_for_endpoint(
+                endpoint,
+                otlp_message_attributes(scope.get("scope"), "scope")?,
+            )?);
             for record in scope
                 .get(records)
                 .and_then(Value::as_array)
@@ -728,7 +746,7 @@ pub(crate) fn visit_otlp_envelope(
                 .flatten()
             {
                 let mut merged = scoped.clone();
-                merged.extend(attributes(record.get("attributes"))?);
+                merged.extend(attributes_for_endpoint(endpoint, record.get("attributes"))?);
                 visit(source, record, merged)?;
             }
         }
@@ -1035,6 +1053,37 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn trace_code_metadata_duplicates_do_not_create_identity_quality_errors() {
+        for key in ["code.file.path", "code.line.number"] {
+            let capture = attributes_at_layer(
+                "otlp_traces",
+                "record",
+                json!([
+                    {"key":key,"value":{"stringValue":"first"}},
+                    {"key":key,"value":{"stringValue":"second"}}
+                ]),
+            );
+            let mut visited = 0;
+            visit_otlp(&capture, |_, _, _| {
+                visited += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(visited, 1, "{key}");
+
+            let logs = attributes_at_layer(
+                "otlp_logs",
+                "record",
+                json!([
+                    {"key":key,"value":{"stringValue":"first"}},
+                    {"key":key,"value":{"stringValue":"second"}}
+                ]),
+            );
+            assert!(visit_otlp(&logs, |_, _, _| Ok(())).is_err(), "{key}");
         }
     }
 

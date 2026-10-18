@@ -81,6 +81,9 @@ OTLP 上下文重复属性或有效身份别名冲突会先保留 Raw，再返�
 入口与离线审计共用 Session/Turn 身份规则，包括 UUID 形式的原生 `thread_id`；冲突记录
 不能派生出工具所有者或带归属的不完整事件。同批正常记录继续保留。相同别名合法，
 resource/scope/record 的既定覆盖顺序不变；原生 Turn 与 root Turn 是不同身份，不要求相等。
+OTLP traces 中重复的 `code.*` 源码定位属性不参与身份、工具或生命周期解释，允许保留 Raw 并按既定
+覆盖顺序读取；其他未知属性以及所有身份、工具、`event.name` 和 `codex.context_scope` 冲突仍然
+拒绝。这样不会把无关的编译定位元数据误计为质量错误，也不会放宽 Session/Turn 归属门禁。
 
 2026-10-15 复查确认，18084、3011、3012 均返回 HTTP 200；Collector/Relay 已运行
 revision `fe9fcf924b226099202cb770b7cf0da29e0c2310`，`pending=0`、`failed=0`、

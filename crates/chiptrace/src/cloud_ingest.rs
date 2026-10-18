@@ -2055,6 +2055,30 @@ mod tests {
     }
 
     #[test]
+    fn trace_code_metadata_duplicates_are_not_quality_errors() {
+        let raw = br#"{
+            "resourceSpans":[{"scopeSpans":[{"spans":[{
+                "traceId":"0123456789abcdef0123456789abcdef",
+                "attributes":[
+                    {"key":"code.file.path","value":{"stringValue":"first"}},
+                    {"key":"code.file.path","value":{"stringValue":"second"}},
+                    {"key":"code.line.number","value":{"intValue":"1"}},
+                    {"key":"code.line.number","value":{"intValue":"2"}}
+                ]
+            }]}]}]
+        }"#;
+        let batch = prepare_cloud_ingest(CloudEndpoint::OtlpTraces, raw, 1024 * 1024).unwrap();
+        assert_eq!(batch.summary.source_records, 1);
+        assert!(batch.summary.conversion_errors.is_empty());
+        assert_eq!(batch.summary.unknown_events, 0);
+        let values = values(&batch);
+        assert_eq!(
+            values[0]["telemetryBatch"]["quality_error_reasons"],
+            json!({})
+        );
+    }
+
+    #[test]
     fn telemetry_reason_labels_are_revalidated_against_the_raw_batch() {
         let raw = br#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"01"}]}]}]}"#;
         let batch = prepare_cloud_ingest(CloudEndpoint::OtlpTraces, raw, 1024 * 1024).unwrap();
