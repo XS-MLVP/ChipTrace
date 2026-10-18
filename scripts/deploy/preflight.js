@@ -17,15 +17,21 @@ async function docker(args, env = process.env, timeout = 60000) {
   return stdout;
 }
 
-function validateConfig(config, revision) {
+function validateConfig(config, revision, { requirePlatform = true } = {}) {
   assert.match(revision || '', revisionPattern, 'expected revision must be a full Git commit SHA');
   const services = Object.entries(config.services || {});
   assert.ok(services.length, 'deployment must contain services');
-  const backend = config.services.platform?.environment?.CHIPTRACE_BACKEND;
-  assert.ok(['fs', 'oss', 's3'].includes(backend), 'platform storage backend must be explicitly fs, oss, or s3');
-  const platformRevision = config.services.platform?.environment?.CHIPTRACE_BUILD_REVISION;
-  assert.equal(platformRevision, revision,
-    'platform health revision must be bound to the expected Git commit');
+  const platform = config.services.platform;
+  if (requirePlatform) {
+    assert.ok(platform, 'deployment must contain a platform service');
+  }
+  if (platform) {
+    const backend = platform.environment?.CHIPTRACE_BACKEND;
+    assert.ok(['fs', 'oss', 's3'].includes(backend), 'platform storage backend must be explicitly fs, oss, or s3');
+    const platformRevision = platform.environment?.CHIPTRACE_BUILD_REVISION;
+    assert.equal(platformRevision, revision,
+      'platform health revision must be bound to the expected Git commit');
+  }
   const writableBindSources = new Map();
   for (const [name, service] of services) {
     assert.ok(['collector', 'relay', 'platform'].includes(name), 'unexpected deployment service');
@@ -75,12 +81,18 @@ function validateConfig(config, revision) {
   return services.map(([name, service]) => ({ name, image: service.image }));
 }
 
+function requiresPlatform(files, config) {
+  const configuredPlatform = Object.hasOwn(config.services || {}, 'platform');
+  const explicitPlatformFile = files.some(file => path.basename(file) === 'cloud-platform.yml');
+  return configuredPlatform || explicitPlatformFile || files.length !== 1;
+}
+
 async function preflight({ files, revision, project, env = process.env }) {
   const compose = ['compose', '--env-file', '/dev/null'];
   for (const file of files) compose.push('-f', file);
   if (project) compose.push('--project-name', project);
   const config = JSON.parse(await docker([...compose, 'config', '--format', 'json'], env));
-  const services = validateConfig(config, revision);
+  const services = validateConfig(config, revision, { requirePlatform: requiresPlatform(files, config) });
   const images = new Map();
   for (const { image } of services) {
     if (images.has(image)) continue;
@@ -114,4 +126,4 @@ if (require.main === module) {
     .catch(error => { console.error(`deployment preflight failed: ${error.message}`); process.exitCode = 1; });
 }
 
-module.exports = { docker, preflight, validateConfig };
+module.exports = { docker, preflight, requiresPlatform, validateConfig };
