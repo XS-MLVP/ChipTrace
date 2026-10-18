@@ -752,6 +752,26 @@ HTTP 200，但 Relay/Collector 仍为旧 revision `e5237065ff3a48623179c5846ff19
 提交 `ba0600a` 修正 hosted Runner 的原生沙箱启动流程：内核 sysctl 写入失败只产生明确警告，
 真正的 user namespace 探针仍是硬门禁，避免平台权限差异把 CI 误报为启动失败，也不会把不可用沙箱放行。
 
+## 2026-10-18 21:50 线上只读复核
+
+最新只读快照中 18084、3011、3012 和 18086 均返回 HTTP 200。Collector 与 Relay 使用同一
+revision `7f5abad42fff171fd80f024bb0f03c2ae6de52b6`，捕获/投递计数均为 `1,238,018`，队列为 0，
+`conservation_ok=true`；Platform 也报告同一 revision，队列和运行任务均为 0。18084 的完整正文捕获
+仍启用，Gateway outbox 当前 pending/processing/recent failure 均为 0，293 个历史失败原件和
+293 个恢复回执仍保留，未解决历史失败为 0；这证明传输与恢复闭环，不证明业务 Turn 已采集。
+
+业务覆盖仍为 `degraded`：Relay 持久 `quality_errors=2785`（当前进程新增 539），全部来自
+`otlp_traces`，原因是 `identity_conflict=182`、`invalid_lifecycle=638`、
+`legacy_unclassified=1965`；`wire` 同时列入 `missing_sources` 和 `stale_sources`，
+`successful_turn_scoped_captures=0`，`turn_capture_ready=false`。Gateway 的
+`fullTraceCapture.stats.acceptedCount=0`，其 OCI revision `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`
+也未与维护分支 revision 对齐。带 `--max-quality-errors 0` 和历史失败门槛运行的 runtime gate
+真实退出 1，阻断项包含质量错误、来源缺失/过期、Turn 未就绪和无成功逐 Turn Wire。
+
+当前工作树上的完整 `make cloud-test` 已真实退出 0，包含 Rust/Node、Raw/WAL、确认回执、Session/Turn、
+标签质量、平台 FS/OSS 适配、大对象内存和部署配置回归。该结果证明代码和离线契约稳定，不能替代
+受管 Provider 路由、未修改 Stock Codex 多轮 Canary、真实 OSS 账号和远端 Actions 结果。
+
 ## 已有优势
 
 - Wire、OTLP logs、OTLP traces 和 Hook 按原生身份精确关联，覆盖请求、工具定义、
