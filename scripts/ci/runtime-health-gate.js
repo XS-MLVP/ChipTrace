@@ -685,15 +685,20 @@ async function runRemoteHealthGate(
       maxHistoricalFailedFiles,
     });
   } catch (error) {
+    const observed = healthObservation(gateway, relay, collector, {
+      expectedRevision,
+      maxQualityErrors,
+      maxHistoricalFailedFiles,
+    });
     writeReport(reportPath, {
       ok: false,
-      ...healthObservation(gateway, relay, collector, {
-        expectedRevision,
-        maxQualityErrors,
-        maxHistoricalFailedFiles,
-      }),
+      ...observed,
       failure_kind: 'validation_failed',
     });
+    const reasons = observed.blocking_reasons.join(',');
+    if (reasons) {
+      throw new Error(`${error.message}; blocking_reasons=${reasons}`);
+    }
     throw error;
   }
   writeReport(reportPath, { ok: true, ...result });

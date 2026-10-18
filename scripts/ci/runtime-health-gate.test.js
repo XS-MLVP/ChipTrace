@@ -205,6 +205,8 @@ test('runtime gate report records bounded failure state without arbitrary health
     assert.equal(error.code, 1);
     assert.equal(error.stdout, '');
     assert.match(error.stderr, /observed=degraded; missing_sources=wire; stale_sources=wire/);
+    assert.match(error.stderr, /blocking_reasons=.*relay_coverage_not_complete/);
+    assert.match(error.stderr, /relay_sources_missing/);
     assert.doesNotMatch(error.stderr, /PRIVATE_SOURCE_MUST_NOT_LEAK/);
     return true;
   });
