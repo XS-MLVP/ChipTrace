@@ -50,6 +50,28 @@ test('quality seed accepts raw Relay health and rejects inconsistent evidence', 
   }
 });
 
+test('quality seed preserves bounded reason taxonomy when the Relay provides it', () => {
+  const value = coverage();
+  value.quality_errors_by_endpoint.otlp_logs.reasons = {
+    unsupported_event: 1,
+    conversion_error: 2,
+  };
+  value.quality_errors_by_endpoint.otlp_traces.reasons = { invalid_structure: 4 };
+  value.quality_errors_by_endpoint.hooks.reasons = {};
+  const seed = buildSeed({ ingest_coverage: value });
+  assert.deepEqual(seed.counters, {
+    otlp_logs_unknown_events: 1,
+    otlp_logs_conversion_errors: 2,
+    otlp_logs_quality_reasons: { unsupported_event: 1, conversion_error: 2 },
+    otlp_traces_unknown_events: 0,
+    otlp_traces_conversion_errors: 4,
+    otlp_traces_quality_reasons: { invalid_structure: 4 },
+    codex_hook_unknown_events: 0,
+    codex_hook_conversion_errors: 0,
+    codex_hook_quality_reasons: {},
+  });
+});
+
 test('quality seed output is exclusive and bounded to counters', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chiptrace-quality-seed-'));
   const output = path.join(root, 'ingest-quality-seed.json');

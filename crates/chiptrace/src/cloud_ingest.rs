@@ -16,6 +16,21 @@ use time::format_description::well_known::Rfc3339;
 pub const TELEMETRY_BATCH_SCHEMA_VERSION: &str = "chiptrace.telemetry-batch.v1";
 pub const CLOUD_SOURCE_NAMESPACE: &str = "stock-codex-cloud";
 
+/// Stable, bounded labels for producer-quality failures.  These labels are
+/// safe to expose in health snapshots because they never contain source text,
+/// attribute values, request bodies, or credentials.
+pub const QUALITY_REASON_CODES: &[&str] = &[
+    "unsupported_event",
+    "invalid_structure",
+    "invalid_attributes",
+    "identity_conflict",
+    "missing_identity",
+    "invalid_tool",
+    "invalid_lifecycle",
+    "invalid_timestamp",
+    "conversion_error",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudEndpoint {
     OtlpLogs,
@@ -50,6 +65,68 @@ pub struct CloudIngestSummary {
     pub unknown_events: u64,
     pub attributed_quality_errors: u64,
     pub conversion_errors: Vec<String>,
+}
+
+/// Convert the detailed, bounded conversion diagnostics into a stable reason
+/// taxonomy for operational counters.  The detailed strings remain in the
+/// sealed Raw telemetry batch for offline diagnosis; this map is deliberately
+/// limited to fixed labels and counts.
+pub fn quality_error_reasons(summary: &CloudIngestSummary) -> BTreeMap<String, u64> {
+    let mut reasons = BTreeMap::new();
+    if summary.unknown_events > 0 {
+        reasons.insert("unsupported_event".to_owned(), summary.unknown_events);
+    }
+    for error in &summary.conversion_errors {
+        let reason = classify_quality_error(error);
+        let count = reasons.entry(reason.to_owned()).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+    reasons
+}
+
+fn classify_quality_error(error: &str) -> &'static str {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("conflicting")
+        || normalized.contains("identity conflict")
+        || normalized.contains("duplicate context")
+    {
+        return "identity_conflict";
+    }
+    if normalized.contains("missing session")
+        || normalized.contains("requires session")
+        || normalized.contains("missing turn")
+        || normalized.contains("requires turn")
+        || normalized.contains("conversation.id")
+        || normalized.contains("turn.id")
+        || normalized.contains("session_id")
+        || normalized.contains("turn_id")
+    {
+        return "missing_identity";
+    }
+    if normalized.contains("unsupported") || normalized.contains("unknown event") {
+        return "unsupported_event";
+    }
+    if normalized.contains("attribute") || normalized.contains("metadata") {
+        return "invalid_attributes";
+    }
+    if normalized.contains("tool") {
+        return "invalid_tool";
+    }
+    if normalized.contains("lifecycle") || normalized.contains("status") {
+        return "invalid_lifecycle";
+    }
+    if normalized.contains("timestamp") || normalized.contains("occurred_at") {
+        return "invalid_timestamp";
+    }
+    if normalized.contains("structure")
+        || normalized.contains("must be an object")
+        || normalized.contains("must be an array")
+        || normalized.contains("must contain")
+        || normalized.contains("invalid json")
+    {
+        return "invalid_structure";
+    }
+    "conversion_error"
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +196,7 @@ pub fn prepare_cloud_ingest(
         attributed_quality_errors: attributed_quality_errors.min(quality_error_count),
         conversion_errors,
     };
+    let quality_reasons = quality_error_reasons(&summary);
     let batch_id = capture_id("batch", &[endpoint.as_str(), &raw_sha256]);
     let batch = json!({
         "recordType":"telemetry_batch",
@@ -136,6 +214,7 @@ pub fn prepare_cloud_ingest(
             "unknown_events":summary.unknown_events,
             "attributed_quality_errors":summary.attributed_quality_errors,
             "conversion_errors":summary.conversion_errors,
+            "quality_error_reasons":quality_reasons,
         }
     });
     let mut records = Vec::with_capacity(derived.len() + 1);
@@ -157,7 +236,16 @@ pub(crate) fn revalidate_telemetry_batch(capture: &Value) -> Result<CloudIngestS
         .get("raw_json")
         .and_then(Value::as_str)
         .context("telemetryBatch.raw_json is required")?;
-    Ok(prepare_cloud_ingest(CloudEndpoint::parse(endpoint)?, raw.as_bytes(), usize::MAX)?.summary)
+    let summary =
+        prepare_cloud_ingest(CloudEndpoint::parse(endpoint)?, raw.as_bytes(), usize::MAX)?.summary;
+    if let Some(observed) = batch.get("quality_error_reasons") {
+        let observed: BTreeMap<String, u64> = serde_json::from_value(observed.clone())
+            .context("telemetryBatch.quality_error_reasons must be a reason-count object")?;
+        if observed != quality_error_reasons(&summary) {
+            bail!("telemetryBatch.quality_error_reasons does not match the raw telemetry");
+        }
+    }
+    Ok(summary)
 }
 
 type DerivedBatch = (Vec<CaptureRecord>, u64, u64, Vec<String>);
@@ -1238,6 +1326,18 @@ mod tests {
                     .unwrap()
                     .is_empty()
             );
+            assert_eq!(
+                saved["telemetryBatch"]["quality_error_reasons"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .map(Value::as_u64)
+                    .collect::<Option<Vec<_>>>()
+                    .unwrap()
+                    .into_iter()
+                    .sum::<u64>(),
+                batch.summary.unknown_events + batch.summary.conversion_errors.len() as u64
+            );
         }
     }
 
@@ -1364,6 +1464,10 @@ mod tests {
         assert_eq!(batch.summary.source_records, 2);
         assert_eq!(batch.summary.derived_captures, 2);
         assert!(batch.summary.conversion_errors.is_empty());
+        assert_eq!(
+            values[0]["telemetryBatch"]["quality_error_reasons"],
+            json!({})
+        );
         assert_eq!(values[0]["recordType"], "telemetry_batch");
         assert_eq!(
             values[0]["telemetryBatch"]["raw_json"],
@@ -1907,6 +2011,37 @@ mod tests {
         let batch = prepare_cloud_ingest(CloudEndpoint::CodexHook, raw, 1024 * 1024).unwrap();
         assert_eq!(batch.records.len(), 1);
         assert_eq!(batch.summary.conversion_errors, ["Stop requires turn_id"]);
+        assert_eq!(
+            quality_error_reasons(&batch.summary),
+            BTreeMap::from([("missing_identity".to_owned(), 1)])
+        );
+    }
+
+    #[test]
+    fn quality_reason_taxonomy_is_fixed_and_counts_every_quality_error() {
+        let summary = CloudIngestSummary {
+            endpoint: "otlp_logs".to_owned(),
+            source_records: 0,
+            derived_captures: 0,
+            unknown_events: 2,
+            attributed_quality_errors: 0,
+            conversion_errors: vec![
+                "conflicting duplicate context attribute".to_owned(),
+                "invalid OTLP structure".to_owned(),
+                "private body must not appear".to_owned(),
+            ],
+        };
+        let reasons = quality_error_reasons(&summary);
+        assert_eq!(reasons.values().sum::<u64>(), 5);
+        assert_eq!(reasons["unsupported_event"], 2);
+        assert_eq!(reasons["identity_conflict"], 1);
+        assert_eq!(reasons["invalid_structure"], 1);
+        assert_eq!(reasons["conversion_error"], 1);
+        assert!(
+            reasons
+                .keys()
+                .all(|reason| QUALITY_REASON_CODES.contains(&reason.as_str()))
+        );
     }
 
     #[test]
@@ -1917,5 +2052,18 @@ mod tests {
         assert_eq!(batch.summary.source_records, 1);
         let values = values(&batch);
         assert_eq!(values[0]["telemetryBatch"]["endpoint"], "otlp_traces");
+    }
+
+    #[test]
+    fn telemetry_reason_labels_are_revalidated_against_the_raw_batch() {
+        let raw = br#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"01"}]}]}]}"#;
+        let batch = prepare_cloud_ingest(CloudEndpoint::OtlpTraces, raw, 1024 * 1024).unwrap();
+        let mut capture = values(&batch).remove(0);
+        assert!(revalidate_telemetry_batch(&capture).is_ok());
+        capture["telemetryBatch"]["quality_error_reasons"] = json!({
+            "invalid_structure": 1
+        });
+        let error = revalidate_telemetry_batch(&capture).unwrap_err();
+        assert!(error.to_string().contains("quality_error_reasons"));
     }
 }

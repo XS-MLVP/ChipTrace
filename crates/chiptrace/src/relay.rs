@@ -2,7 +2,10 @@ use crate::capture::{
     CaptureRecord, WireCaptureEvidence, normalize_capture, normalize_wire_capture,
     normalize_wire_capture_batch,
 };
-use crate::cloud_ingest::{CloudEndpoint, CloudIngestBatch, prepare_cloud_ingest};
+use crate::cloud_ingest::{
+    CloudEndpoint, CloudIngestBatch, QUALITY_REASON_CODES, prepare_cloud_ingest,
+    quality_error_reasons,
+};
 use crate::ingest::{BodyReadError, InflightBodyBudget};
 use crate::jsonl::utc_now;
 use crate::managed_models::{CATALOG_SOURCE_VERSION, managed_model_catalog};
@@ -18,7 +21,7 @@ use futures_util::stream::{self, StreamExt};
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -45,6 +48,7 @@ const INGEST_QUALITY_SEED_SCHEMA_VERSION: &str = "chiptrace.ingest-quality-seed.
 const INGEST_QUALITY_SEED_FILE: &str = "ingest-quality-seed.json";
 const MAX_INGEST_QUALITY_SEED_BYTES: u64 = 64 * 1024;
 const INGEST_COVERAGE_FRESHNESS_WINDOW_MS: u64 = 5 * 60 * 1_000;
+const LEGACY_UNCLASSIFIED_QUALITY_REASON: &str = "legacy_unclassified";
 
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
@@ -123,6 +127,12 @@ struct IngestQualityCounters {
     codex_hook_unknown_events: u64,
     #[serde(default)]
     codex_hook_conversion_errors: u64,
+    #[serde(default)]
+    otlp_logs_quality_reasons: BTreeMap<String, u64>,
+    #[serde(default)]
+    otlp_traces_quality_reasons: BTreeMap<String, u64>,
+    #[serde(default)]
+    codex_hook_quality_reasons: BTreeMap<String, u64>,
 }
 
 /// One-time migration evidence for a Delivery ledger created before quality
@@ -153,12 +163,20 @@ impl IngestQualitySeed {
                 total
             );
         }
-        Ok(self.counters)
+        let mut counters = self.counters;
+        counters.reconcile_reason_maps()?;
+        Ok(counters)
     }
 }
 
 impl IngestQualityCounters {
-    fn add(&mut self, endpoint: CloudEndpoint, unknown_events: u64, conversion_errors: u64) {
+    fn add(
+        &mut self,
+        endpoint: CloudEndpoint,
+        unknown_events: u64,
+        conversion_errors: u64,
+        reasons: &BTreeMap<String, u64>,
+    ) -> Result<()> {
         match endpoint {
             CloudEndpoint::OtlpLogs => {
                 self.otlp_logs_unknown_events =
@@ -184,6 +202,43 @@ impl IngestQualityCounters {
                     .saturating_add(conversion_errors);
             }
         }
+        let expected = unknown_events.saturating_add(conversion_errors);
+        let observed = reasons
+            .values()
+            .fold(0_u64, |total, count| total.saturating_add(*count));
+        if observed != expected {
+            bail!(
+                "quality reason total mismatch for {}: reasons={}, expected={}",
+                endpoint.as_str(),
+                observed,
+                expected
+            );
+        }
+        let destination = self.reasons_mut(endpoint);
+        for (reason, count) in reasons {
+            if !is_quality_reason(reason) {
+                bail!("unsupported quality reason code: {reason}");
+            }
+            let value = destination.entry(reason.clone()).or_insert(0);
+            *value = value.saturating_add(*count);
+        }
+        Ok(())
+    }
+
+    fn reasons_mut(&mut self, endpoint: CloudEndpoint) -> &mut BTreeMap<String, u64> {
+        match endpoint {
+            CloudEndpoint::OtlpLogs => &mut self.otlp_logs_quality_reasons,
+            CloudEndpoint::OtlpTraces => &mut self.otlp_traces_quality_reasons,
+            CloudEndpoint::CodexHook => &mut self.codex_hook_quality_reasons,
+        }
+    }
+
+    fn reasons(&self, endpoint: CloudEndpoint) -> &BTreeMap<String, u64> {
+        match endpoint {
+            CloudEndpoint::OtlpLogs => &self.otlp_logs_quality_reasons,
+            CloudEndpoint::OtlpTraces => &self.otlp_traces_quality_reasons,
+            CloudEndpoint::CodexHook => &self.codex_hook_quality_reasons,
+        }
     }
 
     fn total(&self) -> u64 {
@@ -194,6 +249,50 @@ impl IngestQualityCounters {
             .saturating_add(self.codex_hook_unknown_events)
             .saturating_add(self.codex_hook_conversion_errors)
     }
+
+    fn reconcile_reason_maps(&mut self) -> Result<()> {
+        for endpoint in [
+            CloudEndpoint::OtlpLogs,
+            CloudEndpoint::OtlpTraces,
+            CloudEndpoint::CodexHook,
+        ] {
+            let expected = match endpoint {
+                CloudEndpoint::OtlpLogs => self
+                    .otlp_logs_unknown_events
+                    .saturating_add(self.otlp_logs_conversion_errors),
+                CloudEndpoint::OtlpTraces => self
+                    .otlp_traces_unknown_events
+                    .saturating_add(self.otlp_traces_conversion_errors),
+                CloudEndpoint::CodexHook => self
+                    .codex_hook_unknown_events
+                    .saturating_add(self.codex_hook_conversion_errors),
+            };
+            let reasons = self.reasons_mut(endpoint);
+            if reasons.keys().any(|reason| !is_quality_reason(reason)) {
+                bail!("ingest quality ledger contains an unsupported reason code");
+            }
+            let observed = reasons
+                .values()
+                .fold(0_u64, |total, count| total.saturating_add(*count));
+            if observed > expected {
+                bail!(
+                    "ingest quality reason total exceeds endpoint total for {}",
+                    endpoint.as_str()
+                );
+            }
+            if observed < expected {
+                let legacy = reasons
+                    .entry(LEGACY_UNCLASSIFIED_QUALITY_REASON.to_owned())
+                    .or_insert(0);
+                *legacy = legacy.saturating_add(expected - observed);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_quality_reason(reason: &str) -> bool {
+    reason == LEGACY_UNCLASSIFIED_QUALITY_REASON || QUALITY_REASON_CODES.contains(&reason)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -605,11 +704,12 @@ impl DeliveryLedger {
         read_ingest_quality_counters(&meta)
     }
 
-    fn record_ingest_quality(
+    fn record_ingest_quality_with_reasons(
         &self,
         endpoint: CloudEndpoint,
         unknown_events: u64,
         conversion_errors: u64,
+        reasons: &BTreeMap<String, u64>,
     ) -> Result<IngestQualityCounters> {
         if unknown_events == 0 && conversion_errors == 0 {
             return self.ingest_quality_counters();
@@ -618,7 +718,7 @@ impl DeliveryLedger {
         let counters = {
             let mut meta = transaction.open_table(META)?;
             let mut counters = read_ingest_quality_counters(&meta)?;
-            counters.add(endpoint, unknown_events, conversion_errors);
+            counters.add(endpoint, unknown_events, conversion_errors, reasons)?;
             write_ingest_quality_counters(&mut meta, &counters)?;
             counters
         };
@@ -695,17 +795,22 @@ fn read_ingest_quality_counters<T>(meta: &T) -> Result<IngestQualityCounters>
 where
     T: ReadableTable<&'static str, &'static [u8]>,
 {
-    meta.get(INGEST_QUALITY_COUNTERS_KEY)?
+    let mut counters: IngestQualityCounters = meta
+        .get(INGEST_QUALITY_COUNTERS_KEY)?
         .map(|value| serde_json::from_slice(value.value()).map_err(anyhow::Error::from))
         .transpose()
-        .map(|value| value.unwrap_or_default())
+        .map(|value| value.unwrap_or_default())?;
+    counters.reconcile_reason_maps()?;
+    Ok(counters)
 }
 
 fn write_ingest_quality_counters(
     meta: &mut redb::Table<'_, &'static str, &'static [u8]>,
     counters: &IngestQualityCounters,
 ) -> Result<()> {
-    let bytes = serde_json::to_vec(counters)?;
+    let mut checked = counters.clone();
+    checked.reconcile_reason_maps()?;
+    let bytes = serde_json::to_vec(&checked)?;
     meta.insert(INGEST_QUALITY_COUNTERS_KEY, bytes.as_slice())?;
     Ok(())
 }
@@ -883,17 +988,23 @@ impl DurableRelay {
             .ingest_quality_counters()
     }
 
-    fn record_ingest_quality(
+    fn record_ingest_quality_with_reasons(
         &self,
         endpoint: CloudEndpoint,
         unknown_events: u64,
         conversion_errors: u64,
+        reasons: &BTreeMap<String, u64>,
     ) -> Result<IngestQualityCounters> {
         self.inner
             .ledger
             .lock()
             .expect("delivery ledger poisoned")
-            .record_ingest_quality(endpoint, unknown_events, conversion_errors)
+            .record_ingest_quality_with_reasons(
+                endpoint,
+                unknown_events,
+                conversion_errors,
+                reasons,
+            )
     }
 
     pub async fn flush(&self) -> Result<Vec<crate::store::SegmentMetadata>> {
@@ -1474,6 +1585,7 @@ struct RouteCoverage {
     duplicates: u64,
     quality_unknown_events: u64,
     quality_conversion_errors: u64,
+    quality_reasons: BTreeMap<String, u64>,
     last_at: Option<String>,
     first_observed_millis: Option<u64>,
     last_observed_millis: Option<u64>,
@@ -1524,10 +1636,13 @@ impl IngestCoverageState {
         };
         state.otlp_logs.quality_unknown_events = counters.otlp_logs_unknown_events;
         state.otlp_logs.quality_conversion_errors = counters.otlp_logs_conversion_errors;
+        state.otlp_logs.quality_reasons = counters.reasons(CloudEndpoint::OtlpLogs).clone();
         state.otlp_traces.quality_unknown_events = counters.otlp_traces_unknown_events;
         state.otlp_traces.quality_conversion_errors = counters.otlp_traces_conversion_errors;
+        state.otlp_traces.quality_reasons = counters.reasons(CloudEndpoint::OtlpTraces).clone();
         state.hooks.quality_unknown_events = counters.codex_hook_unknown_events;
         state.hooks.quality_conversion_errors = counters.codex_hook_conversion_errors;
+        state.hooks.quality_reasons = counters.reasons(CloudEndpoint::CodexHook).clone();
         state
     }
 
@@ -1611,6 +1726,10 @@ impl IngestCoverageState {
         route.quality_conversion_errors = route
             .quality_conversion_errors
             .saturating_add(conversion_errors);
+        for (reason, count) in quality_error_reasons(summary) {
+            let value = route.quality_reasons.entry(reason).or_insert(0);
+            *value = value.saturating_add(count);
+        }
     }
 
     fn snapshot(&self) -> Value {
@@ -1773,6 +1892,7 @@ fn route_quality_value(route: &RouteCoverage) -> Value {
         "total":route
             .quality_unknown_events
             .saturating_add(route.quality_conversion_errors),
+        "reasons":route.quality_reasons,
     })
 }
 
@@ -1954,10 +2074,11 @@ async fn relay_cloud_ingest(
         .unknown_events
         .saturating_add(summary.conversion_errors.len() as u64);
     if quality_rejections > 0
-        && let Err(error) = state.relay.record_ingest_quality(
+        && let Err(error) = state.relay.record_ingest_quality_with_reasons(
             endpoint,
             summary.unknown_events,
             summary.conversion_errors.len() as u64,
+            &quality_error_reasons(&summary),
         )
     {
         // The raw batch is already durable. Refuse the request until its
@@ -3567,18 +3688,30 @@ mod tests {
         {
             let ledger = DeliveryLedger::open(&path).unwrap();
             assert_eq!(ledger.ingest_quality_counters().unwrap().total(), 0);
+            let reasons = BTreeMap::from([
+                ("unsupported_event".to_owned(), 2),
+                ("invalid_structure".to_owned(), 3),
+            ]);
             let counters = ledger
-                .record_ingest_quality(CloudEndpoint::OtlpTraces, 2, 3)
+                .record_ingest_quality_with_reasons(CloudEndpoint::OtlpTraces, 2, 3, &reasons)
                 .unwrap();
             assert_eq!(counters.total(), 5);
             assert_eq!(counters.otlp_traces_unknown_events, 2);
             assert_eq!(counters.otlp_traces_conversion_errors, 3);
+            assert_eq!(counters.otlp_traces_quality_reasons, reasons);
         }
         let reopened = DeliveryLedger::open(&path).unwrap();
         let counters = reopened.ingest_quality_counters().unwrap();
         assert_eq!(counters.total(), 5);
         assert_eq!(counters.otlp_traces_unknown_events, 2);
         assert_eq!(counters.otlp_traces_conversion_errors, 3);
+        assert_eq!(
+            counters.otlp_traces_quality_reasons,
+            BTreeMap::from([
+                ("unsupported_event".to_owned(), 2),
+                ("invalid_structure".to_owned(), 3),
+            ])
+        );
         let coverage = IngestCoverageState::with_quality_counters(counters).snapshot();
         assert_eq!(coverage["quality_errors_scope"], "durable_relay_state");
         assert_eq!(coverage["quality_errors"], 5);
@@ -3643,6 +3776,13 @@ mod tests {
                 .unwrap()
                 .otlp_traces_conversion_errors,
             7
+        );
+        assert_eq!(
+            reopened
+                .ingest_quality_counters()
+                .unwrap()
+                .otlp_traces_quality_reasons,
+            BTreeMap::from([("legacy_unclassified".to_owned(), 7)])
         );
     }
 }

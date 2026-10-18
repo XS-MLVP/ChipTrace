@@ -151,8 +151,9 @@ GitHub CI 的 `live-provider-runtime-preflight` 只在手工 `workflow_dispatch`
 `self-hosted, linux, chiptrace-canary` 的内网 Runner 上执行。Environment Secret 必须提供
 `CHIPTRACE_API_KEY`；Environment Variables 必须提供
 `CHIPTRACE_RESPONSES_URL`、`CHIPTRACE_GATEWAY_HEALTH_URL`、`CHIPTRACE_RELAY_HEALTH_URL`、
-`CHIPTRACE_COLLECTOR_HEALTH_URL` 和 `CHIPTRACE_PLATFORM_HEALTH_URL`。手工输入的 `expected_revision` 必须是 Collector/Relay
-实际构建的完整 Git SHA。普通 push/PR 不接触这些 Secret，也不会因为缺少 Runner 或变量而
+`CHIPTRACE_COLLECTOR_HEALTH_URL` 和 `CHIPTRACE_PLATFORM_HEALTH_URL`。启用真实预检时，手工输入的
+`expected_revision` 必须是 Collector/Relay 实际构建的完整 Git SHA；普通手工 CI 可以留空。
+普通 push/PR 不接触这些 Secret，也不会因为缺少 Runner 或变量而
 跳过真实预检。该作业只确认 Provider 请求和当前进程 readiness，随后仍须用同一 Session
 执行未修改 Stock Codex 的多轮四源 Canary、OSS 验收和 `cloud-acceptance`。
 Live preflight 还要求 Relay 的 `ingest_coverage.quality_errors` 为 0；该计数从持久
@@ -298,9 +299,14 @@ Relay/Collector 的精确 Raw、重复确认、平台归档/恢复、Turn 和采
   `false` 只表示当前进程缺少就绪证据，不代表已有 Raw 可以补造为完整 Session。
 - `output_truncated=true`、未知 OTLP 事件、转换错误和身份冲突。
 - `ingest_coverage.quality_errors_by_endpoint` 用于区分 `otlp_logs`、`otlp_traces` 和 `hooks`
-  的 `unknown_events`、`conversion_errors` 与总数；总数必须和持久化的 `quality_errors` 对账，
-  `quality_errors_current_process` 仅表示本次进程增量。`quality_errors_scope` 缺失或不是
-  `durable_relay_state` 时门禁必须失败。先保留失败快照，再修正生产者或采集配置。
+  的 `unknown_events`、`conversion_errors`、固定 `reasons` 原因码与总数；原因码只能是
+  `unsupported_event`、`invalid_structure`、`invalid_attributes`、`identity_conflict`、
+  `missing_identity`、`invalid_tool`、`invalid_lifecycle`、`invalid_timestamp`、
+  `conversion_error` 或历史迁移专用的 `legacy_unclassified`，每个端点的原因计数必须和
+  端点总数一致，总数必须和持久化的 `quality_errors` 对账。`quality_errors_current_process`
+  仅表示本次进程增量，运行门禁还必须拒绝缺少原因分解的旧 Relay。旧 ledger 无法回溯原因时
+  只能归入 `legacy_unclassified`，不能按正文或时间猜测更具体标签。先保留失败快照，再
+  修正生产者或采集配置。
 - Session start/end、模型调用/结果/执行、内部父引用的完整率；以及每个 Turn 的 Wire、
   OTLP logs、OTLP traces、required Hook 覆盖和 `incomplete_turns`。
 - Buyer v7 失败原因、合格 Session 数和四种 Token 口径。

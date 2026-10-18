@@ -13,6 +13,7 @@ test('live provider preflight is manual, protected and isolated from ordinary CI
   assert.match(workflow, /if: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.live_preflight == true && github\.ref_protected == true \}\}/);
   assert.match(workflow, /runs-on: \[self-hosted, linux, chiptrace-canary\]/);
   assert.match(workflow, /environment: production-canary/);
+  assert.match(workflow, /expected_revision:[\s\S]*?required: false[\s\S]*?default: ""/);
 });
 
 test('live provider preflight requires protected endpoints and runs both gates', () => {

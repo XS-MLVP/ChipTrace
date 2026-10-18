@@ -97,5 +97,7 @@ HTTP 2xx 也不证明 Responses 终态或客户端交付；门禁声明 `session
 Session 是否可交付仍只由 `cloud-acceptance` 判定。
 质量错误计数从持久 Delivery ledger 恢复。`quality_errors_scope` 必须为
 `durable_relay_state`；`quality_errors_current_process` 单独报告本次进程新增值，避免重启
-掩盖历史错误。Collector 和 Relay 的健康响应还包含 `build.version` 与 `build.revision`；部署门禁可以用
+掩盖历史错误。每个端点还持久化固定、脱敏的 `quality_errors_by_endpoint.*.reasons` 原因码，
+原因计数必须和端点总数及全局总数守恒；旧 ledger 无法恢复具体原因时只标记
+`legacy_unclassified`。健康快照不会输出转换错误正文。Collector 和 Relay 的健康响应还包含 `build.version` 与 `build.revision`；部署门禁可以用
 固定 Git revision 拒绝旧镜像继续接收或交接数据。

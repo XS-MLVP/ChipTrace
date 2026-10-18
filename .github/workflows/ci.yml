@@ -12,7 +12,10 @@ on:
         type: boolean
       expected_revision:
         description: Full Collector/Relay Git revision expected by the runtime gate
-        required: true
+        # This input is only consumed by the protected live preflight.  Keep
+        # ordinary manual CI runs startable without production state.
+        required: false
+        default: ""
         type: string
       model:
         description: Provider model used for the bounded Responses probe

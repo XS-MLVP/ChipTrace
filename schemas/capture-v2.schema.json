@@ -422,6 +422,16 @@
         "conversion_errors": {
           "type": "array",
           "items": {"type": "string", "minLength": 1}
+        },
+        "quality_error_reasons": {
+          "type": "object",
+          "propertyNames": {"enum": [
+            "unsupported_event", "invalid_structure", "invalid_attributes",
+            "identity_conflict", "missing_identity", "invalid_tool",
+            "invalid_lifecycle", "invalid_timestamp", "conversion_error",
+            "legacy_unclassified"
+          ]},
+          "additionalProperties": {"type": "integer", "minimum": 0}
         }
       },
       "additionalProperties": false

@@ -83,9 +83,9 @@ function relay() {
       quality_errors_current_process: 0,
       quality_errors_scope: 'durable_relay_state',
       quality_errors_by_endpoint: {
-        otlp_logs: { unknown_events: 0, conversion_errors: 0, total: 0 },
-        otlp_traces: { unknown_events: 0, conversion_errors: 0, total: 0 },
-        hooks: { unknown_events: 0, conversion_errors: 0, total: 0 },
+        otlp_logs: { unknown_events: 0, conversion_errors: 0, total: 0, reasons: {} },
+        otlp_traces: { unknown_events: 0, conversion_errors: 0, total: 0, reasons: {} },
+        hooks: { unknown_events: 0, conversion_errors: 0, total: 0, reasons: {} },
       },
     },
   };
@@ -230,6 +230,7 @@ test('runtime failure reports enumerate bounded blocking categories in one pass'
   value.ingest_coverage.quality_errors = 4;
   value.ingest_coverage.quality_errors_by_endpoint.otlp_traces = {
     unknown_events: 0, conversion_errors: 4, total: 4,
+    reasons: { conversion_error: 4 },
   };
   Object.assign(value.ingest_coverage.wire_turn_coverage, {
     successful_turn_scoped_captures: 0,
@@ -315,6 +316,7 @@ test('live quality-error maximum rejects accumulated source conversion errors', 
   value.ingest_coverage.quality_errors = 1;
   value.ingest_coverage.quality_errors_by_endpoint.otlp_traces.conversion_errors = 1;
   value.ingest_coverage.quality_errors_by_endpoint.otlp_traces.total = 1;
+  value.ingest_coverage.quality_errors_by_endpoint.otlp_traces.reasons = { conversion_error: 1 };
   assert.throws(
     () => verifyRuntimeHealth(gateway(), value, { collectorHealth: collector(), maxQualityErrors: 0 }),
     /quality_errors exceeds the configured maximum \(observed=1; maximum=0\)/,
@@ -341,9 +343,9 @@ test('runtime observations preserve endpoint quality-error breakdowns', () => {
   const value = relay();
   value.ingest_coverage.quality_errors = 3;
   value.ingest_coverage.quality_errors_by_endpoint = {
-    otlp_logs: { unknown_events: 1, conversion_errors: 0, total: 1 },
-    otlp_traces: { unknown_events: 0, conversion_errors: 2, total: 2 },
-    hooks: { unknown_events: 0, conversion_errors: 0, total: 0 },
+    otlp_logs: { unknown_events: 1, conversion_errors: 0, total: 1, reasons: { unsupported_event: 1 } },
+    otlp_traces: { unknown_events: 0, conversion_errors: 2, total: 2, reasons: { conversion_error: 2 } },
+    hooks: { unknown_events: 0, conversion_errors: 0, total: 0, reasons: {} },
   };
   const observed = healthObservation(gateway(), value, collector());
   assert.deepEqual(observed.relay.coverage.quality_errors_by_endpoint, value.ingest_coverage.quality_errors_by_endpoint);
@@ -353,9 +355,9 @@ test('runtime gate reconciles endpoint quality errors with the process total', (
   const value = relay();
   value.ingest_coverage.quality_errors = 3;
   value.ingest_coverage.quality_errors_by_endpoint = {
-    otlp_logs: { unknown_events: 1, conversion_errors: 0, total: 1 },
-    otlp_traces: { unknown_events: 0, conversion_errors: 2, total: 2 },
-    hooks: { unknown_events: 0, conversion_errors: 0, total: 0 },
+    otlp_logs: { unknown_events: 1, conversion_errors: 0, total: 1, reasons: { unsupported_event: 1 } },
+    otlp_traces: { unknown_events: 0, conversion_errors: 2, total: 2, reasons: { conversion_error: 2 } },
+    hooks: { unknown_events: 0, conversion_errors: 0, total: 0, reasons: {} },
   };
   const result = verifyRuntimeHealth(gateway(), value, { collectorHealth: collector() });
   assert.deepEqual(result.relay.quality_errors_by_endpoint, value.ingest_coverage.quality_errors_by_endpoint);
@@ -371,9 +373,37 @@ test('runtime gate reconciles endpoint quality errors with the process total', (
   processMismatch.ingest_coverage.quality_errors = 2;
   processMismatch.ingest_coverage.quality_errors_by_endpoint.otlp_logs.unknown_events = 1;
   processMismatch.ingest_coverage.quality_errors_by_endpoint.otlp_logs.total = 1;
+  processMismatch.ingest_coverage.quality_errors_by_endpoint.otlp_logs.reasons = { unsupported_event: 1 };
   assert.throws(
     () => verifyRuntimeHealth(gateway(), processMismatch, { collectorHealth: collector() }),
     /quality_errors_by_endpoint total does not match relay\.ingest_coverage\.quality_errors/,
+  );
+});
+
+test('runtime gate rejects unbounded or inconsistent quality reason labels', () => {
+  const unsupported = relay();
+  unsupported.ingest_coverage.quality_errors = 1;
+  unsupported.ingest_coverage.quality_errors_by_endpoint.otlp_logs = {
+    unknown_events: 1,
+    conversion_errors: 0,
+    total: 1,
+    reasons: { PRIVATE_REASON_MUST_NOT_LEAK: 1 },
+  };
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), unsupported, { collectorHealth: collector() }),
+    /reasons contains an unsupported code/,
+  );
+  const mismatch = relay();
+  mismatch.ingest_coverage.quality_errors = 1;
+  mismatch.ingest_coverage.quality_errors_by_endpoint.otlp_logs = {
+    unknown_events: 1,
+    conversion_errors: 0,
+    total: 1,
+    reasons: {},
+  };
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), mismatch, { collectorHealth: collector() }),
+    /reasons total does not match endpoint total/,
   );
 });
 

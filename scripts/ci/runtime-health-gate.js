@@ -5,6 +5,18 @@ const fs = require('node:fs');
 const DEFAULT_TIMEOUT_MS = 5000;
 const REQUIRED_SOURCES = ['wire', 'otlp_logs', 'otlp_traces', 'hooks'];
 const QUALITY_ENDPOINTS = ['otlp_logs', 'otlp_traces', 'hooks'];
+const QUALITY_REASON_CODES = [
+  'unsupported_event',
+  'invalid_structure',
+  'invalid_attributes',
+  'identity_conflict',
+  'missing_identity',
+  'invalid_tool',
+  'invalid_lifecycle',
+  'invalid_timestamp',
+  'conversion_error',
+  'legacy_unclassified',
+];
 const QUALITY_ERRORS_SCOPE = 'durable_relay_state';
 const REVISION_PATTERN = /^[a-f0-9]{40}$/;
 
@@ -82,10 +94,19 @@ function routeObservation(route) {
 
 function qualityErrorObservation(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const reasons = {};
+  if (value.reasons && typeof value.reasons === 'object' && !Array.isArray(value.reasons)) {
+    for (const code of QUALITY_REASON_CODES) {
+      if (Number.isSafeInteger(value.reasons[code]) && value.reasons[code] >= 0) {
+        reasons[code] = value.reasons[code];
+      }
+    }
+  }
   return {
     unknown_events: safeInteger(value.unknown_events),
     conversion_errors: safeInteger(value.conversion_errors),
     total: safeInteger(value.total),
+    reasons,
   };
 }
 
@@ -139,6 +160,9 @@ function blockingReasons(
   if (coverage.turn_capture_ready !== true) add('relay_turn_capture_not_ready');
   if (coverage.quality_errors_scope !== QUALITY_ERRORS_SCOPE) {
     add('relay_quality_history_not_durable');
+  }
+  if (coverage.quality_reason_breakdown_complete !== true) {
+    add('relay_quality_reason_breakdown_missing');
   }
   if (Number.isSafeInteger(turns.successful_turn_scoped_captures)
     && turns.successful_turn_scoped_captures === 0) {
@@ -237,6 +261,11 @@ function healthObservation(
           otlp_traces: qualityErrorObservation(coverage?.quality_errors_by_endpoint?.otlp_traces),
           hooks: qualityErrorObservation(coverage?.quality_errors_by_endpoint?.hooks),
         },
+        quality_reason_breakdown_complete: QUALITY_ENDPOINTS.every(endpoint => (
+          coverage?.quality_errors_by_endpoint?.[endpoint]?.reasons
+          && typeof coverage.quality_errors_by_endpoint[endpoint].reasons === 'object'
+          && !Array.isArray(coverage.quality_errors_by_endpoint[endpoint].reasons)
+        )),
         wire_turn_coverage: {
           turn_scoped_captures: safeInteger(turnCoverage?.turn_scoped_captures),
           successful_turn_scoped_captures: safeInteger(turnCoverage?.successful_turn_scoped_captures),
@@ -407,7 +436,9 @@ function verifyWireTurnCoverage(coverage) {
 }
 
 function verifyQualityBreakdown(coverage, qualityErrors) {
-  if (coverage.quality_errors_by_endpoint === undefined) return null;
+  if (coverage.quality_errors_by_endpoint === undefined) {
+    fail('relay.ingest_coverage.quality_errors_by_endpoint is required');
+  }
   const breakdown = object(
     coverage.quality_errors_by_endpoint,
     'relay.ingest_coverage.quality_errors_by_endpoint',
@@ -437,11 +468,34 @@ function verifyQualityBreakdown(coverage, qualityErrors) {
         + `does not equal unknown_events + conversion_errors`,
       );
     }
+    const reasons = object(
+      value.reasons,
+      `relay.ingest_coverage.quality_errors_by_endpoint.${endpoint}.reasons`,
+    );
+    let reasonTotal = 0;
+    for (const [code, count] of Object.entries(reasons)) {
+      if (!QUALITY_REASON_CODES.includes(code)) {
+        fail(`relay.ingest_coverage.quality_errors_by_endpoint.${endpoint}.reasons contains an unsupported code`);
+      }
+      reasonTotal += nonNegativeInteger(
+        count,
+        `relay.ingest_coverage.quality_errors_by_endpoint.${endpoint}.reasons.${code}`,
+      );
+    }
+    if (reasonTotal !== endpointTotal) {
+      fail(
+        `relay.ingest_coverage.quality_errors_by_endpoint.${endpoint}.reasons total `
+        + `does not match endpoint total (observed=${reasonTotal}; expected=${endpointTotal})`,
+      );
+    }
     total += endpointTotal;
     result[endpoint] = {
       unknown_events: unknown,
       conversion_errors: conversion,
       total: endpointTotal,
+      reasons: Object.fromEntries(QUALITY_REASON_CODES
+        .filter(code => Object.hasOwn(reasons, code))
+        .map(code => [code, reasons[code]])),
     };
   }
   if (total !== qualityErrors) {
@@ -705,6 +759,7 @@ if (require.main === module) {
 module.exports = {
   DEFAULT_TIMEOUT_MS,
   REQUIRED_SOURCES,
+  QUALITY_REASON_CODES,
   verifyGatewayHealth,
   verifyRelayHealth,
   verifyCollectorHealth,

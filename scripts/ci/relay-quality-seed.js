@@ -5,6 +5,18 @@ const fs = require('node:fs');
 const SEED_SCHEMA_VERSION = 'chiptrace.ingest-quality-seed.v1';
 const MAX_INPUT_BYTES = 256 * 1024;
 const ENDPOINTS = ['otlp_logs', 'otlp_traces', 'hooks'];
+const QUALITY_REASON_CODES = [
+  'unsupported_event',
+  'invalid_structure',
+  'invalid_attributes',
+  'identity_conflict',
+  'missing_identity',
+  'invalid_tool',
+  'invalid_lifecycle',
+  'invalid_timestamp',
+  'conversion_error',
+  'legacy_unclassified',
+];
 
 function fail(message) {
   throw new Error(`relay quality seed: ${message}`);
@@ -45,6 +57,20 @@ function qualityCountersFromReport(report) {
     const prefix = endpoint === 'hooks' ? 'codex_hook' : endpoint;
     counters[`${prefix}_unknown_events`] = unknown;
     counters[`${prefix}_conversion_errors`] = conversion;
+    if (Object.hasOwn(route, 'reasons')) {
+      const reasons = object(route.reasons, `${endpoint}.reasons`);
+      let reasonTotal = 0;
+      const normalizedReasons = {};
+      for (const [reason, count] of Object.entries(reasons)) {
+        if (!QUALITY_REASON_CODES.includes(reason)) fail(`${endpoint}.reasons contains an unsupported code`);
+        normalizedReasons[reason] = nonNegativeInteger(count, `${endpoint}.reasons.${reason}`);
+        reasonTotal += normalizedReasons[reason];
+      }
+      if (reasonTotal !== endpointTotal) {
+        fail(`${endpoint}.reasons total must equal endpoint total`);
+      }
+      counters[`${prefix}_quality_reasons`] = normalizedReasons;
+    }
   }
   if (total !== qualityErrors) {
     fail(`quality error total mismatch: breakdown=${total}, quality_errors=${qualityErrors}`);
@@ -120,6 +146,7 @@ if (require.main === module) {
 
 module.exports = {
   ENDPOINTS,
+  QUALITY_REASON_CODES,
   MAX_INPUT_BYTES,
   SEED_SCHEMA_VERSION,
   buildSeed,

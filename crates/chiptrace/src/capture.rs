@@ -1192,6 +1192,38 @@ fn validate_telemetry_batch(object: &Map<String, Value>) -> Result<()> {
     {
         bail!("telemetryBatch.conversion_errors must contain strings");
     }
+    if let Some(reasons) = batch.get("quality_error_reasons") {
+        let reasons = reasons.as_object().ok_or_else(|| {
+            anyhow::anyhow!("telemetryBatch.quality_error_reasons must be an object")
+        })?;
+        let mut total = 0_u64;
+        for (reason, count) in reasons {
+            if reason != "legacy_unclassified"
+                && !crate::cloud_ingest::QUALITY_REASON_CODES.contains(&reason.as_str())
+            {
+                bail!("telemetryBatch.quality_error_reasons contains an unsupported code");
+            }
+            let count = count.as_u64().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "telemetryBatch.quality_error_reasons values must be non-negative integers"
+                )
+            })?;
+            total = total.saturating_add(count);
+        }
+        let expected = batch
+            .get("unknown_events")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            .saturating_add(
+                batch
+                    .get("conversion_errors")
+                    .and_then(Value::as_array)
+                    .map_or(0, |errors| errors.len() as u64),
+            );
+        if total != expected {
+            bail!("telemetryBatch.quality_error_reasons total does not match quality errors");
+        }
+    }
     Ok(())
 }
 
