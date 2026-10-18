@@ -1,13 +1,14 @@
 # 生产就绪评估
 
-评估日期：2026-10-18。最新线上只读快照为 20:32（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-18。最新线上只读快照为 20:48（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
 最新快照中 Collector 与 Relay 的传输计数仍守恒：Collector 捕获、Relay 已投递均为
-`1,231,652`，队列和失败均为 0，Collector ready；18084、3011、3012、18086 均返回 HTTP 200。
-业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2416`，其中
-`otlp_traces.identity_conflict=182`、`invalid_lifecycle=269`、`legacy_unclassified=1965`；当前
+`1,233,021` 与 `1,233,020`（Collector 还包含 1 条其他来源记录），队列和失败均为 0，Collector ready；
+18084、3011、3012、18086 均返回 HTTP 200。
+业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2512`，其中
+`otlp_traces.identity_conflict=182`、`invalid_lifecycle=365`、`legacy_unclassified=1965`；当前
 进程新增错误仍来自上游同一 Span 的矛盾 `outcome` 标签，已按生命周期原因单独计数并保留 Raw。
 Wire 未观察到，`missing_sources=["wire"]`、`stale_sources=["wire"]`、`turn_capture_ready=false`，
 runtime gate 以质量、新鲜度、历史失败、原因分解和 revision 门禁真实退出 1。
@@ -16,7 +17,7 @@ runtime gate 以质量、新鲜度、历史失败、原因分解和 revision 门
 外部镜像的 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`；带维护 SHA 的 Gateway preflight 真实退出 1，
 因此入口镜像尚未与维护提交对齐。真实 Alibaba OSS 提交、恢复、远端对象哈希、未修改 Stock Codex
 新鲜多轮 Canary 和目标租户导出仍未完成。GitHub API/CLI 当前无法核验远端 Actions 结论；当前维护分支
-HEAD 为 `a3d4a6dc5f966d496415e02c5eff1080bdd7deff`，仅 `git ls-remote` 证明远端 ref 已更新。
+HEAD 为 `eb73b8eb677cdb2384d21ee373f313a30c727408`，仅 `git ls-remote` 证明远端 ref 已更新。
 
 当前复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
 failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留，Collector/Relay 队列为空且
