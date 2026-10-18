@@ -209,8 +209,9 @@ setup-node 7.1.0、upload-artifact 7.0.2 固定到 SHA；三者原生使用 Node
 
 `dd3de61` 的 S3 作业在初始化阶段下载 `actions/setup-go@v6` 归档失败，尚未执行协议
 测试。只读 HEAD 复查确认 tag API 可用，但 v6 对应提交与稳定 v7.0.0 的 codeload
-归档均返回 HTTP 404。工作流改由 runner 预装 Go 的原生 `GOTOOLCHAIN=go1.24.2`
-机制选择工具链，构建前检查真实 `go env GOVERSION`；MinIO 源码仍固定同一 commit。
+归档均返回 HTTP 404。所有 MinIO/S3 job 均改由 runner 预装 Go 的原生
+`GOTOOLCHAIN=go1.24.2` 机制选择工具链，完全移除 `actions/setup-go` 的启动依赖，构建前检查
+真实 `go env GOVERSION`；MinIO 源码仍固定同一 commit。
 工具链日志和完整构建日志另随 S3 报告保留。`91bcd79` 的上述 Actions run 已真实完成
 工具链检查、MinIO 编译和 S3 测试，五个作业均成功；生产者作业再次实际命中缓存，仍执行
 全部测试及 CLI 构建。该结果不替代后续提交的 CI，也不证明线上部署或真实 Alibaba OSS
