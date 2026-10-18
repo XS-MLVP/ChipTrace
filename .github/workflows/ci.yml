@@ -166,10 +166,10 @@ jobs:
         with:
           node-version: "22"
           package-manager-cache: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action revision
         with:
           toolchain: "1.91.0"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Install the official release without changing the runner's CLI
         run: |
           stock_spec=$(node -p 'require("./integrations/codex/stock-release.json").npm_spec')
@@ -257,7 +257,7 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           unshare --user --map-root-user true
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action revision
         with:
           toolchain: "1.95.0"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -289,7 +289,7 @@ jobs:
             | tee "$RUNNER_TEMP/producer-cache-identity.json"
           digest=$(node -p 'require(process.argv[1]).source_sha256' "$RUNNER_TEMP/producer-cache-identity.json")
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         id: producer-cache
         with:
           workspaces: |
@@ -364,7 +364,7 @@ jobs:
           bash "$GITHUB_WORKSPACE/scripts/ci/run-producer-check.sh" build \
             "$RUNNER_TEMP/producer-build.log" \
             cargo build -p codex-cli --bin codex -p codex-app-server --bin codex-app-server --locked
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action revision
         with:
           toolchain: "1.91.0"
       - name: Build the current release Collector and Relay for newly executed protocol collection
@@ -493,11 +493,11 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action revision
         with:
           toolchain: "1.91"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
@@ -891,10 +891,10 @@ jobs:
       GOTOOLCHAIN: go1.24.2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action revision
         with:
           toolchain: "1.91"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"

@@ -43,3 +43,13 @@ test('live provider preflight requires protected endpoints and runs both gates',
   assert.match(workflow, /--expected-revision "\$CHIPTRACE_EXPECTED_REVISION"/);
   assert.match(workflow, /name: live-provider-runtime-preflight/);
 });
+
+test('CI actions are immutable and the MinIO job verifies its Go toolchain before compiling', () => {
+  const actions = [...workflow.matchAll(/^\s*- uses:\s+([^\s#]+)/gm)].map(match => match[1]);
+  assert.ok(actions.length > 0);
+  assert.ok(actions.every(action => /@[a-f0-9]{40}$/.test(action)),
+    `all third-party Actions must be pinned by commit: ${actions.filter(action => !/@[a-f0-9]{40}$/.test(action)).join(', ')}`);
+  assert.match(workflow, /GOTOOLCHAIN: go1\.24\.2/);
+  assert.match(workflow, /test "\$\(go env GOVERSION\)" = "go1\.24\.2"/);
+  assert.match(workflow, /name: Select and verify the pinned Go toolchain using the runner's Go bootstrap/);
+});

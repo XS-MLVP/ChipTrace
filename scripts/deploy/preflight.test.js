@@ -72,4 +72,10 @@ test('deployment preflight rejects mutable images, unknown revisions and missing
   const invalidBackend = structuredClone(config);
   invalidBackend.services.platform.environment.CHIPTRACE_BACKEND = 'local';
   assert.throws(() => validateConfig(invalidBackend, revision), /backend/);
+  const missingPlatformRevision = structuredClone(config);
+  delete missingPlatformRevision.services.platform.environment.CHIPTRACE_BUILD_REVISION;
+  assert.throws(() => validateConfig(missingPlatformRevision, revision), /platform health revision/);
+  const stalePlatformRevision = structuredClone(config);
+  stalePlatformRevision.services.platform.environment.CHIPTRACE_BUILD_REVISION = 'e'.repeat(40);
+  assert.throws(() => validateConfig(stalePlatformRevision, revision), /platform health revision/);
 });

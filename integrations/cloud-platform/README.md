@@ -74,9 +74,11 @@ Completion verification scans chunks, hashing all bytes and counting records.
 HTTP Turn pages keep the existing JSON object format but stream selected rows
 without materializing them in Node. `read-turn-page` validates every JSONL
 record and all UTF-8 bytes in Rust, returning only the recorded digest, count
-and at most 100 selected byte ranges. Node verifies that descriptor and the
-complete sidecar again on the handle used to stream the selected rows. Invalid
-records, including those outside the page, fail before response headers.
+and at most 100 selected byte ranges. Node opens one `O_NOFOLLOW` descriptor
+before that scan, verifies its identity against the path and recorded size
+afterward, then streams from the same descriptor. Invalid records, including
+those outside the page, fail before response headers; a missing, replaced or
+unreadable sidecar is reported as `ARTIFACT_CHANGED`.
 Use `client.streamTurns(id, { offset, limit })` to consume a page's Response
 body as a stream. `client.getTurns` still parses that Response into an object
 on the client. The embedding-only `plugin.getTurns` object API also retains

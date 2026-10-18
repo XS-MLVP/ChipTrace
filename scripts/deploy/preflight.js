@@ -23,6 +23,9 @@ function validateConfig(config, revision) {
   assert.ok(services.length, 'deployment must contain services');
   const backend = config.services.platform?.environment?.CHIPTRACE_BACKEND;
   assert.ok(['fs', 'oss', 's3'].includes(backend), 'platform storage backend must be explicitly fs, oss, or s3');
+  const platformRevision = config.services.platform?.environment?.CHIPTRACE_BUILD_REVISION;
+  assert.equal(platformRevision, revision,
+    'platform health revision must be bound to the expected Git commit');
   const writableBindSources = new Map();
   for (const [name, service] of services) {
     assert.ok(['collector', 'relay', 'platform'].includes(name), 'unexpected deployment service');

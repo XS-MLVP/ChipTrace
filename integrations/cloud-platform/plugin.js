@@ -161,6 +161,10 @@ function turnPageStream(handle, prefix, rows, release) {
   });
 }
 
+function fileFingerprint(stat) {
+  return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(':');
+}
+
 function projectionMetadata(value, manifest = null) {
   if (!value || typeof value !== 'object' || !Array.isArray(value.parts)) return null;
   const parts = value.parts.map(part => ({
@@ -812,6 +816,18 @@ class ChipTracePlugin {
         throw new PlatformError('Turn evidence exceeds disk limit', 503, 'OUTPUT_LIMIT');
       }
       const file = path.join(this.root, 'work', job.request.id, 'turns.jsonl');
+      // Keep one verified descriptor open across the Rust metadata scan and
+      // the response stream. This removes the previous second full-file scan
+      // while retaining path, inode, size and timestamp checks against a
+      // replacement or in-place mutation.
+      handle = await fsp.open(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)
+        .catch(() => { throw new PlatformError('Turn evidence changed or cannot be read', 422, 'ARTIFACT_CHANGED'); });
+      const before = await handle.stat().catch(() => {
+        throw new PlatformError('Turn evidence changed or cannot be read', 422, 'ARTIFACT_CHANGED');
+      });
+      if (!before.isFile() || before.size !== job.turns.bytes) {
+        throw new PlatformError('Turn evidence changed or cannot be read', 422, 'ARTIFACT_CHANGED');
+      }
       let report;
       try {
         report = await this.#engine(['read-turn-page', '--input', file,
@@ -835,10 +851,17 @@ class ChipTracePlugin {
         }
         previousEnd = end;
       }
-      // The CLI validates all JSONL records without materializing them. Check
-      // the complete digest again on the handle used to stream the page, so a
-      // path replacement cannot substitute unverified bytes or byte ranges.
-      ({ handle } = await this.#openTurnEvidence(job, 0, 0));
+      // The CLI validated and hashed every JSONL byte. Verify that the
+      // descriptor opened before that scan still names the same regular file
+      // and that the path was not replaced while the child process ran.
+      const after = await handle.stat();
+      const pathStat = await fsp.lstat(file).catch(() => null);
+      if (!pathStat || pathStat.isSymbolicLink() || !pathStat.isFile()
+          || fileFingerprint(before) !== fileFingerprint(after)
+          || fileFingerprint(after) !== fileFingerprint(pathStat)
+          || after.size !== report.evidence.bytes) {
+        throw new PlatformError('Turn evidence changed during validation', 422, 'ARTIFACT_CHANGED');
+      }
       const session = job.result.session || job.result.session_view;
       const deliveryReady = recordedDeliveryReady(job.result, job.request.session_id, job.request.kind);
       const prefix = Buffer.from(JSON.stringify({ delivery_ready: deliveryReady, summary: session,

@@ -380,6 +380,7 @@ test('Turn scanning preserves line boundaries and pins downloads to the verified
   assert.equal(Buffer.concat(chunks).toString('utf8'), JSON.stringify(second) + '\n');
   await assert.rejects(plugin.openTurns('boundary'), error => error.code === 'ARTIFACT_CHANGED');
   await fs.unlink(file);
+  await assert.rejects(plugin.openTurnPage('boundary'), error => error.code === 'ARTIFACT_CHANGED');
   await fs.symlink(original, file);
   await assert.rejects(plugin.getTurns('boundary'), error => error.code === 'ARTIFACT_CHANGED');
   await assert.rejects(plugin.openTurns('boundary'), error => error.code === 'ARTIFACT_CHANGED');
