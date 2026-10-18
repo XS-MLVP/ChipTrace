@@ -59,14 +59,17 @@ async function verifyHostHealth(mode) {
   const health = async () => (await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1000) })).json();
   try {
     let initial;
-    for (let i = 0; i < 100; i++) {
+    // A healthy HTTP listener can appear before the outbox has completed its
+    // filesystem scan. Allow a slow hosted runner up to ten seconds while
+    // still requiring the actual health state rather than a bare HTTP 200.
+    for (let i = 0; i < 200; i++) {
       try {
         initial = await health();
         if (initial?.status === 'healthy') break;
       } catch {
         // The child may still be binding its listener or starting the outbox.
       }
-      await new Promise(resolve => setTimeout(resolve, 10));
+      await new Promise(resolve => setTimeout(resolve, 50));
     }
     assert.equal(initial?.status, 'healthy', stderr);
     request = http.request(`http://127.0.0.1:${port}/responses`, {
