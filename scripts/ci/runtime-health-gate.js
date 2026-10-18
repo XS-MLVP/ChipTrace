@@ -232,6 +232,8 @@ function healthObservation(
       pending: safeInteger(relay?.pending),
       inflight: safeInteger(relay?.inflight),
       failed: safeInteger(relay?.failed),
+      delivery_attempts: safeInteger(relay?.delivery_attempts),
+      delivery_retries: safeInteger(relay?.delivery_retries),
       conservation_ok: relay?.conservation_ok === true,
       coverage: {
         status: typeof coverage?.status === 'string' ? coverage.status : null,
@@ -574,6 +576,8 @@ function verifyRelayHealth(health, { maxQualityErrors } = {}) {
   return {
     status: health.status,
     delivered: health.delivered,
+    delivery_attempts: safeInteger(health.delivery_attempts),
+    delivery_retries: safeInteger(health.delivery_retries),
     conservation_ok: health.conservation_ok,
     coverage_status: coverage.status,
     freshness_applicable: coverage.freshness_applicable,

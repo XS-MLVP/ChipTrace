@@ -54,6 +54,10 @@ Collector 与 Relay 的存储拓扑可通过 `CHIPTRACE_STORE_SHARDS` 配置，�
 数据目录会在 `sharding.json` 中固定拓扑，运行中改变 shard 数会被拒绝；迁移必须先
 完成独立的数据归档、恢复和字节校验，不能只修改环境变量。
 
+Relay `/health` 的 `delivery_retries` 是持久账本中的 `delivery_attempts - delivery_records`
+（下限为零），用于区分可恢复的 Collector 背压和最终失败。它本身不构成交付成功证明；
+生产监控应同时观察重试速率、`pending`、`inflight`、`failed` 和 `conservation_ok`。
+
 18084 网关也必须通过容器级隔离预检。它拥有原始 Wire 的 durable outbox，不能继续使用
 可变镜像 tag、可写根文件系统或无资源上限的容器：
 

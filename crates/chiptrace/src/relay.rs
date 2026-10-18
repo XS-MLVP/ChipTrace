@@ -308,6 +308,10 @@ pub struct RelayHealth {
     pub conflicts: u64,
     pub failed: u64,
     pub delivery_attempts: u64,
+    /// Attempts beyond the first attempt for each durable delivery record.
+    /// This is derived from the durable counters and is an operational
+    /// backpressure signal, not a delivery success claim.
+    pub delivery_retries: u64,
     pub queue_depth: usize,
     pub queue_capacity: usize,
     pub delivery_body_budget_available: usize,
@@ -1020,6 +1024,7 @@ impl DurableRelay {
             .expect("delivery ledger poisoned")
             .health()?;
         let conservation_ok = total == pending + inflight + delivered + conflicts + failed;
+        let delivery_retries = attempts.saturating_sub(total);
         let unsettled = pending.saturating_add(inflight);
         let backlog_degraded = total >= 32 && unsettled.saturating_mul(10) > total;
         let ok = local.ok && conservation_ok && conflicts == 0 && failed == 0 && !backlog_degraded;
@@ -1035,6 +1040,7 @@ impl DurableRelay {
             conflicts,
             failed,
             delivery_attempts: attempts,
+            delivery_retries,
             queue_depth: self.inner.sender.len(),
             queue_capacity: self.inner.sender.capacity().unwrap_or(0),
             delivery_body_budget_available: self.inner.delivery_body_budget.available_permits(),
@@ -3625,6 +3631,13 @@ mod tests {
         };
         assert_eq!(health.delivery_records, 3);
         assert_eq!(health.delivered, 3);
+        assert_eq!(
+            health.delivery_retries,
+            health
+                .delivery_attempts
+                .saturating_sub(health.delivery_records)
+        );
+        assert!(health.delivery_retries > 0);
         assert_eq!((health.pending, health.inflight, health.failed), (0, 0, 0));
         assert!(health.conservation_ok);
         // The real Collector returns a duplicate receipt on replay. It must

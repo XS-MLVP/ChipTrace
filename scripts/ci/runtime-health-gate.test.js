@@ -53,6 +53,8 @@ function relay() {
     inflight: 0,
     failed: 0,
     delivered: 32,
+    delivery_attempts: 32,
+    delivery_retries: 0,
     conservation_ok: true,
     ingest_coverage: {
       status: 'complete',
@@ -271,6 +273,8 @@ test('runtime health gate requires fresh scoped HTTP success without claiming Se
   assert.equal(result.relay.freshness_applicable, true);
   assert.equal(result.relay.turn_capture_ready, true);
   assert.equal(result.relay.quality_errors, 0);
+  assert.equal(result.relay.delivery_attempts, 32);
+  assert.equal(result.relay.delivery_retries, 0);
   assert.deepEqual(result.relay.sources, { wire: 8, otlp_logs: 15, otlp_traces: 9, hooks: 8 });
   assert.equal(result.relay.wire_turn_coverage.successful_turn_scoped_captures, 5);
   assert.equal(result.relay.wire_turn_coverage.successful_turn_scoped_fresh, true);
