@@ -1,25 +1,25 @@
 # 生产就绪评估
 
-评估日期：2026-10-19。最新线上只读快照为 03:50（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-19。最新线上只读快照为 04:58（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-最新快照中 Collector 与 Relay 的传输计数仍守恒：03:50 健康观测到两者均为
-`1,267,147`，`pending=0`、`failed=0`、`inflight=0`，Collector ready；18084、3011、3012、
+最新快照中 Collector 与 Relay 的传输计数仍守恒：04:58 健康观测到两者均为
+`1,272,760`，`pending=0`、`failed=0`、`inflight=0`，Collector ready；18084、3011、3012、
 18086 的 `/health` 均返回 HTTP 200，但 Relay `/ready` 为 HTTP 503。Collector/Relay/Platform
-实际 build revision 均为本次部署的代码基线 `bd2bf5cb54fe5fab4161f37bff5294eff0ebcffb`，版本已完成受控滚动更新。
-业务覆盖仍拒绝：`ingest_coverage.status=degraded`，持久 `quality_errors=4658`
-（全部来自 `otlp_traces`，其中 `identity_conflict=182`、`invalid_lifecycle=2511`、
-`legacy_unclassified=1965`），重启后的本次进程质量错误为 12。原因标签按固定分类计数并保留 Raw；
-新进程尚未观察到 Wire 或 Hook，`successful_turn_scoped_captures=0`、
+实际 build revision 均为 `2480641eeff970baf3284a6f17ee7bae6dd6c313`，已完成受控滚动更新。
+业务覆盖仍拒绝：`ingest_coverage.status=degraded`，持久 `quality_errors=5072`
+（全部来自 `otlp_traces`，其中 `identity_conflict=182`、`invalid_lifecycle=2925`、
+`legacy_unclassified=1965`），本次进程质量错误为 43。原因标签按固定分类计数并保留 Raw；
+当前缺少且过期的来源为 `wire`，`successful_turn_scoped_captures=0`、
 `turn_capture_ready=false`，runtime gate 仍以质量、新鲜度、来源和 revision 门禁真实退出 1。
 18086 的平台后端仍为 `fs`；Gateway outbox 当前 pending/processing/recent failure 均为 0，
-293 个历史失败原件和 recovery receipt 保留且未解决数为 0，但 watchdog 最近仍报告上游 403，
+历史失败原件和 recovery receipt 保留且未解决数为 0，但 trace exporter 仍关闭。
 真实 Alibaba OSS 提交、恢复、远端对象哈希、未修改 Stock Codex 新鲜多轮 Canary 和目标租户导出
 仍未完成。GitHub API/CLI 当前无法核验远端 Actions 结论；维护分支与 `main` 的远端 ref 已更新，
 当前仅以 `git ls-remote` 证明远端 ref 存在。
 
-本次升级后复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
+较早的 03:50 快照显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
 failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留，Collector/Relay 队列为空且
 `conservation_ok=true`。Collector/Relay/Platform 实际 revision 均为本次部署的代码基线
 `bd2bf5cb54fe5fab4161f37bff5294eff0ebcffb`；Gateway 入口仍是独立发布组件，需在 live preflight
