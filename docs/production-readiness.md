@@ -17,7 +17,7 @@ runtime gate 以质量、新鲜度、历史失败、原因分解和 revision 门
 外部镜像的 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`；带维护 SHA 的 Gateway preflight 真实退出 1，
 因此入口镜像尚未与维护提交对齐。真实 Alibaba OSS 提交、恢复、远端对象哈希、未修改 Stock Codex
 新鲜多轮 Canary 和目标租户导出仍未完成。GitHub API/CLI 当前无法核验远端 Actions 结论；当前维护分支
-HEAD 为 `eb73b8eb677cdb2384d21ee373f313a30c727408`，仅 `git ls-remote` 证明远端 ref 已更新。
+HEAD 为 `e654944590797534701e4d0a9c0b32e43a05562f`，仅 `git ls-remote` 证明远端 ref 已更新。
 
 当前复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
 failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留，Collector/Relay 队列为空且
