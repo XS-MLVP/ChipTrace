@@ -12,8 +12,21 @@ if ! [[ "$trace_bwrap_help" == *--perms* ]]; then
   exit 1
 fi
 unshare --user --map-root-user /bin/true
-# Actually enter the namespace and prove the shared root is read-only.
+# Actually enter the namespace and prove the shared root is read-only. The
+# released producer creates a private daemon socket below /tmp even when the
+# requested tools use a read-only sandbox, so exercise that mount here too.
 # No host file is written and no permission setting is changed here.
+private_tmp=$(mktemp -d "${TMPDIR:-/tmp}/chiptrace-bwrap.XXXXXX")
+probe_name="chiptrace-bwrap-probe-${BASHPID}"
+probe_file="$private_tmp/$probe_name"
+trap 'rm -rf -- "$private_tmp"' EXIT
 bwrap --unshare-user --unshare-pid --die-with-parent \
-  --ro-bind / / --proc /proc --dev /dev -- \
-  /bin/sh -c 'test -r /etc/os-release && test ! -w /etc && printf "BWRAP_READ_ONLY_OK\n"'
+  --ro-bind / / --proc /proc --dev /dev --bind "$private_tmp" /tmp \
+  --setenv CHIPTRACE_BWRAP_PROBE_NAME "$probe_name" -- \
+  /bin/sh -ceu 'test -r /etc/os-release && test ! -w /etc && test -w /tmp
+    probe="/tmp/$CHIPTRACE_BWRAP_PROBE_NAME"
+    printf "private daemon socket probe\n" > "$probe"
+    test -s "$probe"
+    printf "BWRAP_READ_ONLY_OK\n"'
+test -s "$probe_file"
+printf '%s\n' 'BWRAP_PRIVATE_TMP_OK'
