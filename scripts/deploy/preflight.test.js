@@ -88,4 +88,22 @@ test('deployment preflight rejects mutable images, unknown revisions and missing
     invalidShards.services[name].command[shardIndex + 1] = '0';
     assert.throws(() => validateConfig(invalidShards, revision), /--store-shards must be/);
   }
+  const missingDeliveryConcurrency = structuredClone(config);
+  const deliveryIndex = missingDeliveryConcurrency.services.relay.command.indexOf('--delivery-concurrency');
+  missingDeliveryConcurrency.services.relay.command.splice(deliveryIndex, 2);
+  assert.throws(() => validateConfig(missingDeliveryConcurrency, revision), /--delivery-concurrency/);
+  for (const value of ['0', '129', 'not-a-number']) {
+    const invalidDeliveryConcurrency = structuredClone(config);
+    const index = invalidDeliveryConcurrency.services.relay.command.indexOf('--delivery-concurrency');
+    invalidDeliveryConcurrency.services.relay.command[index + 1] = value;
+    assert.throws(() => validateConfig(invalidDeliveryConcurrency, revision), /--delivery-concurrency must be/);
+  }
+});
+
+test('deployment exposes bounded Relay delivery concurrency for capacity tuning', async () => {
+  const config = await render({ ...baseEnvironment, ...variables, CHIPTRACE_DELIVERY_CONCURRENCY: '32' });
+  const command = config.services.relay.command;
+  const index = command.indexOf('--delivery-concurrency');
+  assert.equal(command[index + 1], '32');
+  assert.doesNotThrow(() => validateConfig(config, revision));
 });

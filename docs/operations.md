@@ -63,9 +63,11 @@ Relay 对照（10,000 条、64 KiB、批量 64、并发 16、带 `fsync`）中�
 数据目录会在 `sharding.json` 中固定拓扑，运行中改变 shard 数会被拒绝；迁移必须先
 完成独立的数据归档、恢复和字节校验，不能只修改环境变量。
 
-Relay 的 `--delivery-concurrency` 同时决定正文读取的受限并行度：读取并发在 4 到 16 之间
-随 worker 数调整，默认部署值 16 不再被固定的四路读取限制。`max-delivery-inflight-mib`
-的字节信号量仍是总内存上限，大正文不会因为提高 worker 数而无限并行。修改并发或 shard
+Relay 的 `--delivery-concurrency` 同时决定正文读取的受限并行度，可通过
+`CHIPTRACE_DELIVERY_CONCURRENCY` 在部署时调整，默认值为 16，预检允许 1 到 128。最近同一
+release 的合成对照在 64 KiB 正文、10,000 条记录、4 shard 下，16 并发端到端约 `1,222 records/s`，
+32 并发约 `2,417 records/s`，均为零重试和计数守恒；该结果只用于容量调参，不能直接成为生产 SLO。
+`max-delivery-inflight-mib` 的字节信号量仍是总内存上限，大正文不会因为提高 worker 数而无限并行。修改并发或 shard
 前必须用 `benchmark-http --relay` 观察入口、端到端、排空时间、背压轮询、重试率和最终守恒，
 并在目标 OSS 路径上重新测量；小样本 loopback 基准不能直接作为生产 SLO。
 

@@ -111,7 +111,7 @@ services:
       - --max-batch-records
       - "4096"
       - --delivery-concurrency
-      - "16"
+      - "${CHIPTRACE_DELIVERY_CONCURRENCY:-16}"
       - --delivery-queue-items
       - "16384"
       - --delivery-batch-records

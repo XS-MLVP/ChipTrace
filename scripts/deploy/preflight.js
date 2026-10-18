@@ -52,6 +52,14 @@ function validateConfig(config, revision) {
       const shardCount = Number(command[optionIndex + 1]);
       assert.ok(Number.isInteger(shardCount) && shardCount >= 1 && shardCount <= 1024,
         `${name}: --store-shards must be an integer between 1 and 1024`);
+      if (name === 'relay') {
+        const deliveryIndex = command.indexOf('--delivery-concurrency');
+        assert.ok(deliveryIndex >= 0 && deliveryIndex + 1 < command.length,
+          'relay: --delivery-concurrency is required');
+        const deliveryConcurrency = Number(command[deliveryIndex + 1]);
+        assert.ok(Number.isInteger(deliveryConcurrency) && deliveryConcurrency >= 1 && deliveryConcurrency <= 128,
+          'relay: --delivery-concurrency must be an integer between 1 and 128');
+      }
     }
     for (const volume of service.volumes) {
       if (volume?.type !== 'bind' || volume.read_only === true) continue;
