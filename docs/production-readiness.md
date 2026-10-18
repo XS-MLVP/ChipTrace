@@ -1,14 +1,14 @@
 # 生产就绪评估
 
-评估日期：2026-10-18。最新线上只读快照为 22:14（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+评估日期：2026-10-18。最新线上只读快照为 23:40（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-最新快照中 Collector 与 Relay 的传输计数仍守恒：两者捕获/投递均为 `1,239,955`，队列和失败均为 0，
+最新快照中 Collector 与 Relay 的传输计数仍守恒：Relay delivered 为 `1,246,860`，队列和失败均为 0，
 Collector ready；18084、3011、3012、18086 均返回 HTTP 200。
-业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=2905`，其中
-`otlp_traces.identity_conflict=182`、`invalid_lifecycle=758`、`legacy_unclassified=1965`；当前
-进程新增错误为 659，原因标签已按固定分类计数并保留 Raw。Wire 未观察到，
+业务覆盖仍拒绝：Relay `ingest_coverage.status=degraded`，持久 `quality_errors=3266`，其中
+`otlp_traces.identity_conflict=182`、`invalid_lifecycle=1119`、`legacy_unclassified=1965`；当前
+质量错误仍随线上 traces 增长，原因标签已按固定分类计数并保留 Raw。Wire 未观察到，
 `missing_sources=["wire"]`、`stale_sources=["wire"]`、`successful_turn_scoped_captures=0`、
 `turn_capture_ready=false`，runtime gate 以质量、新鲜度、历史失败、原因分解和 revision 门禁真实退出 1。
 18086 的 platform health gate 以 `7f5abad42fff171fd80f024bb0f03c2ae6de52b6` 真实通过，平台后端仍为
@@ -16,8 +16,8 @@ Collector ready；18084、3011、3012、18086 均返回 HTTP 200。
 外部镜像的 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`；带维护 SHA 的 Gateway preflight 真实退出 1，
 因此入口镜像尚未与维护提交对齐。当前 relay-shell 的 `fullTraceCapture.stats.acceptedCount=0`，本机用户级
 Codex 配置仍指向外部 Provider，尚未经过 18084。真实 Alibaba OSS 提交、恢复、远端对象哈希、未修改 Stock Codex
-新鲜多轮 Canary 和目标租户导出仍未完成。GitHub API/CLI 当前无法核验远端 Actions 结论；当前维护分支
-维护分支已推送，当前仅以 `git ls-remote` 证明远端 ref 已更新。
+新鲜多轮 Canary 和目标租户导出仍未完成。GitHub API/CLI 当前无法核验远端 Actions 结论；当前维护分支已推送，
+当前仅以 `git ls-remote` 证明远端 ref 已更新。
 
 当前复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
 failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留，Collector/Relay 队列为空且
@@ -37,6 +37,16 @@ Gateway 容器 OCI revision 为 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`，新
 
 本轮维护新增 Gateway revision 对齐护栏和 Platform health gate；本地 `make cloud-test` 已真实退出 0，
 但本地绿色测试不能替代待发布 SHA 的 GitHub Actions、真实 OSS 和生产 Canary 证据。
+
+## 2026-10-18 23:40 维护分支 CI 启动护栏
+
+提交 `b6d7635` 将正式版 Producer 的 Bubblewrap 参数集中到可测试的构造函数，固定只读根、私有
+`/etc` 和私有可写 `/tmp`；提交 `266bded` 又让 `scripts/ci/check-native-sandbox.sh` 在长时 Canary
+前实际进入 user/PID namespace，写入并校验私有 `/tmp` 探针。两次本机执行均真实退出 0，输出
+`BWRAP_READ_ONLY_OK` 和 `BWRAP_PRIVATE_TMP_OK`；协议契约测试 2/2 通过。该检查覆盖了上游
+`codex-daemon-*` socket 的启动前置条件，但仍需对应提交的 GitHub Actions run 作为远端证据。
+维护分支 `fix/oss-disk-session-platform` 的远端 ref 已更新到 `266bded4e71df227f7940ee628ed6c7520d6347b`；
+Actions API 当前不可达，不能声称远端作业已通过。
 
 21:22 的热服务只读复核显示：18084、3011、3012、18086 均返回 HTTP 200；Gateway
 health 为 `healthy`，outbox 的 pending/processing/open 均为 0，最近失败为 0。Collector
