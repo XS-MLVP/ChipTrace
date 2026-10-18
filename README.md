@@ -16,21 +16,21 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新线上只读复核（2026-10-19 02:37，Asia/Shanghai）确认 18084、3011、3012、18086 均返回
+最新线上只读复核（2026-10-19 02:54，Asia/Shanghai）确认 18084、3011、3012、18086 的 `/health` 均返回
 HTTP 200；Collector、Relay 和平台已滚动到维护提交
 `e9cc4569d25db87636aa74099dc80095ac59485e`，使用内容寻址镜像、非 root、只读根和持久目录。
-Relay 投递为 `1,260,920` 条，`pending=0`、`inflight=1`、`failed=0`、`conservation_ok=true`；
-Collector `captures=1,260,920`、队列深度为 0，平台无排队任务。Gateway outbox 当前
+Relay 与 Collector 均为 `1,262,557` 条，`pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`；
+Collector 队列深度为 0、ready，平台无排队任务。Gateway outbox 当前
 pending/processing/recent failure 均为 0，293 个历史失败原件和 recovery receipt 仍保留。
 
-业务门禁仍未通过：Relay `ingest_coverage.status=degraded`，健康快照持久 `quality_errors=4223`，全部来自
-`otlp_traces`，其中 `identity_conflict=182`、`invalid_lifecycle=2076`、旧账本无法回溯的
-`legacy_unclassified=1965`；本次进程质量错误为 169，随后运行门禁采样到 4228，Raw 仍保留。Wire 未观察到，
+业务门禁仍未通过：Relay `/ready` 返回 HTTP 503，`ingest_coverage.status=degraded`，持久
+`quality_errors=4339`，全部来自 `otlp_traces`，其中 `identity_conflict=182`、`invalid_lifecycle=2192`、
+旧账本无法回溯的 `legacy_unclassified=1965`；本次进程质量错误为 285，Raw 仍保留。Wire 未观察到，
 Hook 只有少量旧记录，`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，带质量、新鲜度
 和来源门禁的 runtime gate 真实退出 1。平台 health gate 以该 revision 真实通过，但平台后端
 仍是本地 FS；18084 trace exporter 关闭，Gateway 的 `fullTraceCapture.stats.acceptedCount=0`，其
 OCI revision 仍为 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`，本机用户级 Codex 配置仍指向外部
-Provider，尚未经过 18084；watchdog 对内外 Sub2API `/v1/responses` 均返回 `502 Upstream access forbidden`；真实 Alibaba OSS 提交/恢复/远端对象哈希及未修改 Stock Codex 多轮
+Provider，尚未经过 18084；18084 `/v1/models` 返回 HTTP 401；真实 Alibaba OSS 提交/恢复/远端对象哈希及未修改 Stock Codex 多轮
 Canary 尚未完成。因此可用于内部传输与恢复验证，不能对外承诺完整 Session/Turn 采集或生产 OSS
 导出。详见[生产就绪评估](docs/production-readiness.md)。
 
