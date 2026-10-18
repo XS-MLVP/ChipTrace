@@ -13,7 +13,7 @@
 平台 18086 返回 HTTP 200，但没有 `build.revision`；以当前部署 revision 检查 platform health gate 也真实退出 1。
 线上平台容器尚未注入本分支新增的 `CHIPTRACE_BUILD_REVISION`，Collector/Relay 仍运行旧的
 `e5237065ff3a48623179c5846ff1916040030c9a`。维护分支修复已推送为
-`b3696d2f0c0994ed887e89a0a59694e3b251e3f3`；Gateway preflight 对该 SHA 真实退出 1，
+`f3b5459531683e72046f5f4a07965ceaf0059af8`；Gateway preflight 对该 SHA 真实退出 1，
 因为线上 Gateway 仍是 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`。GitHub Actions 结果因当前
 CLI 未认证且网络超时尚未核验。
 
