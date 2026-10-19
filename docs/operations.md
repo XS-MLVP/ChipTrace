@@ -66,6 +66,12 @@ release Relay 对照（10,000 条、64 KiB、批量 64、并发 16、带 `fsync`
 数据目录会在 `sharding.json` 中固定拓扑，运行中改变 shard 数会被拒绝；迁移必须先
 完成独立的数据归档、恢复和字节校验，不能只修改环境变量。
 
+2026-10-19 13:06（Asia/Shanghai）的当前 release 复测使用 4 shard、16 并发、64 KiB、批量
+64、`fsync` 和 10,000 条记录：入口 `4,351.4 records/s`，端到端 `1,244.1 records/s`，P95
+`316.8 ms`、P99 `338.8 ms`，排空 `5.74 s`，`10,000/10,000` delivered、`failed=0`、
+`delivery_retries=0`、计数守恒。排空期间有 360/435 次健康轮询观察到背压；这仍是本机回环
+基线，不包含目标 NFS/OSS 上传、多租户竞争或长期 SLO。
+
 Relay 的 `--delivery-concurrency` 同时决定正文读取的受限并行度，可通过
 `CHIPTRACE_DELIVERY_CONCURRENCY` 在部署时调整，默认值为 16，预检允许 1 到 128。最近同一
 release 的合成对照在 64 KiB 正文、10,000 条记录、4 shard 下，16 并发端到端约 `1,222 records/s`，
