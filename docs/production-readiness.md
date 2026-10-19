@@ -1,5 +1,28 @@
 # 生产就绪评估
 
+## 2026-10-19 09:01:42（Asia/Shanghai）线上只读复核
+
+本次复核只读取健康端点、Docker 容器元数据和 Git 状态，未重启服务、修改配置或清理 Raw。18084
+Gateway、3011 Collector、3012 Relay 和 18086 Platform 的 `/health` 均返回 HTTP 200；Relay `/ready`
+返回 HTTP 503。Collector/Relay 实际运行 revision
+`db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，Collector 与 Relay 的 Capture/Delivered 均为
+`1,291,300`，`pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`，Collector 队列为 0
+且 ready。Relay delivery attempts 为 `1,291,383`，其中 `83` 次为重试；Gateway outbox 的
+pending/processing/最近失败均为 0，293 个历史失败原件均有 recovery receipt，未解决数为 0。
+
+业务交付门禁仍失败：Relay 持久质量账本在本次健康采样为 `6,506`，全部来自 `otlp_traces`，其中
+`identity_conflict=182`、`invalid_lifecycle=4,359`、`legacy_unclassified=1,965`；本进程新增 984，
+Raw 未被改写。Wire `requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，
+`wire` 同时缺失且过期。随后以同一 revision 运行 runtime gate，实际观察到质量计数 `6,515`，退出码为
+1，阻断原因包含质量、新鲜度、Wire 覆盖和 Turn 就绪；持续增长的 OTLP 不能替代缺失的 Wire。
+
+Platform `/health` 返回 HTTP 200 且无排队任务，但响应没有 `backend` 字段；只读容器元数据显示
+`CHIPTRACE_BACKEND=fs`，运行 revision 仍为 `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`。对同一
+端点执行 `platform-health-gate --expected-backend oss` 实际退出 1。维护分支当前已推送提交
+`5cb4521`，线上尚未部署它，因此真实 OSS 提交、恢复、远端 SHA-256、同 SHA GitHub Actions 和
+新鲜多轮 Wire Canary 仍未验收。服务目前只适合内部 Raw/恢复验证，不能向外部使用者承诺完整
+Session/Turn 和远端持久导出。
+
 ## 2026-10-19 08:30（Asia/Shanghai）线上只读复核
 
 本次复核仅读取健康端点和容器元数据，未重启服务、修改配置或清理 Raw。18084 Gateway、3011
