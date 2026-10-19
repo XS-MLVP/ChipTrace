@@ -16,7 +16,7 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新维护状态（2026-10-20 03:21，Asia/Shanghai）的代码基线为 [`f201cf7`](https://github.com/XS-MLVP/ChipTrace/commit/f201cf76a7ea677542d952767f8440c2eb567730)。
+最新维护状态（2026-10-20 03:21，Asia/Shanghai）的代码基线为 [`bde52f4`](https://github.com/XS-MLVP/ChipTrace/commit/bde52f454d19a386e56d2288132587ef937e750d)。
 维护分支与 `origin/fix/oss-disk-session-platform` 的 SHA 一致；工作区只保留三份外部 DOCX
 作为未跟踪的需求原件，没有改写或纳入仓库。`make check`、`make test`、Codex 配置契约和
 质量/部署门禁契约均在本机通过。GitHub CLI 未认证且 Actions API 当前超时，远端运行结果仍

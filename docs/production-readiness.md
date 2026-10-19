@@ -2,7 +2,7 @@
 
 ## 2026-10-20 03:21（Asia/Shanghai）当前服务与仓库复核
 
-当前维护基线为 `f201cf76a7ea677542d952767f8440c2eb567730`，维护分支与远端 SHA 一致；工作区另有
+当前维护基线为 `bde52f454d19a386e56d2288132587ef937e750d`，维护分支与远端 SHA 一致；工作区另有
 三份未跟踪的外部 DOCX 需求原件。当前本地 `make check`、`make test`、CI/部署/质量契约测试、
 Relay 基准和 `make m0-test` 的实际检查均通过。该结果不能替代
 真实 Provider、未修改 Stock Codex、目标 NFS/OSS 或同 SHA 的 GitHub Actions 运行证据。
