@@ -17,17 +17,20 @@ async function docker(args, env = process.env, timeout = 60000) {
   return stdout;
 }
 
-function validateConfig(config, revision, { requirePlatform = true } = {}) {
+function validateConfig(config, revision, { requirePlatform = true, requireCloudBackend = false } = {}) {
   assert.match(revision || '', revisionPattern, 'expected revision must be a full Git commit SHA');
   const services = Object.entries(config.services || {});
   assert.ok(services.length, 'deployment must contain services');
   const platform = config.services.platform;
-  if (requirePlatform) {
+  if (requirePlatform || requireCloudBackend) {
     assert.ok(platform, 'deployment must contain a platform service');
   }
   if (platform) {
     const backend = platform.environment?.CHIPTRACE_BACKEND;
     assert.ok(['fs', 'oss', 's3'].includes(backend), 'platform storage backend must be explicitly fs, oss, or s3');
+    if (requireCloudBackend) {
+      assert.ok(['oss', 's3'].includes(backend), 'production platform storage backend must be oss or s3');
+    }
     const platformRevision = platform.environment?.CHIPTRACE_BUILD_REVISION;
     assert.equal(platformRevision, revision,
       'platform health revision must be bound to the expected Git commit');
@@ -87,12 +90,14 @@ function requiresPlatform(files, config) {
   return configuredPlatform || explicitPlatformFile || files.length !== 1;
 }
 
-async function preflight({ files, revision, project, env = process.env }) {
+async function preflight({ files, revision, project, env = process.env, requireCloudBackend = false }) {
   const compose = ['compose', '--env-file', '/dev/null'];
   for (const file of files) compose.push('-f', file);
   if (project) compose.push('--project-name', project);
   const config = JSON.parse(await docker([...compose, 'config', '--format', 'json'], env));
-  const services = validateConfig(config, revision, { requirePlatform: requiresPlatform(files, config) });
+  const services = validateConfig(config, revision, {
+    requirePlatform: requiresPlatform(files, config), requireCloudBackend,
+  });
   const images = new Map();
   for (const { image } of services) {
     if (images.has(image)) continue;
@@ -112,17 +117,25 @@ async function preflight({ files, revision, project, env = process.env }) {
 if (require.main === module) {
   const files = [];
   let project;
+  let requireCloudBackend = false;
   let revision = process.env.CHIPTRACE_REVISION;
-  for (let index = 2; index < process.argv.length; index += 2) {
+  for (let index = 2; index < process.argv.length;) {
     const flag = process.argv[index];
+    if (flag === '--require-cloud-backend') {
+      if (requireCloudBackend) throw new Error('duplicate --require-cloud-backend');
+      requireCloudBackend = true;
+      index += 1;
+      continue;
+    }
     const value = process.argv[index + 1];
     if (!value || !['--file', '--revision', '--project'].includes(flag)) throw new Error('usage: preflight.js --file COMPOSE [--file COMPOSE] [--revision SHA] [--project NAME]');
     if (flag === '--file') files.push(value);
     else if (flag === '--revision') revision = value;
     else project = value;
+    index += 2;
   }
   if (!files.length) files.push('deploy/collector-relay.yml', 'deploy/cloud-platform.yml');
-  preflight({ files, revision, project }).then(result => console.log(JSON.stringify(result)))
+  preflight({ files, revision, project, requireCloudBackend }).then(result => console.log(JSON.stringify(result)))
     .catch(error => { console.error(`deployment preflight failed: ${error.message}`); process.exitCode = 1; });
 }
 

@@ -40,6 +40,15 @@ docker compose -f deploy/collector-relay.yml up -d --no-build --pull never --wai
 构建参数写入 Collector/Relay 的健康响应；启动后还需核对实际编译 revision 和业务门禁。
 预检通过不替代真实 Stock Codex、OSS 账号或目标 Session 验收。
 
+平台生产发布还必须显式加上 `--require-cloud-backend`；该选项只接受 `oss` 或 `s3`，本地
+`fs` 继续保留给隔离测试：
+
+```bash
+node scripts/deploy/preflight.js \
+  --file deploy/cloud-platform.yml \
+  --require-cloud-backend
+```
+
 模板默认 Collector 8 GiB、Relay 12 GiB、平台 4 GiB 内存上限，均为 2 CPU、256 PID。
 可通过 `CHIPTRACE_COLLECTOR_MEMORY_LIMIT`、`CHIPTRACE_RELAY_MEMORY_LIMIT`、
 `CHIPTRACE_PLATFORM_MEMORY_LIMIT`、`CHIPTRACE_CPU_LIMIT`、`CHIPTRACE_PID_LIMIT` 调整。
@@ -377,7 +386,7 @@ docker build --target platform --build-arg CHIPTRACE_REVISION="$CHIPTRACE_REVISI
 export CHIPTRACE_PLATFORM_IMAGE="$(docker image inspect --format '{{.Id}}' "chiptrace-platform:$CHIPTRACE_REVISION")"
 sudo install -d -o 10001 -g 10001 -m 0700 \
   /srv/chiptrace/platform /srv/chiptrace/objects
-node scripts/deploy/preflight.js --file deploy/cloud-platform.yml
+node scripts/deploy/preflight.js --file deploy/cloud-platform.yml --require-cloud-backend
 docker compose --project-name "${CHIPTRACE_PLATFORM_PROJECT:-chiptrace-platform}" \
   -f deploy/cloud-platform.yml up -d --no-build --pull never --wait --wait-timeout 600
 ```

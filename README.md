@@ -16,20 +16,20 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新维护状态（2026-10-19 12:44，Asia/Shanghai）的代码基线为 [`a9b900d`](https://github.com/XS-MLVP/ChipTrace/commit/a9b900d)。
-当前分支已同步后续文档标记提交，工作区干净。本轮 `make cloud-test` 实际退出 0，
-覆盖 Rust 343 项通过、平台/OSS 集成 100/100、Session/Turn 与标签门禁、部署隔离和路由预检。
-GitHub CLI 未认证，远端 Actions 对该 SHA 的运行结果不可观测，不能用本地通过替代 GitHub 证据。
+最新维护状态（2026-10-19 13:33，Asia/Shanghai）的代码基线为 [`b9967c1`](https://github.com/XS-MLVP/ChipTrace/commit/b9967c1)。
+维护分支工作区干净，`make cloud-test` 在该提交实际退出 0，覆盖 Rust 343 项通过、平台/OSS
+集成 100/100、Session/Turn 与标签门禁、部署隔离和路由预检。GitHub CLI 未认证，远端 Actions
+对该 SHA 的运行结果不可观测，不能用本地通过替代 GitHub 证据。
 
-同一窗口线上 18084、3011、3012、18086 的 `/health` 均返回 HTTP 200；Collector 队列为 0 且 ready，
-Relay `delivered=1,305,705`、`pending=0`、`inflight=0`、`failed=0`、`delivery_retries=85`、
-`conservation_ok=true`，Gateway outbox 无待处理或最近失败文件，历史失败原件仍保留并有 recovery receipt。
-这些是 Raw/WAL、恢复和投递守恒证据，不代表业务 Session/Turn 已就绪。
+线上采样中 18084、3011、3012、18086 的 `/health` 均返回 HTTP 200；Collector 队列为 0 且 ready，
+Relay `delivered=1,307,997`、`pending=0`、`inflight=1`、`failed=0`、`delivery_retries=85`、
+`conservation_ok=true`，Gateway outbox 当前无待处理或最近失败文件，历史失败原件均有 recovery receipt。
+这些证据说明 Raw/WAL、恢复和投递守恒正常，不能据此宣称业务 Session/Turn 已就绪。
 
-业务门禁仍未通过：Relay `/ready` 返回 HTTP 503，持久 `quality_errors=7,338`（`identity_conflict=184`、
-`invalid_lifecycle=5,189`、`legacy_unclassified=1,965`），`missing_sources=["wire"]`、
+业务门禁仍未通过：Relay `/ready` 返回 HTTP 503，持久 `quality_errors=7,453`（`identity_conflict=184`、
+`invalid_lifecycle=5,304`、`legacy_unclassified=1,965`），`missing_sources=["wire"]`、
 `wire.requests=0`、`turn_capture_ready=false`。实际 `CODEX_HOME` 用户配置的路由预检退出 1，
-Provider 绕过 18084；Platform 健康虽为 200，实际后端仍是 `fs`。因此真实 OSS 上传/恢复/远端哈希、
+Provider 绕过 18084；Platform 健康虽为 200，实际后端仍是 `fs`。真实 OSS 上传/恢复/远端哈希、
 未修改 Stock Codex 多轮四源 Canary 和同 SHA 远端 CI 尚未验收，当前只能用于内部 Raw/恢复验证。
 
 历史线上只读快照（2026-10-19 09:01:42，Asia/Shanghai）确认 18084、3011、3012、18086 的

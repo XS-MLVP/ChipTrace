@@ -87,6 +87,12 @@ test('deployment preflight rejects mutable images, unknown revisions and missing
   const invalidBackend = structuredClone(config);
   invalidBackend.services.platform.environment.CHIPTRACE_BACKEND = 'local';
   assert.throws(() => validateConfig(invalidBackend, revision), /backend/);
+  const localStorage = structuredClone(config);
+  localStorage.services.platform.environment.CHIPTRACE_BACKEND = 'fs';
+  assert.doesNotThrow(() => validateConfig(localStorage, revision), 'local FS remains available for isolated tests');
+  assert.throws(() => validateConfig(localStorage, revision, { requireCloudBackend: true }), /production platform storage backend/);
+  assert.throws(() => validateConfig({ services: { collector: config.services.collector } }, revision,
+    { requirePlatform: false, requireCloudBackend: true }), /platform service/);
   const missingPlatformRevision = structuredClone(config);
   delete missingPlatformRevision.services.platform.environment.CHIPTRACE_BUILD_REVISION;
   assert.throws(() => validateConfig(missingPlatformRevision, revision), /platform health revision/);

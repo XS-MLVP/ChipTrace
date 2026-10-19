@@ -1,5 +1,26 @@
 # 生产就绪评估
 
+## 2026-10-19 13:33（Asia/Shanghai）当前服务与仓库复核
+
+当前维护基线为 `b9967c1596584c7644e0f81538d2ac3a1e1a2ce7`，工作区干净；完整 `make cloud-test`
+实际退出 0，Rust 单元测试为 `343 passed, 0 failed, 3 ignored`，平台/OSS 集成测试为 `100/100`。
+该结果证明仓库的构建、磁盘恢复、Session/Turn 读取、质量账本和容器启动合同可回归通过，不能替代
+真实 Provider、未修改 Stock Codex 或云端账号验收。
+
+线上只读采样中 Gateway、Collector、Relay 和 Platform `/health` 均为 HTTP 200。Collector revision
+为 `f5a4a9c1e1b389c1bb85e1067968f91942b15304`、队列深度为 0、`captures=1,307,997`；Relay 同一
+revision 下 `delivered=1,307,997`、`delivery_attempts=1,308,083`、`delivery_retries=85`、
+`pending=0`、`failed=0`、`conservation_ok=true`，该快照有 1 条瞬时 inflight。Gateway outbox
+当前 pending/processing/recent failure 均为 0，293 个历史失败原件均已有 recovery receipt，未解决数为 0。
+
+业务就绪仍然失败：Relay `/ready` 返回 HTTP 503；持久质量账本为 `7,453`，其中
+`identity_conflict=184`、`invalid_lifecycle=5,304`、`legacy_unclassified=1,965`，新增错误仍来自
+`otlp_traces`。Wire `requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，
+缺失且过期来源为 `wire`。对实际 `CODEX_HOME=/var/tmp/zhangyuxin/codex-home/by-node/open21`
+执行路由预检实际退出 1，用户 `OpenAI.base_url` 绕过 18084；18086 `/health` 实际报告
+`backend=fs`。因此当前可证明传输层和本地 Raw/恢复工作，尚未达到完整 Session/Turn、真实 OSS/S3
+导出或对外生产承诺的标准。
+
 ## 2026-10-19 12:44（Asia/Shanghai）当前 HEAD 与线上复核
 
 本轮复核使用的维护代码基线为 `a9b900d`；随后仅继续提交了文档标记更新，均已推送到
