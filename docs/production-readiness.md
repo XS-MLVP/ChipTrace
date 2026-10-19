@@ -1,5 +1,28 @@
 # 生产就绪评估
 
+## 2026-10-19 11:04（Asia/Shanghai）当前服务与 CI 复核
+
+本次复核只读取本机健康端点、容器元数据和 Git 远端状态，未重启服务、修改运行配置或清理
+Raw。Gateway、Collector、Relay 和 Platform 的 `/health` 均返回 HTTP 200；Collector 队列为 0
+且 ready，Relay 投递 `delivered=1,299,997`、`pending=0`、`inflight=0`、`failed=0`、
+`conservation_ok=true`，累计 `delivery_retries=85`。Gateway full-trace outbox 当前
+`pending=0`、`processing=0`、`recentFailures=0`，293 个历史失败原件均有 recovery receipt，
+`unresolvedHistoricalFailedFiles=0`；独立 trace exporter 仍关闭，watchdog 最近一次上游探测为
+HTTP 403。
+
+业务就绪仍未通过：Relay `/ready` 返回 HTTP 503，持久质量账本为 `7,079`，其中
+`identity_conflict=184`、`invalid_lifecycle=4,930`、`legacy_unclassified=1,965`，本进程新增
+318；`missing_sources=["wire"]`、`wire.requests=0`、`turn_capture_ready=false`。对最新活动
+WAL 的有界只读抽样确认，新增 `invalid_lifecycle` 均是同一 Span 同时声明
+`outcome=interrupted` 和 `outcome=completed`。Relay 保留原始批次并拒绝解释冲突终态，标签和计数
+因此没有被清零或伪造为成功。Platform `/health` 返回 `backend=fs`、revision
+`f5a4a9c1e1b389c1bb85e1067968f91942b15304`，当前无排队任务；真实 OSS 账号验收仍未完成。
+
+本轮将 Hook 契约测试在共享 NFS runner 上的固定 30 秒超时调整为有界 120 秒，保留 ACK、重试、
+重复计数和真实 Relay WAL 断言；完整 `make cloud-test` 以退出码 0 完成后，修复已推送到维护分支
+提交 [`1728f94`](https://github.com/XS-MLVP/ChipTrace/commit/1728f94)。GitHub Actions API 在本机
+请求超时，因此同一 SHA 的远端 Run 尚不能据此声明通过。
+
 ## 2026-10-19 09:54（Asia/Shanghai）部署配置持久化复核
 
 为避免宿主自动重启回滚，已将 `/nfs/home/zhangyuxin/router_v2/deploy/.env` 中的
