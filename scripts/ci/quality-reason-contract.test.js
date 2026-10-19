@@ -46,4 +46,3 @@ test('legacy_unclassified is accepted only as historical migration evidence', ()
   const operations = fs.readFileSync(path.join(root, 'docs', 'operations.md'), 'utf8');
   assert.match(operations, /历史迁移专用的 `legacy_unclassified`/);
 });
-
