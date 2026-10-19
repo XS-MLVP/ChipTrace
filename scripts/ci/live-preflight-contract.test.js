@@ -88,6 +88,18 @@ test('managed route uses a digest-pinned container image for deterministic start
   assert.doesNotMatch(workflow, /docker pull node:22-bookworm-slim\s*$/m);
 });
 
+test('hosted jobs use an immutable Ubuntu runner label', () => {
+  const runners = [...workflow.matchAll(/^\s*runs-on:\s*(.+)$/gm)]
+    .map(match => match[1].trim());
+  assert.ok(runners.length >= 5, 'workflow must declare all hosted job runners');
+  const hosted = runners.filter(value => value.startsWith('ubuntu-'));
+  assert.ok(hosted.length >= 5, 'workflow must retain hosted Ubuntu jobs');
+  assert.ok(hosted.every(value => value === 'ubuntu-24.04'),
+    `hosted jobs must stay on ubuntu-24.04: ${hosted.join(', ')}`);
+  assert.doesNotMatch(workflow, /^\s*runs-on:\s*ubuntu-latest\s*$/m,
+    'floating ubuntu-latest labels can silently change the startup environment');
+});
+
 test('hosted sandbox startup tolerates optional sysctl writes but requires a real namespace probe', () => {
   assert.match(workflow, /Could not enable kernel\.unprivileged_userns_clone; continuing to the real namespace probe/);
   assert.match(workflow, /Could not disable AppArmor unprivileged-userns restriction; continuing to the real namespace probe/);
