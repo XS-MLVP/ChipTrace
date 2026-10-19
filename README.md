@@ -16,22 +16,21 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新线上只读复核（2026-10-19 09:45:00，Asia/Shanghai）确认 Collector/Relay 实际 revision 仍为
-`db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`；Relay `delivery_records=1,294,320`、
-`delivered=1,294,320`、`pending=0`、`inflight=0`、`failed=0`、`delivery_retries=83` 且
-`conservation_ok=true`。业务门禁仍未通过：持久 `quality_errors=6,745`，原因是
-`identity_conflict=182`、`invalid_lifecycle=4,598`、`legacy_unclassified=1,965`；
-`missing_sources=["wire"]`、`turn_capture_ready=false`。使用实际 `/etc/codex` 与用户配置执行
-路由预检真实退出 1，报错为用户 `OpenAI.base_url` 未指向受管 18084 Gateway；因此 OTLP/Hook
-增长不能被解释成完整 Wire 采集。维护分支最新提交为 [`414af71`](https://github.com/XS-MLVP/ChipTrace/commit/414af71)，
-但线上尚未部署该 docs-only revision。
+最新维护状态（2026-10-19 12:44，Asia/Shanghai）为 [`a9b900d`](https://github.com/XS-MLVP/ChipTrace/commit/a9b900d)，
+已与 `origin/fix/oss-disk-session-platform` 对齐，工作区干净。本轮 `make cloud-test` 实际退出 0，
+覆盖 Rust 343 项通过、平台/OSS 集成 100/100、Session/Turn 与标签门禁、部署隔离和路由预检。
+GitHub CLI 未认证，远端 Actions 对该 SHA 的运行结果不可观测，不能用本地通过替代 GitHub 证据。
 
-随后在 09:51 完成受控滚动更新：Collector、Relay、Platform 均运行 revision
-`f5a4a9c1e1b389c1bb85e1067968f91942b15304`，容器 health 全部为 healthy，Platform `backend=fs`
-且对应 revision 的健康门禁通过。runtime gate 仍真实退出 1，持久质量账本为 `6,764`、Wire
-仍缺失；这只完成了代码部署和持久计数验证，尚未完成真实 Provider 路由、四源 Session/Turn
-Canary 或 OSS 后端切换。随后已同步宿主部署 env 中的三个镜像/revision 字段，自动重启不会回滚
-到旧镜像；部署预检使用该 env 实际退出 0。
+同一窗口线上 18084、3011、3012、18086 的 `/health` 均返回 HTTP 200；Collector 队列为 0 且 ready，
+Relay `delivered=1,305,705`、`pending=0`、`inflight=0`、`failed=0`、`delivery_retries=85`、
+`conservation_ok=true`，Gateway outbox 无待处理或最近失败文件，历史失败原件仍保留并有 recovery receipt。
+这些是 Raw/WAL、恢复和投递守恒证据，不代表业务 Session/Turn 已就绪。
+
+业务门禁仍未通过：Relay `/ready` 返回 HTTP 503，持久 `quality_errors=7,338`（`identity_conflict=184`、
+`invalid_lifecycle=5,189`、`legacy_unclassified=1,965`），`missing_sources=["wire"]`、
+`wire.requests=0`、`turn_capture_ready=false`。实际 `CODEX_HOME` 用户配置的路由预检退出 1，
+Provider 绕过 18084；Platform 健康虽为 200，实际后端仍是 `fs`。因此真实 OSS 上传/恢复/远端哈希、
+未修改 Stock Codex 多轮四源 Canary 和同 SHA 远端 CI 尚未验收，当前只能用于内部 Raw/恢复验证。
 
 最新线上只读复核（2026-10-19 09:01:42，Asia/Shanghai）确认 18084、3011、3012、18086 的
 `/health` 均返回 HTTP 200，但 Relay `/ready` 返回 HTTP 503。Collector/Relay

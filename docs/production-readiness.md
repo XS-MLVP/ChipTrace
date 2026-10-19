@@ -1,24 +1,26 @@
 # 生产就绪评估
 
-## 2026-10-19 12:30（Asia/Shanghai）当前 HEAD 验证与性能复测
+## 2026-10-19 12:44（Asia/Shanghai）当前 HEAD 与线上复核
 
-当前维护分支 HEAD 为 `6cf867f`，已推送到
-`origin/fix/oss-disk-session-platform`，工作区干净。`make check` 实际退出 0；远程启动合同测试
-9/9 通过，动作 pin 门禁确认工作流的 56 个引用只使用 5 个固定 SHA。新增合同会拒绝任何将 hosted
-runner 改回 `ubuntu-latest` 的变更，防止操作系统漂移重新造成启动差异。随后提交 `cada281` 将
-所有 hosted `setup-node` 步骤固定到已验证的 Node `22.23.3`，并由同一合同拒绝回退到浮动主版本。
+维护分支 HEAD 为 `a9b900d`，已与 `origin/fix/oss-disk-session-platform` 对齐，工作区干净。
+本轮 `make cloud-test` 实际退出 0；Rust 单元测试 `343 passed, 0 failed, 3 ignored`，平台/OSS
+集成测试 `100/100`，路由预检 `8/8`，并覆盖标签、生命周期、Session/Turn、部署隔离、受限堆
+读取和 MinIO/S3 协议合同。GitHub CLI 未认证（退出 4），因此同一 SHA 的 GitHub Actions 远端
+结果仍不可观测，不能把本地通过替代远端 Run 证据。
 
-当前 HEAD 的 Relay 回环基准使用 4 shard、16 并发、64 KiB、`fsync`、10,000 条记录和零重试上限：
-入口吞吐 `4,450.7 records/s`，端到端吞吐 `1,235.96 records/s`，P95 批延迟 `266.94 ms`，
-P99 `318.36 ms`，`10,000/10,000` delivered，`failed=0`、`delivery_retries=0`、计数守恒，排空
-`5.84 s`。其中 `394/470` 次排空轮询处于背压观察状态；该测试不含目标 NFS/OSS 对象上传、
-多租户竞争或长期 SLO。
+线上只读采样显示 Gateway、Collector、Relay 和 Platform `/health` 均为 HTTP 200；Collector 队列
+为 0 且 ready，Relay `delivered=1,305,705`、`pending=0`、`inflight=0`、`failed=0`、
+`delivery_retries=85`、`conservation_ok=true`。Gateway outbox 当前无待处理或最近失败文件，历史
+失败原件和 recovery receipt 仍保留且未解决数为 0。该组数据证明 Raw/WAL、重启恢复和投递守恒正常，
+不等同于业务 Session/Turn 已就绪。
 
-本次线上只读采样仍未达到业务就绪：运行 revision 是 `f5a4a9c1e1b389c1bb85e1067968f91942b15304`，
-Relay `/ready=503`，持久质量错误 `7,294`（`identity_conflict=184`、`invalid_lifecycle=5,145`、
-`legacy_unclassified=1,965`），`missing_sources=["wire"]`、`wire.requests=0`、
-`turn_capture_ready=false`；Platform 仍为 `backend=fs`。新增 CI 代码和性能验证尚未部署线上，
-也不能替代真实 Provider 路由、目标 OSS 账号和同 SHA GitHub Actions 证据。
+业务门禁仍真实失败：Relay `/ready=503`，持久质量错误 `7,338`（`identity_conflict=184`、
+`invalid_lifecycle=5,189`、`legacy_unclassified=1,965`），`missing_sources=["wire"]`、
+`wire.requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`。18084
+独立 trace exporter 当前关闭；实际 `CODEX_HOME=/var/tmp/zhangyuxin/codex-home/by-node/open21`
+的路由预检退出 1，用户 `OpenAI.base_url` 绕过 18084。18086 `/health` 为 HTTP 200 但实际
+`backend=fs`，所以真实 OSS 上传/恢复/远端 SHA-256、未修改 Stock Codex 多轮四源 Canary 和
+同 SHA 远端 CI 尚未验收，当前只能用于内部 Raw/恢复验证。
 
 ## 2026-10-19 11:04（Asia/Shanghai）当前服务与 CI 复核
 
