@@ -19,7 +19,7 @@ Raw 未被改写。Wire `requests=0`、`successful_turn_scoped_captures=0`、`tu
 Platform `/health` 返回 HTTP 200 且无排队任务，但响应没有 `backend` 字段；只读容器元数据显示
 `CHIPTRACE_BACKEND=fs`，运行 revision 仍为 `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`。对同一
 端点执行 `platform-health-gate --expected-backend oss` 实际退出 1。维护分支当前已推送提交
-`5cb4521`，线上尚未部署它，因此真实 OSS 提交、恢复、远端 SHA-256、同 SHA GitHub Actions 和
+`1204af4`，线上尚未部署它，因此真实 OSS 提交、恢复、远端 SHA-256、同 SHA GitHub Actions 和
 新鲜多轮 Wire Canary 仍未验收。服务目前只适合内部 Raw/恢复验证，不能向外部使用者承诺完整
 Session/Turn 和远端持久导出。
 
