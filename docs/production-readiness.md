@@ -33,6 +33,15 @@ Run 仍因本环境未认证 `gh` CLI 无法取得真实运行证据，不能把
 当前节点用非 root、只读根、无网络参数启动该 digest，实际输出 Node `v22.23.3` 并退出 0。该修复
 降低远程 CI 因基础镜像漂移产生的启动差异，但仍需要 GitHub Actions 对同一 SHA 的真实 Run 作为最终证据。
 
+## 2026-10-19 09:42（Asia/Shanghai）最新 Platform 镜像临时启动验证
+
+从维护分支 `f5a4a9c1e1b389c1bb85e1067968f91942b15304` 构建 Platform target，镜像 ID 为
+`sha256:2a8ff89dbf4d094077c09858730100710a9e76a0886879a8bd6b594cd55b8335`。在独立临时端口和
+tmpfs 目录以 UID `10001:10001`、只读根、`cap_drop=ALL`、`no-new-privileges` 启动，健康响应实际为
+`ok=true`、`backend=fs`、对应完整 revision，`queued=0`、`running=0`、`jobs=0`、`failure=null`。
+该 smoke 只验证新版 Platform 进程和健康契约，使用 FS 临时存储；没有修改 18086 热服务，也不能替代
+真实 OSS 账号的提交、恢复、远端哈希和租户鉴权验收。
+
 ## 2026-10-19 09:01:42（Asia/Shanghai）线上只读复核
 
 本次复核只读取健康端点、Docker 容器元数据和 Git 状态，未重启服务、修改配置或清理 Raw。18084
