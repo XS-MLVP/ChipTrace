@@ -1,5 +1,30 @@
 # 生产就绪评估
 
+## 2026-10-19 09:28（Asia/Shanghai）线上只读复核（维护分支 `6db26f8`）
+
+本轮只读取健康端点、容器元数据和 Git 状态，未重启服务、修改配置或清理 Raw。18084 Gateway、
+3011 Collector、3012 Relay 和 18086 Platform 的 `/health` 均返回 HTTP 200；Relay `/ready` 返回
+HTTP 503。Collector 与 Relay 实际运行 revision `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，
+Collector `captures=1,293,154`，Relay `delivered=1,293,154`、`delivery_records=1,293,155`、
+`pending=0`、`failed=0`、`conservation_ok=true`，但仍有 1 条 inflight 和 83 次 delivery retry。
+
+业务交付门禁仍真实失败：Relay 持久质量账本为 `6,668`，全部来自 `otlp_traces`，其中
+`identity_conflict=182`、`invalid_lifecycle=4,521`、`legacy_unclassified=1,965`；本进程新增
+`1,146`。Wire `requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，
+缺失且过期来源为 `wire`。同一时刻运行 runtime gate 观察到质量计数 `6,670`，退出码为 1，阻断
+原因包含质量、新鲜度、来源覆盖、Turn 就绪和部署 revision 不匹配；OTLP/Hook 流量不能替代
+缺失的 Wire。
+
+Platform `/health` 返回 HTTP 200，但没有 `backend` 字段；只读容器环境为
+`CHIPTRACE_BUILD_REVISION=db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`、`CHIPTRACE_BACKEND=fs`。
+以维护分支 revision 和 `--expected-backend oss` 执行 Platform 健康门禁实际退出 1。因此当前运行
+只证明 Raw/WAL、投递守恒和恢复基础仍在工作，尚未达到对外提供完整 Session/Turn 与真实 OSS 导出的
+生产标准。
+
+本轮维护分支已推送 `6db26f8`；本地 `make cloud-test` 以退出码 0 完成，覆盖 343 个 Rust 通过、
+OSS 签名/恢复、受限堆内存平台路径、质量标签和 GitHub Actions 合同门禁。GitHub Actions 新提交
+Run 仍因本环境未认证 `gh` CLI 无法取得真实运行证据，不能把本地绿色替代远端同 SHA 检查。
+
 ## 2026-10-19 09:01:42（Asia/Shanghai）线上只读复核
 
 本次复核只读取健康端点、Docker 容器元数据和 Git 状态，未重启服务、修改配置或清理 Raw。18084
