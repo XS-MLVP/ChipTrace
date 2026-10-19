@@ -1,23 +1,23 @@
 # 生产就绪评估
 
-## 2026-10-19 13:59（Asia/Shanghai）当前服务与仓库复核
+## 2026-10-20 02:01（Asia/Shanghai）当前服务与仓库复核
 
-当前维护基线为 `dd4692f64149a6c7332a4a346a7841bdf51530b7`，工作区干净，维护分支远端已同步。
-完整 `make cloud-test` 在该基线实际退出 0，Rust 单元测试为 `343 passed, 0 failed, 3 ignored`，
-平台/OSS 集成测试为 `100/100`；生产云后端预检和质量标签契约也已定向回归通过。该结果不能替代
+当前维护基线为 `b63d9792764df93e4df4090f1be468f400b1e4b3`，维护分支与远端 SHA 一致；工作区另有
+三份未跟踪的外部 DOCX 需求原件。当前本地 `make cloud-test`、`make codex-config-test` 和
+`make m0-test` 的实际检查均通过。该结果不能替代
 真实 Provider、未修改 Stock Codex、目标 NFS/OSS 或同 SHA 的 GitHub Actions 运行证据。
 
 线上只读采样中 Gateway、Collector、Relay 和 Platform `/health` 均为 HTTP 200。Collector revision
 为 `f5a4a9c1e1b389c1bb85e1067968f91942b15304`、队列深度为 0 且 ready；Relay 同一 revision 下
-`delivered=1,309,289`、`delivery_attempts=1,309,374`、`delivery_retries=85`、`pending=0`、
+`delivered=1,335,308`、`delivery_attempts=1,335,393`、`delivery_retries=85`、`pending=0`、
 `inflight=0`、`failed=0`、`conservation_ok=true`。这组证据证明 Raw/WAL、恢复和投递守恒正常，
 不等同于业务 Session/Turn 已就绪。
 
-业务就绪仍然失败：Relay `/ready` 返回 HTTP 503；持久质量账本为 `7,505`，其中
-`identity_conflict=184`、`invalid_lifecycle=5,356`、`legacy_unclassified=1,965`，错误来自
-`otlp_traces`。Wire `requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，
+业务就绪仍然失败：Relay `/ready` 返回 HTTP 503；持久质量账本为 `8,549`，其中
+`identity_conflict=184`、`invalid_lifecycle=6,397`、`legacy_unclassified=1,965`，另有 Hook
+`conversion_error=3`。Wire `requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，
 缺失且过期来源为 `wire`。实际用户配置的路由预检退出 1，Provider 绕过 18084；18086 `/health`
-实际报告 `backend=fs`。因此当前可证明传输层和本地 Raw/恢复工作，尚未达到完整 Session/Turn、真实
+实际报告 `backend=fs`；18084 的 `traceExporter` 未配置且 payload sanitization 关闭。因此当前可证明传输层和本地 Raw/恢复工作，尚未达到完整 Session/Turn、真实
 OSS/S3 导出或对外生产承诺的标准。
 
 ## 2026-10-19 12:44（Asia/Shanghai）当前 HEAD 与线上复核

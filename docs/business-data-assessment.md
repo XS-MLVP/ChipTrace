@@ -1,6 +1,6 @@
 # 业务采集数据符合性评估
 
-本页记录 2026-10-19 对当前在线服务、真实封存 Capture 和外部 MaaS 交付合同的复核结果。它区分
+本页记录 2026-10-20 02:01（Asia/Shanghai）对当前在线服务、真实封存 Capture 和外部 MaaS 交付合同的复核结果。它区分
 “传输层已经持久化”与“业务 Session/Turn 可以对外交付”，后者必须由真实来源覆盖和质量门禁证明。
 
 ## 结论
@@ -26,17 +26,25 @@
 | 邮箱、手机号、身份证、人名、地址等统一为 `<|mask_privacy|>` | 结构化敏感字段按字段别名统一掩码，邮箱/手机号/身份证/凭据和高置信姓名/地址上下文有规则；验证器拒绝未掩码字段和高置信模式 | 代码通过；低置信自由文本实体仍需来源端实体识别证据 |
 | T+1 发布和 SFTP/FTP 拉取 | 仓库只生成北京时间日期目录和发布包，凭据和外部 SFTP 由供应商运维 | 交付流程待真实账号验收 |
 
+三份外部需求原件当前仍以未跟踪文件保存在工作区：`外部 MaaS 数据交付规范.docx` 定义目录、
+`batch_*.tar.gz`、100 MB 上限和三文件 request 目录；`数据要求说明(1).docx` 增加真实数据、
+内容安全、禁止作假、账号/技术资产/双向保密和 `<|mask_privacy|>` 统一脱敏要求；
+`Metarouters_SFTP连接与样例映射说明示例.docx` 给出 11 字段映射、T+1 02:00 和 SFTP 样例。
+其中供应商编码、主机、账号、密码、指纹和具体 UTC 偏移在原件中是 `****`/`UTC+**` 占位符，
+因此本机没有足够事实证明真实 SFTP 连接或最终时区已经验收。仓库当前默认 UTC+08:00 是实现选择，
+需要接收方确认后才能作为外部合同事实。
+
 ## 在线服务实测
 
 只读请求观察到：
 
-- `3011 /health` 返回 200，Collector ready，`captures=1,328,503`，`queue_depth=0`，已封存约
-  `125,790,994,838` 字节。这证明 Raw/WAL 接收，不证明业务关联完整。
+- `3011 /health` 返回 200，Collector ready，`captures=1,335,308`，`queue_depth=0`，已封存约
+  `126,526,778,392` 字节。这证明 Raw/WAL 接收，不证明业务关联完整。
 - `3012 /health` 返回 200，但 `ingest_coverage.wire.requests=0`、
   `wire.durable_captures=0`、`successful_turn_scoped_captures=0`，`missing_sources=["wire"]`，
   `turn_capture_ready=false`。
-- `3012 /ready` 返回 503。Relay 的 `quality_errors=8,328`，包括 `identity_conflict=184`、
-  `invalid_lifecycle=6,176`、`legacy_unclassified=1,965`，另有 Hook `conversion_error=3`。
+- `3012 /ready` 返回 503。Relay 的 `quality_errors=8,549`，包括 `identity_conflict=184`、
+  `invalid_lifecycle=6,397`、`legacy_unclassified=1,965`，另有 Hook `conversion_error=3`。
   因此四源覆盖、来源新鲜度和零质量错误门禁均失败。
 - `18084 /health` 返回 200，但 `traceExporter.enabled=false`、`configured=false`，
   `fullTraceCapture.adapterDoesPayloadSanitization=false`，且保留 293 个历史失败文件（约 267 MB）。
