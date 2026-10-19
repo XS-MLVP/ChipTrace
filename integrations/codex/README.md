@@ -46,7 +46,7 @@ export CHIPTRACE_INGEST_TOKEN_FILE=/etc/chiptrace/ingest-token
 Hook 预检：
 
 ```bash
-printf '%s' '{"hook_event_name":"SessionStart","session_id":"preflight"}' \
+printf '%s' '{"hook_event_name":"SessionStart","session_id":"preflight","model":"preflight","permission_mode":"default","source":"startup"}' \
   | CHIPTRACE_HOOK_EVENT=SessionStart \
     CHIPTRACE_HOOK_BIN=/usr/local/libexec/chiptrace-codex-hook \
     /bin/sh -c 'exec "$CHIPTRACE_HOOK_BIN"'

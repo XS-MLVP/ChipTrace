@@ -119,6 +119,13 @@ test('required Hooks contain lifecycle only and fail closed at SessionStart', ()
   assert.doesNotMatch(requirements, /--max-time 8|timeout = 10/);
 });
 
+test('README SessionStart preflight includes the native fields required by the converter', () => {
+  assert.match(readme, /"hook_event_name":"SessionStart","session_id":"preflight"/);
+  assert.match(readme, /"model":"preflight"/);
+  assert.match(readme, /"permission_mode":"default"/);
+  assert.match(readme, /"source":"startup"/);
+});
+
 test('configuration has no ChipTrace client or plugin dependency', () => {
   const repositoryRoot = path.resolve(integrationRoot, '..', '..');
   assert.equal(fs.existsSync(path.join(repositoryRoot, 'examples', 'tool-registry.json')), false);
