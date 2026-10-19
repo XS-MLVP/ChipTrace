@@ -2,7 +2,7 @@
 
 ## 2026-10-19 12:30（Asia/Shanghai）当前 HEAD 验证与性能复测
 
-当前维护分支 HEAD 为 `cada281`，已推送到
+当前维护分支 HEAD 为 `6cf867f`，已推送到
 `origin/fix/oss-disk-session-platform`，工作区干净。`make check` 实际退出 0；远程启动合同测试
 9/9 通过，动作 pin 门禁确认工作流的 56 个引用只使用 5 个固定 SHA。新增合同会拒绝任何将 hosted
 runner 改回 `ubuntu-latest` 的变更，防止操作系统漂移重新造成启动差异。随后提交 `cada281` 将
