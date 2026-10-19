@@ -655,8 +655,9 @@ fn validate_otlp_attributes_mode(
             // updates while the handler is being interrupted and then
             // finalized. The span's status code remains successful and the
             // duplicate is limited to the known `interrupted -> completed`
-            // transition. Keep both values in Raw, but do not turn this
-            // producer status update into a false lifecycle quality error.
+            // or `interrupted -> failed` transition. Keep both values in Raw,
+            // but do not turn this producer status update into a false
+            // lifecycle quality error.
             if allow_known_trace_lifecycle_duplicates
                 && key == "outcome"
                 && known_code_mode_outcome_update(previous, value)
@@ -686,11 +687,11 @@ fn known_code_mode_outcome_update(previous: Option<&Value>, current: Option<&Val
         .and_then(|value| value.get("stringValue"))
         .and_then(Value::as_str)
         .is_some_and(|value| value == "interrupted");
-    let current_completed = current
+    let current_terminal = current
         .and_then(|value| value.get("stringValue"))
         .and_then(Value::as_str)
-        .is_some_and(|value| value == "completed");
-    previous_interrupted && current_completed
+        .is_some_and(|value| matches!(value, "completed" | "failed"));
+    previous_interrupted && current_terminal
 }
 
 fn attributes_for_endpoint(
