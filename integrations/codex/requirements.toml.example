@@ -5,7 +5,7 @@
 # SessionStart fails closed when cloud ingest is unavailable.
 # Every Hook requires HTTP 200 and a conserved, error-free Relay durable receipt.
 # Set CHIPTRACE_GATEWAY_URL to the same Gateway used by config.toml.  The
-# default keeps compatibility with the reference deployment.
+# helper defaults to a local 127.0.0.1:18084 Gateway for single-host installs.
 # Set CHIPTRACE_INGEST_TOKEN or CHIPTRACE_INGEST_TOKEN_FILE; the provider key
 # and OTLP header are intentionally not prerequisites for lifecycle delivery.
 # Exact requirements prevent user/profile/session overrides from bypassing Wire capture.
@@ -13,7 +13,9 @@ model_provider = "OpenAI"
 
 [model_providers.OpenAI]
 name = "OpenAI-compatible Gateway"
-base_url = "http://172.28.11.121:18084/"
+# Same-host default. Remote/sidecar deployments must replace this with the
+# exact Gateway address and set CHIPTRACE_GATEWAY_URL for the Hook helper.
+base_url = "http://127.0.0.1:18084/"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false

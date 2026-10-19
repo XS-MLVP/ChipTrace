@@ -569,6 +569,8 @@ jobs:
           bash scripts/ci/run-producer-check.sh workspace-tests rust-tests.log \
             timeout --signal=TERM --kill-after=30s 5m \
             cargo test --workspace --all-targets --locked
+      - name: Verify external MaaS delivery contract
+        run: make maas-contract-test
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

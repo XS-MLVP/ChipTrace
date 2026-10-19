@@ -179,7 +179,7 @@ trace exporter 未启用，watchdog 最近报告重试失败；18086 没有监�
 node scripts/deploy/codex-route-preflight.js \
   --config /etc/codex/config.toml \
   --user-config /path/to/actual/CODEX_HOME/config.toml \
-  --expected-base-url http://172.28.11.121:18084/
+  --expected-base-url http://127.0.0.1:18084/
 ```
 
 如果省略 `--user-config`，预检会自动读取当前进程 `CODEX_HOME/config.toml`；`CODEX_HOME`

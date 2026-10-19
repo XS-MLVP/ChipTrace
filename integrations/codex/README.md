@@ -22,7 +22,9 @@ Gateway 地址和采集凭据；它不依赖 Provider 业务 Key 或 OTLP header
 export CHIPTRACE_API_KEY='<provider-token>'
 export CHIPTRACE_INGEST_TOKEN='<ingest-token>'
 export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer%20${CHIPTRACE_INGEST_TOKEN}"
-export CHIPTRACE_GATEWAY_URL='http://172.28.11.121:18084'
+# Same-host installs may omit this (the helper defaults to 127.0.0.1:18084).
+# For a remote/sidecar Gateway set the exact address used by config.toml.
+export CHIPTRACE_GATEWAY_URL='http://127.0.0.1:18084'
 ```
 
 推荐把采集凭据放在权限为 `0600` 的 root-owned 文件中，避免把内部 token 放进用户 shell
@@ -39,8 +41,8 @@ install -m 0600 /path/to/chiptrace-ingest-token /etc/chiptrace/ingest-token
 export CHIPTRACE_INGEST_TOKEN_FILE=/etc/chiptrace/ingest-token
 ```
 
-`CHIPTRACE_GATEWAY_URL` 必须与 `config.toml` 的 `base_url` 使用同一个网关；若网关地址不是
-参考部署的 `172.28.11.121:18084`，必须显式设置该变量。安装后先执行一次无业务请求的
+`CHIPTRACE_GATEWAY_URL` 必须与 `config.toml` 的 `base_url` 使用同一个网关；远程部署必须显式
+设置该变量。安装后先执行一次无业务请求的
 Hook 预检：
 
 ```bash
@@ -123,7 +125,7 @@ CHIPTRACE_STOCK_CODEX_MODULES=/path/to/pinned-install/node_modules make managed-
 node scripts/deploy/codex-route-preflight.js \
   --config /etc/codex/config.toml \
   --user-config /path/to/actual/CODEX_HOME/config.toml \
-  --expected-base-url http://172.28.11.121:18084/
+  --expected-base-url http://127.0.0.1:18084/
 ```
 
 `--user-config` 必须指向实际运行 Stock Codex 的 `CODEX_HOME/config.toml`，而不是另一个

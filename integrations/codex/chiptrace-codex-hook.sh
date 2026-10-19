@@ -7,7 +7,10 @@
 set -u
 
 hook_event=${CHIPTRACE_HOOK_EVENT:-}
-gateway=${CHIPTRACE_GATEWAY_URL:-http://172.28.11.121:18084}
+# Keep the default local so a standard single-host deployment does not send
+# lifecycle data to a private example address.  Remote/sidecar deployments
+# must set CHIPTRACE_GATEWAY_URL explicitly in the service environment.
+gateway=${CHIPTRACE_GATEWAY_URL:-http://127.0.0.1:18084}
 gateway=${gateway%/}
 
 fail() {
@@ -26,10 +29,15 @@ case "$gateway" in
 esac
 
 token=${CHIPTRACE_INGEST_TOKEN:-}
-if [ -z "$token" ] && [ -n "${CHIPTRACE_INGEST_TOKEN_FILE:-}" ]; then
-  token_file=$CHIPTRACE_INGEST_TOKEN_FILE
+if [ -z "$token" ]; then
+  token_file=${CHIPTRACE_INGEST_TOKEN_FILE:-/etc/chiptrace/ingest-token}
   if [ ! -f "$token_file" ] || [ ! -r "$token_file" ]; then
-    fail ingest_token_file_unreadable
+    # A missing default file is reported as a missing credential, while an
+    # explicitly supplied path remains distinguishable as a deployment error.
+    if [ -n "${CHIPTRACE_INGEST_TOKEN_FILE:-}" ]; then
+      fail ingest_token_file_unreadable
+    fi
+    fail ingest_token_missing
   fi
   token=$(/usr/bin/head -c 4097 -- "$token_file" 2>/dev/null | /usr/bin/tr -d '\r\n') || fail ingest_token_file_unreadable
 fi

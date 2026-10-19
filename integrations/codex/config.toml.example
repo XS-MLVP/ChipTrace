@@ -4,7 +4,9 @@ model_provider = "OpenAI"
 
 [model_providers.OpenAI]
 name = "OpenAI-compatible Gateway"
-base_url = "http://172.28.11.121:18084/"
+# Same-host default. Remote/sidecar deployments must replace every
+# 127.0.0.1 endpoint with the managed Gateway address.
+base_url = "http://127.0.0.1:18084/"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
@@ -19,8 +21,8 @@ hooks = true
 [otel]
 environment = "production"
 log_user_prompt = true
-exporter = { otlp-http = { endpoint = "http://172.28.11.121:18084/otel/v1/logs", protocol = "json" } }
-trace_exporter = { otlp-http = { endpoint = "http://172.28.11.121:18084/otel/v1/traces", protocol = "json" } }
+exporter = { otlp-http = { endpoint = "http://127.0.0.1:18084/otel/v1/logs", protocol = "json" } }
+trace_exporter = { otlp-http = { endpoint = "http://127.0.0.1:18084/otel/v1/traces", protocol = "json" } }
 metrics_exporter = "none"
 
 [otel.tool_result]
