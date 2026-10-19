@@ -798,7 +798,7 @@ jobs:
         run: |
           cargo run --locked --bin chiptrace -- benchmark-http \
             --records 32 --payload-kib 4 --batch-records 8 \
-            --concurrency 4 --store-shards 2 --relay \
+            --concurrency 4 --store-shards 2 --relay --max-delivery-retries 0 \
           | python3 -c '
           import json, sys
           result = json.load(sys.stdin)
@@ -811,6 +811,7 @@ jobs:
           assert result["drain_health_polls"] >= result["drain_health_degraded_polls"]
           assert result["delivery_attempts"] == result["relay_health"]["delivery_attempts"]
           assert result["delivery_retries"] == result["relay_health"]["delivery_retries"]
+          assert result["delivery_retries"] == 0
           '
       - run: cargo build --release --locked --bin chiptrace
       - run: target/release/chiptrace --help

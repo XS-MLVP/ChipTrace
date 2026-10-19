@@ -94,3 +94,8 @@ test('container fixture mounts are readable by the fixed non-root image user', (
   assert.match(workflow,
     /- name: Verify non-root container mounts before test runners[\s\S]*?--user 10001:10001[\s\S]*?--entrypoint node[\s\S]*?NON_ROOT_TEST_MOUNTS_READABLE/);
 });
+
+test('Relay CI benchmark fails on hidden delivery retries', () => {
+  assert.match(workflow,
+    /name: Verify Relay cloud delivery benchmark path[\s\S]*?--relay --max-delivery-retries 0[\s\S]*?assert result\["delivery_retries"\] == 0/);
+});
