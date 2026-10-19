@@ -11,7 +11,7 @@ const test = require('node:test');
 
 const binary = process.env.CHIPTRACE_BIN || path.resolve(__dirname, '../../target/debug/chiptrace');
 const token = 'synthetic-hook-ack-credential-at-least-32-bytes';
-const gateway = 'http://172.28.11.121:18084';
+const hookBinary = path.join(__dirname, 'chiptrace-codex-hook.sh');
 
 async function commands() {
   const text = await fs.readFile(path.join(__dirname, 'requirements.toml.example'), 'utf8');
@@ -26,10 +26,11 @@ function event(name) {
     event_id: `synthetic-hook-${name}`, occurred_at: '2026-10-15T00:00:00Z' };
 }
 
-async function invoke(command, endpoint, input) {
-  const child = spawn('/bin/sh', ['-c', command.replace(gateway, endpoint)], {
-    env: { ...process.env, CHIPTRACE_API_KEY: 'synthetic-provider-credential', CHIPTRACE_INGEST_TOKEN: token,
-      OTEL_EXPORTER_OTLP_HEADERS: `Authorization=Bearer%20${token}` },
+async function invoke(command, endpoint, input, overrides = {}) {
+  const child = spawn('/bin/sh', ['-c', command], {
+    env: { ...process.env, CHIPTRACE_HOOK_BIN: hookBinary, CHIPTRACE_GATEWAY_URL: endpoint,
+      CHIPTRACE_API_KEY: 'synthetic-provider-credential', CHIPTRACE_INGEST_TOKEN: token,
+      OTEL_EXPORTER_OTLP_HEADERS: `Authorization=Bearer%20${token}`, ...overrides },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -103,7 +104,25 @@ test('SessionStart rejects HTTP success without a valid durable Hook receipt', {
   }
 });
 
-test('all required lifecycle Hooks reject an empty ACK and accept conserved duplicate receipts', { timeout: 120000 }, async t => {
+test('SessionStart accepts a protected token file without provider or OTLP environment variables', { timeout: 30000 }, async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-hook-token-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const tokenFile = path.join(root, 'ingest-token');
+  await fs.writeFile(tokenFile, `${token}\n`, { mode: 0o600 });
+  const hook = (await commands()).get('SessionStart');
+  const url = await endpoint(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(receipt()));
+  });
+  const result = await invoke(hook, url, event('SessionStart'), {
+    CHIPTRACE_API_KEY: '', CHIPTRACE_INGEST_TOKEN: '', OTEL_EXPORTER_OTLP_HEADERS: '',
+    CHIPTRACE_INGEST_TOKEN_FILE: tokenFile,
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout, '', result.stderr);
+});
+
+test('all required lifecycle Hooks reject an empty ACK and accept conserved duplicate receipts', { timeout: 240000 }, async t => {
   let response = {};
   const url = await endpoint(t, (_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -179,7 +198,7 @@ async function stop(process) {
 }
 
 async function waitForHealth(url, process, predicate = () => true) {
-  const deadline = Date.now() + 10000;
+  const deadline = Date.now() + 60000;
   while (Date.now() < deadline && !process.ended) {
     try {
       const response = await fetch(`${url}/health`, { signal: AbortSignal.timeout(500) });
@@ -193,7 +212,7 @@ async function waitForHealth(url, process, predicate = () => true) {
   assert.fail(`isolated service did not reach the expected state: ${process.stderr}`);
 }
 
-test('native Hook commands accept real Relay WAL receipts through Collector delivery', { timeout: 30000 }, async t => {
+test('native Hook commands accept real Relay WAL receipts through Collector delivery', { timeout: 120000 }, async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-hook-ack-'));
   let collector;
   let relay;

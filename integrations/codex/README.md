@@ -1,11 +1,12 @@
 # Stock Codex 接入
 
-用户侧只运行未修改的 Stock Codex。管理员统一下发两个原生配置文件：
+用户侧只运行未修改的 Stock Codex。管理员统一下发两个原生配置文件和一个 Hook helper：
 
 | 模板 | 安装位置 | 作用 |
 | --- | --- | --- |
 | [config.toml.example](config.toml.example) | `/etc/codex/config.toml` | 默认 18084 Responses、OTLP 和 25 次网络重试 |
 | [requirements.toml.example](requirements.toml.example) | `/etc/codex/requirements.toml` | 强制 Provider 选择及完整定义、required 生命周期 Hook，并在 SessionStart 执行前置检查 |
+| [chiptrace-codex-hook.sh](chiptrace-codex-hook.sh) | `/usr/local/libexec/chiptrace-codex-hook` | 发送生命周期事件并校验 Relay durable receipt |
 
 系统 `config.toml` 提供默认值，用户配置和会话参数可以覆盖它。仅安装该文件不能证明
 Responses 经过 18084：OTLP/Hook 可以仍发往云端，而同名 Provider 已被用户改到另一个入口。
@@ -14,30 +15,64 @@ Responses 经过 18084：OTLP/Hook 可以仍发往云端，而同名 Provider �
 目前原生 requirements 没有对应的 OTLP 强制字段；OTLP 仍是默认配置，必须在真实 Canary
 中逐 Turn 验证，不能把 Provider 约束当作四路来源已经完整。
 
-业务凭据和采集凭据由主机管理系统注入环境，不写入配置或 Trace：
+业务凭据和采集凭据由主机管理系统注入环境，不写入配置或 Trace。生命周期 Hook 只需要
+Gateway 地址和采集凭据；它不依赖 Provider 业务 Key 或 OTLP header 才能启动：
 
 ```bash
 export CHIPTRACE_API_KEY='<provider-token>'
 export CHIPTRACE_INGEST_TOKEN='<ingest-token>'
 export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer%20${CHIPTRACE_INGEST_TOKEN}"
+export CHIPTRACE_GATEWAY_URL='http://172.28.11.121:18084'
 ```
+
+推荐把采集凭据放在权限为 `0600` 的 root-owned 文件中，避免把内部 token 放进用户 shell
+历史或进程启动参数：
+
+```bash
+install -d -m 0755 /etc/codex
+install -m 0600 config.toml.example /etc/codex/config.toml
+install -m 0600 requirements.toml.example /etc/codex/requirements.toml
+install -d -m 0755 /usr/local/libexec
+install -m 0755 chiptrace-codex-hook.sh /usr/local/libexec/chiptrace-codex-hook
+install -d -m 0700 /etc/chiptrace
+install -m 0600 /path/to/chiptrace-ingest-token /etc/chiptrace/ingest-token
+export CHIPTRACE_INGEST_TOKEN_FILE=/etc/chiptrace/ingest-token
+```
+
+`CHIPTRACE_GATEWAY_URL` 必须与 `config.toml` 的 `base_url` 使用同一个网关；若网关地址不是
+参考部署的 `172.28.11.121:18084`，必须显式设置该变量。安装后先执行一次无业务请求的
+Hook 预检：
+
+```bash
+printf '%s' '{"hook_event_name":"SessionStart","session_id":"preflight"}' \
+  | CHIPTRACE_HOOK_EVENT=SessionStart \
+    CHIPTRACE_HOOK_BIN=/usr/local/libexec/chiptrace-codex-hook \
+    /bin/sh -c 'exec "$CHIPTRACE_HOOK_BIN"'
+```
+
+预检必须输出空成功流（收到有效 durable receipt 时）或包含固定原因码的
+`continue:false`；看到 `ingest_token_missing`、`gateway_unavailable` 或
+`invalid_durable_receipt` 时不要启动 Codex，先修复配置。Hook 不会把 token、请求正文或
+响应正文写入诊断。
 
 `CHIPTRACE_API_KEY` 必须是目标 18084 上游业务系统授权的凭据。当前 router_v2 部署由
 Sub2API 验证业务鉴权；另一个 Provider 接受的凭据不能据此视为可在 18084 使用。
 2026-10-15 使用同一份现有 Codex 凭据做只读目录检查，共享 Provider 返回 HTTP 200，
 18084 `/models` 返回 HTTP 401；没有发送模型请求，也没有输出凭据或响应正文。
-管理员应先在目标新客户端进程注入三项环境变量，并用该部署授权的业务凭据验证目录
-访问，再下发受管配置和运行真实 Canary。目录访问成功只证明该次目录请求被接受，
+管理员应先在目标新客户端进程注入 Provider 业务凭据、采集凭据和网关地址，并用该部署
+授权的业务凭据验证目录访问，再下发受管配置和运行真实 Canary。目录访问成功只证明该次目录请求被接受，
 模型生成、逐 Turn 四源和远端持久化仍需分别验收。
 
-安装文件后保持权限为 `0600`，并用严格配置启动：
+配置文件保持权限为 `0600`，Hook helper 保持权限为 `0755`，并用严格配置启动：
 
 ```bash
 codex --strict-config
 ```
 
-此后用户仍直接运行 `codex`。`SessionStart` 会验证三项环境配置和 18084 Hook 入口的
-真实持久化确认；缺失、认证失败、入口不可用或确认无效时，在首个 Turn 前停止。
+此后用户仍直接运行 `codex`。`SessionStart` 会验证采集凭据和 18084 Hook 入口的真实
+持久化确认；缺失、认证失败、入口不可用或确认无效时，在首个 Turn 前停止。
+`CHIPTRACE_API_KEY` 和 `OTEL_EXPORTER_OTLP_HEADERS` 只分别用于 Provider Responses 与
+OTLP 路由，缺失它们不会误报为 Hook 配置错误。
 Responses Wire 记录模型事实，
 `codex.tool_result` OTLP 记录真实工具执行，required Hook 只记录 Session、Turn、压缩和子代理
 生命周期，且不覆盖用户已有 Hook。三类事实缺失或冲突时，云端保留 Raw，但拒绝进入采购
@@ -119,7 +154,8 @@ Stock Codex 0.153.4 的 `exec --json` 被 SessionStart Hook 前置拦截时，�
 退出码 0 和零 Token 的 `turn.completed`。前置拦截测试应验证零模型请求；正常采集测试
 则应验证真实模型交互、工具结果以及 Collector 的会话完整性。
 
-原生 Hook 命令依赖 `/usr/bin/python3` 和 `/usr/bin/curl`。命令在每次 Hook 调用时保留原生
+原生 Hook helper 依赖 `/usr/bin/python3`、`/usr/bin/curl`、`/usr/bin/head` 和 `/usr/bin/tr`。
+命令在每次 Hook 调用时保留原生
 JSON 字段，并为缺少身份的事件补充独立 `event_id` 与 `occurred_at`，然后把同一份 JSON
 交给 curl，最多执行两次、每次不超过一秒。每次响应独立读取，传输中断时丢弃该次确认
 残片，再验证下一次完整响应；不会把多次响应拼接成 JSON。Stock Codex 恢复会话后可能

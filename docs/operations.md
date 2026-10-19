@@ -28,6 +28,8 @@ export CHIPTRACE_CAPTURE_ROOT='/srv/chiptrace/capture'
 export CHIPTRACE_COLLECTOR_STATE_ROOT='/srv/chiptrace/collector-state'
 export CHIPTRACE_RELAY_ROOT='/srv/chiptrace/relay'
 export CHIPTRACE_INGEST_TOKEN='<at-least-32-bytes>'
+# Stock Codex lifecycle Hooks may read the same token from a root-owned file:
+# export CHIPTRACE_INGEST_TOKEN_FILE='/etc/chiptrace/ingest-token'
 sudo install -d -o 10001 -g 10001 -m 0700 \
   /srv/chiptrace/capture /srv/chiptrace/collector-state /srv/chiptrace/relay
 node scripts/deploy/preflight.js --file deploy/collector-relay.yml
@@ -201,6 +203,14 @@ Session 的四源关联；不能用合成 Capture 把线上计数补成通过。
 
 管理员按 [Stock Codex 接入](../integrations/codex/README.md) 下发原生配置。用户主机没有
 ChipTrace 程序或服务，用户仍直接运行：
+
+安装前必须同时部署 `integrations/codex/requirements.toml.example` 和
+`integrations/codex/chiptrace-codex-hook.sh`；后者安装为
+`/usr/local/libexec/chiptrace-codex-hook` 并设置为 `0755`。Hook 使用
+`CHIPTRACE_GATEWAY_URL` 选择入口，使用 `CHIPTRACE_INGEST_TOKEN` 或
+`CHIPTRACE_INGEST_TOKEN_FILE` 认证。`CHIPTRACE_API_KEY` 和
+`OTEL_EXPORTER_OTLP_HEADERS` 分别属于 Provider/OTLP 路由，不是 SessionStart Hook 的
+前置条件。安装后先执行 README 中的无业务预检，再启动 Codex。
 
 ```bash
 codex
