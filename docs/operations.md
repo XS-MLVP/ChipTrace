@@ -226,8 +226,9 @@ Session 交付证据。
 GitHub CI 的 `live-provider-runtime-preflight` 只在手工 `workflow_dispatch`、
 `live_preflight=true`、受保护分支/规则集、受保护的 `production-canary` Environment 和标签为
 `self-hosted, linux, chiptrace-canary` 的内网 Runner 上执行。Environment Secret 必须提供
-`CHIPTRACE_API_KEY`；Environment Variables 必须提供实际 Canary 配置文件路径
-`CHIPTRACE_CODEX_CONFIG`、对应网关地址 `CHIPTRACE_CODEX_BASE_URL`，以及
+`CHIPTRACE_API_KEY`；Environment Variables 必须提供实际 Canary 的系统配置文件路径
+`CHIPTRACE_CODEX_CONFIG`、实际运行用户覆盖文件路径 `CHIPTRACE_CODEX_USER_CONFIG`、对应网关地址
+`CHIPTRACE_CODEX_BASE_URL`，以及
 `CHIPTRACE_RESPONSES_URL`、`CHIPTRACE_GATEWAY_HEALTH_URL`、`CHIPTRACE_RELAY_HEALTH_URL`、
 `CHIPTRACE_COLLECTOR_HEALTH_URL` 和 `CHIPTRACE_PLATFORM_HEALTH_URL`。启用真实预检时，手工输入的
 `expected_revision` 必须是 Collector/Relay 实际构建的完整 Git SHA；普通手工 CI 可以留空。
