@@ -1,5 +1,27 @@
 # 生产就绪评估
 
+## 2026-10-19 08:17:11（Asia/Shanghai）线上只读复核
+
+本次复核未重启容器、未修改配置或清理 Raw。18084 Gateway、3011 Collector、3012 Relay 和
+18086 Platform 的 `/health` 均返回 HTTP 200；Relay `/ready` 返回 HTTP 503。Collector 与
+Relay 实际运行 revision `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，Capture/Delivered
+均为 `1,287,967`，`pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`；Collector
+队列深度为 0 且 ready，单 shard 已封存 849 个 Segment、`119,280,003,319` bytes。Gateway
+outbox 当前 pending、processing 和最近失败均为 0，293 个历史失败原件仍有恢复凭据，未解决数
+为 0；独立 trace exporter 关闭。
+
+业务交付门禁仍失败：Relay 持久质量账本为 `6,243`，其中 `identity_conflict=182`、
+`invalid_lifecycle=4,096`、`legacy_unclassified=1,965`；当前进程新增 721。错误全部来自
+OTLP traces，原因分解完整且 Raw 未被改写。Wire `requests=0`、
+`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，`wire` 同时缺失且过期；
+runtime gate 在质量、新鲜度和来源覆盖门禁下真实退出 1。新增 `invalid_lifecycle` 仍对应上游
+重复 `outcome` 属性，必须修复 Producer 或采用已验收的补丁版本，不能在 Relay 中择一终态来掩盖冲突。
+
+Platform 健康响应仍没有新版 `backend` 字段，实际容器环境为 `CHIPTRACE_BACKEND=fs`，运行 revision
+为 `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`；维护分支最新提交尚未部署，真实 OSS 提交、恢复、
+远端 SHA-256、同 SHA GitHub Actions 和新鲜多轮 Wire Canary 仍未验收。因此当前只能用于内部
+Raw/恢复验证，不能向外部使用者承诺完整 Session/Turn 和远端持久导出。
+
 ## 2026-10-19 07:52（Asia/Shanghai）线上只读复核
 
 本次复核未重启容器、未改动配置或清理 Raw。18084 Gateway、3011 Collector、3012 Relay 和

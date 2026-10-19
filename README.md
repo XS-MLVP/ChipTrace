@@ -16,13 +16,15 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新线上只读复核（2026-10-19 07:52，Asia/Shanghai）确认四个服务 `/health` 均返回 HTTP 200，
-Collector/Relay revision 为 `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，累计 Capture/Delivered
-为 `1,286,211`，队列和失败均为 0 且计数守恒；Gateway outbox 最近失败为 0，历史失败原件与恢复凭据
-仍保留。Relay `/ready` 和 runtime gate 仍失败：持久质量账本为 `6,105`（182 个身份冲突、
-3,958 个生命周期冲突、1,965 个旧账本未分类），本进程新增 583，Wire 为 0，
-`successful_turn_scoped_captures=0`。新增错误仍是上游重复 `outcome` 属性；实际 Platform 容器明确
-使用本地 `fs` 后端，维护分支的新后端健康字段和 `oss/s3` 生产门禁尚未部署。当前适合内部 Raw/恢复
+最新线上只读复核（2026-10-19 08:17:11，Asia/Shanghai）确认四个服务 `/health` 均返回 HTTP 200，
+但 Relay `/ready` 返回 HTTP 503。Collector/Relay revision 为
+`db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，累计 Capture/Delivered 为 `1,287,967`，
+`pending=0`、`inflight=0`、`failed=0` 且计数守恒；Collector 队列为 0 且 ready。Gateway full-trace
+outbox 当前 pending/processing/最近失败均为 0，293 个历史失败原件仍有恢复凭据且未解决数为 0，
+独立 trace exporter 仍关闭。Relay 持久质量账本为 `6,243`（182 个身份冲突、4,096 个生命周期冲突、
+1,965 个旧账本未分类），本进程新增 721；Wire 请求和成功的逐 Turn Wire 均为 0，缺失且过期来源为
+`wire`，`turn_capture_ready=false`。Platform 仍报告旧 revision 且健康响应没有 `backend` 字段；容器
+实际使用本地 `fs` 后端。runtime gate 因质量、新鲜度和来源覆盖真实退出 1；当前适合内部 Raw/恢复
 验证，尚未达到对外承诺完整 Session/Turn 采集、真实 OSS 和在线导出的生产标准。
 
 最新线上只读复核（2026-10-19 06:07:26，Asia/Shanghai）确认 18084、3011、3012、18086 的 `/health` 均返回
