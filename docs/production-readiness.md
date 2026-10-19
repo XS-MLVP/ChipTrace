@@ -1,5 +1,14 @@
 # 生产就绪评估
 
+## 2026-10-19 09:54（Asia/Shanghai）部署配置持久化复核
+
+为避免宿主自动重启回滚，已将 `/nfs/home/zhangyuxin/router_v2/deploy/.env` 中的
+`CHIPTRACE_IMAGE`、`CHIPTRACE_PLATFORM_IMAGE` 和 `CHIPTRACE_REVISION` 同步到本轮已验证镜像与
+`f5a4a9c1e1b389c1bb85e1067968f91942b15304`；后端仍为 `fs`，其余路径、端口和凭据未改动。
+使用该 env 文件直接运行 `scripts/deploy/preflight.js` 实际退出 0，三个运行容器的镜像 ID、
+期望 revision 和 health 均与预检一致。该配置持久化只保证重启继续运行当前版本，不改变真实 OSS
+和四源业务门禁仍未通过的事实。
+
 ## 2026-10-19 09:51（Asia/Shanghai）ChipTrace 组件滚动更新后的复核
 
 使用部署预检通过的不可变镜像完成 Collector、Relay、Platform 的受控滚动更新，未修改宿主

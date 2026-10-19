@@ -30,7 +30,8 @@ Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 `f5a4a9c1e1b389c1bb85e1067968f91942b15304`，容器 health 全部为 healthy，Platform `backend=fs`
 且对应 revision 的健康门禁通过。runtime gate 仍真实退出 1，持久质量账本为 `6,764`、Wire
 仍缺失；这只完成了代码部署和持久计数验证，尚未完成真实 Provider 路由、四源 Session/Turn
-Canary 或 OSS 后端切换。
+Canary 或 OSS 后端切换。随后已同步宿主部署 env 中的三个镜像/revision 字段，自动重启不会回滚
+到旧镜像；部署预检使用该 env 实际退出 0。
 
 最新线上只读复核（2026-10-19 09:01:42，Asia/Shanghai）确认 18084、3011、3012、18086 的
 `/health` 均返回 HTTP 200，但 Relay `/ready` 返回 HTTP 503。Collector/Relay
