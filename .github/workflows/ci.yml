@@ -891,6 +891,15 @@ jobs:
           '
       - name: Build cloud platform image
         run: docker build --target platform --build-arg CHIPTRACE_REVISION="$GITHUB_SHA" -t chiptrace-platform:ci .
+      - name: Prepare read-only test mounts for the non-root container
+        run: |
+          set -euo pipefail
+          # The image runs as UID 10001.  A self-hosted checkout can inherit a
+          # private umask (0700), which would make a read-only bind mount
+          # unreadable and look like a container startup failure.  These paths
+          # contain tests and redacted fixtures only; make their permissions
+          # traversable without changing file contents or tracked modes.
+          chmod -R a+rX integrations/openai-gateway integrations/cloud-platform integrations/codex fixtures
       - name: Verify actual deployment templates reject mutable images and missing limits
         run: |
           set -euo pipefail

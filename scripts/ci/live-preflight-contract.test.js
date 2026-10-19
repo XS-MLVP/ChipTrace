@@ -87,3 +87,8 @@ test('hosted sandbox startup tolerates optional sysctl writes but requires a rea
   assert.match(workflow, /if ! unshare --user --map-root-user \/bin\/true; then/);
   assert.match(workflow, /native producer sandbox namespace is unavailable on this runner/);
 });
+
+test('container fixture mounts are readable by the fixed non-root image user', () => {
+  assert.match(workflow,
+    /- name: Prepare read-only test mounts for the non-root container[\s\S]*?chmod -R a\+rX integrations\/openai-gateway integrations\/cloud-platform integrations\/codex fixtures/);
+});
