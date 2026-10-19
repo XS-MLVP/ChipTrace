@@ -1,5 +1,24 @@
 # 生产就绪评估
 
+## 2026-10-19 12:30（Asia/Shanghai）当前 HEAD 验证与性能复测
+
+当前维护分支 HEAD 为 `ea3d93848ebc203ef6582a68b2d342f44840c9c5`，已推送到
+`origin/fix/oss-disk-session-platform`，工作区干净。`make check` 实际退出 0；远程启动合同测试
+8/8 通过，动作 pin 门禁确认工作流的 56 个引用只使用 5 个固定 SHA。新增合同会拒绝任何将 hosted
+runner 改回 `ubuntu-latest` 的变更，防止操作系统漂移重新造成启动差异。
+
+当前 HEAD 的 Relay 回环基准使用 4 shard、16 并发、64 KiB、`fsync`、10,000 条记录和零重试上限：
+入口吞吐 `4,450.7 records/s`，端到端吞吐 `1,235.96 records/s`，P95 批延迟 `266.94 ms`，
+P99 `318.36 ms`，`10,000/10,000` delivered，`failed=0`、`delivery_retries=0`、计数守恒，排空
+`5.84 s`。其中 `394/470` 次排空轮询处于背压观察状态；该测试不含目标 NFS/OSS 对象上传、
+多租户竞争或长期 SLO。
+
+本次线上只读采样仍未达到业务就绪：运行 revision 是 `f5a4a9c1e1b389c1bb85e1067968f91942b15304`，
+Relay `/ready=503`，持久质量错误 `7,294`（`identity_conflict=184`、`invalid_lifecycle=5,145`、
+`legacy_unclassified=1,965`），`missing_sources=["wire"]`、`wire.requests=0`、
+`turn_capture_ready=false`；Platform 仍为 `backend=fs`。新增 CI 代码和性能验证尚未部署线上，
+也不能替代真实 Provider 路由、目标 OSS 账号和同 SHA GitHub Actions 证据。
+
 ## 2026-10-19 11:04（Asia/Shanghai）当前服务与 CI 复核
 
 本次复核只读取本机健康端点、容器元数据和 Git 远端状态，未重启服务、修改运行配置或清理
