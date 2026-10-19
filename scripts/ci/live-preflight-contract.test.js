@@ -100,6 +100,14 @@ test('hosted jobs use an immutable Ubuntu runner label', () => {
     'floating ubuntu-latest labels can silently change the startup environment');
 });
 
+test('hosted jobs use the verified Node patch release', () => {
+  const versions = [...workflow.matchAll(/^\s*node-version:\s*["']?([^"'\s]+)["']?\s*$/gm)]
+    .map(match => match[1]);
+  assert.ok(versions.length >= 5, 'workflow must configure Node for hosted jobs');
+  assert.ok(versions.every(version => version === '22.23.3'),
+    `hosted jobs must stay on Node 22.23.3: ${versions.join(', ')}`);
+});
+
 test('hosted sandbox startup tolerates optional sysctl writes but requires a real namespace probe', () => {
   assert.match(workflow, /Could not enable kernel\.unprivileged_userns_clone; continuing to the real namespace probe/);
   assert.match(workflow, /Could not disable AppArmor unprivileged-userns restriction; continuing to the real namespace probe/);
