@@ -16,6 +16,16 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
+最新线上只读复核（2026-10-19 09:45:00，Asia/Shanghai）确认 Collector/Relay 实际 revision 仍为
+`db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`；Relay `delivery_records=1,294,320`、
+`delivered=1,294,320`、`pending=0`、`inflight=0`、`failed=0`、`delivery_retries=83` 且
+`conservation_ok=true`。业务门禁仍未通过：持久 `quality_errors=6,745`，原因是
+`identity_conflict=182`、`invalid_lifecycle=4,598`、`legacy_unclassified=1,965`；
+`missing_sources=["wire"]`、`turn_capture_ready=false`。使用实际 `/etc/codex` 与用户配置执行
+路由预检真实退出 1，报错为用户 `OpenAI.base_url` 未指向受管 18084 Gateway；因此 OTLP/Hook
+增长不能被解释成完整 Wire 采集。维护分支最新提交为 [`0d81aad`](https://github.com/XS-MLVP/ChipTrace/commit/0d81aad)，
+但线上尚未部署该 revision。
+
 最新线上只读复核（2026-10-19 09:01:42，Asia/Shanghai）确认 18084、3011、3012、18086 的
 `/health` 均返回 HTTP 200，但 Relay `/ready` 返回 HTTP 503。Collector/Relay
 revision 为 `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，Collector Capture 与 Relay Delivered
