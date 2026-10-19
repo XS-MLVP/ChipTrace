@@ -428,7 +428,8 @@ Relay/Collector 的精确 Raw、重复确认、平台归档/恢复、Turn 和采
   `quality_reason_breakdown_complete=true`。`quality_errors_current_process`
   仅表示本次进程增量，运行门禁还必须拒绝缺少原因分解的旧 Relay。旧 ledger 无法回溯原因时
   只能归入 `legacy_unclassified`，不能按正文或时间猜测更具体标签。先保留失败快照，再
-  修正生产者或采集配置。
+  修正生产者或采集配置。`scripts/ci/quality-reason-contract.test.js` 会在 CI 中对照 Rust
+  ingest、Relay seed 和 runtime gate 的标签集合，防止新增原因码只在单一路径生效。
 - Session start/end、模型调用/结果/执行、内部父引用的完整率；以及每个 Turn 的 Wire、
   OTLP logs、OTLP traces、required Hook 覆盖和 `incomplete_turns`。
 - Buyer v7 失败原因、合格 Session 数和四种 Token 口径。
