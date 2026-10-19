@@ -23,6 +23,14 @@ WAL 的有界只读抽样确认，新增 `invalid_lifecycle` 均是同一 Span �
 提交 [`1728f94`](https://github.com/XS-MLVP/ChipTrace/commit/1728f94)。GitHub Actions API 在本机
 请求超时，因此同一 SHA 的远端 Run 尚不能据此声明通过。
 
+## 2026-10-19 11:23（Asia/Shanghai）平台大文件读取优化
+
+将平台共享 JSON 证据读取器的固定缓冲从 64 KiB 调整为 1 MiB，降低大 Turn/Projection
+sidecar 在 NFS 或对象存储恢复目录上的读取调用次数；SHA-256、UTF-8、长度、inode 和变更检测
+保持不变，缓冲仍是每个引擎进程的固定上限。`make turn-memory-test`、平台/OSS 集成测试
+（100/100）和 `cargo clippy --workspace --all-targets --locked -- -D warnings` 均实际退出 0。
+该优化改善读取路径的系统调用开销，尚未替代目标 NFS/OSS 上的长期吞吐与 P99 容量验收。
+
 ## 2026-10-19 09:54（Asia/Shanghai）部署配置持久化复核
 
 为避免宿主自动重启回滚，已将 `/nfs/home/zhangyuxin/router_v2/deploy/.env` 中的

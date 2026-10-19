@@ -7,6 +7,11 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{BufReader, Read};
 use std::path::Path;
 
+// Evidence readers validate and hash every byte of large JSONL sidecars.  A
+// MiB buffer materially reduces NFS/object-restore read calls while remaining
+// a fixed, bounded allocation per engine process.
+const EVIDENCE_BUFFER_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct EvidenceDigest {
     pub(crate) bytes: u64,
@@ -40,7 +45,10 @@ impl JsonEvidence {
             bail!("JSON evidence exceeds byte limit");
         }
         Ok(Self {
-            reader: BufReader::with_capacity(64 * 1024, CheckedReader::new(file, before.len())),
+            reader: BufReader::with_capacity(
+                EVIDENCE_BUFFER_BYTES,
+                CheckedReader::new(file, before.len()),
+            ),
             before,
         })
     }
