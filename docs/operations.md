@@ -386,7 +386,7 @@ docker build --target platform --build-arg CHIPTRACE_REVISION="$CHIPTRACE_REVISI
 export CHIPTRACE_PLATFORM_IMAGE="$(docker image inspect --format '{{.Id}}' "chiptrace-platform:$CHIPTRACE_REVISION")"
 sudo install -d -o 10001 -g 10001 -m 0700 \
   /srv/chiptrace/platform /srv/chiptrace/objects
-node scripts/deploy/preflight.js --file deploy/cloud-platform.yml --require-cloud-backend
+node scripts/deploy/preflight.js --file deploy/cloud-platform.yml
 docker compose --project-name "${CHIPTRACE_PLATFORM_PROJECT:-chiptrace-platform}" \
   -f deploy/cloud-platform.yml up -d --no-build --pull never --wait --wait-timeout 600
 ```
@@ -409,6 +409,7 @@ export OSS_ACCESS_KEY_ID='<service-key>'
 export OSS_ACCESS_KEY_SECRET='<service-secret>'
 sudo install -d -o 10001 -g 10001 -m 0700 \
   /srv/chiptrace/platform-oss-project-001
+node scripts/deploy/preflight.js --file deploy/cloud-platform.yml --require-cloud-backend
 ```
 
 CI 使用隔离 MinIO 验证 S3 协议、对象长度和 SHA-256；真实 Alibaba OSS 账号、区域 endpoint
