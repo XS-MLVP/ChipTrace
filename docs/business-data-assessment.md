@@ -56,6 +56,15 @@
 因此本次刷新仍不满足真实 Session/Turn MaaS 交付门禁；当前可证明的是 Raw/WAL 接收、持久化、
 恢复和投递守恒。上述标签保持 fail-closed：缺失 Turn 或身份冲突的记录不被重分类为成功。
 
+## 05:15 真实客户端 Canary 结果
+
+在上述刷新后，用未修改的 Stock Codex 二进制发起最小只读请求。18084 和 Relay 实际封存了
+`20` 条带 Session/Turn 的 `api_snapshot`，响应状态全部为 `401`，因此
+`successful_turn_scoped_captures=0`、`turn_capture_ready=false`；客户端在重试后超时退出。
+这证明 Wire 入口、原始字节封存和 Turn 标签链路工作，但当前注入的业务凭据不被 18084 上游接受，
+不能把这些失败请求当作可交付业务交互。随后用仓库 Hook helper 发出一个 SessionStart 预检，
+真实返回码为 0 且没有错误输出；Hook 的传输确认正常，仍不替代成功的模型 Turn。
+
 ## 03:21 历史在线实测
 
 只读请求观察到：
