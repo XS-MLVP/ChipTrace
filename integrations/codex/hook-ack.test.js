@@ -62,7 +62,11 @@ async function endpoint(t, respond) {
   return `http://127.0.0.1:${server.address().port}`;
 }
 
-test('SessionStart rejects HTTP success without a valid durable Hook receipt', { timeout: 30000 }, async t => {
+// These cases deliberately launch the native shell/curl/python Hook command
+// for every retry.  On the shared NFS runner, process startup can be much
+// slower than the local endpoint; keep the contract strict while allowing
+// bounded runner variance.
+test('SessionStart rejects HTTP success without a valid durable Hook receipt', { timeout: 120000 }, async t => {
   const hook = (await commands()).get('SessionStart');
   const cases = [
     ['ACK-only stand-in', () => ({}), 200],
@@ -99,7 +103,7 @@ test('SessionStart rejects HTTP success without a valid durable Hook receipt', {
   }
 });
 
-test('all required lifecycle Hooks reject an empty ACK and accept conserved duplicate receipts', { timeout: 30000 }, async t => {
+test('all required lifecycle Hooks reject an empty ACK and accept conserved duplicate receipts', { timeout: 120000 }, async t => {
   let response = {};
   const url = await endpoint(t, (_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
