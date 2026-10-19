@@ -16,8 +16,8 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新维护状态（2026-10-19 12:44，Asia/Shanghai）为 [`a9b900d`](https://github.com/XS-MLVP/ChipTrace/commit/a9b900d)，
-已与 `origin/fix/oss-disk-session-platform` 对齐，工作区干净。本轮 `make cloud-test` 实际退出 0，
+最新维护状态（2026-10-19 12:44，Asia/Shanghai）的代码基线为 [`a9b900d`](https://github.com/XS-MLVP/ChipTrace/commit/a9b900d)。
+当前分支已同步后续文档标记提交，工作区干净。本轮 `make cloud-test` 实际退出 0，
 覆盖 Rust 343 项通过、平台/OSS 集成 100/100、Session/Turn 与标签门禁、部署隔离和路由预检。
 GitHub CLI 未认证，远端 Actions 对该 SHA 的运行结果不可观测，不能用本地通过替代 GitHub 证据。
 

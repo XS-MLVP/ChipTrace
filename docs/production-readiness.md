@@ -2,7 +2,8 @@
 
 ## 2026-10-19 12:44（Asia/Shanghai）当前 HEAD 与线上复核
 
-维护分支 HEAD 为 `a9b900d`，已与 `origin/fix/oss-disk-session-platform` 对齐，工作区干净。
+本轮复核使用的维护代码基线为 `a9b900d`；随后仅继续提交了文档标记更新，均已推送到
+`origin/fix/oss-disk-session-platform`，工作区干净。
 本轮 `make cloud-test` 实际退出 0；Rust 单元测试 `343 passed, 0 failed, 3 ignored`，平台/OSS
 集成测试 `100/100`，路由预检 `8/8`，并覆盖标签、生命周期、Session/Turn、部署隔离、受限堆
 读取和 MinIO/S3 协议合同。GitHub CLI 未认证（退出 4），因此同一 SHA 的 GitHub Actions 远端
