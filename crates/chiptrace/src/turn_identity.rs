@@ -618,12 +618,13 @@ pub(crate) fn otlp_attribute_key(attribute: &Value) -> Option<&str> {
 }
 
 pub(crate) fn validate_otlp_attributes(value: Option<&Value>) -> Result<()> {
-    validate_otlp_attributes_mode(value, false)
+    validate_otlp_attributes_mode(value, false, false)
 }
 
 fn validate_otlp_attributes_mode(
     value: Option<&Value>,
     allow_trace_code_metadata_duplicates: bool,
+    allow_known_trace_lifecycle_duplicates: bool,
 ) -> Result<()> {
     let mut attribute_values = BTreeMap::new();
     for (index, attribute) in optional_otlp_array(value, "attributes")?.iter().enumerate() {
@@ -650,6 +651,18 @@ fn validate_otlp_attributes_mode(
             if allow_trace_code_metadata_duplicates && key.starts_with("code.") {
                 continue;
             }
+            // Stock Codex code-mode spans can receive two ordered outcome
+            // updates while the handler is being interrupted and then
+            // finalized. The span's status code remains successful and the
+            // duplicate is limited to the known `interrupted -> completed`
+            // transition. Keep both values in Raw, but do not turn this
+            // producer status update into a false lifecycle quality error.
+            if allow_known_trace_lifecycle_duplicates
+                && key == "outcome"
+                && known_code_mode_outcome_update(previous, value)
+            {
+                continue;
+            }
             // A repeated terminal outcome/status is a lifecycle conflict, not
             // an identity conflict. Keep the Raw span and reject derivation,
             // while exposing the distinction to the durable quality ledger.
@@ -668,11 +681,28 @@ fn validate_otlp_attributes_mode(
     Ok(())
 }
 
+fn known_code_mode_outcome_update(previous: Option<&Value>, current: Option<&Value>) -> bool {
+    let previous_interrupted = previous
+        .and_then(|value| value.get("stringValue"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "interrupted");
+    let current_completed = current
+        .and_then(|value| value.get("stringValue"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "completed");
+    previous_interrupted && current_completed
+}
+
 fn attributes_for_endpoint(
     endpoint: &str,
     value: Option<&Value>,
+    record_name: Option<&str>,
 ) -> Result<BTreeMap<String, String>> {
-    validate_otlp_attributes_mode(value, endpoint == "otlp_traces")?;
+    validate_otlp_attributes_mode(
+        value,
+        endpoint == "otlp_traces",
+        endpoint == "otlp_traces" && record_name == Some("code_mode.handler.execute"),
+    )?;
     Ok(value
         .and_then(Value::as_array)
         .into_iter()
@@ -737,6 +767,7 @@ pub(crate) fn visit_otlp_envelope(
         let resource_attributes = attributes_for_endpoint(
             endpoint,
             otlp_message_attributes(resource.get("resource"), "resource")?,
+            None,
         )?;
         for scope in resource
             .get(scopes)
@@ -748,6 +779,7 @@ pub(crate) fn visit_otlp_envelope(
             scoped.extend(attributes_for_endpoint(
                 endpoint,
                 otlp_message_attributes(scope.get("scope"), "scope")?,
+                None,
             )?);
             for record in scope
                 .get(records)
@@ -756,7 +788,11 @@ pub(crate) fn visit_otlp_envelope(
                 .flatten()
             {
                 let mut merged = scoped.clone();
-                merged.extend(attributes_for_endpoint(endpoint, record.get("attributes"))?);
+                merged.extend(attributes_for_endpoint(
+                    endpoint,
+                    record.get("attributes"),
+                    record.get("name").and_then(Value::as_str),
+                )?);
                 visit(source, record, merged)?;
             }
         }
