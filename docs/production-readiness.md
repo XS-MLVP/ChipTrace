@@ -1,5 +1,32 @@
 # 生产就绪评估
 
+## 2026-10-20 06:02（Asia/Shanghai）当前 revision 滚动更新与复核
+
+已将本机 Collector、Relay 和 Platform 受控更新到维护分支完整 revision
+`00f4080a3ca74329da74220720a3c51fcbab559b`。Runtime 镜像为
+`sha256:fda6b455bd223cc581cd4b1e72b255794d49be1e1d221a87ed338b9cb02f3a3d`，Platform 镜像为
+`sha256:9aa192edb2fe8ef01094763550f2fc0a052a5c5f5a772ee9bdd6aaa93ca0702c`；三个容器均通过
+Docker healthcheck，仍使用非 root、只读根、资源上限和原有持久目录。滚动过程没有清理 WAL、Relay
+outbox 或对象目录。
+
+同一镜像在临时 Compose 环境的 deployment smoke 实际退出 0，覆盖模板不可变镜像、revision 绑定、
+Collector/Relay 精确 Raw 投递和去重、重启恢复、Platform 归档/恢复/导出以及重启后重新要求来源证据。
+Action pin、部署 preflight、quality baseline、quality reason 和 runtime/platform 门禁合同测试也全部通过。
+512 条、4 KiB 负载、8 并发、双 shard 的 release 回环基准达到约 `4,304 records/s`、`16.8 MiB/s`
+端到端吞吐，512/512 投递、0 重试、守恒通过；该数字是本机基线，不替代目标 NFS/OSS 的长期 SLO。
+
+更新后的在线健康快照为：Collector `ready=true`、`captures=1,346,750`、队列 0、875 个 sealed
+Segment、`128,116,855,008` bytes；Relay `delivered=1,346,750`、`pending=0`、`inflight=0`、
+`failed=0`、`conservation_ok=true`。质量账本仍保留 `8,766`，没有被清零。由于进程重启后尚未产生新的
+业务来源，Relay 当前 `missing_sources=["wire","hooks"]`、`successful_turn_scoped_captures=0`、
+`turn_capture_ready=false`，`/ready` 仍为 503；runtime gate 真实退出 1。重启导致当前进程覆盖窗口重新
+等待新证据是预期的 fail-closed 行为，不能用历史成功计数代替新的 Wire Canary。
+
+18084 Gateway 的 full-trace body capture 和 payload sanitization 均开启，20 条历史捕获已 durable，
+当前 pending/failed 均为 0；独立 trace exporter 仍关闭。18086 Platform 已运行新 revision，但后端仍是
+`fs`，没有真实 OSS/S3 上传、恢复和远端 SHA-256 证据。因此本轮解决了远端启动和部署 revision 漂移，
+但业务交付仍需有效 Provider 凭据、成功的多轮 Wire、质量错误修复以及 OSS/S3 和 SFTP 实际验收。
+
 ## 2026-10-20 03:21（Asia/Shanghai）当前服务与仓库复核
 
 当前维护基线为 `bde52f454d19a386e56d2288132587ef937e750d`，维护分支与远端 SHA 一致；工作区另有
