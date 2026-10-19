@@ -157,7 +157,9 @@ impl IngestQualitySeed {
                 self.schema_version
             );
         }
-        let total = self.counters.total();
+        let mut counters = self.counters;
+        counters.reconcile_reason_maps()?;
+        let total = counters.checked_total()?;
         if self.source_quality_errors != total {
             bail!(
                 "ingest quality seed total mismatch: source={}, counters={}",
@@ -165,8 +167,6 @@ impl IngestQualitySeed {
                 total
             );
         }
-        let mut counters = self.counters;
-        counters.reconcile_reason_maps()?;
         Ok(counters)
     }
 }
@@ -179,35 +179,14 @@ impl IngestQualityCounters {
         conversion_errors: u64,
         reasons: &BTreeMap<String, u64>,
     ) -> Result<()> {
-        match endpoint {
-            CloudEndpoint::OtlpLogs => {
-                self.otlp_logs_unknown_events =
-                    self.otlp_logs_unknown_events.saturating_add(unknown_events);
-                self.otlp_logs_conversion_errors = self
-                    .otlp_logs_conversion_errors
-                    .saturating_add(conversion_errors);
-            }
-            CloudEndpoint::OtlpTraces => {
-                self.otlp_traces_unknown_events = self
-                    .otlp_traces_unknown_events
-                    .saturating_add(unknown_events);
-                self.otlp_traces_conversion_errors = self
-                    .otlp_traces_conversion_errors
-                    .saturating_add(conversion_errors);
-            }
-            CloudEndpoint::CodexHook => {
-                self.codex_hook_unknown_events = self
-                    .codex_hook_unknown_events
-                    .saturating_add(unknown_events);
-                self.codex_hook_conversion_errors = self
-                    .codex_hook_conversion_errors
-                    .saturating_add(conversion_errors);
-            }
-        }
-        let expected = unknown_events.saturating_add(conversion_errors);
-        let observed = reasons
-            .values()
-            .fold(0_u64, |total, count| total.saturating_add(*count));
+        let expected = unknown_events
+            .checked_add(conversion_errors)
+            .context("quality reason total overflow")?;
+        let observed = reasons.values().try_fold(0_u64, |total, count| {
+            total
+                .checked_add(*count)
+                .context("quality reason map total overflow")
+        })?;
         if observed != expected {
             bail!(
                 "quality reason total mismatch for {}: reasons={}, expected={}",
@@ -216,14 +195,55 @@ impl IngestQualityCounters {
                 expected
             );
         }
-        let destination = self.reasons_mut(endpoint);
-        for (reason, count) in reasons {
+        for reason in reasons.keys() {
             if !is_quality_reason(reason) {
                 bail!("unsupported quality reason code: {reason}");
             }
-            let value = destination.entry(reason.clone()).or_insert(0);
-            *value = value.saturating_add(*count);
         }
+        // Build the new ledger value off to the side.  A failed checked
+        // addition must leave the caller's in-memory counters untouched as
+        // well as aborting the surrounding durable transaction.
+        let mut updated = self.clone();
+        match endpoint {
+            CloudEndpoint::OtlpLogs => {
+                updated.otlp_logs_unknown_events = updated
+                    .otlp_logs_unknown_events
+                    .checked_add(unknown_events)
+                    .context("OTLP logs unknown-event counter overflow")?;
+                updated.otlp_logs_conversion_errors = updated
+                    .otlp_logs_conversion_errors
+                    .checked_add(conversion_errors)
+                    .context("OTLP logs conversion-error counter overflow")?;
+            }
+            CloudEndpoint::OtlpTraces => {
+                updated.otlp_traces_unknown_events = updated
+                    .otlp_traces_unknown_events
+                    .checked_add(unknown_events)
+                    .context("OTLP traces unknown-event counter overflow")?;
+                updated.otlp_traces_conversion_errors = updated
+                    .otlp_traces_conversion_errors
+                    .checked_add(conversion_errors)
+                    .context("OTLP traces conversion-error counter overflow")?;
+            }
+            CloudEndpoint::CodexHook => {
+                updated.codex_hook_unknown_events = updated
+                    .codex_hook_unknown_events
+                    .checked_add(unknown_events)
+                    .context("Hook unknown-event counter overflow")?;
+                updated.codex_hook_conversion_errors = updated
+                    .codex_hook_conversion_errors
+                    .checked_add(conversion_errors)
+                    .context("Hook conversion-error counter overflow")?;
+            }
+        }
+        let destination = updated.reasons_mut(endpoint);
+        for (reason, count) in reasons {
+            let value = destination.entry(reason.clone()).or_insert(0);
+            *value = value
+                .checked_add(*count)
+                .context("quality reason counter overflow")?;
+        }
+        *self = updated;
         Ok(())
     }
 
@@ -244,12 +264,24 @@ impl IngestQualityCounters {
     }
 
     fn total(&self) -> u64 {
-        self.otlp_logs_unknown_events
-            .saturating_add(self.otlp_logs_conversion_errors)
-            .saturating_add(self.otlp_traces_unknown_events)
-            .saturating_add(self.otlp_traces_conversion_errors)
-            .saturating_add(self.codex_hook_unknown_events)
-            .saturating_add(self.codex_hook_conversion_errors)
+        self.checked_total().unwrap_or(u64::MAX)
+    }
+
+    fn checked_total(&self) -> Result<u64> {
+        let mut total = 0_u64;
+        for count in [
+            self.otlp_logs_unknown_events,
+            self.otlp_logs_conversion_errors,
+            self.otlp_traces_unknown_events,
+            self.otlp_traces_conversion_errors,
+            self.codex_hook_unknown_events,
+            self.codex_hook_conversion_errors,
+        ] {
+            total = total
+                .checked_add(count)
+                .context("durable quality counter total overflow")?;
+        }
+        Ok(total)
     }
 
     fn reconcile_reason_maps(&mut self) -> Result<()> {
@@ -261,21 +293,26 @@ impl IngestQualityCounters {
             let expected = match endpoint {
                 CloudEndpoint::OtlpLogs => self
                     .otlp_logs_unknown_events
-                    .saturating_add(self.otlp_logs_conversion_errors),
+                    .checked_add(self.otlp_logs_conversion_errors)
+                    .context("OTLP logs quality counter overflow")?,
                 CloudEndpoint::OtlpTraces => self
                     .otlp_traces_unknown_events
-                    .saturating_add(self.otlp_traces_conversion_errors),
+                    .checked_add(self.otlp_traces_conversion_errors)
+                    .context("OTLP traces quality counter overflow")?,
                 CloudEndpoint::CodexHook => self
                     .codex_hook_unknown_events
-                    .saturating_add(self.codex_hook_conversion_errors),
+                    .checked_add(self.codex_hook_conversion_errors)
+                    .context("Hook quality counter overflow")?,
             };
             let reasons = self.reasons_mut(endpoint);
             if reasons.keys().any(|reason| !is_quality_reason(reason)) {
                 bail!("ingest quality ledger contains an unsupported reason code");
             }
-            let observed = reasons
-                .values()
-                .fold(0_u64, |total, count| total.saturating_add(*count));
+            let observed = reasons.values().try_fold(0_u64, |total, count| {
+                total
+                    .checked_add(*count)
+                    .context("quality reason map total overflow")
+            })?;
             if observed > expected {
                 bail!(
                     "ingest quality reason total exceeds endpoint total for {}",
@@ -286,9 +323,12 @@ impl IngestQualityCounters {
                 let legacy = reasons
                     .entry(LEGACY_UNCLASSIFIED_QUALITY_REASON.to_owned())
                     .or_insert(0);
-                *legacy = legacy.saturating_add(expected - observed);
+                *legacy = legacy
+                    .checked_add(expected - observed)
+                    .context("legacy quality reason counter overflow")?;
             }
         }
+        self.checked_total()?;
         Ok(())
     }
 }
@@ -4205,6 +4245,52 @@ mod tests {
         assert_eq!(
             coverage["quality_errors_by_endpoint"]["otlp_traces"]["total"],
             5
+        );
+    }
+
+    #[test]
+    fn ingest_quality_counter_overflow_fails_closed_without_partial_update() {
+        let mut counters = IngestQualityCounters {
+            otlp_logs_unknown_events: u64::MAX,
+            otlp_logs_quality_reasons: BTreeMap::from([("unsupported_event".to_owned(), u64::MAX)]),
+            ..IngestQualityCounters::default()
+        };
+        let before = counters.clone();
+        let reasons = BTreeMap::from([("unsupported_event".to_owned(), 1)]);
+        let error = counters
+            .add(CloudEndpoint::OtlpLogs, 1, 0, &reasons)
+            .expect_err("u64 quality counters must reject overflow");
+        assert!(
+            error
+                .to_string()
+                .contains("OTLP logs unknown-event counter overflow")
+        );
+        assert_eq!(
+            counters.otlp_logs_unknown_events,
+            before.otlp_logs_unknown_events
+        );
+        assert_eq!(
+            counters.otlp_logs_quality_reasons,
+            before.otlp_logs_quality_reasons
+        );
+
+        let mut reason_overflow = IngestQualityCounters {
+            otlp_logs_quality_reasons: BTreeMap::from([("unsupported_event".to_owned(), u64::MAX)]),
+            ..IngestQualityCounters::default()
+        };
+        let before_reason_overflow = reason_overflow.clone();
+        let error = reason_overflow
+            .add(CloudEndpoint::OtlpLogs, 1, 0, &reasons)
+            .expect_err("quality reason counters must reject overflow");
+        assert!(
+            error
+                .to_string()
+                .contains("quality reason counter overflow")
+        );
+        assert_eq!(reason_overflow.otlp_logs_unknown_events, 0);
+        assert_eq!(
+            reason_overflow.otlp_logs_quality_reasons,
+            before_reason_overflow.otlp_logs_quality_reasons
         );
     }
 
