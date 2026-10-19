@@ -263,8 +263,9 @@ impl IngestQualityCounters {
         }
     }
 
-    fn total(&self) -> u64 {
-        self.checked_total().unwrap_or(u64::MAX)
+    #[cfg(test)]
+    fn total(&self) -> Result<u64> {
+        self.checked_total()
     }
 
     fn checked_total(&self) -> Result<u64> {
@@ -1794,9 +1795,11 @@ impl IngestCoverageState {
     #[cfg(test)]
     fn new() -> Self {
         Self::with_quality_counters(IngestQualityCounters::default())
+            .expect("default quality counters must be valid")
     }
 
-    fn with_quality_counters(counters: IngestQualityCounters) -> Self {
+    fn with_quality_counters(counters: IngestQualityCounters) -> Result<Self> {
+        let quality_errors = counters.checked_total()?;
         let mut state = Self {
             started_at: utc_now(),
             wire: RouteCoverage::default(),
@@ -1806,7 +1809,7 @@ impl IngestCoverageState {
             hooks: RouteCoverage::default(),
             lifecycle_events: 0,
             tool_executions: 0,
-            quality_errors: counters.total(),
+            quality_errors,
             quality_errors_current_process: 0,
         };
         state.otlp_logs.quality_unknown_events = counters.otlp_logs_unknown_events;
@@ -1818,7 +1821,7 @@ impl IngestCoverageState {
         state.hooks.quality_unknown_events = counters.codex_hook_unknown_events;
         state.hooks.quality_conversion_errors = counters.codex_hook_conversion_errors;
         state.hooks.quality_reasons = counters.reasons(CloudEndpoint::CodexHook).clone();
-        state
+        Ok(state)
     }
 
     fn observe_wire(&mut self, acknowledged: &[(WireCaptureEvidence, bool)]) {
@@ -2164,7 +2167,7 @@ pub async fn serve_relay(
             body_budget,
             ingest_coverage: Arc::new(Mutex::new(IngestCoverageState::with_quality_counters(
                 ingest_quality_counters,
-            ))),
+            )?)),
         });
     let listener = TcpListener::bind(bind).await?;
     info!(address = %bind, "Relay ready");
@@ -3407,7 +3410,10 @@ mod tests {
         drop(state);
         drop(relay);
         let reopened = DurableRelay::open(test_config(&temporary)).await.unwrap();
-        assert_eq!(reopened.ingest_quality_counters().unwrap().total(), 1);
+        assert_eq!(
+            reopened.ingest_quality_counters().unwrap().total().unwrap(),
+            1
+        );
         reopened.close().await.unwrap();
     }
 
@@ -4213,7 +4219,10 @@ mod tests {
         let path = temporary.path().join("delivery.redb");
         {
             let ledger = DeliveryLedger::open(&path).unwrap();
-            assert_eq!(ledger.ingest_quality_counters().unwrap().total(), 0);
+            assert_eq!(
+                ledger.ingest_quality_counters().unwrap().total().unwrap(),
+                0
+            );
             let reasons = BTreeMap::from([
                 ("unsupported_event".to_owned(), 2),
                 ("invalid_structure".to_owned(), 3),
@@ -4221,14 +4230,14 @@ mod tests {
             let counters = ledger
                 .record_ingest_quality_with_reasons(CloudEndpoint::OtlpTraces, 2, 3, &reasons)
                 .unwrap();
-            assert_eq!(counters.total(), 5);
+            assert_eq!(counters.total().unwrap(), 5);
             assert_eq!(counters.otlp_traces_unknown_events, 2);
             assert_eq!(counters.otlp_traces_conversion_errors, 3);
             assert_eq!(counters.otlp_traces_quality_reasons, reasons);
         }
         let reopened = DeliveryLedger::open(&path).unwrap();
         let counters = reopened.ingest_quality_counters().unwrap();
-        assert_eq!(counters.total(), 5);
+        assert_eq!(counters.total().unwrap(), 5);
         assert_eq!(counters.otlp_traces_unknown_events, 2);
         assert_eq!(counters.otlp_traces_conversion_errors, 3);
         assert_eq!(
@@ -4238,7 +4247,9 @@ mod tests {
                 ("invalid_structure".to_owned(), 3),
             ])
         );
-        let coverage = IngestCoverageState::with_quality_counters(counters).snapshot();
+        let coverage = IngestCoverageState::with_quality_counters(counters)
+            .unwrap()
+            .snapshot();
         assert_eq!(coverage["quality_errors_scope"], "durable_relay_state");
         assert_eq!(coverage["quality_errors"], 5);
         assert_eq!(coverage["quality_errors_current_process"], 0);
@@ -4292,6 +4303,18 @@ mod tests {
             reason_overflow.otlp_logs_quality_reasons,
             before_reason_overflow.otlp_logs_quality_reasons
         );
+
+        let coverage_error = IngestCoverageState::with_quality_counters(IngestQualityCounters {
+            otlp_logs_unknown_events: u64::MAX,
+            otlp_logs_conversion_errors: 1,
+            ..IngestQualityCounters::default()
+        })
+        .expect_err("coverage state must reject an overflowing durable total");
+        assert!(
+            coverage_error
+                .to_string()
+                .contains("durable quality counter total overflow")
+        );
     }
 
     #[test]
@@ -4332,7 +4355,7 @@ mod tests {
         };
         let seed = IngestQualitySeed {
             schema_version: INGEST_QUALITY_SEED_SCHEMA_VERSION.to_owned(),
-            source_quality_errors: counters.total(),
+            source_quality_errors: counters.total().unwrap(),
             counters,
         };
         fs::write(
@@ -4341,7 +4364,10 @@ mod tests {
         )
         .unwrap();
         let reopened = DeliveryLedger::open(&path).unwrap();
-        assert_eq!(reopened.ingest_quality_counters().unwrap().total(), 7);
+        assert_eq!(
+            reopened.ingest_quality_counters().unwrap().total().unwrap(),
+            7
+        );
         assert_eq!(
             reopened
                 .ingest_quality_counters()
