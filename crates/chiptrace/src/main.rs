@@ -8,7 +8,10 @@ use chiptrace::cloud_acceptance::{
 use chiptrace::collector::{CollectorConfig, serve};
 use chiptrace::enrich::{EnrichConfig, enrich_captures, verify_enrichment};
 use chiptrace::jsonl::absolute_path;
-use chiptrace::maas_export::{DEFAULT_MAX_BATCH_BYTES, MaasExportConfig, export_maas, verify_maas};
+use chiptrace::maas_export::{
+    DEFAULT_MAX_BATCH_BYTES, DEFAULT_TIMEZONE_OFFSET_MINUTES, MaasExportConfig, export_maas,
+    verify_maas,
+};
 use chiptrace::model_interaction::{
     InteractionProjectConfig, audit_session_context, inspect_session, project_interactions,
     verify_interaction_projection,
@@ -491,6 +494,9 @@ struct ExportMaasArgs {
     /// 可选协议覆盖；缺省时从 Wire 路由严格推导。
     #[arg(long)]
     protocol: Option<String>,
+    /// 外部 requestTime 和日期目录使用的固定时区偏移（分钟），默认北京时间 UTC+08:00。
+    #[arg(long, default_value_t = DEFAULT_TIMEZONE_OFFSET_MINUTES)]
+    timezone_offset_minutes: i32,
     /// 压缩后单包上限，默认 100 MB；不得超过外部合同上限。
     #[arg(long, default_value_t = DEFAULT_MAX_BATCH_BYTES)]
     max_batch_bytes: u64,
@@ -1053,6 +1059,7 @@ async fn main() -> Result<()> {
             provider_code: args.provider_code,
             platform: args.platform,
             protocol: args.protocol,
+            timezone_offset_minutes: args.timezone_offset_minutes,
             max_batch_bytes: args.max_batch_bytes,
             replace: args.replace,
         })?)?,

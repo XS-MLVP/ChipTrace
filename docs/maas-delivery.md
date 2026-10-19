@@ -21,8 +21,9 @@ Token 用量。缺少或冲突的身份、协议、用量和正文会使命令�
 
 `metadata.json` 固定包含：`requestId`、`sessionId`、`requestTime`、`httpStatus`、`protocol`、
 `requestMode`、`modelName`、`platform`、`inputTokens`、`outputTokens`、`providerCode`。
-`requestTime` 为 UTC 的 `yyyy-MM-dd HH:mm:ss`；日期目录取同一 UTC 日期。协议、模式、平台和
-供应商编码均做枚举/路径校验。
+`requestTime` 默认按外部约定使用北京时间（UTC+08:00）的 `yyyy-MM-dd HH:mm:ss`；日期目录取
+同一北京时间日期。导出 CLI 支持用固定分钟偏移覆盖该默认值，禁止依赖主机本地时区。协议、模式、
+平台和供应商编码均做枚举/路径校验。
 
 正文导出前会拦截已识别的恶意 Prompt 注入，并把高置信度邮箱、手机号、身份证号、Bearer/API
 凭据、姓名/地址上下文以及敏感字段统一替换为 `<|mask_privacy|>`。结构化字段按大小写、下划线、
@@ -37,6 +38,7 @@ chiptrace export-maas \
   --output /maasData/archive \
   --provider-code providerX \
   --platform openai \
+  --timezone-offset-minutes 480 \
   --replace
 
 chiptrace verify-maas \

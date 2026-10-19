@@ -29,6 +29,10 @@ pub const MAAS_SCHEMA_VERSION: &str = "chiptrace.maas-delivery.v1";
 /// The external contract says 100 MB (decimal), so keep a strict decimal cap
 /// instead of relying on the host's MiB interpretation.
 pub const DEFAULT_MAX_BATCH_BYTES: u64 = 100_000_000;
+/// The external delivery instructions use Beijing time for the publication
+/// date and the requestTime value. Keep the offset explicit so a deployment
+/// cannot silently use the host timezone or move a request across dates.
+pub const DEFAULT_TIMEZONE_OFFSET_MINUTES: i32 = 8 * 60;
 pub const PRIVACY_MASK: &str = "<|mask_privacy|>";
 
 static EMAIL: LazyLock<Regex> =
@@ -97,6 +101,10 @@ pub struct MaasExportConfig {
     /// Optional override for protocol inference.  It must be one of the
     /// external contract values and is never inferred for an unknown path.
     pub protocol: Option<String>,
+    /// Fixed offset used by the external requestTime/date contract. The
+    /// default is Beijing time (UTC+08:00); callers serving a different
+    /// contract must provide that fixed offset explicitly.
+    pub timezone_offset_minutes: i32,
     pub max_batch_bytes: u64,
     pub replace: bool,
 }
@@ -594,7 +602,8 @@ fn build_payload(capture: &Value, config: &MaasExportConfig) -> Result<RequestPa
         .into_iter()
         .find_map(|field| string_field(capture, field))
         .ok_or_else(|| anyhow::anyhow!("api_snapshot {request_id} has no request time"))?;
-    let (request_time, _date) = format_request_time(request_time_raw)?;
+    let (request_time, _date) =
+        format_request_time(request_time_raw, config.timezone_offset_minutes)?;
     let status = capture
         .get("responseStatus")
         .and_then(|value| match value {
@@ -786,10 +795,16 @@ fn header_string(value: &Value, object: &str, name: &str) -> Option<String> {
         })
 }
 
-fn format_request_time(raw: &str) -> Result<(String, String)> {
+fn format_request_time(raw: &str, timezone_offset_minutes: i32) -> Result<(String, String)> {
+    let offset_seconds = timezone_offset_minutes
+        .checked_mul(60)
+        .ok_or_else(|| anyhow::anyhow!("MaaS timezone offset is out of range"))?;
+    let offset = time::UtcOffset::from_whole_seconds(offset_seconds).with_context(|| {
+        format!("MaaS timezone offset must be within ±23:59:59: {timezone_offset_minutes} minutes")
+    })?;
     let parsed = OffsetDateTime::parse(raw, &Rfc3339)
         .with_context(|| format!("request time must be RFC3339: {raw}"))?
-        .to_offset(time::UtcOffset::UTC);
+        .to_offset(offset);
     let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
     let request_time = parsed.format(&format)?;
     let date = parsed.date().to_string();
@@ -1526,6 +1541,7 @@ mod tests {
             provider_code: "providerX".to_owned(),
             platform: "openai".to_owned(),
             protocol: None,
+            timezone_offset_minutes: DEFAULT_TIMEZONE_OFFSET_MINUTES,
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             replace: false,
         }
@@ -1783,6 +1799,18 @@ mod tests {
             invalid.request_time = request_time.to_owned();
             assert!(validate_metadata(&invalid).is_err(), "{request_time}");
         }
+    }
+
+    #[test]
+    fn formats_request_time_and_date_in_configured_external_timezone() {
+        let (request_time, date) =
+            format_request_time("2026-08-16T16:30:00Z", DEFAULT_TIMEZONE_OFFSET_MINUTES).unwrap();
+        assert_eq!(request_time, "2026-08-17 00:30:00");
+        assert_eq!(date, "2026-08-17");
+
+        let (utc_time, utc_date) = format_request_time("2026-08-16T16:30:00Z", 0).unwrap();
+        assert_eq!(utc_time, "2026-08-16 16:30:00");
+        assert_eq!(utc_date, "2026-08-16");
     }
 
     #[test]
