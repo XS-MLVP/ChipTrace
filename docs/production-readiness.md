@@ -19,9 +19,20 @@ Raw 未被改写。Wire `requests=0`、`successful_turn_scoped_captures=0`、`tu
 Platform `/health` 返回 HTTP 200 且无排队任务，但响应没有 `backend` 字段；只读容器元数据显示
 `CHIPTRACE_BACKEND=fs`，运行 revision 仍为 `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`。对同一
 端点执行 `platform-health-gate --expected-backend oss` 实际退出 1。维护分支当前已推送提交
-`1204af4`，线上尚未部署它，因此真实 OSS 提交、恢复、远端 SHA-256、同 SHA GitHub Actions 和
+`0bf28dc`，线上尚未部署它，因此真实 OSS 提交、恢复、远端 SHA-256、同 SHA GitHub Actions 和
 新鲜多轮 Wire Canary 仍未验收。服务目前只适合内部 Raw/恢复验证，不能向外部使用者承诺完整
 Session/Turn 和远端持久导出。
+
+## 2026-10-19 09:13（Asia/Shanghai）当前 release 性能复测
+
+在当前工作树的 release binary 上使用 4 shard、16 并发、64 KiB、批量 64、`fsync` 和
+`--max-delivery-retries 0` 连续复测两次。入口确认吞吐为 `3,969–4,071 records/s`，端到端
+吞吐为 `1,230–1,235 records/s`，P95 批请求延迟约 `319–335 ms`，两次均为 `10,000/10,000`
+delivered、`failed=0`、`delivery_retries=0`、`conservation_ok=true`；排空耗时约 `5.58–5.68 s`。
+复测主机 load average 约 `27`，根文件系统使用率约 `91%`，因此不能把历史的 `1,384 records/s`
+直接判定为代码回退。下一轮容量结论必须在隔离主机或明确的目标 NFS/OSS 上重复相同参数，并同时记录
+P95/P99、磁盘余量、`pending/inflight/retries/failed` 和对象上传耗时；当前结果只证明本版本在受限
+环境下仍保持零重试和投递守恒。
 
 ## 2026-10-19 08:30（Asia/Shanghai）线上只读复核
 
