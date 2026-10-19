@@ -32,7 +32,7 @@ Relay `delivered=1,305,705`、`pending=0`、`inflight=0`、`failed=0`、`deliver
 Provider 绕过 18084；Platform 健康虽为 200，实际后端仍是 `fs`。因此真实 OSS 上传/恢复/远端哈希、
 未修改 Stock Codex 多轮四源 Canary 和同 SHA 远端 CI 尚未验收，当前只能用于内部 Raw/恢复验证。
 
-最新线上只读复核（2026-10-19 09:01:42，Asia/Shanghai）确认 18084、3011、3012、18086 的
+历史线上只读快照（2026-10-19 09:01:42，Asia/Shanghai）确认 18084、3011、3012、18086 的
 `/health` 均返回 HTTP 200，但 Relay `/ready` 返回 HTTP 503。Collector/Relay
 revision 为 `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，Collector Capture 与 Relay Delivered
 均为 `1,291,300`，`pending=0`、`inflight=0`、`failed=0` 且计数守恒；Collector 队列为 0 且 ready。
@@ -44,7 +44,7 @@ Gateway full-trace outbox 的 pending/processing/最近失败均为 0，293 个�
 随后 runtime gate 采样到质量计数 `6,515` 并真实退出 1。当前适合内部 Raw/恢复验证，尚未达到对外
 承诺完整 Session/Turn 采集、真实 OSS 和在线导出的生产标准。
 
-最新线上只读复核（2026-10-19 06:07:26，Asia/Shanghai）确认 18084、3011、3012、18086 的 `/health` 均返回
+历史线上只读快照（2026-10-19 06:07:26，Asia/Shanghai）确认 18084、3011、3012、18086 的 `/health` 均返回
 HTTP 200，但 Relay `/ready` 返回 HTTP 503；Collector、Relay 和平台实际已运行维护提交
 `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，使用内容寻址镜像、非 root、只读根和持久目录。
 该时刻 Collector 与 Relay 均为 `1,278,543` 条，`pending=0`、`failed=0`、`conservation_ok=true`，
