@@ -2,10 +2,11 @@
 
 ## 2026-10-19 12:30（Asia/Shanghai）当前 HEAD 验证与性能复测
 
-当前维护分支 HEAD 为 `ea3d93848ebc203ef6582a68b2d342f44840c9c5`，已推送到
+当前维护分支 HEAD 为 `cada281`，已推送到
 `origin/fix/oss-disk-session-platform`，工作区干净。`make check` 实际退出 0；远程启动合同测试
-8/8 通过，动作 pin 门禁确认工作流的 56 个引用只使用 5 个固定 SHA。新增合同会拒绝任何将 hosted
-runner 改回 `ubuntu-latest` 的变更，防止操作系统漂移重新造成启动差异。
+9/9 通过，动作 pin 门禁确认工作流的 56 个引用只使用 5 个固定 SHA。新增合同会拒绝任何将 hosted
+runner 改回 `ubuntu-latest` 的变更，防止操作系统漂移重新造成启动差异。随后提交 `cada281` 将
+所有 hosted `setup-node` 步骤固定到已验证的 Node `22.23.3`，并由同一合同拒绝回退到浮动主版本。
 
 当前 HEAD 的 Relay 回环基准使用 4 shard、16 并发、64 KiB、`fsync`、10,000 条记录和零重试上限：
 入口吞吐 `4,450.7 records/s`，端到端吞吐 `1,235.96 records/s`，P95 批延迟 `266.94 ms`，
