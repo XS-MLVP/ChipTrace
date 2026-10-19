@@ -31,6 +31,21 @@ sidecar 在 NFS 或对象存储恢复目录上的读取调用次数；SHA-256、
 （100/100）和 `cargo clippy --workspace --all-targets --locked -- -D warnings` 均实际退出 0。
 该优化改善读取路径的系统调用开销，尚未替代目标 NFS/OSS 上的长期吞吐与 P99 容量验收。
 
+## 2026-10-19 12:09（Asia/Shanghai）平台读取路径与容器烟测复核
+
+平台 Node 适配器的完整 Turn/Projection 摘要读取也统一使用固定 1 MiB 缓冲，减少恢复目录
+在 NFS 或对象存储挂载上的读取调用；读取仍逐字节校验 UTF-8、长度、SHA-256、inode 和
+变更时间，不把完整 sidecar 放入内存。平台/OSS 集成测试实际通过 100/100，三项内存门禁
+分别为 Turn writer `78,336/131,072 KiB`、Projection reader `27,128/49,152 KiB`、
+Turn page reader `25,080/49,152 KiB`。
+
+最新提交的 runtime 镜像通过 `make m0-test` 本地容器烟测：镜像以当前完整 revision 启动，
+Raw/WAL、四源 Session/Turn、Buyer v7、发布幂等和篡改检测均通过，退出码为 0。当前 release
+在 4 shard、16 并发、64 KiB、`fsync` 的 Relay 回环基准中入口吞吐为 `4,188 records/s`，
+端到端吞吐为 `1,239 records/s`，P95 批延迟 `308 ms`，`10,000/10,000` 投递、零重试、
+计数守恒，排空约 `5.69 s`。该结果仍是本机回环基准，不替代目标 NFS/OSS、多租户和长期
+容量 SLO 验收。
+
 ## 2026-10-19 09:54（Asia/Shanghai）部署配置持久化复核
 
 为避免宿主自动重启回滚，已将 `/nfs/home/zhangyuxin/router_v2/deploy/.env` 中的
