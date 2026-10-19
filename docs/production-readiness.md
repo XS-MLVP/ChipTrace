@@ -2,10 +2,11 @@
 
 ## 2026-10-19 13:33（Asia/Shanghai）当前服务与仓库复核
 
-当前维护基线为 `b9967c1596584c7644e0f81538d2ac3a1e1a2ce7`，工作区干净；完整 `make cloud-test`
-实际退出 0，Rust 单元测试为 `343 passed, 0 failed, 3 ignored`，平台/OSS 集成测试为 `100/100`。
-该结果证明仓库的构建、磁盘恢复、Session/Turn 读取、质量账本和容器启动合同可回归通过，不能替代
-真实 Provider、未修改 Stock Codex 或云端账号验收。
+当前维护基线为 `87063e565744ab94ebc907ff72de57206166f9cd`，工作区干净。完整 `make cloud-test`
+最近在功能基线 `b9967c1596584c7644e0f81538d2ac3a1e1a2ce7` 实际退出 0，Rust 单元测试为
+`343 passed, 0 failed, 3 ignored`，平台/OSS 集成测试为 `100/100`；最新提交新增的生产云后端
+护栏已由 `make deployment-config-test` 定向回归通过。该结果不能替代真实 Provider、未修改
+Stock Codex 或云端账号验收。
 
 线上只读采样中 Gateway、Collector、Relay 和 Platform `/health` 均为 HTTP 200。Collector revision
 为 `f5a4a9c1e1b389c1bb85e1067968f91942b15304`、队列深度为 0、`captures=1,307,997`；Relay 同一

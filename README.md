@@ -16,10 +16,10 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新维护状态（2026-10-19 13:33，Asia/Shanghai）的代码基线为 [`b9967c1`](https://github.com/XS-MLVP/ChipTrace/commit/b9967c1)。
-维护分支工作区干净，`make cloud-test` 在该提交实际退出 0，覆盖 Rust 343 项通过、平台/OSS
-集成 100/100、Session/Turn 与标签门禁、部署隔离和路由预检。GitHub CLI 未认证，远端 Actions
-对该 SHA 的运行结果不可观测，不能用本地通过替代 GitHub 证据。
+最新维护状态（2026-10-19 13:41，Asia/Shanghai）的代码基线为 [`87063e5`](https://github.com/XS-MLVP/ChipTrace/commit/87063e5)。
+维护分支工作区干净；完整 `make cloud-test` 最近在功能基线 `b9967c1` 实际退出 0，最新提交
+新增的生产云后端护栏已由 `make deployment-config-test` 定向回归通过。GitHub CLI 未认证，远端
+Actions 对该 SHA 的运行结果不可观测，不能用本地通过替代 GitHub 证据。
 
 线上采样中 18084、3011、3012、18086 的 `/health` 均返回 HTTP 200；Collector 队列为 0 且 ready，
 Relay `delivered=1,307,997`、`pending=0`、`inflight=1`、`failed=0`、`delivery_retries=85`、
