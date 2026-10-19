@@ -81,6 +81,13 @@ test('CI actions are immutable and the MinIO job verifies its Go toolchain befor
   assert.match(workflow, /Swatinem\/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6/);
 });
 
+test('managed route uses a digest-pinned container image for deterministic startup', () => {
+  const image = 'node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392';
+  assert.ok(workflow.includes(`docker pull ${image}`));
+  assert.ok(workflow.includes(`CHIPTRACE_CONFIG_TEST_IMAGE: ${image}`));
+  assert.doesNotMatch(workflow, /docker pull node:22-bookworm-slim\s*$/m);
+});
+
 test('hosted sandbox startup tolerates optional sysctl writes but requires a real namespace probe', () => {
   assert.match(workflow, /Could not enable kernel\.unprivileged_userns_clone; continuing to the real namespace probe/);
   assert.match(workflow, /Could not disable AppArmor unprivileged-userns restriction; continuing to the real namespace probe/);
