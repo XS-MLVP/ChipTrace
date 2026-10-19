@@ -16,21 +16,23 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新维护状态（2026-10-19 13:41，Asia/Shanghai）的代码基线为 [`87063e5`](https://github.com/XS-MLVP/ChipTrace/commit/87063e5)。
-维护分支工作区干净；完整 `make cloud-test` 最近在功能基线 `b9967c1` 实际退出 0，最新提交
-新增的生产云后端护栏已由 `make deployment-config-test` 定向回归通过。GitHub CLI 未认证，远端
-Actions 对该 SHA 的运行结果不可观测，不能用本地通过替代 GitHub 证据。
+最新维护状态（2026-10-19 13:59，Asia/Shanghai）的代码基线为 [`dd4692f`](https://github.com/XS-MLVP/ChipTrace/commit/dd4692f64149a6c7332a4a346a7841bdf51530b7)。
+维护分支工作区干净，且 `origin/fix/oss-disk-session-platform` 与该提交一致；完整 `make cloud-test`
+在该基线实际退出 0（Rust `343 passed, 0 failed, 3 ignored`，平台/OSS 集成 `100/100`）。生产云
+后端预检和质量标签契约也已定向回归通过。GitHub CLI 未认证，远端 Actions 对该 SHA 的运行结果
+仍不可观测，不能用本地通过替代 GitHub 证据。
 
 线上采样中 18084、3011、3012、18086 的 `/health` 均返回 HTTP 200；Collector 队列为 0 且 ready，
-Relay `delivered=1,307,997`、`pending=0`、`inflight=1`、`failed=0`、`delivery_retries=85`、
-`conservation_ok=true`，Gateway outbox 当前无待处理或最近失败文件，历史失败原件均有 recovery receipt。
-这些证据说明 Raw/WAL、恢复和投递守恒正常，不能据此宣称业务 Session/Turn 已就绪。
+Relay `delivered=1,309,289`、`delivery_attempts=1,309,374`、`pending=0`、`inflight=0`、
+`failed=0`、`delivery_retries=85`、`conservation_ok=true`。这些证据说明 Raw/WAL、恢复和投递
+守恒正常，不能据此宣称业务 Session/Turn 已就绪。
 
-业务门禁仍未通过：Relay `/ready` 返回 HTTP 503，持久 `quality_errors=7,453`（`identity_conflict=184`、
-`invalid_lifecycle=5,304`、`legacy_unclassified=1,965`），`missing_sources=["wire"]`、
-`wire.requests=0`、`turn_capture_ready=false`。实际 `CODEX_HOME` 用户配置的路由预检退出 1，
-Provider 绕过 18084；Platform 健康虽为 200，实际后端仍是 `fs`。真实 OSS 上传/恢复/远端哈希、
-未修改 Stock Codex 多轮四源 Canary 和同 SHA 远端 CI 尚未验收，当前只能用于内部 Raw/恢复验证。
+业务门禁仍未通过：Relay `/ready` 返回 HTTP 503，持久 `quality_errors=7,505`
+（`identity_conflict=184`、`invalid_lifecycle=5,356`、`legacy_unclassified=1,965`），
+`missing_sources=["wire"]`、`wire.requests=0`、`turn_capture_ready=false`。实际用户配置的路由
+预检退出 1，Provider 绕过 18084；Platform 健康虽为 200，实际后端仍是 `fs`。真实 OSS 上传/恢复/
+远端哈希、未修改 Stock Codex 多轮四源 Canary 和同 SHA 远端 CI 尚未验收，当前只能用于内部 Raw/
+恢复验证。
 
 历史线上只读快照（2026-10-19 09:01:42，Asia/Shanghai）确认 18084、3011、3012、18086 的
 `/health` 均返回 HTTP 200，但 Relay `/ready` 返回 HTTP 503。Collector/Relay
