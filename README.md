@@ -23,8 +23,14 @@ Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 `identity_conflict=182`、`invalid_lifecycle=4,598`、`legacy_unclassified=1,965`；
 `missing_sources=["wire"]`、`turn_capture_ready=false`。使用实际 `/etc/codex` 与用户配置执行
 路由预检真实退出 1，报错为用户 `OpenAI.base_url` 未指向受管 18084 Gateway；因此 OTLP/Hook
-增长不能被解释成完整 Wire 采集。维护分支最新提交为 [`0d81aad`](https://github.com/XS-MLVP/ChipTrace/commit/0d81aad)，
-但线上尚未部署该 revision。
+增长不能被解释成完整 Wire 采集。维护分支最新提交为 [`414af71`](https://github.com/XS-MLVP/ChipTrace/commit/414af71)，
+但线上尚未部署该 docs-only revision。
+
+随后在 09:51 完成受控滚动更新：Collector、Relay、Platform 均运行 revision
+`f5a4a9c1e1b389c1bb85e1067968f91942b15304`，容器 health 全部为 healthy，Platform `backend=fs`
+且对应 revision 的健康门禁通过。runtime gate 仍真实退出 1，持久质量账本为 `6,764`、Wire
+仍缺失；这只完成了代码部署和持久计数验证，尚未完成真实 Provider 路由、四源 Session/Turn
+Canary 或 OSS 后端切换。
 
 最新线上只读复核（2026-10-19 09:01:42，Asia/Shanghai）确认 18084、3011、3012、18086 的
 `/health` 均返回 HTTP 200，但 Relay `/ready` 返回 HTTP 503。Collector/Relay

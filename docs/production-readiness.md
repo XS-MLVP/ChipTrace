@@ -1,5 +1,20 @@
 # 生产就绪评估
 
+## 2026-10-19 09:51（Asia/Shanghai）ChipTrace 组件滚动更新后的复核
+
+使用部署预检通过的不可变镜像完成 Collector、Relay、Platform 的受控滚动更新，未修改宿主
+`.env`：Collector/Relay 使用 `sha256:2029a5d927f53c8a1eaf2cb39972963006f8c3f670b924d4dbce6360d52d177e`，
+Platform 使用 `sha256:2a8ff89dbf4d094077c09858730100710a9e76a0886879a8bd6b594cd55b8335`，三者
+容器均运行 revision `f5a4a9c1e1b389c1bb85e1067968f91942b15304` 且 Docker health 为 healthy。
+Collector 队列为 0、ready；Relay 投递计数守恒，Platform `/health` 返回 `backend=fs` 和对应
+revision，`platform-health-gate --expected-backend fs` 实际退出 0。
+
+更新后运行 runtime gate 仍真实退出 1：持久质量账本为 `6,764`（`identity_conflict=182`、
+`invalid_lifecycle=4,617`、`legacy_unclassified=1,965`），本进程新增仅 3，`missing_sources=["wire"]`、
+`turn_capture_ready=false`。这证明重启和换镜像没有清空历史标签或把 OTLP/Hook 流量伪造成 Wire；
+真实 Provider 路由和四源 Canary 仍是业务就绪的阻断项。最新维护分支还包含文档提交
+`414af71`，该 docs-only 提交未重新构建镜像，当前运行 revision 明确记录为上面的 `f5a4a9c`。
+
 ## 2026-10-19 09:28（Asia/Shanghai）线上只读复核（维护分支 `6db26f8`）
 
 本轮只读取健康端点、容器元数据和 Git 状态，未重启服务、修改配置或清理 Raw。18084 Gateway、
