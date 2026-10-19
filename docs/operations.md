@@ -81,6 +81,13 @@ release Relay 对照（10,000 条、64 KiB、批量 64、并发 16、带 `fsync`
 `delivery_retries=0`、计数守恒。排空期间有 360/435 次健康轮询观察到背压；这仍是本机回环
 基线，不包含目标 NFS/OSS 上传、多租户竞争或长期 SLO。
 
+2026-10-19 14:22（Asia/Shanghai）在同一 release binary 上复测 4 shard、16 并发、64 KiB、
+批量 64、`fsync`、10,000 条并设置 `--max-delivery-retries 0`：入口 `4,311.6 records/s`，
+端到端 `1,234.6 records/s`，P95 `336.0 ms`、P99 `350.1 ms`，排空 `5.78 s`；
+`10,000/10,000` delivered、`failed=0`、`delivery_retries=0`、`conservation_ok=true`。
+排空期间有 386/471 次健康轮询处于背压 503。结果与前一轮在误差范围内一致，继续说明
+Relay 是回环热路径；它仍不替代目标 NFS/OSS、多租户或长期压测。
+
 Relay 的 `--delivery-concurrency` 同时决定正文读取的受限并行度，可通过
 `CHIPTRACE_DELIVERY_CONCURRENCY` 在部署时调整，默认值为 16，预检允许 1 到 128。最近同一
 release 的合成对照在 64 KiB 正文、10,000 条记录、4 shard 下，16 并发端到端约 `1,222 records/s`，
