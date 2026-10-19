@@ -147,6 +147,13 @@ Run 仍因本环境未认证 `gh` CLI 无法取得真实运行证据，不能把
 当前节点用非 root、只读根、无网络参数启动该 digest，实际输出 Node `v22.23.3` 并退出 0。该修复
 降低远程 CI 因基础镜像漂移产生的启动差异，但仍需要 GitHub Actions 对同一 SHA 的真实 Run 作为最终证据。
 
+## 2026-10-20 Platform Dockerfile 基镜像锁定
+
+维护提交将 Platform Dockerfile 的默认 `CHIPTRACE_PLATFORM_BASE` 与上述已验证 digest 对齐，
+并在镜像构建阶段强制 `node --version` 为 `v22.23.3`。因此 managed-route 测试、CI Platform
+镜像和本地部署候选不会因 `node:22-bookworm-slim` 标签漂移而产生不同启动运行时；这仍需由同一
+提交的 GitHub Actions Run 复核远端 runner 结果。
+
 ## 2026-10-19 09:42（Asia/Shanghai）最新 Platform 镜像临时启动验证
 
 从维护分支 `f5a4a9c1e1b389c1bb85e1067968f91942b15304` 构建 Platform target，镜像 ID 为

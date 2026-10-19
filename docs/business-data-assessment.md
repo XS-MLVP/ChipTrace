@@ -1,6 +1,6 @@
 # 业务采集数据符合性评估
 
-本页记录 2026-10-20 03:21（Asia/Shanghai）对当前在线服务、真实封存 Capture 和外部 MaaS 交付合同的复核结果。它区分
+本页保留 2026-10-20 03:21（Asia/Shanghai）的历史复核，并在“最新在线只读刷新”中记录当前事实。它区分
 “传输层已经持久化”与“业务 Session/Turn 可以对外交付”，后者必须由真实来源覆盖和质量门禁证明。
 
 ## 结论
@@ -34,7 +34,29 @@
 因此本机没有足够事实证明真实 SFTP 连接或最终时区已经验收。仓库当前默认 UTC+08:00 是实现选择，
 需要接收方确认后才能作为外部合同事实。
 
-## 在线服务实测
+## 最新在线只读刷新
+
+2026-10-20 05:02:17（Asia/Shanghai）对同一组本机端口只读采样得到：
+
+- `3011 /health` 返回 200，Collector `ready=true`，`captures=1,343,679`，`queue_depth=0`，
+  `sealed_bytes=127,364,327,921`，`sealed_segments=873`；`3012` 的 `delivered` 与该数量一致，
+  `pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`。这只证明接收、封存和投递守恒。
+- `3012 /health` 返回 200、`/ready` 返回 503：`wire.requests=0`、`wire.durable_captures=0`、
+  `successful_turn_scoped_captures=0`，`missing_sources=["wire"]`、`stale_sources=["wire"]`、
+  `turn_capture_ready=false`。持久 `quality_errors=8,766`，其中 `otlp_traces` 为
+  `identity_conflict=184`、`invalid_lifecycle=6,611`、`legacy_unclassified=1,965`，Hooks 另有
+  `conversion_error=6`；本进程新增值为 1，历史账本没有被清零。
+- 最新已封存的 Relay Segment `00873` 含 `1,104` 个 `telemetry_batch` 和 `157` 个
+  `tool_execution`，没有 `api_snapshot`；157 条工具记录都有 Session/Thread 和 call ID，但
+  `turn_id` 为 0/157，因此只能保留为未归属证据，不能按时间或 Thread 猜成某一 Turn。
+- `18084 /health` 返回 200，`fullTraceCapture.bodyEnabled=true`、脱敏开关为 true，历史失败原件
+  293 个（267,219,223 字节），未解决历史失败为 0；`traceExporter` 仍未配置。`18086 /health`
+  返回 200，但 `backend=fs`，不是已验收的 OSS/S3。
+
+因此本次刷新仍不满足真实 Session/Turn MaaS 交付门禁；当前可证明的是 Raw/WAL 接收、持久化、
+恢复和投递守恒。上述标签保持 fail-closed：缺失 Turn 或身份冲突的记录不被重分类为成功。
+
+## 03:21 历史在线实测
 
 只读请求观察到：
 

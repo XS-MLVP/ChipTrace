@@ -2,9 +2,11 @@
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const path = require('node:path');
 const test = require('node:test');
 
-const workflow = fs.readFileSync('.github/workflows/ci.yml', 'utf8');
+const repositoryRoot = path.resolve(__dirname, '../..');
+const workflow = fs.readFileSync(path.join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8');
 
 test('live provider preflight is manual, protected and isolated from ordinary CI', () => {
   assert.match(workflow, /workflow_dispatch:/);
@@ -86,6 +88,14 @@ test('managed route uses a digest-pinned container image for deterministic start
   assert.ok(workflow.includes(`docker pull ${image}`));
   assert.ok(workflow.includes(`CHIPTRACE_CONFIG_TEST_IMAGE: ${image}`));
   assert.doesNotMatch(workflow, /docker pull node:22-bookworm-slim\s*$/m);
+});
+
+test('the platform Dockerfile uses the same digest and asserts its Node runtime', () => {
+  const dockerfile = fs.readFileSync(path.join(repositoryRoot, 'Dockerfile'), 'utf8');
+  const image = 'node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392';
+  assert.ok(dockerfile.includes(`ARG CHIPTRACE_PLATFORM_BASE=${image}`));
+  assert.match(dockerfile, /test "\$\(node --version\)" = "v22\.23\.3"/);
+  assert.doesNotMatch(dockerfile, /^ARG CHIPTRACE_PLATFORM_BASE=node:22-bookworm-slim$/m);
 });
 
 test('hosted jobs use an immutable Ubuntu runner label', () => {
