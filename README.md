@@ -16,19 +16,19 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新维护状态（2026-10-20 03:04，Asia/Shanghai）的代码基线为 [`6e9cc4a`](https://github.com/XS-MLVP/ChipTrace/commit/6e9cc4aa0418e4889cec0ab4d396c83bd599ada2)。
+最新维护状态（2026-10-20 03:21，Asia/Shanghai）的代码基线为 [`f201cf7`](https://github.com/XS-MLVP/ChipTrace/commit/f201cf76a7ea677542d952767f8440c2eb567730)。
 维护分支与 `origin/fix/oss-disk-session-platform` 的 SHA 一致；工作区只保留三份外部 DOCX
 作为未跟踪的需求原件，没有改写或纳入仓库。`make check`、`make test`、Codex 配置契约和
 质量/部署门禁契约均在本机通过。GitHub CLI 未认证且 Actions API 当前超时，远端运行结果仍
 不可观测，不能用本地通过替代 GitHub 证据。
 
 最新线上只读采样中 18084、3011、3012、18086 的 `/health` 均返回 HTTP 200；Collector
-队列为 0 且 ready，Relay `delivered=1,337,718`、`pending=0`、`inflight=0`、`failed=0`、
+队列为 0 且 ready，Relay `delivered=1,338,902`、`pending=0`、`inflight=0`、`failed=0`、
 `conservation_ok=true`。这些证据说明 Raw/WAL 接收、恢复和投递守恒正常，不能据此宣称业务
 Session/Turn 已就绪。
 
-业务门禁仍未通过：Relay `/ready` 返回 HTTP 503，持久 `quality_errors=8,632`
-（`otlp_traces.identity_conflict=184`、`invalid_lifecycle=6,477`、
+业务门禁仍未通过：Relay `/ready` 返回 HTTP 503，持久 `quality_errors=8,684`
+（`otlp_traces.identity_conflict=184`、`invalid_lifecycle=6,529`、
 `legacy_unclassified=1,965`，另有 Hook `conversion_error=6`），`missing_sources=["wire"]`、
 `wire.requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`。
 当前 `/etc/codex/config.toml` 与实际 `CODEX_HOME/config.toml` 的静态路由预检已对同一网关退出 0，

@@ -1,20 +1,20 @@
 # 生产就绪评估
 
-## 2026-10-20 03:04（Asia/Shanghai）当前服务与仓库复核
+## 2026-10-20 03:21（Asia/Shanghai）当前服务与仓库复核
 
-当前维护基线为 `e026c2e3731eb8a195b85a098852fb5ac7f86b83`，维护分支与远端 SHA 一致；工作区另有
+当前维护基线为 `f201cf76a7ea677542d952767f8440c2eb567730`，维护分支与远端 SHA 一致；工作区另有
 三份未跟踪的外部 DOCX 需求原件。当前本地 `make check`、`make test`、CI/部署/质量契约测试、
 Relay 基准和 `make m0-test` 的实际检查均通过。该结果不能替代
 真实 Provider、未修改 Stock Codex、目标 NFS/OSS 或同 SHA 的 GitHub Actions 运行证据。
 
 线上只读采样中 Gateway、Collector、Relay 和 Platform `/health` 均为 HTTP 200。Collector、Relay 和
 Platform revision 为 `b2f6f6d454da29f41e4529789c901d14a47c45b6`，Collector 队列深度为 0 且 ready；
-Relay `delivered=1,337,718`、`pending=0`、
+Relay `delivered=1,338,902`、`pending=0`、
 `inflight=0`、`failed=0`、`conservation_ok=true`。这组证据证明 Raw/WAL、恢复和投递守恒正常，
 不等同于业务 Session/Turn 已就绪。
 
-业务就绪仍然失败：Relay `/ready` 返回 HTTP 503；持久质量账本为 `8,632`，其中
-`identity_conflict=184`、`invalid_lifecycle=6,477`、`legacy_unclassified=1,965`，另有 Hook
+业务就绪仍然失败：Relay `/ready` 返回 HTTP 503；持久质量账本为 `8,684`，其中
+`identity_conflict=184`、`invalid_lifecycle=6,529`、`legacy_unclassified=1,965`，另有 Hook
 `conversion_error=6`。Wire `requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，
 缺失且过期来源为 `wire`。当前 `/etc/codex/config.toml` 与实际 `CODEX_HOME/config.toml` 的静态
 路由预检均对同一 18084 网关退出 0，但尚未产生可验收的真实 Wire；18086 `/health` 实际报告
