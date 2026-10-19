@@ -16,24 +16,24 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新维护状态（2026-10-20 02:01，Asia/Shanghai）的代码基线为 [`b63d979`](https://github.com/XS-MLVP/ChipTrace/commit/b63d9792764df93e4df4090f1be468f400b1e4b3)。
+最新维护状态（2026-10-20 03:04，Asia/Shanghai）的代码基线为 [`6e9cc4a`](https://github.com/XS-MLVP/ChipTrace/commit/6e9cc4aa0418e4889cec0ab4d396c83bd599ada2)。
 维护分支与 `origin/fix/oss-disk-session-platform` 的 SHA 一致；工作区只保留三份外部 DOCX
-作为未跟踪的需求原件，没有改写或纳入仓库。当前本地 `make cloud-test`、`make codex-config-test`
-和 `make m0-test` 的实际检查均通过。GitHub CLI 未认证且 Actions API 当前超时，远端运行结果仍
+作为未跟踪的需求原件，没有改写或纳入仓库。`make check`、`make test`、Codex 配置契约和
+质量/部署门禁契约均在本机通过。GitHub CLI 未认证且 Actions API 当前超时，远端运行结果仍
 不可观测，不能用本地通过替代 GitHub 证据。
 
-线上采样中 18084、3011、3012、18086 的 `/health` 均返回 HTTP 200；Collector 队列为 0 且 ready，
-Relay `delivered=1,335,308`、`delivery_attempts=1,335,393`、`pending=0`、`inflight=0`、
-`failed=0`、`delivery_retries=85`、`conservation_ok=true`。这些证据说明 Raw/WAL、恢复和投递
-守恒正常，不能据此宣称业务 Session/Turn 已就绪。
+最新线上只读采样中 18084、3011、3012、18086 的 `/health` 均返回 HTTP 200；Collector
+队列为 0 且 ready，Relay `delivered=1,337,718`、`pending=0`、`inflight=0`、`failed=0`、
+`conservation_ok=true`。这些证据说明 Raw/WAL 接收、恢复和投递守恒正常，不能据此宣称业务
+Session/Turn 已就绪。
 
-业务门禁仍未通过：Relay `/ready` 返回 HTTP 503，持久 `quality_errors=8,549`
-（`identity_conflict=184`、`invalid_lifecycle=6,397`、`legacy_unclassified=1,965`，另有 Hook
-`conversion_error=3`），
-`missing_sources=["wire"]`、`wire.requests=0`、`turn_capture_ready=false`。实际用户配置的路由
-预检退出 1，Provider 绕过 18084；Platform 健康虽为 200，实际后端仍是 `fs`。真实 OSS 上传/恢复/
-远端哈希、未修改 Stock Codex 多轮四源 Canary 和同 SHA 远端 CI 尚未验收，当前只能用于内部 Raw/
-恢复验证。
+业务门禁仍未通过：Relay `/ready` 返回 HTTP 503，持久 `quality_errors=8,632`
+（`otlp_traces.identity_conflict=184`、`invalid_lifecycle=6,477`、
+`legacy_unclassified=1,965`，另有 Hook `conversion_error=6`），`missing_sources=["wire"]`、
+`wire.requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`。
+18084 的 payload 脱敏仍关闭并保留 293 个历史失败文件；Platform 健康虽为 200，实际后端仍是
+`fs`。真实 OSS 上传/恢复/远端哈希、未修改 Stock Codex 多轮四源 Canary 和同 SHA 远端 CI
+尚未验收，当前只能用于内部 Raw/恢复验证，不能作为外部 MaaS 交付服务。
 
 历史线上只读快照（2026-10-19 09:01:42，Asia/Shanghai）确认 18084、3011、3012、18086 的
 `/health` 均返回 HTTP 200，但 Relay `/ready` 返回 HTTP 503。Collector/Relay
