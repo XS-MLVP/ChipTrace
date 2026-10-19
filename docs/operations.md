@@ -158,6 +158,11 @@ node scripts/deploy/codex-route-preflight.js \
   --expected-base-url http://172.28.11.121:18084/
 ```
 
+如果省略 `--user-config`，预检会自动读取当前进程 `CODEX_HOME/config.toml`；`CODEX_HOME`
+必须是绝对路径。这样可以检查实际运行 Codex 的用户覆盖层，避免只验证 `/etc/codex` 而漏掉
+绕过 Gateway 的用户 Provider。未设置 `CODEX_HOME` 时只校验系统配置；无法读取自动发现的用户
+配置或发现 Provider/OTLP 覆盖时会 fail-closed，且不会输出配置正文、凭据或请求内容。
+
 预检会拒绝用户 Provider 绕过 Gateway、关闭 OTLP 或覆盖受管鉴权。新 requirements 模板
 通过原生 exact Provider 约束进一步修复这个接入风险，但本次没有改动线上 `/etc/codex`
 或用户配置。更新受管配置后必须从新客户端进程获取真实 Wire，再复验 runtime gate 和目标

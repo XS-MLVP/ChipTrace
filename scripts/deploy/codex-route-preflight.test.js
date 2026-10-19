@@ -4,7 +4,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
-const { validateCodexRoute, validateCodexUserOverrides } = require('./codex-route-preflight');
+const {
+  main,
+  resolveUserConfigPath,
+  validateCodexRoute,
+  validateCodexUserOverrides,
+} = require('./codex-route-preflight');
 
 const config = fs.readFileSync(path.join(__dirname, '../../integrations/codex/config.toml.example'), 'utf8');
 const gateway = 'http://172.28.11.121:18084/';
@@ -63,4 +68,29 @@ trace_exporter = { otlp-http = { endpoint = "${gateway}otel/v1/traces" } }
     checked: true,
     inherited_system_route: true,
   });
+});
+
+test('CODEX_HOME is automatically resolved when an explicit user config is absent', () => {
+  assert.equal(resolveUserConfigPath({ CODEX_HOME: '/srv/codex' }), '/srv/codex/config.toml');
+  assert.throws(() => resolveUserConfigPath({ CODEX_HOME: 'relative/codex' }), /absolute path/);
+  assert.equal(resolveUserConfigPath({}), null);
+});
+
+test('CLI refuses the active CODEX_HOME override when --user-config is omitted', () => {
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'chiptrace-route-preflight-'));
+  const systemPath = path.join(root, 'system.toml');
+  fs.writeFileSync(systemPath, config);
+  fs.writeFileSync(path.join(root, 'config.toml'), 'model_provider = "Bypass"\n');
+  const previous = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = root;
+  try {
+    assert.throws(() => main([
+      '--config', systemPath,
+      '--expected-base-url', gateway,
+    ]), /different model_provider/);
+  } finally {
+    if (previous === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -3,6 +3,7 @@
 // Validate the managed Stock Codex route without reading or printing secrets.
 // This is a configuration contract check, not a model request.
 const fs = require('node:fs');
+const path = require('node:path');
 
 const SCHEMA_VERSION = 'chiptrace.codex-route-preflight.v1';
 
@@ -158,8 +159,18 @@ function parseArgs(argv) {
   return { config, userConfig, expectedBaseUrl };
 }
 
+function resolveUserConfigPath(env = process.env) {
+  const codeHome = typeof env.CODEX_HOME === 'string' ? env.CODEX_HOME.trim() : '';
+  if (!codeHome) return null;
+  if (!path.isAbsolute(codeHome)) {
+    fail('CODEX_HOME must be an absolute path when used for route preflight');
+  }
+  return path.join(codeHome, 'config.toml');
+}
+
 function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
+  const userConfig = args.userConfig || resolveUserConfigPath();
   let text;
   try {
     text = fs.readFileSync(args.config, 'utf8');
@@ -167,10 +178,10 @@ function main(argv = process.argv.slice(2)) {
     fail(`cannot read configuration: ${error.code || 'read_error'}`);
   }
   const result = validateCodexRoute(text, args.expectedBaseUrl);
-  if (args.userConfig) {
+  if (userConfig) {
     let userText;
     try {
-      userText = fs.readFileSync(args.userConfig, 'utf8');
+      userText = fs.readFileSync(userConfig, 'utf8');
     } catch (error) {
       fail(`cannot read user configuration: ${error.code || 'read_error'}`);
     }
@@ -190,5 +201,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  SCHEMA_VERSION, validateCodexRoute, validateCodexUserOverrides, parseArgs, main,
+  SCHEMA_VERSION, validateCodexRoute, validateCodexUserOverrides,
+  parseArgs, resolveUserConfigPath, main,
 };
