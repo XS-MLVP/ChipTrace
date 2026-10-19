@@ -1,6 +1,6 @@
 # 业务采集数据符合性评估
 
-本页记录 2026-10-20 02:01（Asia/Shanghai）对当前在线服务、真实封存 Capture 和外部 MaaS 交付合同的复核结果。它区分
+本页记录 2026-10-20 03:04（Asia/Shanghai）对当前在线服务、真实封存 Capture 和外部 MaaS 交付合同的复核结果。它区分
 “传输层已经持久化”与“业务 Session/Turn 可以对外交付”，后者必须由真实来源覆盖和质量门禁证明。
 
 ## 结论
@@ -38,13 +38,13 @@
 
 只读请求观察到：
 
-- `3011 /health` 返回 200，Collector ready，`captures=1,335,308`，`queue_depth=0`，已封存约
-  `126,526,778,392` 字节。这证明 Raw/WAL 接收，不证明业务关联完整。
+- `3011 /health` 返回 200，Collector ready，`captures=1,337,472`，`queue_depth=0`，已封存约
+  `126,835,243,904` 字节。这证明 Raw/WAL 接收，不证明业务关联完整。
 - `3012 /health` 返回 200，但 `ingest_coverage.wire.requests=0`、
   `wire.durable_captures=0`、`successful_turn_scoped_captures=0`，`missing_sources=["wire"]`，
   `turn_capture_ready=false`。
-- `3012 /ready` 返回 503。Relay 的 `quality_errors=8,549`，包括 `identity_conflict=184`、
-  `invalid_lifecycle=6,397`、`legacy_unclassified=1,965`，另有 Hook `conversion_error=3`。
+- `3012 /ready` 返回 503。Relay 的 `quality_errors=8,632`，包括 `identity_conflict=184`、
+  `invalid_lifecycle=6,477`、`legacy_unclassified=1,965`，另有 Hook `conversion_error=6`。
   因此四源覆盖、来源新鲜度和零质量错误门禁均失败。
 - `18084 /health` 返回 200，但 `traceExporter.enabled=false`、`configured=false`，
   `fullTraceCapture.adapterDoesPayloadSanitization=false`，且保留 293 个历史失败文件（约 267 MB）。
@@ -75,8 +75,8 @@ request 级 MaaS 数据。
 
 ## 交付前必须补齐
 
-1. 修复实际运行 Codex 的 Provider 路由，使 Wire 请求确实经过 18084，并从新进程产生带真实
-   Session/Turn 身份的请求。
+1. 虽然当前系统和实际 `CODEX_HOME` 路由预检已对同一 18084 网关退出 0，仍需从新进程产生带
+   真实 Session/Turn 身份的请求，并确认 Wire 成功到达 Relay。
 2. 修复 OTLP traces 的身份冲突、重复 lifecycle 终态和历史未分类来源；保留历史 Raw，重新验收
    新增数据，直到质量门禁为零且四源覆盖、新鲜度完整。
 3. 在 18084 启用并验证 payload 采集/脱敏和失败 outbox 清理策略，保留可审计失败记录。

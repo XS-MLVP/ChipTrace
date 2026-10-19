@@ -31,7 +31,8 @@ Session/Turn 已就绪。
 （`otlp_traces.identity_conflict=184`、`invalid_lifecycle=6,477`、
 `legacy_unclassified=1,965`，另有 Hook `conversion_error=6`），`missing_sources=["wire"]`、
 `wire.requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`。
-18084 的 payload 脱敏仍关闭并保留 293 个历史失败文件；Platform 健康虽为 200，实际后端仍是
+当前 `/etc/codex/config.toml` 与实际 `CODEX_HOME/config.toml` 的静态路由预检已对同一网关退出 0，
+但尚未由真实新进程产生可验收的 Wire。18084 的 payload 脱敏仍关闭并保留 293 个历史失败文件；Platform 健康虽为 200，实际后端仍是
 `fs`。真实 OSS 上传/恢复/远端哈希、未修改 Stock Codex 多轮四源 Canary 和同 SHA 远端 CI
 尚未验收，当前只能用于内部 Raw/恢复验证，不能作为外部 MaaS 交付服务。
 
