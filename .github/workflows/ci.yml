@@ -900,6 +900,20 @@ jobs:
           # contain tests and redacted fixtures only; make their permissions
           # traversable without changing file contents or tracked modes.
           chmod -R a+rX integrations/openai-gateway integrations/cloud-platform integrations/codex fixtures
+      - name: Verify non-root container mounts before test runners
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --read-only \
+            --user 10001:10001 \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --tmpfs /tmp:size=32m,mode=1777 \
+            --entrypoint node \
+            -v "$PWD/integrations/openai-gateway:/tests/gateway:ro" \
+            -v "$PWD/integrations/cloud-platform:/tests/platform:ro" \
+            -v "$PWD/integrations/codex:/tests/codex:ro" \
+            -v "$PWD/fixtures:/tests/fixtures:ro" \
+            chiptrace-platform:ci \
+            -e 'const fs = require("node:fs"); for (const file of ["/tests/gateway/relay-receipt.test.js", "/tests/platform/platform.test.js", "/tests/codex/native-context.test.js", "/tests/fixtures/native-context-0163.json"]) fs.readFileSync(file); process.stdout.write("NON_ROOT_TEST_MOUNTS_READABLE\\n");'
       - name: Verify actual deployment templates reject mutable images and missing limits
         run: |
           set -euo pipefail

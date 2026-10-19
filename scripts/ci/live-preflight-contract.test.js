@@ -91,4 +91,6 @@ test('hosted sandbox startup tolerates optional sysctl writes but requires a rea
 test('container fixture mounts are readable by the fixed non-root image user', () => {
   assert.match(workflow,
     /- name: Prepare read-only test mounts for the non-root container[\s\S]*?chmod -R a\+rX integrations\/openai-gateway integrations\/cloud-platform integrations\/codex fixtures/);
+  assert.match(workflow,
+    /- name: Verify non-root container mounts before test runners[\s\S]*?--user 10001:10001[\s\S]*?--entrypoint node[\s\S]*?NON_ROOT_TEST_MOUNTS_READABLE/);
 });
