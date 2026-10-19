@@ -25,6 +25,14 @@ Platform `/health` 返回 HTTP 200，但没有 `backend` 字段；只读容器�
 OSS 签名/恢复、受限堆内存平台路径、质量标签和 GitHub Actions 合同门禁。GitHub Actions 新提交
 Run 仍因本环境未认证 `gh` CLI 无法取得真实运行证据，不能把本地绿色替代远端同 SHA 检查。
 
+## 2026-10-19 09:35（Asia/Shanghai）CI 启动输入收敛
+
+维护分支提交 `881f6aa` 将 `stock-managed-route` 作业使用的 `node:22-bookworm-slim` 固定为
+`node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392`，
+并把同一 digest 通过 `CHIPTRACE_CONFIG_TEST_IMAGE` 传给实际 Docker 测试；合同测试会拒绝退回可变标签。
+当前节点用非 root、只读根、无网络参数启动该 digest，实际输出 Node `v22.23.3` 并退出 0。该修复
+降低远程 CI 因基础镜像漂移产生的启动差异，但仍需要 GitHub Actions 对同一 SHA 的真实 Run 作为最终证据。
+
 ## 2026-10-19 09:01:42（Asia/Shanghai）线上只读复核
 
 本次复核只读取健康端点、Docker 容器元数据和 Git 状态，未重启服务、修改配置或清理 Raw。18084
