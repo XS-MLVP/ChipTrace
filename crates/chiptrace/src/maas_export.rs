@@ -107,6 +107,10 @@ pub struct MaasExportConfig {
     pub timezone_offset_minutes: i32,
     pub max_batch_bytes: u64,
     pub replace: bool,
+    /// Skip Wire captures that have no complete input/output usage instead of
+    /// failing the whole export. Failed or client-aborted attempts are kept in
+    /// Raw but cannot satisfy the external 11-field contract.
+    pub skip_incomplete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,6 +146,7 @@ pub struct MaasExportReport {
     pub batches: Vec<MaasBatchInfo>,
     pub requests: u64,
     pub skipped_non_wire_records: u64,
+    pub skipped_incomplete_requests: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -200,6 +205,7 @@ pub fn export_maas(config: MaasExportConfig) -> Result<MaasExportReport> {
     let mut requests_by_date: BTreeMap<String, Vec<StagedRequest>> = BTreeMap::new();
     let mut seen_request_ids = BTreeSet::new();
     let mut skipped_non_wire_records = 0_u64;
+    let mut skipped_incomplete_requests = 0_u64;
     for input in inputs {
         let mut reader = open_jsonl_reader(&input)?;
         let mut line = Vec::new();
@@ -225,6 +231,10 @@ pub fn export_maas(config: MaasExportConfig) -> Result<MaasExportReport> {
             })?;
             if value.get("recordType").and_then(Value::as_str) != Some("api_snapshot") {
                 skipped_non_wire_records = skipped_non_wire_records.saturating_add(1);
+                continue;
+            }
+            if config.skip_incomplete && !has_complete_usage(&value) {
+                skipped_incomplete_requests = skipped_incomplete_requests.saturating_add(1);
                 continue;
             }
             let payload = build_payload(&value, &config)?;
@@ -316,6 +326,7 @@ pub fn export_maas(config: MaasExportConfig) -> Result<MaasExportReport> {
         requests: batches.iter().map(|batch| batch.requests).sum(),
         batches,
         skipped_non_wire_records,
+        skipped_incomplete_requests,
     })
 }
 
@@ -592,12 +603,13 @@ fn build_payload(capture: &Value, config: &MaasExportConfig) -> Result<RequestPa
     )
     .or_else(|| header_string(capture, "requestHeaders", "session-id"))
     .ok_or_else(|| anyhow::anyhow!("api_snapshot {request_id} has no sessionId"))?;
-    trace_string(
-        capture,
-        &["turn_id", "turnId", "root_turn_id", "rootTurnId"],
-    )
-    .or_else(|| header_string(capture, "requestHeaders", "turn-id"))
-    .ok_or_else(|| anyhow::anyhow!("api_snapshot {request_id} has no turnId"))?;
+    // The native turn and the root turn are distinct identities: subagent and
+    // window-scoped requests carry both with different values. Prefer the
+    // native turn and use the root only when no native identity exists.
+    trace_string(capture, &["turn_id", "turnId"])
+        .or_else(|| trace_string(capture, &["root_turn_id", "rootTurnId"]))
+        .or_else(|| header_string(capture, "requestHeaders", "turn-id"))
+        .ok_or_else(|| anyhow::anyhow!("api_snapshot {request_id} has no turnId"))?;
     let request_time_raw = ["requestTime", "startedAt", "receivedAt"]
         .into_iter()
         .find_map(|field| string_field(capture, field))
@@ -725,10 +737,8 @@ fn reject_identity_conflicts(capture: &Value, request_id: &str) -> Result<()> {
             ]
             .as_slice(),
         ),
-        (
-            "turnId",
-            ["turn_id", "turnId", "root_turn_id", "rootTurnId"].as_slice(),
-        ),
+        ("turnId", ["turn_id", "turnId"].as_slice()),
+        ("rootTurnId", ["root_turn_id", "rootTurnId"].as_slice()),
     ];
     for (field, aliases) in trace_aliases {
         let values = aliases
@@ -758,11 +768,10 @@ fn reject_identity_conflicts(capture: &Value, request_id: &str) -> Result<()> {
             .as_slice(),
             "session-id",
         ),
-        (
-            "turnId",
-            ["turn_id", "turnId", "root_turn_id", "rootTurnId"].as_slice(),
-            "turn-id",
-        ),
+        // Only the native turn is comparable to the `turn-id` header. A
+        // root-only capture falls back to the header above and must not be
+        // rejected for a legitimate native/root difference.
+        ("turnId", ["turn_id", "turnId"].as_slice(), "turn-id"),
     ] {
         let trace_value = aliases.iter().find_map(|alias| {
             capture
@@ -1018,37 +1027,71 @@ fn extract_usage(capture: &Value, response: &Value, response_text: &str) -> Opti
     Some(usage).filter(|value| value.input.is_some() && value.output.is_some())
 }
 
+fn has_complete_usage(capture: &Value) -> bool {
+    let Ok(response) = body_value(capture, "response") else {
+        return false;
+    };
+    let Ok(text) = response_text(capture, &response) else {
+        return false;
+    };
+    extract_usage(capture, &response, &text).is_some()
+}
+
 fn find_usage(value: &Value, usage: &mut Usage) {
     match value {
         Value::Array(items) => items.iter().for_each(|item| find_usage(item, usage)),
         Value::Object(object) => {
-            if let Some(input) = find_number(
-                object,
-                &[
-                    "input_tokens",
-                    "prompt_tokens",
-                    "inputTokenCount",
-                    "promptTokenCount",
-                ],
-            ) {
-                usage.input = usage.input.or(Some(input));
+            // Canonical usage containers are authoritative. Responses streams
+            // also carry zero-valued per-tool counters under tool_usage; those
+            // must never be mistaken for request usage.
+            for name in [
+                "usage",
+                "usageMetadata",
+                "usage_metadata",
+                "token_usage",
+                "tokenUsage",
+            ] {
+                if let Some(child) = object.get(name).filter(|child| child.is_object()) {
+                    read_usage_fields(child, usage);
+                }
             }
-            if let Some(output) = find_number(
-                object,
-                &[
-                    "output_tokens",
-                    "completion_tokens",
-                    "outputTokenCount",
-                    "candidatesTokenCount",
-                ],
-            ) {
-                usage.output = usage.output.or(Some(output));
-            }
-            for child in object.values() {
+            read_usage_fields(value, usage);
+            for (key, child) in object {
+                if matches!(key.as_str(), "tool_usage" | "toolUsage") {
+                    continue;
+                }
                 find_usage(child, usage);
             }
         }
         _ => {}
+    }
+}
+
+fn read_usage_fields(object: &Value, usage: &mut Usage) {
+    let Value::Object(object) = object else {
+        return;
+    };
+    if let Some(input) = find_number(
+        object,
+        &[
+            "input_tokens",
+            "prompt_tokens",
+            "inputTokenCount",
+            "promptTokenCount",
+        ],
+    ) {
+        usage.input = usage.input.or(Some(input));
+    }
+    if let Some(output) = find_number(
+        object,
+        &[
+            "output_tokens",
+            "completion_tokens",
+            "outputTokenCount",
+            "candidatesTokenCount",
+        ],
+    ) {
+        usage.output = usage.output.or(Some(output));
     }
 }
 
@@ -1544,6 +1587,7 @@ mod tests {
             timezone_offset_minutes: DEFAULT_TIMEZONE_OFFSET_MINUTES,
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             replace: false,
+            skip_incomplete: false,
         }
     }
 
@@ -1776,6 +1820,119 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("conflicting traceContext sessionId aliases"));
+    }
+
+    #[test]
+    fn accepts_distinct_native_and_root_turn_identities() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("native-root.ndjson");
+        let mut value = capture(
+            "req-native-root",
+            false,
+            json!({"model":"gpt-5.6-sol","input":[]}),
+        );
+        value["traceContext"]["turn_id"] = json!("turn-native");
+        value["traceContext"]["root_turn_id"] = json!("turn-root");
+        value["requestHeaders"] = json!({
+            "session-id":"sess-1",
+            "turn-id":"turn-native",
+        });
+        fs::write(
+            &input,
+            format!("{}\n", serde_json::to_string(&value).unwrap()),
+        )
+        .unwrap();
+        let output = root.path().join("native-root-archive");
+        let report = export_maas(config(input, output.clone())).unwrap();
+        assert_eq!(report.requests, 1);
+        verify_maas(&output, DEFAULT_MAX_BATCH_BYTES).unwrap();
+    }
+
+    #[test]
+    fn ignores_zero_per_tool_counters_when_exporting_usage() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("tool-usage.ndjson");
+        let mut value = capture(
+            "req-tool-usage",
+            true,
+            json!({"model":"gpt-5.6-sol","input":[]}),
+        );
+        let created = json!({
+            "type":"response.created",
+            "response":{"usage":null,"tool_usage":{"image_gen":{"input_tokens":0,"output_tokens":0}}}
+        });
+        let completed = json!({
+            "type":"response.completed",
+            "response":{
+                "usage":{"input_tokens":42435,"output_tokens":54},
+                "tool_usage":{"image_gen":{"input_tokens":0,"output_tokens":0}}
+            }
+        });
+        value["responseBody"] = json!({
+            "kind":"text",
+            "value":format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                serde_json::to_string(&created).unwrap(),
+                serde_json::to_string(&completed).unwrap()
+            ),
+        });
+        fs::write(
+            &input,
+            format!("{}\n", serde_json::to_string(&value).unwrap()),
+        )
+        .unwrap();
+        let output = root.path().join("tool-usage-archive");
+        export_maas(config(input, output.clone())).unwrap();
+        let file = output.join("providerX/2026-08-17/batch_00001.tar.gz");
+        let decoder = flate2::read::GzDecoder::new(File::open(file).unwrap());
+        let mut archive = tar::Archive::new(decoder);
+        let mut metadata = None;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().ends_with("metadata.json") {
+                let mut text = String::new();
+                entry.read_to_string(&mut text).unwrap();
+                metadata = Some(serde_json::from_str::<Value>(&text).unwrap());
+            }
+        }
+        let metadata = metadata.expect("metadata.json");
+        assert_eq!(metadata["inputTokens"], 42435);
+        assert_eq!(metadata["outputTokens"], 54);
+    }
+
+    #[test]
+    fn skips_incomplete_usage_only_when_requested() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("mixed.ndjson");
+        let good = capture("req-good", true, json!({"model":"gpt-5.6-sol","input":[]}));
+        let mut failed = capture(
+            "req-failed",
+            true,
+            json!({"model":"gpt-5.6-sol","input":[]}),
+        );
+        failed["responseBody"] = json!({
+            "kind":"text",
+            "value":"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"usage\":null}}\n\n",
+        });
+        fs::write(
+            &input,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&good).unwrap(),
+                serde_json::to_string(&failed).unwrap()
+            ),
+        )
+        .unwrap();
+        assert!(
+            export_maas(config(input.clone(), root.path().join("strict"))).is_err(),
+            "default export must fail closed on missing usage"
+        );
+        let mut skip = config(input, root.path().join("skip"));
+        skip.skip_incomplete = true;
+        let report = export_maas(skip).unwrap();
+        assert_eq!(report.requests, 1);
+        assert_eq!(report.skipped_incomplete_requests, 1);
+        verify_maas(&root.path().join("skip"), DEFAULT_MAX_BATCH_BYTES).unwrap();
     }
 
     #[test]

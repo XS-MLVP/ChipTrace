@@ -48,6 +48,10 @@ const INGEST_QUALITY_SEED_SCHEMA_VERSION: &str = "chiptrace.ingest-quality-seed.
 const INGEST_QUALITY_SEED_FILE: &str = "ingest-quality-seed.json";
 const MAX_INGEST_QUALITY_SEED_BYTES: u64 = 64 * 1024;
 const INGEST_COVERAGE_FRESHNESS_WINDOW_MS: u64 = 5 * 60 * 1_000;
+// Lifecycle Hooks are sparse: a single Turn can spend well over five minutes
+// in model/tool loops with no new Hook. A short window made a healthy,
+// long-running Session look stale and flipped turn_capture_ready to false.
+const INGEST_COVERAGE_HOOK_FRESHNESS_WINDOW_MS: u64 = 60 * 60 * 1_000;
 const LEGACY_UNCLASSIFIED_QUALITY_REASON: &str = "legacy_unclassified";
 const MIN_DELIVERY_READ_CONCURRENCY: usize = 4;
 const MAX_DELIVERY_READ_CONCURRENCY: usize = 16;
@@ -1963,9 +1967,13 @@ impl IngestCoverageState {
                 required_routes
                     .iter()
                     .filter_map(|(name, route)| {
+                        let window = if *name == "hooks" {
+                            INGEST_COVERAGE_HOOK_FRESHNESS_WINDOW_MS
+                        } else {
+                            INGEST_COVERAGE_FRESHNESS_WINDOW_MS
+                        };
                         route.last_observed_millis.and_then(|last| {
-                            (wire_last.saturating_sub(last) > INGEST_COVERAGE_FRESHNESS_WINDOW_MS)
-                                .then_some(*name)
+                            (wire_last.saturating_sub(last) > window).then_some(*name)
                         })
                     })
                     .collect()
@@ -2013,6 +2021,7 @@ impl IngestCoverageState {
             "required_sources_fresh":required_sources_fresh,
             "freshness_applicable":wire_active || runtime_active,
             "freshness_window_ms":INGEST_COVERAGE_FRESHNESS_WINDOW_MS,
+            "hooks_freshness_window_ms":INGEST_COVERAGE_HOOK_FRESHNESS_WINDOW_MS,
             "wire_age_ms":wire_age_ms,
             "runtime_age_ms":runtime_age_ms,
             "runtime_active":runtime_active,
@@ -3868,6 +3877,56 @@ mod tests {
     }
 
     #[test]
+    fn ingest_coverage_keeps_sparse_hooks_fresh_for_long_turns() {
+        let mut coverage = IngestCoverageState::new();
+        coverage.observe_wire(&[(
+            WireCaptureEvidence {
+                turn_scoped: true,
+                http_success: true,
+                identity_conflict: false,
+            },
+            false,
+        )]);
+        for endpoint in [
+            CloudEndpoint::OtlpLogs,
+            CloudEndpoint::OtlpTraces,
+            CloudEndpoint::CodexHook,
+        ] {
+            coverage.observe_cloud(
+                endpoint,
+                &crate::cloud_ingest::CloudIngestSummary {
+                    endpoint: "test".to_owned(),
+                    source_records: 1,
+                    derived_captures: 1,
+                    unknown_events: 0,
+                    attributed_quality_errors: 0,
+                    conversion_errors: Vec::new(),
+                },
+                1,
+                0,
+                0,
+                0,
+            );
+        }
+        let now = unix_millis();
+        coverage.wire.first_observed_millis = Some(now - INGEST_COVERAGE_FRESHNESS_WINDOW_MS - 1);
+        coverage.wire.last_observed_millis = Some(now);
+        coverage.otlp_logs.last_observed_millis = Some(now - 60_000);
+        coverage.otlp_traces.last_observed_millis = Some(now - 60_000);
+        // A long model/tool loop can easily go ten minutes without a Hook.
+        coverage.hooks.last_observed_millis = Some(now - 10 * 60_000);
+
+        let snapshot = coverage.snapshot_at(now);
+        assert_eq!(snapshot["stale_sources"], json!([]));
+        assert_eq!(snapshot["required_sources_fresh"], true);
+        assert_eq!(snapshot["turn_capture_ready"], true);
+        assert_eq!(
+            snapshot["hooks_freshness_window_ms"],
+            INGEST_COVERAGE_HOOK_FRESHNESS_WINDOW_MS
+        );
+    }
+
+    #[test]
     fn ingest_coverage_degrades_when_runtime_sources_lag_active_wire() {
         let mut coverage = IngestCoverageState::new();
         coverage.observe_wire(&[(WireCaptureEvidence::default(), false)]);
@@ -3900,7 +3959,7 @@ mod tests {
         .into_iter()
         .max()
         .unwrap();
-        let latest_wire = latest_runtime + INGEST_COVERAGE_FRESHNESS_WINDOW_MS + 1;
+        let latest_wire = latest_runtime + INGEST_COVERAGE_HOOK_FRESHNESS_WINDOW_MS + 1;
         coverage.wire.last_observed_millis = Some(latest_wire);
 
         let snapshot = coverage.snapshot_at(latest_wire);

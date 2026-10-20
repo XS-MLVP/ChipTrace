@@ -1,5 +1,59 @@
 # 生产就绪评估
 
+## 2026-10-20 12:26（Asia/Shanghai）上游恢复、真实 Turn 采集与 MaaS 导出修复
+
+18084 的 Sub2API GPT pro 上游账户 1 和 12 实际返回
+`403 INSUFFICIENT_BALANCE`，这是此前“无成功 Wire”的直接原因。新增 kxyai 供应商账户
+（id 27、group 3、`https://api.kxyai.top`）作为低优先级故障转移，并将失效账户降为
+priority 50；`/v1/responses` 实测恢复 HTTP 200。共享 `~/.codex` Provider 已改为
+`http://172.28.11.121:18084/`，认证使用用户自己的 Sub2API Key，原 kxyai Provider Key
+仅保留在备份中。该变更适用于共享该 NFS 配置的所有节点；不能访问 18084 的节点会 fail-closed。
+
+真实未修改 Stock Codex `0.163.0-alpha.11` 交互 canary（Session
+`01a1575c-1aaf-7111-b569-c59263abd6d0`，两轮人工输入）产生了 59 条 Wire、349 个 OTLP
+日志批次、82 个 OTLP Trace 批次、10 个 Hook 和 26 条工具执行。会话级四源覆盖完整，Relay
+`turn_capture_ready=true`，当前进程累计成功 Turn-scoped Wire 279 条、全部 pending/failed 为 0、
+守恒通过。该 canary 不是交付证据：0.163 的 `codex.tool_result` 与 SSE 日志没有
+`turn.id`/`root_turn_id`，`inspect-session` 按设计 fail-closed；本次 TUI 又被驱动脚本强制退出，
+缺少 `SessionEnd`。要得到逐 Turn 可交付数据，必须使用仓库 `docs/upstream-*.patch` 描述的
+patched 生产者。
+
+真实数据同时暴露并修复了 `export-maas` 两个缺陷：
+
+- `turn_id` 与 `root_turn_id` 被错误当作同一别名，导致合法的原生/root Turn（子代理、
+  window）差异被拒绝；现在优先原生 Turn，仅在缺失时回退 root，并分别检查别名冲突。
+- Responses SSE 的 `tool_usage.image_gen.input_tokens/output_tokens=0` 早于 canonical
+  `usage`，旧逻辑先写入 0 后不再覆盖，导致所有请求导出为零 Token；现在 canonical
+  usage/usageMetadata 优先，并跳过 `tool_usage` 子树。
+
+修复后 `cargo test -p chiptrace --lib` 的 353 个测试和完整 `make cloud-test` 实际退出 0。
+
+本轮还修复了一个采集可用性缺陷：Hooks 是稀疏的生命周期事件，一个 Turn 可能连续十几分钟
+只有模型和工具流量而没有新 Hook；旧的 5 分钟窗口会把健康的活跃会话判为 `hooks` stale，进而
+把 `turn_capture_ready` 翻成 false。现在 Wire/OTLP 仍使用 5 分钟窗口，Hooks 单独使用 60 分钟
+窗口，并在健康快照中输出 `hooks_freshness_window_ms`。外部 MaaS 导出新增
+`--skip-incomplete`：显式跳过没有完整 input/output 用量的失败或中断 Wire 并在报告中计数，
+默认行为仍是整体 fail-closed。
+
+本机同时部署了受管 requirements Hook 和用户 `hooks.json`，每个 SessionStart/SessionEnd 会被
+投递两次（相差几毫秒）。旧视图把第二个连续边界记为 invalid，导致会话永远显示未闭合；现在
+同类型边界在 2 秒内去重，重复投递不再产生额外 epoch。使用 patched 生产者和
+`OTEL_EXPORTER_OTLP_HEADERS` 的短 Session `01a15829-acf8-7d31-bbfe-38ae1b6d976a` 实测：
+1 个 native Turn 闭合、1 个 Session epoch 闭合、四源齐全（Wire 24、OTLP logs 41、OTLP traces
+31、Hook 8）、7/7 工具调用/执行/结果配对、4 种工具。`inspect-session` 仍为
+`delivery_ready=false` 的唯一原因是 source-context 审计记录了 1,051 条启动/辅助 OTLP span
+（`fs.*`、`config/read`、`auth`、app-server RPC 等）没有生产者声明的 Session/process 作用域；
+业务 Turn 的 Wire、工具和 SSE 记录不在缺口列表中。该缺口属于
+[session-scope-audit](session-scope-audit.md) 仍需上游化的生产者作用域补丁，不能用名称豁免或
+默认归属绕过。
+从上述 canary 的 27 条协议完成请求导出外部 MaaS 包：`batch_00001.tar.gz` 为
+`3,989,724` bytes（低于 100 MB）、27 个 request、11 个 metadata 字段、真实 Token 统计，
+`verify-maas` 退出 0；32 条失败/中断请求保留在 Raw，但因没有协议终态用量而不进入外部包。
+
+业务 `/ready` 仍为 503：持久质量账本约 8,77x（历史 OTLP 标签为主），平台后端仍是 `fs`，
+真实 OSS/S3 与 SFTP 参数未提供。当前结论是：采集、恢复、投递和外部 request 级打包已能用真实
+业务流量验证；严格逐 Turn 交付仍需 patched 生产者 canary、质量基线审计和真实对象存储验收。
+
 ## 2026-10-20 06:02（Asia/Shanghai）当前 revision 滚动更新与复核
 
 已将本机 Collector、Relay 和 Platform 受控更新到维护分支完整 revision

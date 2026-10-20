@@ -9,6 +9,8 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 pub const SESSION_VIEW_SCHEMA_VERSION: &str = "chiptrace.session-view.v2";
 
@@ -226,6 +228,34 @@ fn string<'a>(value: &'a Value, pointer: &str) -> Option<&'a str> {
         .filter(|v| !v.trim().is_empty())
 }
 
+fn boundary_millis(capture: &Value) -> Option<i64> {
+    let text = string(capture, "/lifecycleEvent/occurred_at")
+        .or_else(|| string(capture, "/lifecycleEvent/source_event/occurred_at"))?;
+    let parsed = OffsetDateTime::parse(text, &Rfc3339).ok()?;
+    i64::try_from(parsed.unix_timestamp_nanos() / 1_000_000).ok()
+}
+
+fn duplicate_boundary(
+    last: &mut Option<(&'static str, i64)>,
+    event: &'static str,
+    at: Option<i64>,
+) -> bool {
+    const DUPLICATE_WINDOW_MS: i64 = 2_000;
+    let Some(at) = at else {
+        *last = Some((event, i64::MIN));
+        return false;
+    };
+    if let Some((previous, previous_at)) = *last
+        && previous == event
+        && at >= previous_at
+        && at - previous_at <= DUPLICATE_WINDOW_MS
+    {
+        return true;
+    }
+    *last = Some((event, at));
+    false
+}
+
 fn source_session(capture: &Value) -> Option<&str> {
     string(capture, "/traceContext/source_session_id")
         .or_else(|| string(capture, "/lifecycleEvent/source_event/session_id"))
@@ -405,6 +435,11 @@ pub(crate) fn summarize_session_with_scopes(
     let allowed_sessions = allowed_source_sessions(captures, session_id);
     let compaction = CompactionBoundaries::from_captures(captures);
     let mut lifecycle = LifecycleState::new("stock_codex_hook");
+    // Open21 runs both the managed requirements Hooks and the user hooks.json.
+    // Each boundary is therefore delivered twice, a few milliseconds apart;
+    // counting both made a healthy Session look like an invalid/never-closed
+    // epoch. Collapse a repeated boundary of the same kind inside this window.
+    let mut last_boundary: Option<(&'static str, i64)> = None;
     let mut turns: BTreeMap<(String, String), TurnView> = BTreeMap::new();
     let mut terminal_statuses: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     let mut unscoped_turn_records = 0;
@@ -419,10 +454,23 @@ pub(crate) fn summarize_session_with_scopes(
             .is_some_and(|value| value.eq_ignore_ascii_case("compact"));
         if source_session == Some(session_id) {
             match hook {
-                Some("SessionStart") if !compact => {
+                Some("SessionStart")
+                    if !compact
+                        && !duplicate_boundary(
+                            &mut last_boundary,
+                            "session_start",
+                            boundary_millis(capture),
+                        ) =>
+                {
                     lifecycle.observe_event("session_start", capture_id, true);
                 }
-                Some("SessionEnd") => {
+                Some("SessionEnd")
+                    if !duplicate_boundary(
+                        &mut last_boundary,
+                        "session_end",
+                        boundary_millis(capture),
+                    ) =>
+                {
                     lifecycle.observe_event("session_end", capture_id, true);
                 }
                 _ => {}
@@ -620,6 +668,35 @@ mod tests {
     fn boundary(id: &str, hook: &str, source: &str) -> Value {
         json!({"captureId":id,"recordType":"lifecycle_event", "traceContext":{"session_id":"s"},
             "lifecycleEvent":{"source_event_name":hook,"source_event":{"session_id":"s","source":source}}})
+    }
+
+    fn boundary_at(id: &str, hook: &str, occurred_at: &str) -> Value {
+        json!({"captureId":id,"recordType":"lifecycle_event", "traceContext":{"session_id":"s"},
+            "lifecycleEvent":{"source_event_name":hook,"occurred_at":occurred_at,
+                "source_event":{"session_id":"s"}}})
+    }
+
+    #[test]
+    fn duplicate_hook_boundaries_do_not_open_extra_epochs() {
+        let captures = vec![
+            boundary_at(
+                "start-1",
+                "SessionStart",
+                "2026-10-20T07:14:49.169098+00:00",
+            ),
+            boundary_at(
+                "start-2",
+                "SessionStart",
+                "2026-10-20T07:14:49.172448+00:00",
+            ),
+            boundary_at("end-1", "SessionEnd", "2026-10-20T07:19:47.570448+00:00"),
+            boundary_at("end-2", "SessionEnd", "2026-10-20T07:19:47.571474+00:00"),
+        ];
+        let view = summarize_session(&captures, "s").unwrap();
+        assert_eq!(view.session_epochs, 1);
+        assert_eq!(view.closed_session_epochs, 1);
+        assert_eq!(view.invalid_session_boundaries, 0);
+        assert!(view.latest_epoch_closed);
     }
 
     fn telemetry(id: &str, endpoint: &str, raw: Value) -> Value {

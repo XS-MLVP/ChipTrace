@@ -502,6 +502,9 @@ struct ExportMaasArgs {
     max_batch_bytes: u64,
     #[arg(long)]
     replace: bool,
+    /// 跳过没有完整 input/output Token 用量的失败或中断 Wire，而不是让整批导出失败。
+    #[arg(long)]
+    skip_incomplete: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1062,6 +1065,7 @@ async fn main() -> Result<()> {
             timezone_offset_minutes: args.timezone_offset_minutes,
             max_batch_bytes: args.max_batch_bytes,
             replace: args.replace,
+            skip_incomplete: args.skip_incomplete,
         })?)?,
         Command::VerifyMaas(args) => {
             serde_json::to_value(verify_maas(&args.input, args.max_batch_bytes)?)?
