@@ -40,6 +40,10 @@ COPY --from=builder /out/chiptrace /usr/local/bin/chiptrace
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY integrations/cloud-platform/plugin.js integrations/cloud-platform/server.js integrations/cloud-platform/client.js /opt/chiptrace/
 RUN test "$(node --version)" = "v22.23.3" \
+    # The build context may carry 0600 source files on NFS.  The runtime user
+    # is configurable (CHIPTRACE_RUN_AS), so the copied scripts must be
+    # readable independently of the source mode.
+    && chmod 0755 /opt/chiptrace/*.js \
     && mkdir -p /data/platform /data/capture /data/objects \
     && chown -R 10001:10001 /data /opt/chiptrace
 ENV CHIPTRACE_BIN=/usr/local/bin/chiptrace \

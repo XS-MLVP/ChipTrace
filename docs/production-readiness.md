@@ -1,5 +1,36 @@
 # 生产就绪评估
 
+## 2026-10-20 15:55（Asia/Shanghai）采集修复上线与实时复核
+
+提交 `8dbd12c4b206b61065b7e24807174a3f0b6fdd44` 已构建并滚动到本机三者：Runtime 镜像
+`sha256:10b1a4b23980ab1064f0f2c8a9e02639b1929ca5cd18e0b5760a229889b3807e`，Platform 镜像
+`sha256:f478c0d1cec6f2152f9f1b3691211bcf28fae32e157e078fabbcea3d7b9f1646`；部署 preflight
+实际退出 0，三个服务的 revision、非 root、资源上限与只读根均一致。Collector/Relay 的 WAL、
+inbox、outbox 和持久质量账本未清理。
+
+滚动后的短 Session `01a15846-a82c-74a2-bc6f-10c6b73283ea`（patched 生产者、真实 18084）
+实测 6 条 Wire、17 个 OTLP 日志批次、11 个 OTLP Trace 批次、8 个 Hook、5 条工具执行；四源
+均观测且新鲜，`turn_capture_ready=true`，进程内成功 Turn-scoped Wire 7 条，pending/inflight/
+failed 均为 0、守恒通过。持久质量账本仍为 `8,797`，本进程新增 0；`hooks_freshness_window_ms`
+线上已为 3,600,000。Relay `/ready` 仍为 503，唯一原因是历史质量账本非零，代码和业务门禁没有
+新的失败项。使用第二次审计基线 `ceab1cf5...`（8,797 条，含 5 条空/合成 Hook 探针和 1 条
+unsupported OTLP log，均非 Stock Codex 业务记录）运行的 `runtime-health-gate` 实际退出 0：
+`coverage_status=complete`、`turn_capture_ready=true`、`new_quality_errors=0`，Wire/OTLP
+logs/OTLP traces/Hook 四源均在窗口内。`/ready` 的 503 与这个基线门禁是两套契约：前者坚持
+持久账本为零，后者按已审计增量判断。
+
+本轮同时修复网关可用性：客户端被杀死时会在 outbox 留下 open transaction，旧实现只在进程启动
+时恢复，导致 `/health` 长期 degraded。现在启动后每 5 分钟只恢复超过 30 分钟的 open 事务，
+不会与在途 Capture 竞争；重启后 `openTransactions=0`、`currentDeliveryHealthy=true`。
+Platform 镜像构建还暴露了 NFS 源文件 `0600` 导致非 10001 运行用户无法读取 `server.js` 的问题，
+Dockerfile 已显式 `chmod 0755 /opt/chiptrace/*.js`。
+
+严格 `inspect-session` 仍为 `delivery_ready=false`：该 Session 的 1 个 Turn 已闭合、四源完整、
+5/5 工具调用/执行/结果配对，但 source-context 审计仍列出启动/辅助 OTLP span（`fs.*`、
+config/auth、plugin、app-server RPC 等）没有 producer 声明的 Session/process 作用域。业务
+Turn 的 Wire、工具和 SSE 记录不在缺口内；这属于 `session-scope-audit` 仍需上游化的生产者
+作用域补丁，不能用名称豁免或默认归属绕过。
+
 ## 2026-10-20 12:26（Asia/Shanghai）上游恢复、真实 Turn 采集与 MaaS 导出修复
 
 18084 的 Sub2API GPT pro 上游账户 1 和 12 实际返回
