@@ -7,6 +7,7 @@
 | [config.toml.example](config.toml.example) | `/etc/codex/config.toml` | 默认 18084 Responses、OTLP 和 25 次网络重试 |
 | [requirements.toml.example](requirements.toml.example) | `/etc/codex/requirements.toml` | 强制 Provider 选择及完整定义、required 生命周期 Hook，并在 SessionStart 执行前置检查 |
 | [chiptrace-codex-hook.sh](chiptrace-codex-hook.sh) | `/usr/local/libexec/chiptrace-codex-hook` | 发送生命周期事件并校验 Relay durable receipt |
+| [install-host.sh](install-host.sh) | root 安装脚本 | 原子备份并安装两个配置、helper 和采集 token |
 
 系统 `config.toml` 提供默认值，用户配置和会话参数可以覆盖它。仅安装该文件不能证明
 Responses 经过 18084：OTLP/Hook 可以仍发往云端，而同名 Provider 已被用户改到另一个入口。
@@ -20,30 +21,35 @@ Gateway 地址和采集凭据；它不依赖 Provider 业务 Key 或 OTLP header
 
 ```bash
 export CHIPTRACE_API_KEY='<provider-token>'
-export CHIPTRACE_INGEST_TOKEN='<ingest-token>'
-export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer%20${CHIPTRACE_INGEST_TOKEN}"
-# Same-host installs may omit this (the helper defaults to 127.0.0.1:18084).
-# For a remote/sidecar Gateway set the exact address used by config.toml.
+export CHIPTRACE_INGEST_TOKEN_FILE=/etc/chiptrace/ingest-token
+# The launcher reads the protected token file and sets the OTLP header for
+# Codex. If an external secret manager supplies the header, its value is
+# Authorization=Bearer%20${CHIPTRACE_INGEST_TOKEN}; do not put the token in a
+# shell command. Same-host installs may omit CHIPTRACE_GATEWAY_URL; the helper
+# uses 127.0.0.1:18084. Remote/sidecar deployments must set the exact Hook
+# gateway.
 export CHIPTRACE_GATEWAY_URL='http://127.0.0.1:18084'
 ```
 
-推荐把采集凭据放在权限为 `0600` 的 root-owned 文件中，避免把内部 token 放进用户 shell
-历史或进程启动参数：
+推荐把采集凭据放在 root-owned、仅 Codex 运行组可读的文件中，避免把内部 token 放进用户
+shell 历史或进程启动参数。Hook 与 Codex 由同一普通用户运行，因此 token 文件必须对该
+用户所属的受管组可读：
 
 ```bash
-install -d -m 0755 /etc/codex
-install -m 0600 config.toml.example /etc/codex/config.toml
-install -m 0600 requirements.toml.example /etc/codex/requirements.toml
-install -d -m 0755 /usr/local/libexec
-install -m 0755 chiptrace-codex-hook.sh /usr/local/libexec/chiptrace-codex-hook
-install -d -m 0700 /etc/chiptrace
-install -m 0600 /path/to/chiptrace-ingest-token /etc/chiptrace/ingest-token
-export CHIPTRACE_INGEST_TOKEN_FILE=/etc/chiptrace/ingest-token
+sudo ./install-host.sh /path/to/chiptrace-ingest-token
+# If /etc/codex is owned by root:root, select the group used to run Codex:
+sudo CHIPTRACE_CODEX_GROUP=codex ./install-host.sh /path/to/chiptrace-ingest-token
 ```
 
-`CHIPTRACE_GATEWAY_URL` 必须与 `config.toml` 的 `base_url` 使用同一个网关；远程部署必须显式
-设置该变量。安装后先执行一次无业务请求的
-Hook 预检：
+脚本会原子替换 `/etc/codex/config.toml`、`/etc/codex/requirements.toml`、
+`/usr/local/libexec/chiptrace-codex-hook` 和 `/etc/chiptrace/ingest-token`，先在
+`/var/lib/chiptrace-codex/backups` 留存旧文件（备份为 `0600 root:root`）；配置为
+`0640 root:<CodexGroup>`，token 目录为 `0750 root:<CodexGroup>`，并拒绝旧内嵌 token、旧
+私网 Hook 地址和 `configuration incomplete` 文案。
+
+`CHIPTRACE_GATEWAY_URL` 必须指向承载 `/hooks/codex` 的 Hook Relay；同机部署使用
+`http://127.0.0.1:18084`，远程或 sidecar 部署必须显式设置该变量。Provider 的
+`base_url` 由路由预检单独核对。安装后先执行一次无业务请求的 Hook 预检：
 
 ```bash
 printf '%s' '{"hook_event_name":"SessionStart","session_id":"preflight","model":"preflight","permission_mode":"default","source":"startup"}' \
@@ -59,13 +65,12 @@ printf '%s' '{"hook_event_name":"SessionStart","session_id":"preflight","model":
 
 `CHIPTRACE_API_KEY` 必须是目标 18084 上游业务系统授权的凭据。当前 router_v2 部署由
 Sub2API 验证业务鉴权；另一个 Provider 接受的凭据不能据此视为可在 18084 使用。
-2026-10-15 使用同一份现有 Codex 凭据做只读目录检查，共享 Provider 返回 HTTP 200，
-18084 `/models` 返回 HTTP 401；没有发送模型请求，也没有输出凭据或响应正文。
-管理员应先在目标新客户端进程注入 Provider 业务凭据、采集凭据和网关地址，并用该部署
+2026-10-20 的 `codex doctor --network` 已用现有 Codex 凭据完成只读目录检查并返回 HTTP 200；
+该检查没有发送模型请求，也没有输出凭据或响应正文。管理员仍应在目标新客户端进程中用该部署
 授权的业务凭据验证目录访问，再下发受管配置和运行真实 Canary。目录访问成功只证明该次目录请求被接受，
 模型生成、逐 Turn 四源和远端持久化仍需分别验收。
 
-配置文件保持权限为 `0600`，Hook helper 保持权限为 `0755`，并用严格配置启动：
+受管配置和采集 token 保持 `0640 root:<CodexGroup>`，token 目录保持 `0750`，Hook helper 保持 `0755 root:root`；回滚备份保持 `0600 root:root`。启动时使用严格配置：
 
 ```bash
 codex --strict-config
