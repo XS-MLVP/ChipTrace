@@ -1,4 +1,4 @@
-.PHONY: check test gateway-test gateway-receipt-test gateway-host-test failed-outbox-replay-test codex-config-test codex-route-preflight-test managed-route-test protocol-collection-test protocol-sandbox-contract-test native-context-test native-canary-gate-test native-canary-evidence-test stock-release-gate-test producer-support-gate-test producer-report-gate-test provider-response-gate-test live-preflight-contract-test action-pin-gate-test runtime-health-gate-test quality-baseline-test quality-reason-contract-test platform-health-gate-test relay-quality-seed-test deployment-smoke-contract-test audit-memory-test turn-memory-test platform-test deployment-config-test gateway-preflight-test maas-contract-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
+.PHONY: check test gateway-test gateway-receipt-test gateway-host-test failed-outbox-replay-test codex-config-test claude-config-test codex-route-preflight-test managed-route-test protocol-collection-test protocol-sandbox-contract-test native-context-test native-canary-gate-test native-canary-evidence-test stock-release-gate-test producer-support-gate-test producer-report-gate-test provider-response-gate-test live-preflight-contract-test action-pin-gate-test runtime-health-gate-test quality-baseline-test quality-reason-contract-test platform-health-gate-test relay-quality-seed-test deployment-smoke-contract-test audit-memory-test turn-memory-test platform-test deployment-config-test gateway-preflight-test maas-contract-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
 
 CHIPTRACE_VERSION ?= 0.6.0
 CHIPTRACE_REVISION ?= $(shell git rev-parse HEAD)
@@ -33,6 +33,9 @@ codex-config-test:
 	cargo build --locked --bin chiptrace
 	node --test integrations/codex/config-contract.test.js integrations/codex/hook-ack.test.js
 	node --test scripts/ci/upstream-context.test.js scripts/ci/producer-source-cache.test.js scripts/ci/producer-command.test.js
+
+claude-config-test:
+	node --test integrations/claude-code/config-contract.test.js
 
 codex-route-preflight-test:
 	node --test scripts/deploy/codex-route-preflight.test.js
@@ -118,6 +121,7 @@ cloud-test:
 	$(MAKE) failed-outbox-replay-test
 	$(MAKE) gateway-receipt-test
 	$(MAKE) self-test
+	$(MAKE) claude-config-test
 	$(MAKE) codex-route-preflight-test
 	$(MAKE) native-context-test
 	$(MAKE) native-canary-gate-test

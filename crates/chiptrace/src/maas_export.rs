@@ -1046,14 +1046,18 @@ fn extract_usage(capture: &Value, response: &Value, response_text: &str) -> Opti
             }
         }
     }
-    let mut usage = Usage::default();
+    // Streams can publish an initial zero usage (Anthropic message_start)
+    // and the authoritative usage later (message_delta). The last complete
+    // observation is the terminal one; keep it instead of the first 0/0.
+    let mut best = None;
     for candidate in candidates {
+        let mut usage = Usage::default();
         find_usage(&candidate, &mut usage);
         if usage.input.is_some() && usage.output.is_some() {
-            return Some(usage);
+            best = Some(usage);
         }
     }
-    Some(usage).filter(|value| value.input.is_some() && value.output.is_some())
+    best
 }
 
 fn has_complete_usage(capture: &Value) -> bool {
@@ -1928,6 +1932,47 @@ mod tests {
         let metadata = metadata.expect("metadata.json");
         assert_eq!(metadata["inputTokens"], 42435);
         assert_eq!(metadata["outputTokens"], 54);
+    }
+
+    #[test]
+    fn uses_terminal_anthropic_usage_after_zero_message_start() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("anthropic-usage.ndjson");
+        let mut value = capture(
+            "req-anthropic-usage",
+            true,
+            json!({"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}),
+        );
+        value["responseBody"] = json!({
+            "kind":"text",
+            "value":concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+                "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":2274,\"output_tokens\":109}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            ),
+        });
+        fs::write(
+            &input,
+            format!("{}\n", serde_json::to_string(&value).unwrap()),
+        )
+        .unwrap();
+        let output = root.path().join("anthropic-usage-archive");
+        export_maas(config(input, output.clone())).unwrap();
+        let file = output.join("providerX/2026-08-17/batch_00001.tar.gz");
+        let decoder = flate2::read::GzDecoder::new(File::open(file).unwrap());
+        let mut archive = tar::Archive::new(decoder);
+        let mut metadata = None;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().ends_with("metadata.json") {
+                let mut text = String::new();
+                entry.read_to_string(&mut text).unwrap();
+                metadata = Some(serde_json::from_str::<Value>(&text).unwrap());
+            }
+        }
+        let metadata = metadata.expect("metadata.json");
+        assert_eq!(metadata["inputTokens"], 2274);
+        assert_eq!(metadata["outputTokens"], 109);
     }
 
     #[test]

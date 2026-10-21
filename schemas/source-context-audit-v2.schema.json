@@ -7,6 +7,7 @@
   "properties": {
     "schema_version": {"const": "chiptrace.source-context-audit.v2"},
     "session_id": {"type": "string", "minLength": 1},
+    "producer_profile": {"type": "string", "enum": ["", "codex", "claude-code"], "description": "Producer source profile. Empty on historical audits, which use the Codex four-source contract."},
     "selected_captures": {"$ref": "#/$defs/count", "description": "Captures included in the audit: selected Session, declared Process and batches with unknown Session owners. May exceed projection input_records."},
     "duplicate_captures_removed": {"$ref": "#/$defs/count"},
     "sources": {

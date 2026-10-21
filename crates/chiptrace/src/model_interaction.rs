@@ -116,6 +116,8 @@ pub struct CloudSourceCoverage {
     pub hooks: u64,
     pub missing_sources: Vec<String>,
     pub complete: bool,
+    #[serde(skip)]
+    profile: crate::session_view::ProducerProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1237,6 +1239,7 @@ fn read_session_snapshot(
         crate::turn_identity::ExactTurnIndex::default()
     };
     let mut found = false;
+    let mut claude_producer = false;
     // Inspect the entire corpus for duplicate conflicts, exact links and child
     // lineage before retaining payloads. Unrelated Sessions stay off the heap;
     // explicitly process-scoped telemetry is retained for audit conservation.
@@ -1253,6 +1256,7 @@ fn read_session_snapshot(
         }
         seen.insert(id.to_owned(), digest);
         found |= trace_string(&capture, "session_id") == Some(session);
+        claude_producer |= capture_is_claude_session(&capture, session);
         lineage.observe(&capture)?;
         observe_exact_task_links(&capture, &mut task_links)?;
         turn_index.observe_capture(&capture)?;
@@ -1293,8 +1297,12 @@ fn read_session_snapshot(
                 .iter()
                 .any(|s| selection.allows_session_id(s))
             || turn_index.capture_has_process_scope(&capture)?;
+        // Claude Code has no Turn-scoped OTLP sources. Unknown-owner OTLP
+        // batches in the same time window belong to other producers and must
+        // not be charged to this Session's audit.
         if let Some(audit) = &mut source_audit
-            && (selected || turn_index.capture_has_unknown_session(&capture)?)
+            && (selected
+                || (!claude_producer && turn_index.capture_has_unknown_session(&capture)?))
         {
             audit.observe_capture(&capture, &turn_index)?;
         }
@@ -1308,11 +1316,16 @@ fn read_session_snapshot(
     if visited.len() != seen.len() || repeated != duplicates {
         bail!("Capture inputs changed between Session selection scans");
     }
+    let producer_profile = crate::session_view::producer_profile(&captures);
     Ok(SessionCaptureSnapshot {
         captures,
         duplicates,
         scopes: turn_index,
-        source_audit: source_audit.map(|audit| audit.finish(duplicates)),
+        source_audit: source_audit.map(|audit| {
+            let mut audit = audit.finish(duplicates);
+            audit.producer_profile = producer_profile.as_str().to_owned();
+            audit
+        }),
     })
 }
 
@@ -1452,6 +1465,29 @@ fn capture_matches_session(
             .any(|session_id| selection.allows_session_id(session_id))
 }
 
+fn capture_is_claude_session(capture: &Value, session: &str) -> bool {
+    if trace_string(capture, "session_id") == Some(session)
+        && trace_string(capture, "session_identity_source") == Some("anthropic_metadata_user_id")
+    {
+        return true;
+    }
+    if let Some(raw) = capture
+        .pointer("/telemetryBatch/raw_json")
+        .and_then(Value::as_str)
+        && raw.contains("prompt_id")
+        && raw.contains(session)
+    {
+        return true;
+    }
+    if let Some(raw) = capture.pointer("/requestBody/raw").and_then(Value::as_str)
+        && raw.contains(session)
+        && raw.contains("\"user_id\"")
+    {
+        return true;
+    }
+    false
+}
+
 fn telemetry_batch_identities(capture: &Value) -> (BTreeSet<String>, BTreeSet<String>) {
     if record_type(capture) != "telemetry_batch" {
         return (BTreeSet::new(), BTreeSet::new());
@@ -1544,6 +1580,7 @@ fn insert_nonempty_str(value: Option<&str>, output: &mut BTreeSet<String>) {
 }
 
 fn cloud_source_coverage(captures: &[Value]) -> CloudSourceCoverage {
+    let profile = crate::session_view::producer_profile(captures);
     let mut coverage = CloudSourceCoverage {
         wire: 0,
         otlp_logs: 0,
@@ -1551,6 +1588,7 @@ fn cloud_source_coverage(captures: &[Value]) -> CloudSourceCoverage {
         hooks: 0,
         missing_sources: Vec::new(),
         complete: false,
+        profile,
     };
     for capture in captures {
         match record_type(capture) {
@@ -1575,7 +1613,7 @@ fn cloud_source_coverage(captures: &[Value]) -> CloudSourceCoverage {
         ("otlp_traces", coverage.otlp_traces),
         ("hooks", coverage.hooks),
     ] {
-        if count == 0 {
+        if count == 0 && profile.required_sources().contains(&name) {
             coverage.missing_sources.push(name.to_owned());
         }
     }
@@ -1584,17 +1622,16 @@ fn cloud_source_coverage(captures: &[Value]) -> CloudSourceCoverage {
 }
 
 fn cloud_source_coverage_consistent(coverage: &CloudSourceCoverage) -> bool {
-    let expected: Vec<String> = [
-        ("wire", coverage.wire),
-        ("otlp_logs", coverage.otlp_logs),
-        ("otlp_traces", coverage.otlp_traces),
-        ("hooks", coverage.hooks),
-    ]
-    .into_iter()
-    .filter(|(_, count)| *count == 0)
-    .map(|(name, _)| name.to_owned())
-    .collect();
-    coverage.missing_sources == expected && coverage.complete == expected.is_empty()
+    // The producer profile is not serialized into the manifest, so the
+    // on-disk check cannot recompute the required set. Validate the shape and
+    // the completion invariant instead; the collector computes missing_sources
+    // from the profile at projection time.
+    let known = ["wire", "otlp_logs", "otlp_traces", "hooks"];
+    coverage
+        .missing_sources
+        .iter()
+        .all(|source| known.contains(&source.as_str()))
+        && coverage.complete == coverage.missing_sources.is_empty()
 }
 
 fn model_interaction_from_capture(capture: &Value) -> Result<Value> {
@@ -1606,6 +1643,7 @@ fn model_interaction_from_capture(capture: &Value) -> Result<Value> {
     match shape.endpoint {
         "responses" => adapt_responses(capture, request_body, response_body, shape),
         "chat_completions" => adapt_chat_completions(capture, request_body, response_body, shape),
+        "messages" => adapt_anthropic(capture, request_body, response_body, shape),
         _ => adapt_opaque(capture, request_body, response_body, shape),
     }
     .with_context(|| format!("adapt Capture {capture_id}"))
@@ -1992,6 +2030,21 @@ fn detect_protocol_shape(
                 .any(|line| line.trim_start().starts_with("data:"))
         })
         || response.captured.get("kind").and_then(Value::as_str) == Some("sse");
+    let anthropic = path.contains("/v1/messages")
+        || path.contains("anthropic")
+        || request_object.is_some_and(|object| {
+            object.contains_key("anthropic_version") || object.contains_key("system")
+        })
+        || response.raw_utf8.as_deref().is_some_and(|raw| {
+            raw.contains("message_start") || raw.contains("content_block_start")
+        });
+    if anthropic {
+        return ProtocolShape {
+            family: "anthropic",
+            endpoint: "messages",
+            transport: if stream { "stream" } else { "non_stream" },
+        };
+    }
     let endpoint = if path.contains("chat/completions")
         || request_object.is_some_and(|object| object.contains_key("messages"))
             && response_object.is_some_and(|object| object.contains_key("choices"))
@@ -2694,8 +2747,8 @@ fn interaction_integrity(
         && response.declared_bytes == Some(0)
         && response.raw_utf8.as_deref() == Some("")
         && !response.truncated;
-    let protocol_complete = shape.family == "openai"
-        && shape.endpoint == "responses"
+    let protocol_complete = ((shape.family == "openai" && shape.endpoint == "responses")
+        || (shape.family == "anthropic" && shape.endpoint == "messages"))
         && shape.transport == "stream"
         && (protocol_terminal_complete
             || pre_response_transport_failure_complete
@@ -3544,6 +3597,386 @@ fn adapt_chat_completions(
             "client_delivery_status":state.client_delivery_status,
             "output_items":output_items,
             "choices":choices,
+            "raw":response,
+        },
+        "tool_definitions":tool_definitions,
+        "model_tool_calls":model_tool_calls,
+        "tool_results_submitted":tool_results_submitted,
+        "usage":normalized_usage(&response, capture),
+        "timing":interaction_timing(capture),
+        "error":capture_error(capture, &response, state.error_event.as_ref()),
+        "raw_capture_refs":[raw_capture_ref(capture)],
+        "integrity":integrity,
+        "extensions":{
+            "wire":{
+                "request":wire_body_value(&request_body),
+                "response":wire_body_value(&response_body),
+                "sse_events":stream_events,
+                "malformed_sse_events":malformed_events,
+                "framing_recovered_events":framing_recovered_events,
+                "stream_state":stream_state_value(&state),
+            },
+            "routing":routing_extension(capture),
+        },
+    }))
+}
+
+#[derive(Debug, Default)]
+struct AnthropicBlockAccumulator {
+    block_type: String,
+    text: String,
+    thinking: String,
+    tool_id: Option<String>,
+    tool_name: Option<String>,
+    partial_json: String,
+    raw_start: Value,
+}
+
+fn anthropic_response_view(
+    body: &WireBody,
+    shape: &ProtocolShape,
+) -> (Value, Value, bool, u64, u64) {
+    if shape.transport != "stream" {
+        return (body.parsed.clone(), json!([]), true, 0, 0);
+    }
+    let Some(raw) = body.raw_utf8.as_deref() else {
+        return (body.parsed.clone(), json!([]), false, 0, 0);
+    };
+    let parsed_sse = parse_sse(raw);
+    let events = parsed_sse.events;
+    let mut response_id = None;
+    let mut response_model = None;
+    let mut role = None;
+    let mut stop_reason = None;
+    let mut usage = serde_json::Map::new();
+    let mut blocks: BTreeMap<u64, AnthropicBlockAccumulator> = BTreeMap::new();
+    let mut terminal = false;
+    let mut error_event = None;
+    for event in &events {
+        let Some(chunk) = event.data.as_ref() else {
+            continue;
+        };
+        match chunk.get("type").and_then(Value::as_str).unwrap_or("") {
+            "message_start" => {
+                let message = chunk.get("message").unwrap_or(&Value::Null);
+                response_id = message.get("id").cloned().or(response_id);
+                response_model = message.get("model").cloned().or(response_model);
+                role = message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or(role);
+                merge_usage(&mut usage, message.get("usage"));
+            }
+            "content_block_start" => {
+                let index = chunk.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let block = chunk.get("content_block").cloned().unwrap_or(Value::Null);
+                blocks.insert(
+                    index,
+                    AnthropicBlockAccumulator {
+                        block_type: block
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_owned(),
+                        text: block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        thinking: block
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        tool_id: block.get("id").and_then(Value::as_str).map(str::to_owned),
+                        tool_name: block.get("name").and_then(Value::as_str).map(str::to_owned),
+                        partial_json: String::new(),
+                        raw_start: block,
+                    },
+                );
+            }
+            "content_block_delta" => {
+                let index = chunk.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let delta = chunk.get("delta").unwrap_or(&Value::Null);
+                let accumulator = blocks.entry(index).or_default();
+                match delta.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "text_delta" => accumulator
+                        .text
+                        .push_str(delta.get("text").and_then(Value::as_str).unwrap_or("")),
+                    "thinking_delta" => accumulator
+                        .thinking
+                        .push_str(delta.get("thinking").and_then(Value::as_str).unwrap_or("")),
+                    "input_json_delta" => accumulator.partial_json.push_str(
+                        delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                    ),
+                    _ => {}
+                }
+            }
+            "message_delta" => {
+                if let Some(reason) = chunk
+                    .get("delta")
+                    .and_then(|delta| delta.get("stop_reason"))
+                    && !reason.is_null()
+                {
+                    stop_reason = Some(reason.clone());
+                }
+                merge_usage(&mut usage, chunk.get("usage"));
+            }
+            "message_stop" => terminal = true,
+            "error" => {
+                error_event = Some(chunk.clone());
+                terminal = true;
+            }
+            _ => {}
+        }
+    }
+    let content: Vec<Value> = blocks
+        .into_values()
+        .map(|block| match block.block_type.as_str() {
+            "text" => json!({"type":"text","text":block.text}),
+            "thinking" => json!({"type":"thinking","thinking":block.thinking}),
+            "tool_use" => {
+                let input = if block.partial_json.is_empty() {
+                    block
+                        .raw_start
+                        .get("input")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}))
+                } else {
+                    serde_json::from_str(&block.partial_json).unwrap_or_else(|_| json!({}))
+                };
+                json!({
+                    "type":"tool_use",
+                    "id":block.tool_id,
+                    "name":block.tool_name,
+                    "input":input
+                })
+            }
+            _ => block.raw_start,
+        })
+        .collect();
+    let response = json!({
+        "id":response_id,
+        "type":"message",
+        "role":role.unwrap_or_else(|| "assistant".to_owned()),
+        "model":response_model,
+        "content":content,
+        "stop_reason":stop_reason,
+        "usage":Value::Object(usage),
+        "error":error_event,
+    });
+    let events_value = json!(
+        events
+            .iter()
+            .map(|event| json!({
+                "index":event.index,
+                "event":event.event,
+                "data_raw":event.data_raw,
+                "data":event.data,
+                "byte_start":event.byte_start,
+                "byte_end":event.byte_end,
+            }))
+            .collect::<Vec<_>>()
+    );
+    (
+        response,
+        events_value,
+        terminal,
+        parsed_sse.malformed,
+        parsed_sse.recovered_boundaries,
+    )
+}
+
+fn merge_usage(usage: &mut serde_json::Map<String, Value>, value: Option<&Value>) {
+    let Some(value) = value.and_then(Value::as_object) else {
+        return;
+    };
+    for (key, item) in value {
+        if item.is_number() {
+            usage.insert(key.clone(), item.clone());
+        }
+    }
+}
+
+fn anthropic_model_tool_calls(content: Option<&Value>) -> Vec<Value> {
+    content
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, block)| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .map(|(index, block)| {
+            json!({
+                "call_id":block.get("id"),
+                "item_id":block.get("id"),
+                "name":block.get("name"),
+                "arguments":block.get("input"),
+                "choice_index":0,
+                "output_index":index,
+                "raw":block,
+            })
+        })
+        .collect()
+}
+
+fn anthropic_submitted_results(messages: &[Value]) -> Vec<Value> {
+    let mut results = Vec::new();
+    for message in messages {
+        let Some(content) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in content {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let is_error = block
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            results.push(json!({
+                "call_id":block.get("tool_use_id"),
+                "content":block.get("content"),
+                "status":if is_error { "error" } else { "success" },
+                "raw":block,
+            }));
+        }
+    }
+    results
+}
+
+fn anthropic_stream_state(capture: &Value, response: &Value, terminal: bool) -> StreamState {
+    let error_event = response
+        .get("error")
+        .filter(|value| !value.is_null())
+        .cloned();
+    let failed = error_event.is_some();
+    let protocol_terminal_observed = terminal
+        || response
+            .get("stop_reason")
+            .is_some_and(|value| !value.is_null());
+    let transport_error = explicit_transport_error(capture);
+    let outcome = if failed {
+        StreamOutcome::Failed
+    } else if protocol_terminal_observed {
+        StreamOutcome::Completed
+    } else if transport_error {
+        StreamOutcome::TransportError
+    } else {
+        StreamOutcome::EofWithoutTerminal
+    };
+    StreamState {
+        outcome,
+        model_status: if failed {
+            "failed"
+        } else if protocol_terminal_observed {
+            "completed"
+        } else {
+            "incomplete"
+        },
+        upstream_transport_status: if transport_error {
+            "transport_error"
+        } else if protocol_terminal_observed {
+            "completed"
+        } else {
+            "eof_without_terminal"
+        },
+        client_delivery_status: client_delivery_status(capture),
+        protocol_terminal_observed,
+        framing_done_observed: terminal,
+        http_error_response_complete: false,
+        error_event,
+    }
+}
+
+fn adapt_anthropic(
+    capture: &Value,
+    request_body: WireBody,
+    response_body: WireBody,
+    shape: ProtocolShape,
+) -> Result<Value> {
+    let request = request_body.parsed.as_object().cloned().unwrap_or_default();
+    let (response, stream_events, terminal, malformed_events, framing_recovered_events) =
+        anthropic_response_view(&response_body, &shape);
+    let request_messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let input_items = normalized_wire_items(&request_messages);
+    let content = response.get("content").and_then(Value::as_array);
+    let output_items = normalized_wire_items(content.map(Vec::as_slice).unwrap_or(&[]));
+    let model_tool_calls = anthropic_model_tool_calls(response.get("content"));
+    let tool_results_submitted = anthropic_submitted_results(&request_messages);
+    let tool_definitions = request_tool_definitions(&request);
+    let unknown_items = request_messages
+        .iter()
+        .filter(|item| {
+            item.get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| !matches!(role, "system" | "user" | "assistant"))
+        })
+        .count() as u64;
+    let features = interaction_features(
+        &request,
+        &response,
+        &input_items,
+        &output_items,
+        &model_tool_calls,
+        shape.endpoint,
+    );
+    let state = if shape.transport == "stream" {
+        anthropic_stream_state(capture, &response, terminal)
+    } else {
+        non_stream_state(capture, &response)
+    };
+    let integrity = interaction_integrity(
+        capture,
+        &request_body,
+        &response_body,
+        &shape,
+        &state,
+        malformed_events,
+        unknown_items,
+    );
+    Ok(json!({
+        "schema_version":MODEL_INTERACTION_SCHEMA_VERSION,
+        "interaction_id":interaction_id(capture),
+        "protocol":{
+            "family":shape.family,
+            "endpoint":shape.endpoint,
+            "transport":shape.transport,
+            "features":features,
+            "adapter_version":ADAPTER_VERSION,
+        },
+        "provenance":producer_provenance(capture),
+        "trace_context":trace_context(capture),
+        "request":{
+            "model":request.get("model"),
+            "input_items":input_items,
+            "raw":request_body.parsed,
+        },
+        "response":{
+            "id":response.get("id"),
+            "model":response.get("model"),
+            "status":state.model_status,
+            "model_status":state.model_status,
+            "upstream_transport_status":state.upstream_transport_status,
+            "client_delivery_status":state.client_delivery_status,
+            "output_items":output_items,
+            "content":response.get("content"),
+            "stop_reason":response.get("stop_reason"),
+            // The canonical schema evolved from the OpenAI adapter and
+            // requires `choices`; expose the Anthropic message as one choice
+            // without changing the wire response above.
+            "choices":[{
+                "index":0,
+                "message":{"role":"assistant","content":response.get("content")},
+                "finish_reason":response.get("stop_reason"),
+            }],
             "raw":response,
         },
         "tool_definitions":tool_definitions,
@@ -9500,6 +9933,7 @@ mod tests {
     ) -> crate::session_view::SessionView {
         crate::session_view::SessionView {
             schema_version: crate::session_view::SESSION_VIEW_SCHEMA_VERSION.to_owned(),
+            profile: crate::session_view::ProducerProfile::Codex,
             session_id: "session-coverage".to_owned(),
             session_epochs: 1,
             closed_session_epochs: 1,
@@ -9617,6 +10051,59 @@ mod tests {
                 .to_string()
                 .contains("has no Raw Capture evidence in Session/Turn")
         );
+    }
+
+    #[test]
+    fn anthropic_messages_stream_extracts_tool_call_and_terminal_usage() {
+        let request = json!({
+            "model":"deepseek-flash","stream":true,"max_tokens":64,
+            "system":"You are Claude Code.",
+            "messages":[{"role":"user","content":"run echo"}],
+            "tools":[{
+                "name":"Bash","description":"run a command",
+                "input_schema":{"type":"object","properties":{"command":{"type":"string"}}}
+            }]
+        });
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"model\":\"deepseek-flash\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu-1\",\"name\":\"Bash\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":42,\"output_tokens\":7}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let capture = json!({
+            "captureId":"cap-anthropic",
+            "recordType":"api_snapshot",
+            "proxiedPath":"/v1/messages",
+            "traceContext":{
+                "session_id":"s","turn_id":"t",
+                "session_identity_source":"anthropic_metadata_user_id"
+            },
+            "requestBody":{"kind":"json","value":request},
+            "responseBody":{"kind":"text","value":sse},
+            "stream":true,
+            "responseStatus":200,
+            "startedAt":"2026-10-21T00:00:00Z",
+            "responseProtocolTerminalEvent":"message_stop",
+            "clientResponseFinished":true
+        });
+        let interaction = model_interaction_from_capture(&capture).unwrap();
+        assert_eq!(interaction["protocol"]["family"], "anthropic");
+        assert_eq!(interaction["protocol"]["endpoint"], "messages");
+        assert_eq!(interaction["model_tool_calls"][0]["call_id"], "toolu-1");
+        assert_eq!(interaction["model_tool_calls"][0]["name"], "Bash");
+        assert_eq!(
+            interaction["model_tool_calls"][0]["arguments"]["command"],
+            "echo hi"
+        );
+        assert_eq!(interaction["usage"]["input_tokens"], 42);
+        assert_eq!(interaction["usage"]["output_tokens"], 7);
+        assert_eq!(interaction["tool_definitions"][0]["name"], "Bash");
     }
 
     #[test]

@@ -1,5 +1,42 @@
 # 生产就绪评估
 
+## 2026-10-21 12:00（Asia/Shanghai）Claude Code + DeepSeek 采集支持
+
+采集器已从 Codex Responses 扩展到 Claude Code 的 Anthropic Messages（DeepSeek 模型）。
+真实 Claude Code `2.1.304` + `deepseek-flash` 会话
+`f7d5c056-d400-4b06-8329-f5dd0d554099`（两个用户 Prompt、Bash/Write 工具）实测：
+
+| 项 | 结果 |
+| --- | --- |
+| `inspect-session` | `delivery_ready=true`，profile=`claude-code` |
+| Session/Turn | 2 个 epoch 全部闭合，2 个 native Turn，`incomplete=0` |
+| 来源 | Wire 6、Hook 20、OTLP 0（Claude 当前只导出 metrics） |
+| 工具 | Bash、Write；6/6 调用/执行/结果配对 |
+| 协议/运行时完整性 | `protocol_complete=true`、`runtime_complete=true` |
+| Source-context 审计 | 0 gap groups |
+
+标签链路：
+
+- Wire 的 native Session 来自请求体 `metadata.user_id.session_id`（网关回填
+  `traceContext.session_id`）。
+- Claude Code 原生 `prompt_id` 作为 `turn_id`/`root_turn_id`，来源标记
+  `claude_prompt_id`；网关从 Hook 状态文件把同一值回填到 Wire，来源标记
+  `claude_hook_prompt_boundary`，因此 Wire、Hook、Tool 共享一个显式 Turn 身份。
+- `PostToolUse.tool_use_id` 与 Wire `tool_use.id` 精确配对；工具状态按
+  `interrupted`/`is_error` 映射为 `cancelled/error`，否则 `success`。
+- Claude profile 的必需来源是 **Wire + Hook**；OTLP logs/traces 不计为缺失。Codex
+  profile 仍保持四源契约。
+
+外部 MaaS 样本：6 个协议完成请求、`batch_00001.tar.gz` 117,820 bytes、SHA-256
+`60608805a557b3fa539ae840fe785fb9b9fd6572ff647fed0bcb45b66d5f6c36`，输入 4,498 /
+输出 1,262 Token，`protocol=ANTHROPIC`、`modelName=deepseek-flash`，`verify-maas` 退出 0。
+样本位于 `router_v2/records/chiptrace-samples/maas-claude-f7d5c056-v2/`。
+
+OTLP 说明：Claude Code `2.1.304` 在当前第三方 DeepSeek 配置下只实际导出
+`/v1/metrics`（本地探测确认），logs/traces 未导出。本轮没有伪造 OTLP 记录，也没有把
+metrics 当作 Turn 级证据；接入说明和 Hook 样例见
+[integrations/claude-code](../integrations/claude-code/README.md)。
+
 ## 2026-10-20 17:00（Asia/Shanghai）严格 Session 验收首次通过
 
 固定 `0.163.0` + 七补丁之外，本轮又补齐了辅助作用域，patched 生产者现在能产生

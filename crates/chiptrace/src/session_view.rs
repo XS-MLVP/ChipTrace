@@ -14,6 +14,50 @@ use time::format_description::well_known::Rfc3339;
 
 pub const SESSION_VIEW_SCHEMA_VERSION: &str = "chiptrace.session-view.v2";
 
+/// Producer profiles have different authoritative source sets. Codex publishes
+/// Turn-scoped Wire, OTLP logs, OTLP traces and lifecycle Hooks; Claude Code
+/// publishes Wire plus lifecycle/tool Hooks and does not emit Turn-scoped OTLP
+/// logs/traces in the audited version. Requiring four sources from Claude Code
+/// would reject complete, correctly labelled data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ProducerProfile {
+    #[default]
+    Codex,
+    ClaudeCode,
+}
+
+impl ProducerProfile {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claude-code",
+        }
+    }
+
+    pub(crate) fn required_sources(self) -> &'static [&'static str] {
+        match self {
+            Self::Codex => &["wire", "otlp_logs", "otlp_traces", "hooks"],
+            Self::ClaudeCode => &["wire", "hooks"],
+        }
+    }
+}
+
+pub(crate) fn producer_profile(captures: &[Value]) -> ProducerProfile {
+    if captures.iter().any(|capture| {
+        string(capture, "/traceContext/session_identity_source")
+            == Some("anthropic_metadata_user_id")
+            || string(capture, "/lifecycleEvent/source_event/prompt_id").is_some()
+            || capture
+                .pointer("/telemetryBatch/raw_json")
+                .and_then(Value::as_str)
+                .is_some_and(|raw| raw.contains("\"prompt_id\""))
+    }) {
+        ProducerProfile::ClaudeCode
+    } else {
+        ProducerProfile::Codex
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TurnSourceCoverage {
     pub wire: u64,
@@ -25,7 +69,7 @@ pub struct TurnSourceCoverage {
 }
 
 impl TurnSourceCoverage {
-    fn new() -> Self {
+    fn new(profile: ProducerProfile) -> Self {
         let mut coverage = Self {
             wire: 0,
             otlp_logs: 0,
@@ -34,11 +78,11 @@ impl TurnSourceCoverage {
             missing_sources: Vec::new(),
             complete: false,
         };
-        coverage.finalize();
+        coverage.finalize(profile);
         coverage
     }
 
-    fn observe(&mut self, source: &str) {
+    fn observe(&mut self, source: &str, profile: ProducerProfile) {
         match source {
             "wire" => self.wire = self.wire.saturating_add(1),
             "otlp_logs" => self.otlp_logs = self.otlp_logs.saturating_add(1),
@@ -46,10 +90,10 @@ impl TurnSourceCoverage {
             "hooks" => self.hooks = self.hooks.saturating_add(1),
             _ => return,
         }
-        self.finalize();
+        self.finalize(profile);
     }
 
-    fn finalize(&mut self) {
+    fn finalize(&mut self, profile: ProducerProfile) {
         self.missing_sources = [
             ("wire", self.wire),
             ("otlp_logs", self.otlp_logs),
@@ -57,24 +101,22 @@ impl TurnSourceCoverage {
             ("hooks", self.hooks),
         ]
         .into_iter()
-        .filter(|(_, count)| *count == 0)
+        .filter(|(source, count)| *count == 0 && profile.required_sources().contains(source))
         .map(|(source, _)| source.to_owned())
         .collect();
         self.complete = self.missing_sources.is_empty();
     }
 
-    fn is_consistent(&self) -> bool {
-        let expected: Vec<String> = [
-            ("wire", self.wire),
-            ("otlp_logs", self.otlp_logs),
-            ("otlp_traces", self.otlp_traces),
-            ("hooks", self.hooks),
-        ]
-        .into_iter()
-        .filter(|(_, count)| *count == 0)
-        .map(|(source, _)| source.to_owned())
-        .collect();
-        self.missing_sources == expected && self.complete == expected.is_empty()
+    fn is_consistent(&self, _profile: ProducerProfile) -> bool {
+        // The producer profile is not serialized with historical Session
+        // views, so validation checks the shape and the completion invariant.
+        // The profile-specific required set is applied when missing_sources is
+        // computed, not re-derived here.
+        let known = ["wire", "otlp_logs", "otlp_traces", "hooks"];
+        self.missing_sources
+            .iter()
+            .all(|source| known.contains(&source.as_str()))
+            && self.complete == self.missing_sources.is_empty()
     }
 }
 
@@ -106,6 +148,8 @@ impl TurnView {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionView {
     pub schema_version: String,
+    #[serde(skip)]
+    pub(crate) profile: ProducerProfile,
     pub session_id: String,
     pub session_epochs: u64,
     pub closed_session_epochs: u64,
@@ -194,7 +238,7 @@ impl SessionView {
             || self
                 .turns
                 .iter()
-                .any(|t| !t.source_coverage.is_consistent())
+                .any(|t| !t.source_coverage.is_consistent(self.profile))
             || self.turns.iter().any(|t| {
                 (t.status == "conflict") != t.state_conflict
                     || (matches!(t.status.as_str(), "closed" | "cancelled")
@@ -436,6 +480,7 @@ pub(crate) fn summarize_session_with_scopes(
     }
     let allowed_sessions = allowed_source_sessions(captures, session_id);
     let compaction = CompactionBoundaries::from_captures(captures);
+    let profile = producer_profile(captures);
     let mut lifecycle = LifecycleState::new("stock_codex_hook");
     // Open21 runs both the managed requirements Hooks and the user hooks.json.
     // Each boundary is therefore delivered twice, a few milliseconds apart;
@@ -527,7 +572,7 @@ pub(crate) fn summarize_session_with_scopes(
             tool_execution_records: 0,
             state_conflict: false,
             raw_capture_refs: BTreeSet::new(),
-            source_coverage: TurnSourceCoverage::new(),
+            source_coverage: TurnSourceCoverage::new(profile),
         });
         if let Some(root) = root_turn_id {
             if turn
@@ -544,7 +589,7 @@ pub(crate) fn summarize_session_with_scopes(
         turn.model_interactions += u64::from(is_wire);
         turn.tool_execution_records += u64::from(is_tool);
         if is_wire {
-            turn.source_coverage.observe("wire");
+            turn.source_coverage.observe("wire", profile);
         }
         // Hook coverage counts the durable original batch only. The derived
         // lifecycle/tool record remains boundary evidence, not another Hook.
@@ -616,10 +661,10 @@ pub(crate) fn summarize_session_with_scopes(
                 tool_execution_records: 0,
                 state_conflict: false,
                 raw_capture_refs: BTreeSet::new(),
-                source_coverage: TurnSourceCoverage::new(),
+                source_coverage: TurnSourceCoverage::new(profile),
             });
             turn.raw_capture_refs.insert(capture_id.to_owned());
-            turn.source_coverage.observe(observation.source);
+            turn.source_coverage.observe(observation.source, profile);
         }
     }
     for (key, turn) in &mut turns {
@@ -640,6 +685,7 @@ pub(crate) fn summarize_session_with_scopes(
     let incomplete_turns = turns.iter().filter(|turn| turn.incomplete()).count() as u64;
     let mut view = SessionView {
         schema_version: SESSION_VIEW_SCHEMA_VERSION.to_owned(),
+        profile,
         session_id: session_id.to_owned(),
         session_epochs: lifecycle.start_count,
         closed_session_epochs: lifecycle.terminal_count,
@@ -722,6 +768,62 @@ mod tests {
         assert_eq!(view.closed_session_epochs, 1);
         assert_eq!(view.invalid_session_boundaries, 0);
         assert!(view.latest_epoch_closed);
+    }
+
+    #[test]
+    fn claude_profile_requires_wire_and_hooks_only() {
+        let wire = json!({
+            "captureId":"wire","recordType":"api_snapshot",
+            "traceContext":{
+                "session_id":"s","turn_id":"t",
+                "session_identity_source":"anthropic_metadata_user_id"
+            }
+        });
+        let start = boundary("start", "SessionStart", "startup");
+        let prompt = telemetry(
+            "hook-prompt",
+            "codex_hook",
+            json!({
+                "hook_event_name":"UserPromptSubmit","session_id":"s","turn_id":"t",
+                "prompt_id":"t","prompt":"hi"
+            }),
+        );
+        let stop = telemetry(
+            "hook-stop",
+            "codex_hook",
+            json!({"hook_event_name":"Stop","session_id":"s","turn_id":"t","prompt_id":"t"}),
+        );
+        let lifecycle_stop = json!({
+            "captureId":"lifecycle-stop","recordType":"lifecycle_event",
+            "traceContext":{"session_id":"s","turn_id":"t"},
+            "lifecycleEvent":{
+                "type":"turn_end","source_event_name":"Stop",
+                "source_event":{"session_id":"s","prompt_id":"t"}
+            }
+        });
+        let end = boundary("end", "SessionEnd", "");
+        let view =
+            summarize_session(&[start, prompt, wire, stop, lifecycle_stop, end], "s").unwrap();
+        assert_eq!(view.profile, ProducerProfile::ClaudeCode);
+        let coverage = &view.turns[0].source_coverage;
+        assert!(coverage.complete, "{coverage:?} turns={:?}", view.turns);
+        assert!(coverage.missing_sources.is_empty());
+        assert_eq!(coverage.wire, 1);
+        assert_eq!(coverage.hooks, 2);
+        assert_eq!(coverage.otlp_logs, 0);
+        assert!(
+            view.delivery_ready,
+            "epochs={} closed={} invalid={} latest={} open={} conflict={} incomplete={} unscoped={} coverage={}",
+            view.session_epochs,
+            view.closed_session_epochs,
+            view.invalid_session_boundaries,
+            view.latest_epoch_closed,
+            view.open_turns,
+            view.conflicted_turns,
+            view.incomplete_turns,
+            view.unscoped_turn_records,
+            view.turn_source_coverage_complete,
+        );
     }
 
     fn telemetry(id: &str, endpoint: &str, raw: Value) -> Value {

@@ -52,6 +52,10 @@ pub struct ContextGapSample {
 pub struct SourceContextAudit {
     pub schema_version: String,
     pub session_id: String,
+    /// Producer profile that determines whether OTLP sources are expected.
+    /// Historical audits deserialize as empty (Codex, four-source).
+    #[serde(default)]
+    pub producer_profile: String,
     pub selected_captures: u64,
     pub duplicate_captures_removed: u64,
     pub sources: BTreeMap<String, SourceContextCounts>,
@@ -87,10 +91,16 @@ impl SourceContextAudit {
         }
         let mut unscoped = 0_u64;
         for source in ["otlp_logs", "otlp_traces"] {
-            let counts = self
-                .sources
-                .get(source)
-                .with_context(|| format!("source context audit is missing {source}"))?;
+            let Some(counts) = self.sources.get(source) else {
+                // Claude Code does not export Turn-scoped OTLP logs/traces in
+                // the audited version; Wire plus Hooks are its authoritative
+                // sources. A Codex audit still fails closed on a missing OTLP
+                // route.
+                if self.producer_profile == "claude-code" {
+                    continue;
+                }
+                bail!("source context audit is missing {source}");
+            };
             if counts.checked_total()? != counts.total_records {
                 bail!("source context audit {source} counts do not conserve records");
             }
@@ -265,6 +275,7 @@ impl SourceContextAuditBuilder {
         SourceContextAudit {
             schema_version: SOURCE_CONTEXT_AUDIT_SCHEMA_VERSION.to_owned(),
             session_id: self.session_id,
+            producer_profile: String::new(),
             selected_captures: self.selected_captures,
             duplicate_captures_removed: duplicates,
             unscoped_otlp_records: self.sources.values().map(|s| s.unscoped_turn_records).sum(),
