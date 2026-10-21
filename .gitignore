@@ -13,3 +13,6 @@ Trajectory 验收标准(1)(1).pdf
 # External requirement documents kept locally, not part of the repository.
 /*.docx
 /*.pdf
+
+# NFS silly-rename handles left by open deleted files.
+.nfs*
