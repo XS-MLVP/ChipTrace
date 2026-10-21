@@ -48,6 +48,10 @@ const INGEST_QUALITY_SEED_SCHEMA_VERSION: &str = "chiptrace.ingest-quality-seed.
 const INGEST_QUALITY_SEED_FILE: &str = "ingest-quality-seed.json";
 const MAX_INGEST_QUALITY_SEED_BYTES: u64 = 64 * 1024;
 const INGEST_COVERAGE_FRESHNESS_WINDOW_MS: u64 = 5 * 60 * 1_000;
+// Lifecycle Hooks are sparse: a single Turn can spend well over five minutes
+// in model/tool loops with no new Hook. A short window made a healthy,
+// long-running Session look stale and flipped turn_capture_ready to false.
+const INGEST_COVERAGE_HOOK_FRESHNESS_WINDOW_MS: u64 = 60 * 60 * 1_000;
 const LEGACY_UNCLASSIFIED_QUALITY_REASON: &str = "legacy_unclassified";
 const MIN_DELIVERY_READ_CONCURRENCY: usize = 4;
 const MAX_DELIVERY_READ_CONCURRENCY: usize = 16;
@@ -157,7 +161,9 @@ impl IngestQualitySeed {
                 self.schema_version
             );
         }
-        let total = self.counters.total();
+        let mut counters = self.counters;
+        counters.reconcile_reason_maps()?;
+        let total = counters.checked_total()?;
         if self.source_quality_errors != total {
             bail!(
                 "ingest quality seed total mismatch: source={}, counters={}",
@@ -165,8 +171,6 @@ impl IngestQualitySeed {
                 total
             );
         }
-        let mut counters = self.counters;
-        counters.reconcile_reason_maps()?;
         Ok(counters)
     }
 }
@@ -179,35 +183,14 @@ impl IngestQualityCounters {
         conversion_errors: u64,
         reasons: &BTreeMap<String, u64>,
     ) -> Result<()> {
-        match endpoint {
-            CloudEndpoint::OtlpLogs => {
-                self.otlp_logs_unknown_events =
-                    self.otlp_logs_unknown_events.saturating_add(unknown_events);
-                self.otlp_logs_conversion_errors = self
-                    .otlp_logs_conversion_errors
-                    .saturating_add(conversion_errors);
-            }
-            CloudEndpoint::OtlpTraces => {
-                self.otlp_traces_unknown_events = self
-                    .otlp_traces_unknown_events
-                    .saturating_add(unknown_events);
-                self.otlp_traces_conversion_errors = self
-                    .otlp_traces_conversion_errors
-                    .saturating_add(conversion_errors);
-            }
-            CloudEndpoint::CodexHook => {
-                self.codex_hook_unknown_events = self
-                    .codex_hook_unknown_events
-                    .saturating_add(unknown_events);
-                self.codex_hook_conversion_errors = self
-                    .codex_hook_conversion_errors
-                    .saturating_add(conversion_errors);
-            }
-        }
-        let expected = unknown_events.saturating_add(conversion_errors);
-        let observed = reasons
-            .values()
-            .fold(0_u64, |total, count| total.saturating_add(*count));
+        let expected = unknown_events
+            .checked_add(conversion_errors)
+            .context("quality reason total overflow")?;
+        let observed = reasons.values().try_fold(0_u64, |total, count| {
+            total
+                .checked_add(*count)
+                .context("quality reason map total overflow")
+        })?;
         if observed != expected {
             bail!(
                 "quality reason total mismatch for {}: reasons={}, expected={}",
@@ -216,14 +199,55 @@ impl IngestQualityCounters {
                 expected
             );
         }
-        let destination = self.reasons_mut(endpoint);
-        for (reason, count) in reasons {
+        for reason in reasons.keys() {
             if !is_quality_reason(reason) {
                 bail!("unsupported quality reason code: {reason}");
             }
-            let value = destination.entry(reason.clone()).or_insert(0);
-            *value = value.saturating_add(*count);
         }
+        // Build the new ledger value off to the side.  A failed checked
+        // addition must leave the caller's in-memory counters untouched as
+        // well as aborting the surrounding durable transaction.
+        let mut updated = self.clone();
+        match endpoint {
+            CloudEndpoint::OtlpLogs => {
+                updated.otlp_logs_unknown_events = updated
+                    .otlp_logs_unknown_events
+                    .checked_add(unknown_events)
+                    .context("OTLP logs unknown-event counter overflow")?;
+                updated.otlp_logs_conversion_errors = updated
+                    .otlp_logs_conversion_errors
+                    .checked_add(conversion_errors)
+                    .context("OTLP logs conversion-error counter overflow")?;
+            }
+            CloudEndpoint::OtlpTraces => {
+                updated.otlp_traces_unknown_events = updated
+                    .otlp_traces_unknown_events
+                    .checked_add(unknown_events)
+                    .context("OTLP traces unknown-event counter overflow")?;
+                updated.otlp_traces_conversion_errors = updated
+                    .otlp_traces_conversion_errors
+                    .checked_add(conversion_errors)
+                    .context("OTLP traces conversion-error counter overflow")?;
+            }
+            CloudEndpoint::CodexHook => {
+                updated.codex_hook_unknown_events = updated
+                    .codex_hook_unknown_events
+                    .checked_add(unknown_events)
+                    .context("Hook unknown-event counter overflow")?;
+                updated.codex_hook_conversion_errors = updated
+                    .codex_hook_conversion_errors
+                    .checked_add(conversion_errors)
+                    .context("Hook conversion-error counter overflow")?;
+            }
+        }
+        let destination = updated.reasons_mut(endpoint);
+        for (reason, count) in reasons {
+            let value = destination.entry(reason.clone()).or_insert(0);
+            *value = value
+                .checked_add(*count)
+                .context("quality reason counter overflow")?;
+        }
+        *self = updated;
         Ok(())
     }
 
@@ -243,13 +267,26 @@ impl IngestQualityCounters {
         }
     }
 
-    fn total(&self) -> u64 {
-        self.otlp_logs_unknown_events
-            .saturating_add(self.otlp_logs_conversion_errors)
-            .saturating_add(self.otlp_traces_unknown_events)
-            .saturating_add(self.otlp_traces_conversion_errors)
-            .saturating_add(self.codex_hook_unknown_events)
-            .saturating_add(self.codex_hook_conversion_errors)
+    #[cfg(test)]
+    fn total(&self) -> Result<u64> {
+        self.checked_total()
+    }
+
+    fn checked_total(&self) -> Result<u64> {
+        let mut total = 0_u64;
+        for count in [
+            self.otlp_logs_unknown_events,
+            self.otlp_logs_conversion_errors,
+            self.otlp_traces_unknown_events,
+            self.otlp_traces_conversion_errors,
+            self.codex_hook_unknown_events,
+            self.codex_hook_conversion_errors,
+        ] {
+            total = total
+                .checked_add(count)
+                .context("durable quality counter total overflow")?;
+        }
+        Ok(total)
     }
 
     fn reconcile_reason_maps(&mut self) -> Result<()> {
@@ -261,21 +298,26 @@ impl IngestQualityCounters {
             let expected = match endpoint {
                 CloudEndpoint::OtlpLogs => self
                     .otlp_logs_unknown_events
-                    .saturating_add(self.otlp_logs_conversion_errors),
+                    .checked_add(self.otlp_logs_conversion_errors)
+                    .context("OTLP logs quality counter overflow")?,
                 CloudEndpoint::OtlpTraces => self
                     .otlp_traces_unknown_events
-                    .saturating_add(self.otlp_traces_conversion_errors),
+                    .checked_add(self.otlp_traces_conversion_errors)
+                    .context("OTLP traces quality counter overflow")?,
                 CloudEndpoint::CodexHook => self
                     .codex_hook_unknown_events
-                    .saturating_add(self.codex_hook_conversion_errors),
+                    .checked_add(self.codex_hook_conversion_errors)
+                    .context("Hook quality counter overflow")?,
             };
             let reasons = self.reasons_mut(endpoint);
             if reasons.keys().any(|reason| !is_quality_reason(reason)) {
                 bail!("ingest quality ledger contains an unsupported reason code");
             }
-            let observed = reasons
-                .values()
-                .fold(0_u64, |total, count| total.saturating_add(*count));
+            let observed = reasons.values().try_fold(0_u64, |total, count| {
+                total
+                    .checked_add(*count)
+                    .context("quality reason map total overflow")
+            })?;
             if observed > expected {
                 bail!(
                     "ingest quality reason total exceeds endpoint total for {}",
@@ -286,9 +328,12 @@ impl IngestQualityCounters {
                 let legacy = reasons
                     .entry(LEGACY_UNCLASSIFIED_QUALITY_REASON.to_owned())
                     .or_insert(0);
-                *legacy = legacy.saturating_add(expected - observed);
+                *legacy = legacy
+                    .checked_add(expected - observed)
+                    .context("legacy quality reason counter overflow")?;
             }
         }
+        self.checked_total()?;
         Ok(())
     }
 }
@@ -1754,9 +1799,11 @@ impl IngestCoverageState {
     #[cfg(test)]
     fn new() -> Self {
         Self::with_quality_counters(IngestQualityCounters::default())
+            .expect("default quality counters must be valid")
     }
 
-    fn with_quality_counters(counters: IngestQualityCounters) -> Self {
+    fn with_quality_counters(counters: IngestQualityCounters) -> Result<Self> {
+        let quality_errors = counters.checked_total()?;
         let mut state = Self {
             started_at: utc_now(),
             wire: RouteCoverage::default(),
@@ -1766,7 +1813,7 @@ impl IngestCoverageState {
             hooks: RouteCoverage::default(),
             lifecycle_events: 0,
             tool_executions: 0,
-            quality_errors: counters.total(),
+            quality_errors,
             quality_errors_current_process: 0,
         };
         state.otlp_logs.quality_unknown_events = counters.otlp_logs_unknown_events;
@@ -1778,7 +1825,7 @@ impl IngestCoverageState {
         state.hooks.quality_unknown_events = counters.codex_hook_unknown_events;
         state.hooks.quality_conversion_errors = counters.codex_hook_conversion_errors;
         state.hooks.quality_reasons = counters.reasons(CloudEndpoint::CodexHook).clone();
-        state
+        Ok(state)
     }
 
     fn observe_wire(&mut self, acknowledged: &[(WireCaptureEvidence, bool)]) {
@@ -1920,9 +1967,13 @@ impl IngestCoverageState {
                 required_routes
                     .iter()
                     .filter_map(|(name, route)| {
+                        let window = if *name == "hooks" {
+                            INGEST_COVERAGE_HOOK_FRESHNESS_WINDOW_MS
+                        } else {
+                            INGEST_COVERAGE_FRESHNESS_WINDOW_MS
+                        };
                         route.last_observed_millis.and_then(|last| {
-                            (wire_last.saturating_sub(last) > INGEST_COVERAGE_FRESHNESS_WINDOW_MS)
-                                .then_some(*name)
+                            (wire_last.saturating_sub(last) > window).then_some(*name)
                         })
                     })
                     .collect()
@@ -1950,6 +2001,10 @@ impl IngestCoverageState {
         };
         let successful_turn_scoped_fresh = successful_turn_scoped_age_ms
             .is_some_and(|age| age <= INGEST_COVERAGE_FRESHNESS_WINDOW_MS);
+        let quality_breakdown_complete = quality_reason_breakdown_complete(
+            self.quality_errors,
+            [&self.otlp_logs, &self.otlp_traces, &self.hooks],
+        );
         // This is a process-level canary signal. It proves that the Relay has
         // recently received at least one fresh, identity-scoped successful
         // Turn Wire alongside synchronized source routes; it never claims
@@ -1966,6 +2021,7 @@ impl IngestCoverageState {
             "required_sources_fresh":required_sources_fresh,
             "freshness_applicable":wire_active || runtime_active,
             "freshness_window_ms":INGEST_COVERAGE_FRESHNESS_WINDOW_MS,
+            "hooks_freshness_window_ms":INGEST_COVERAGE_HOOK_FRESHNESS_WINDOW_MS,
             "wire_age_ms":wire_age_ms,
             "runtime_age_ms":runtime_age_ms,
             "runtime_active":runtime_active,
@@ -2000,6 +2056,7 @@ impl IngestCoverageState {
                 "otlp_traces":route_quality_value(&self.otlp_traces),
                 "hooks":route_quality_value(&self.hooks),
             },
+            "quality_reason_breakdown_complete":quality_breakdown_complete,
             "derived":{
                 "lifecycle_events":self.lifecycle_events,
                 "tool_executions":self.tool_executions,
@@ -2029,6 +2086,35 @@ fn route_quality_value(route: &RouteCoverage) -> Value {
             .saturating_add(route.quality_conversion_errors),
         "reasons":route.quality_reasons,
     })
+}
+
+fn quality_reason_breakdown_complete(total: u64, routes: [&RouteCoverage; 3]) -> bool {
+    let mut sum = 0_u64;
+    for route in routes {
+        let Some(route_total) = route
+            .quality_unknown_events
+            .checked_add(route.quality_conversion_errors)
+        else {
+            return false;
+        };
+        let Some(next_sum) = sum.checked_add(route_total) else {
+            return false;
+        };
+        let reason_total = route
+            .quality_reasons
+            .values()
+            .try_fold(0_u64, |sum, count| sum.checked_add(*count));
+        if route
+            .quality_reasons
+            .keys()
+            .any(|reason| !is_quality_reason(reason))
+            || reason_total != Some(route_total)
+        {
+            return false;
+        }
+        sum = next_sum;
+    }
+    sum == total
 }
 
 fn source_lag_ms(wire: &RouteCoverage, source: &RouteCoverage) -> Option<u64> {
@@ -2083,14 +2169,14 @@ pub async fn serve_relay(
             Duration::from_secs(120),
         ))
         .layer(CatchPanicLayer::new())
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().on_failure(crate::http_trace::on_failure))
         .with_state(RelayAppState {
             max_batch_records: relay.inner.config.max_batch_records,
             relay: relay.clone(),
             body_budget,
             ingest_coverage: Arc::new(Mutex::new(IngestCoverageState::with_quality_counters(
                 ingest_quality_counters,
-            ))),
+            )?)),
         });
     let listener = TcpListener::bind(bind).await?;
     info!(address = %bind, "Relay ready");
@@ -2601,6 +2687,16 @@ fn readiness_blocking_reasons(health: &RelayHealth, coverage: &Value) -> Vec<&'s
     }
     if coverage.get("quality_errors").and_then(Value::as_u64) != Some(0) {
         reasons.push("relay_quality_errors_nonzero");
+    }
+    if coverage.get("quality_errors_scope").and_then(Value::as_str) != Some("durable_relay_state") {
+        reasons.push("relay_quality_history_not_durable");
+    }
+    if coverage
+        .get("quality_reason_breakdown_complete")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        reasons.push("relay_quality_reason_breakdown_missing");
     }
     if coverage.get("turn_capture_ready").and_then(Value::as_bool) != Some(true) {
         reasons.push("relay_turn_capture_not_ready");
@@ -3323,7 +3419,10 @@ mod tests {
         drop(state);
         drop(relay);
         let reopened = DurableRelay::open(test_config(&temporary)).await.unwrap();
-        assert_eq!(reopened.ingest_quality_counters().unwrap().total(), 1);
+        assert_eq!(
+            reopened.ingest_quality_counters().unwrap().total().unwrap(),
+            1
+        );
         reopened.close().await.unwrap();
     }
 
@@ -3394,7 +3493,63 @@ mod tests {
         assert_eq!(ready_body["ok"], true);
         assert_eq!(ready_body["ready"], true);
         assert_eq!(ready_body["blocking_reasons"], json!([]));
+        assert_eq!(
+            ready_body["ingest_coverage"]["quality_reason_breakdown_complete"],
+            true
+        );
+
+        let health = relay.health().await.unwrap();
+        let mut malformed = ready_body["ingest_coverage"].clone();
+        malformed
+            .as_object_mut()
+            .unwrap()
+            .remove("quality_reason_breakdown_complete");
+        malformed
+            .as_object_mut()
+            .unwrap()
+            .remove("quality_errors_scope");
+        let reasons = readiness_blocking_reasons(&health, &malformed);
+        assert!(reasons.contains(&"relay_quality_reason_breakdown_missing"));
+        assert!(reasons.contains(&"relay_quality_history_not_durable"));
         relay.close().await.unwrap();
+    }
+
+    #[test]
+    fn quality_reason_breakdown_requires_exact_durable_totals() {
+        let mut coverage = IngestCoverageState::new();
+        assert_eq!(
+            coverage.snapshot()["quality_reason_breakdown_complete"],
+            true
+        );
+
+        coverage.otlp_traces.quality_conversion_errors = 1;
+        assert_eq!(
+            coverage.snapshot()["quality_reason_breakdown_complete"],
+            false
+        );
+
+        coverage
+            .otlp_traces
+            .quality_reasons
+            .insert("conversion_error".to_owned(), 1);
+        coverage.quality_errors = 1;
+        assert_eq!(
+            coverage.snapshot()["quality_reason_breakdown_complete"],
+            true
+        );
+        coverage
+            .otlp_traces
+            .quality_reasons
+            .insert("unknown_private_reason".to_owned(), 0);
+        assert_eq!(
+            coverage.snapshot()["quality_reason_breakdown_complete"],
+            false
+        );
+        coverage.quality_errors = 0;
+        assert_eq!(
+            coverage.snapshot()["quality_reason_breakdown_complete"],
+            false
+        );
     }
 
     #[tokio::test]
@@ -3722,6 +3877,56 @@ mod tests {
     }
 
     #[test]
+    fn ingest_coverage_keeps_sparse_hooks_fresh_for_long_turns() {
+        let mut coverage = IngestCoverageState::new();
+        coverage.observe_wire(&[(
+            WireCaptureEvidence {
+                turn_scoped: true,
+                http_success: true,
+                identity_conflict: false,
+            },
+            false,
+        )]);
+        for endpoint in [
+            CloudEndpoint::OtlpLogs,
+            CloudEndpoint::OtlpTraces,
+            CloudEndpoint::CodexHook,
+        ] {
+            coverage.observe_cloud(
+                endpoint,
+                &crate::cloud_ingest::CloudIngestSummary {
+                    endpoint: "test".to_owned(),
+                    source_records: 1,
+                    derived_captures: 1,
+                    unknown_events: 0,
+                    attributed_quality_errors: 0,
+                    conversion_errors: Vec::new(),
+                },
+                1,
+                0,
+                0,
+                0,
+            );
+        }
+        let now = unix_millis();
+        coverage.wire.first_observed_millis = Some(now - INGEST_COVERAGE_FRESHNESS_WINDOW_MS - 1);
+        coverage.wire.last_observed_millis = Some(now);
+        coverage.otlp_logs.last_observed_millis = Some(now - 60_000);
+        coverage.otlp_traces.last_observed_millis = Some(now - 60_000);
+        // A long model/tool loop can easily go ten minutes without a Hook.
+        coverage.hooks.last_observed_millis = Some(now - 10 * 60_000);
+
+        let snapshot = coverage.snapshot_at(now);
+        assert_eq!(snapshot["stale_sources"], json!([]));
+        assert_eq!(snapshot["required_sources_fresh"], true);
+        assert_eq!(snapshot["turn_capture_ready"], true);
+        assert_eq!(
+            snapshot["hooks_freshness_window_ms"],
+            INGEST_COVERAGE_HOOK_FRESHNESS_WINDOW_MS
+        );
+    }
+
+    #[test]
     fn ingest_coverage_degrades_when_runtime_sources_lag_active_wire() {
         let mut coverage = IngestCoverageState::new();
         coverage.observe_wire(&[(WireCaptureEvidence::default(), false)]);
@@ -3754,7 +3959,7 @@ mod tests {
         .into_iter()
         .max()
         .unwrap();
-        let latest_wire = latest_runtime + INGEST_COVERAGE_FRESHNESS_WINDOW_MS + 1;
+        let latest_wire = latest_runtime + INGEST_COVERAGE_HOOK_FRESHNESS_WINDOW_MS + 1;
         coverage.wire.last_observed_millis = Some(latest_wire);
 
         let snapshot = coverage.snapshot_at(latest_wire);
@@ -4073,7 +4278,10 @@ mod tests {
         let path = temporary.path().join("delivery.redb");
         {
             let ledger = DeliveryLedger::open(&path).unwrap();
-            assert_eq!(ledger.ingest_quality_counters().unwrap().total(), 0);
+            assert_eq!(
+                ledger.ingest_quality_counters().unwrap().total().unwrap(),
+                0
+            );
             let reasons = BTreeMap::from([
                 ("unsupported_event".to_owned(), 2),
                 ("invalid_structure".to_owned(), 3),
@@ -4081,14 +4289,14 @@ mod tests {
             let counters = ledger
                 .record_ingest_quality_with_reasons(CloudEndpoint::OtlpTraces, 2, 3, &reasons)
                 .unwrap();
-            assert_eq!(counters.total(), 5);
+            assert_eq!(counters.total().unwrap(), 5);
             assert_eq!(counters.otlp_traces_unknown_events, 2);
             assert_eq!(counters.otlp_traces_conversion_errors, 3);
             assert_eq!(counters.otlp_traces_quality_reasons, reasons);
         }
         let reopened = DeliveryLedger::open(&path).unwrap();
         let counters = reopened.ingest_quality_counters().unwrap();
-        assert_eq!(counters.total(), 5);
+        assert_eq!(counters.total().unwrap(), 5);
         assert_eq!(counters.otlp_traces_unknown_events, 2);
         assert_eq!(counters.otlp_traces_conversion_errors, 3);
         assert_eq!(
@@ -4098,13 +4306,73 @@ mod tests {
                 ("invalid_structure".to_owned(), 3),
             ])
         );
-        let coverage = IngestCoverageState::with_quality_counters(counters).snapshot();
+        let coverage = IngestCoverageState::with_quality_counters(counters)
+            .unwrap()
+            .snapshot();
         assert_eq!(coverage["quality_errors_scope"], "durable_relay_state");
         assert_eq!(coverage["quality_errors"], 5);
         assert_eq!(coverage["quality_errors_current_process"], 0);
         assert_eq!(
             coverage["quality_errors_by_endpoint"]["otlp_traces"]["total"],
             5
+        );
+    }
+
+    #[test]
+    fn ingest_quality_counter_overflow_fails_closed_without_partial_update() {
+        let mut counters = IngestQualityCounters {
+            otlp_logs_unknown_events: u64::MAX,
+            otlp_logs_quality_reasons: BTreeMap::from([("unsupported_event".to_owned(), u64::MAX)]),
+            ..IngestQualityCounters::default()
+        };
+        let before = counters.clone();
+        let reasons = BTreeMap::from([("unsupported_event".to_owned(), 1)]);
+        let error = counters
+            .add(CloudEndpoint::OtlpLogs, 1, 0, &reasons)
+            .expect_err("u64 quality counters must reject overflow");
+        assert!(
+            error
+                .to_string()
+                .contains("OTLP logs unknown-event counter overflow")
+        );
+        assert_eq!(
+            counters.otlp_logs_unknown_events,
+            before.otlp_logs_unknown_events
+        );
+        assert_eq!(
+            counters.otlp_logs_quality_reasons,
+            before.otlp_logs_quality_reasons
+        );
+
+        let mut reason_overflow = IngestQualityCounters {
+            otlp_logs_quality_reasons: BTreeMap::from([("unsupported_event".to_owned(), u64::MAX)]),
+            ..IngestQualityCounters::default()
+        };
+        let before_reason_overflow = reason_overflow.clone();
+        let error = reason_overflow
+            .add(CloudEndpoint::OtlpLogs, 1, 0, &reasons)
+            .expect_err("quality reason counters must reject overflow");
+        assert!(
+            error
+                .to_string()
+                .contains("quality reason counter overflow")
+        );
+        assert_eq!(reason_overflow.otlp_logs_unknown_events, 0);
+        assert_eq!(
+            reason_overflow.otlp_logs_quality_reasons,
+            before_reason_overflow.otlp_logs_quality_reasons
+        );
+
+        let coverage_error = IngestCoverageState::with_quality_counters(IngestQualityCounters {
+            otlp_logs_unknown_events: u64::MAX,
+            otlp_logs_conversion_errors: 1,
+            ..IngestQualityCounters::default()
+        })
+        .expect_err("coverage state must reject an overflowing durable total");
+        assert!(
+            coverage_error
+                .to_string()
+                .contains("durable quality counter total overflow")
         );
     }
 
@@ -4146,7 +4414,7 @@ mod tests {
         };
         let seed = IngestQualitySeed {
             schema_version: INGEST_QUALITY_SEED_SCHEMA_VERSION.to_owned(),
-            source_quality_errors: counters.total(),
+            source_quality_errors: counters.total().unwrap(),
             counters,
         };
         fs::write(
@@ -4155,7 +4423,10 @@ mod tests {
         )
         .unwrap();
         let reopened = DeliveryLedger::open(&path).unwrap();
-        assert_eq!(reopened.ingest_quality_counters().unwrap().total(), 7);
+        assert_eq!(
+            reopened.ingest_quality_counters().unwrap().total().unwrap(),
+            7
+        );
         assert_eq!(
             reopened
                 .ingest_quality_counters()

@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
-const { docker, validateConfig } = require('./preflight');
+const { docker, requiresPlatform, validateConfig } = require('./preflight');
 
 const revision = '1'.repeat(40);
 const repository = path.resolve(__dirname, '../..');
@@ -26,11 +26,26 @@ const files = ['deploy/collector-relay.yml', 'deploy/cloud-platform.yml'];
 const baseEnvironment = Object.fromEntries(Object.entries(process.env)
   .filter(([key]) => !/^(CHIPTRACE_|AWS_|OSS_|ALIBABA_)/.test(key)));
 
-async function render(env) {
+async function render(env, selectedFiles = files) {
   return JSON.parse(await docker(['compose', '--env-file', '/dev/null',
-    ...files.flatMap(file => ['-f', path.join(repository, file)]),
+    ...selectedFiles.flatMap(file => ['-f', path.join(repository, file)]),
     'config', '--format', 'json'], env));
 }
+
+test('single-file preflight keeps component deployments independently verifiable', async () => {
+  const collectorRelay = await render({ ...baseEnvironment, ...variables }, ['deploy/collector-relay.yml']);
+  assert.equal(requiresPlatform(['deploy/collector-relay.yml'], collectorRelay), false);
+  assert.doesNotThrow(() => validateConfig(collectorRelay, revision, { requirePlatform: false }));
+  assert.deepEqual(Object.keys(collectorRelay.services).sort(), ['collector', 'relay']);
+
+  const platform = await render({ ...baseEnvironment, ...variables }, ['deploy/cloud-platform.yml']);
+  assert.equal(requiresPlatform(['deploy/cloud-platform.yml'], platform), true);
+  assert.doesNotThrow(() => validateConfig(platform, revision));
+  assert.deepEqual(Object.keys(platform.services), ['platform']);
+
+  const full = await render({ ...baseEnvironment, ...variables });
+  assert.equal(requiresPlatform(files, full), true);
+});
 
 test('real deployment templates require pinned images and enforce runtime isolation', async () => {
   const config = await render({ ...baseEnvironment, ...variables });
@@ -72,6 +87,12 @@ test('deployment preflight rejects mutable images, unknown revisions and missing
   const invalidBackend = structuredClone(config);
   invalidBackend.services.platform.environment.CHIPTRACE_BACKEND = 'local';
   assert.throws(() => validateConfig(invalidBackend, revision), /backend/);
+  const localStorage = structuredClone(config);
+  localStorage.services.platform.environment.CHIPTRACE_BACKEND = 'fs';
+  assert.doesNotThrow(() => validateConfig(localStorage, revision), 'local FS remains available for isolated tests');
+  assert.throws(() => validateConfig(localStorage, revision, { requireCloudBackend: true }), /production platform storage backend/);
+  assert.throws(() => validateConfig({ services: { collector: config.services.collector } }, revision,
+    { requirePlatform: false, requireCloudBackend: true }), /platform service/);
   const missingPlatformRevision = structuredClone(config);
   delete missingPlatformRevision.services.platform.environment.CHIPTRACE_BUILD_REVISION;
   assert.throws(() => validateConfig(missingPlatformRevision, revision), /platform health revision/);

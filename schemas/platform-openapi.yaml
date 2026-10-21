@@ -16,7 +16,11 @@ paths:
     get:
       security: []
       responses:
-        '200': {description: Ready with queued/running/job counters}
+        '200':
+          description: Ready with backend, queued/running/job counters
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PlatformHealth'}
         '503': {description: Not started, shutting down, or storage/writer lock failure}
   /v1/jobs:
     post:
@@ -200,6 +204,24 @@ paths:
         '422': {$ref: '#/components/responses/Error'}
         '503': {$ref: '#/components/responses/Error'}
 components:
+  schemas:
+    PlatformHealth:
+      type: object
+      required: [ok, version, backend, build, queued, running, active_reads, jobs, failure]
+      properties:
+        ok: {type: boolean}
+        version: {type: string, const: chiptrace.platform.v1}
+        backend: {type: string, enum: [fs, oss, s3]}
+        build:
+          type: object
+          required: [revision]
+          properties:
+            revision: {type: [string, 'null'], pattern: '^[a-f0-9]{40}$'}
+        queued: {type: integer, minimum: 0}
+        running: {type: integer, minimum: 0}
+        active_reads: {type: integer, minimum: 0}
+        jobs: {type: integer, minimum: 0}
+        failure: {type: [object, 'null']}
   securitySchemes:
     serviceBearer: {type: http, scheme: bearer}
   parameters:

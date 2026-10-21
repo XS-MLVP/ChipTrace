@@ -9,6 +9,7 @@ const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const test = require('node:test');
 const { blockingReasons, healthObservation, verifyRuntimeHealth } = require('./runtime-health-gate');
+const { buildBaseline, sha256Hex } = require('./quality-baseline');
 
 function gateway() {
   return {
@@ -86,6 +87,7 @@ function relay() {
       quality_errors: 0,
       quality_errors_current_process: 0,
       quality_errors_scope: 'durable_relay_state',
+      quality_reason_breakdown_complete: true,
       quality_errors_by_endpoint: {
         otlp_logs: { unknown_events: 0, conversion_errors: 0, total: 0, reasons: {} },
         otlp_traces: { unknown_events: 0, conversion_errors: 0, total: 0, reasons: {} },
@@ -98,6 +100,15 @@ function relay() {
 function collector() {
   return { ok: true, build: { version: '0.6.0', revision: 'f'.repeat(40) },
     collector: { ok: true, ready: true, captures: 33, queue_depth: 0, last_error: null } };
+}
+
+function qualityBaselineFor(value) {
+  return buildBaseline({ ingest_coverage: value.ingest_coverage }, {
+    sourceReportSha256: sha256Hex(Buffer.from('runtime-health-report', 'utf8')),
+    approvedBy: 'release-owner',
+    approvedAt: '2026-10-19T00:00:00Z',
+    approvalNote: 'Audited historical quality ledger.',
+  });
 }
 
 test('runtime gate rejects an unobserved or unhealthy Collector despite healthy gateway and Relay', () => {
@@ -372,6 +383,52 @@ test('live quality-error maximum rejects accumulated source conversion errors', 
   assert.equal(result.relay.quality_errors, 1);
 });
 
+test('approved quality baseline separates retained history from post-baseline errors', () => {
+  const historical = relay();
+  historical.ingest_coverage.quality_errors = 2;
+  historical.ingest_coverage.quality_errors_by_endpoint.otlp_traces = {
+    unknown_events: 0,
+    conversion_errors: 2,
+    total: 2,
+    reasons: { invalid_lifecycle: 2 },
+  };
+  const baseline = qualityBaselineFor(historical);
+  const result = verifyRuntimeHealth(gateway(), historical, {
+    collectorHealth: collector(),
+    qualityBaseline: baseline,
+    maxNewQualityErrors: 0,
+  });
+  assert.equal(result.relay.quality_errors, 2);
+  assert.equal(result.relay.quality_baseline.baseline_quality_errors, 2);
+  assert.equal(result.relay.quality_baseline.new_quality_errors, 0);
+});
+
+test('quality baseline fails closed when a new labeled error appears', () => {
+  const baseline = qualityBaselineFor(relay());
+  const current = relay();
+  current.ingest_coverage.quality_errors = 1;
+  current.ingest_coverage.quality_errors_by_endpoint.otlp_traces = {
+    unknown_events: 0,
+    conversion_errors: 1,
+    total: 1,
+    reasons: { invalid_lifecycle: 1 },
+  };
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), current, {
+      collectorHealth: collector(),
+      qualityBaseline: baseline,
+      maxNewQualityErrors: 0,
+    }),
+    /new quality errors exceed the configured maximum/,
+  );
+  const observed = healthObservation(gateway(), current, collector(), {
+    qualityBaseline: baseline,
+    maxNewQualityErrors: 0,
+  });
+  assert.equal(observed.relay.coverage.quality_baseline.new_quality_errors, 1);
+  assert.equal(observed.blocking_reasons.includes('relay_new_quality_errors_exceed_max'), true);
+});
+
 test('runtime gate rejects quality counters that are only process-local', () => {
   const value = relay();
   delete value.ingest_coverage.quality_errors_scope;
@@ -384,6 +441,31 @@ test('runtime gate rejects quality counters that are only process-local', () => 
   assert.equal(observed.relay.coverage.quality_errors_scope, null);
 });
 
+test('runtime gate requires an exact quality reason completeness marker', () => {
+  const missing = relay();
+  delete missing.ingest_coverage.quality_reason_breakdown_complete;
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), missing, { collectorHealth: collector() }),
+    /quality_reason_breakdown_complete must be true/,
+  );
+
+  const malformed = relay();
+  malformed.ingest_coverage.quality_errors = 1;
+  malformed.ingest_coverage.quality_errors_by_endpoint.otlp_traces = {
+    unknown_events: 1,
+    conversion_errors: 0,
+    total: 1,
+    reasons: { PRIVATE_REASON_MUST_NOT_LEAK: 1 },
+  };
+  const observed = healthObservation(gateway(), malformed, collector());
+  assert.equal(observed.relay.coverage.quality_reason_breakdown_complete, false);
+  assert.equal(observed.blocking_reasons.includes('relay_quality_reason_breakdown_missing'), true);
+  assert.throws(
+    () => verifyRuntimeHealth(gateway(), malformed, { collectorHealth: collector() }),
+    /reasons contains an unsupported code/,
+  );
+});
+
 test('runtime observations preserve endpoint quality-error breakdowns', () => {
   const value = relay();
   value.ingest_coverage.quality_errors = 3;
@@ -394,6 +476,23 @@ test('runtime observations preserve endpoint quality-error breakdowns', () => {
   };
   const observed = healthObservation(gateway(), value, collector());
   assert.deepEqual(observed.relay.coverage.quality_errors_by_endpoint, value.ingest_coverage.quality_errors_by_endpoint);
+});
+
+test('runtime observations expose endpoint quality counters on their source routes', () => {
+  const value = relay();
+  value.ingest_coverage.quality_errors = 2;
+  value.ingest_coverage.quality_errors_by_endpoint.otlp_traces = {
+    unknown_events: 0,
+    conversion_errors: 2,
+    total: 2,
+    reasons: { conversion_error: 2 },
+  };
+  const observed = healthObservation(gateway(), value, collector());
+  assert.deepEqual(observed.relay.coverage.otlp_traces.quality, {
+    unknown_events: 0,
+    conversion_errors: 2,
+    total: 2,
+  });
 });
 
 test('runtime gate reconciles endpoint quality errors with the process total', () => {
@@ -580,6 +679,38 @@ test('runtime gate CLI preserves a real failure and diagnoses Wire missing from 
     assert.doesNotMatch(error.stderr, /private-untrusted-source/);
     return true;
   });
+});
+
+test('runtime gate retries only a transient drain before accepting a stable snapshot', async t => {
+  let gatewayAttempts = 0;
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    requests.push(req.url);
+    const value = req.url === '/gateway' ? gateway() : req.url === '/collector' ? collector() : relay();
+    if (req.url === '/gateway') {
+      gatewayAttempts += 1;
+      if (gatewayAttempts === 1) value.fullTraceCapture.rustRelay.inflight = 1;
+    }
+    res.writeHead(200, { 'content-type': 'application/json', connection: 'close' });
+    res.end(JSON.stringify(value));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'chiptrace-runtime-retry-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const report = path.join(root, 'healthy.json');
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const result = JSON.parse((await promisify(execFile)(process.execPath, [require.resolve('./runtime-health-gate'),
+    '--gateway-url', `${url}/gateway`, '--relay-url', `${url}/relay`,
+    '--collector-url', `${url}/collector`, '--expected-revision', 'f'.repeat(40),
+    '--transient-retries', '1', '--transient-retry-delay-ms', '1', '--report', report],
+  { timeout: 10000 })).stdout);
+  assert.equal(result.schema_version, 'chiptrace.runtime-health-gate.v3');
+  assert.equal(gatewayAttempts, 2);
+  assert.deepEqual(requests.sort(), [
+    '/collector', '/collector', '/gateway', '/gateway', '/relay', '/relay',
+  ]);
+  assert.equal(JSON.parse(await fs.readFile(report, 'utf8')).ok, true);
 });
 
 test('runtime gate CLI returns nonzero for an unscoped 403 despite fresh four-source health', async t => {

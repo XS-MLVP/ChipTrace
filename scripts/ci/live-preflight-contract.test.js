@@ -2,9 +2,11 @@
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const path = require('node:path');
 const test = require('node:test');
 
-const workflow = fs.readFileSync('.github/workflows/ci.yml', 'utf8');
+const repositoryRoot = path.resolve(__dirname, '../..');
+const workflow = fs.readFileSync(path.join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8');
 
 test('live provider preflight is manual, protected and isolated from ordinary CI', () => {
   assert.match(workflow, /workflow_dispatch:/);
@@ -21,12 +23,14 @@ test('live provider preflight requires protected endpoints and runs both gates',
   for (const name of [
     'CHIPTRACE_API_KEY',
     'CHIPTRACE_CODEX_CONFIG',
+    'CHIPTRACE_CODEX_USER_CONFIG',
     'CHIPTRACE_CODEX_BASE_URL',
     'CHIPTRACE_RESPONSES_URL',
     'CHIPTRACE_GATEWAY_HEALTH_URL',
     'CHIPTRACE_RELAY_HEALTH_URL',
     'CHIPTRACE_COLLECTOR_HEALTH_URL',
     'CHIPTRACE_PLATFORM_HEALTH_URL',
+    'CHIPTRACE_PLATFORM_BACKEND',
     'CHIPTRACE_GATEWAY_CONTAINER',
     'CHIPTRACE_EXPECTED_REVISION',
     'CHIPTRACE_GATEWAY_EXPECTED_REVISION',
@@ -34,7 +38,9 @@ test('live provider preflight requires protected endpoints and runs both gates',
     assert.match(workflow, new RegExp(name));
   }
   assert.match(workflow, /node scripts\/deploy\/codex-route-preflight\.js/);
+  assert.match(workflow, /- name: Verify the actual Codex configuration targets the managed Gateway\n        env:\n          CHIPTRACE_CODEX_CONFIG: \$\{\{ vars\.CHIPTRACE_CODEX_CONFIG \}\}\n          CHIPTRACE_CODEX_USER_CONFIG: \$\{\{ vars\.CHIPTRACE_CODEX_USER_CONFIG \}\}\n          CHIPTRACE_CODEX_BASE_URL: \$\{\{ vars\.CHIPTRACE_CODEX_BASE_URL \}\}/);
   assert.match(workflow, /--config "\$CHIPTRACE_CODEX_CONFIG"/);
+  assert.match(workflow, /--user-config "\$CHIPTRACE_CODEX_USER_CONFIG"/);
   assert.match(workflow, /--expected-base-url "\$CHIPTRACE_CODEX_BASE_URL"/);
   assert.match(workflow, /codex-route-preflight\.json/);
   assert.match(workflow, /node scripts\/ci\/provider-response-gate\.js/);
@@ -44,11 +50,15 @@ test('live provider preflight requires protected endpoints and runs both gates',
   assert.match(workflow, /node scripts\/ci\/platform-health-gate\.js/);
   assert.match(workflow, /--platform-url "\$CHIPTRACE_PLATFORM_HEALTH_URL"/);
   assert.match(workflow, /--expected-revision "\$CHIPTRACE_EXPECTED_REVISION"/);
+  assert.match(workflow, /--expected-backend "\$CHIPTRACE_PLATFORM_BACKEND"/);
+  assert.match(workflow, /CHIPTRACE_PLATFORM_BACKEND must be oss or s3 for protected live preflight/);
   assert.match(workflow, /node --test scripts\/ci\/platform-health-gate\.test\.js/);
   assert.match(workflow, /--max-quality-errors 0/);
   assert.match(workflow, /--max-historical-failed-files 0/);
   assert.match(workflow, /--min-gateway-free-bytes 10737418240/);
   assert.match(workflow, /--min-gateway-free-files 10000/);
+  assert.match(workflow, /--transient-retries 4/);
+  assert.match(workflow, /--transient-retry-delay-ms 250/);
   assert.match(workflow, /node scripts\/deploy\/gateway-preflight\.js/);
   assert.match(workflow, /--container "\$CHIPTRACE_GATEWAY_CONTAINER"/);
   assert.match(workflow, /--expected-gateway-revision "\$CHIPTRACE_GATEWAY_EXPECTED_REVISION"/);
@@ -73,9 +83,56 @@ test('CI actions are immutable and the MinIO job verifies its Go toolchain befor
   assert.match(workflow, /Swatinem\/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6/);
 });
 
+test('managed route uses a digest-pinned container image for deterministic startup', () => {
+  const image = 'node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392';
+  assert.ok(workflow.includes(`docker pull ${image}`));
+  assert.ok(workflow.includes(`CHIPTRACE_CONFIG_TEST_IMAGE: ${image}`));
+  assert.doesNotMatch(workflow, /docker pull node:22-bookworm-slim\s*$/m);
+});
+
+test('the platform Dockerfile uses the same digest and asserts its Node runtime', () => {
+  const dockerfile = fs.readFileSync(path.join(repositoryRoot, 'Dockerfile'), 'utf8');
+  const image = 'node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392';
+  assert.ok(dockerfile.includes(`ARG CHIPTRACE_PLATFORM_BASE=${image}`));
+  assert.match(dockerfile, /test "\$\(node --version\)" = "v22\.23\.3"/);
+  assert.doesNotMatch(dockerfile, /^ARG CHIPTRACE_PLATFORM_BASE=node:22-bookworm-slim$/m);
+});
+
+test('hosted jobs use an immutable Ubuntu runner label', () => {
+  const runners = [...workflow.matchAll(/^\s*runs-on:\s*(.+)$/gm)]
+    .map(match => match[1].trim());
+  assert.ok(runners.length >= 5, 'workflow must declare all hosted job runners');
+  const hosted = runners.filter(value => value.startsWith('ubuntu-'));
+  assert.ok(hosted.length >= 5, 'workflow must retain hosted Ubuntu jobs');
+  assert.ok(hosted.every(value => value === 'ubuntu-24.04'),
+    `hosted jobs must stay on ubuntu-24.04: ${hosted.join(', ')}`);
+  assert.doesNotMatch(workflow, /^\s*runs-on:\s*ubuntu-latest\s*$/m,
+    'floating ubuntu-latest labels can silently change the startup environment');
+});
+
+test('hosted jobs use the verified Node patch release', () => {
+  const versions = [...workflow.matchAll(/^\s*node-version:\s*["']?([^"'\s]+)["']?\s*$/gm)]
+    .map(match => match[1]);
+  assert.ok(versions.length >= 5, 'workflow must configure Node for hosted jobs');
+  assert.ok(versions.every(version => version === '22.23.3'),
+    `hosted jobs must stay on Node 22.23.3: ${versions.join(', ')}`);
+});
+
 test('hosted sandbox startup tolerates optional sysctl writes but requires a real namespace probe', () => {
   assert.match(workflow, /Could not enable kernel\.unprivileged_userns_clone; continuing to the real namespace probe/);
   assert.match(workflow, /Could not disable AppArmor unprivileged-userns restriction; continuing to the real namespace probe/);
   assert.match(workflow, /if ! unshare --user --map-root-user \/bin\/true; then/);
   assert.match(workflow, /native producer sandbox namespace is unavailable on this runner/);
+});
+
+test('container fixture mounts are readable by the fixed non-root image user', () => {
+  assert.match(workflow,
+    /- name: Prepare read-only test mounts for the non-root container[\s\S]*?chmod -R a\+rX integrations\/openai-gateway integrations\/cloud-platform integrations\/codex fixtures/);
+  assert.match(workflow,
+    /- name: Verify non-root container mounts before test runners[\s\S]*?--user 10001:10001[\s\S]*?--entrypoint node[\s\S]*?NON_ROOT_TEST_MOUNTS_READABLE/);
+});
+
+test('Relay CI benchmark fails on hidden delivery retries', () => {
+  assert.match(workflow,
+    /name: Verify Relay cloud delivery benchmark path[\s\S]*?--relay --max-delivery-retries 0[\s\S]*?assert result\["delivery_retries"\] == 0/);
 });

@@ -1034,6 +1034,17 @@ class DurableCaptureOutbox {
     }
     await this.refreshQueueStats();
     this.metrics.startedAt = new Date().toISOString();
+    // A client killed mid-request leaves an open transaction behind.  Without
+    // periodic recovery the gateway stays degraded until the next restart.
+    const recoveryIntervalMs = Math.min(
+      Math.max(Math.floor(this.maxOpenAgeMs / 2), 60_000),
+      5 * 60_000,
+    );
+    this.recoveryTimer = setInterval(() => {
+      if (this.closed) return;
+      this.recoverOpenCaptures({ staleOnly: true }).catch(error => this.recordError(error));
+    }, recoveryIntervalMs);
+    if (typeof this.recoveryTimer.unref === 'function') this.recoveryTimer.unref();
     this.scheduleDrain(0);
     return this.snapshot();
   }
@@ -1065,11 +1076,11 @@ class DurableCaptureOutbox {
     }
   }
 
-  async recoverOpenCaptures() {
-    return this.withQueueMutation(() => this.recoverOpenCapturesInternal());
+  async recoverOpenCaptures({ staleOnly = false } = {}) {
+    return this.withQueueMutation(() => this.recoverOpenCapturesInternal({ staleOnly }));
   }
 
-  async recoverOpenCapturesInternal() {
+  async recoverOpenCapturesInternal({ staleOnly = false } = {}) {
     const metadataFiles = await listRegularFiles(this.openDir, '.open.json');
     for (const metadataFile of metadataFiles) {
       const stem = path.basename(metadataFile, '.open.json');
@@ -1087,6 +1098,16 @@ class DurableCaptureOutbox {
       }
       const captureId = String(baseRecord.captureId || '');
       if (!validCaptureId(captureId)) throw new Error('open Capture has invalid captureId');
+      if (staleOnly) {
+        // Periodic recovery must never race an in-flight capture.  Startup
+        // recovery (staleOnly=false) still finalizes every orphan because the
+        // previous process cannot own any live transaction.
+        const startedAtMs = Date.parse(baseRecord.startedAt || '');
+        const observedAtMs = Number.isFinite(startedAtMs)
+          ? startedAtMs
+          : (await fsp.stat(metadataFile)).mtimeMs;
+        if (Date.now() - observedAtMs <= this.maxOpenAgeMs) continue;
+      }
       const spoolStats = await Promise.all([files.request, files.response].map(async file => {
         try { return await fsp.stat(file); } catch (error) {
           if (error.code === 'ENOENT') return null;
@@ -1237,6 +1258,8 @@ class DurableCaptureOutbox {
     this.closed = true;
     if (this.wakeTimer) clearTimeout(this.wakeTimer);
     this.wakeTimer = null;
+    if (this.recoveryTimer) clearInterval(this.recoveryTimer);
+    this.recoveryTimer = null;
   }
 
   recordError(error) {

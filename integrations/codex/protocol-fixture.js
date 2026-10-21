@@ -319,7 +319,7 @@ async function protocolFixture(t, prefix) {
       await fs.mkdir(managed, { mode: 0o700 });
       const sandboxTmp = path.join(root, 'sandbox-tmp');
       if (cliProducer) await fs.mkdir(sandboxTmp, { mode: 0o700 });
-      const substitute = value => value.replaceAll('http://172.28.11.121:18084', endpoint)
+      const substitute = value => value.replaceAll('http://127.0.0.1:18084', endpoint)
         .replaceAll('CHIPTRACE_API_KEY', 'CHIPTRACE_PROTOCOL_API_KEY');
       const config = substitute(await fs.readFile(path.join(__dirname, 'config.toml.example'), 'utf8'))
         .replaceAll(`${endpoint}/otel/`, `${relayUrl}/otel/`);

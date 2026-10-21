@@ -1,25 +1,550 @@
 # 生产就绪评估
 
-评估日期：2026-10-19。最新线上只读快照为 03:50（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
+## 2026-10-20 17:00（Asia/Shanghai）严格 Session 验收首次通过
+
+固定 `0.163.0` + 七补丁之外，本轮又补齐了辅助作用域，patched 生产者现在能产生
+`inspect-session delivery_ready=true` 的真实 Session：
+
+- `app-server`：`account/read`、`collaborationMode/list`、`hooks/list`、`plugin/list`、
+  `skills/list`、`fs/getMetadata` 等无 Thread 目标的方法显式标记 `process`；
+  `thread/name/set`、`thread/attachment/list` 从参数记录 `conversation.id` 和 `session`。
+- `config_manager::load_with_cli_overrides` 显式 `process`，让 `fs.*` 等子 span 继承。
+- `exec-server` 的 `http_request`、`fs.read_file`、`fs.get_metadata` 显式 `process`。
+- `rmcp` 依赖的 `transport_worker`、`serve_inner`、`streamable_http_session` 在源码
+  checkout 中显式 `process`；使用 `RUSTUP_TOOLCHAIN=1.95.0` 重建，避免其
+  `rust-toolchain.toml` 触发 1.96 同步。
+
+Session `01a15887-9581-7983-b317-619400bc1f56`（真实 18084、patched 生产者、短任务）实测：
+
+| 项 | 结果 |
+| --- | --- |
+| `delivery_ready` | **true** |
+| Session epoch | 1 个，已闭合，`invalid=0` |
+| Native Turn | 1 个，已闭合，`incomplete=0` |
+| 四源 | Wire 5、OTLP logs 15、OTLP traces 9、Hook 8，`missing=[]` |
+| 工具 | 4 次调用/执行，0 缺失 |
+| Source-context 审计 | 0 gap groups、0 unknown_session、0 unscoped_turn |
+
+这证明采集链路和 patched 生产者已经可以为单 Session 生成严格可交付数据。下一层门槛是
+Buyer v7 的规模（≥10 有效轮、≥2 真人交互、≥5 工具）和 `cloud-acceptance` 全阶段；
+短 Session 只证明严格结构与身份闭合，不冒充采购规模。
+
+随后用两轮真实任务 Session `01a1589a-2fac-75d1-b2e4-eaec831ac564` 验证规模：2 个 native
+Turn 全部闭合、1 个 Session epoch 闭合、四源完整（Wire 43、OTLP logs 239、OTLP traces 55、
+Hook 12）、43 次模型交互、6 种工具（`create_goal`、`exec_command`、`get_goal`、
+`update_goal`、`view_image`、`write_stdin`）、29/29 调用/执行/结果配对、0 个 source-context
+缺口，`inspect-session delivery_ready=true`。这满足 Buyer v7 的有效轮次、真人交互和工具
+数量前置条件；canonical `assemble` 仍受共享进程混合 OTLP 批次阻塞，生产者侧已加入按
+Session 拆分的 exporter，待新的隔离 canary 复验后才能声明 `score` 和 `cloud-acceptance`
+通过。
+
+必须用完整的连续 Segment 作为 `inspect-session --input`，不能只抽取包含 Session ID 的行：
+按 Session 拆分后，无 Session 的 process 批次是解析父链和作用域所需的上下文。
+
+为“只抓取指定进程”生成对外样本，`export-maas` 新增可重复的 `--session-id` 和
+`--skip-incomplete`。直接用共享 Collector 的连续 sealed Segment 过滤上述 Session 实测：
+30 个协议完成请求、`batch_00001.tar.gz` 3,866,469 bytes、SHA-256
+`96f87bedc77f58d4651ebfbeb6bfad79d436c8a759494b06fa8879ee08c7bda6`，30 个请求的
+`sessionId` 全部为 `01a1589a-...`，真实用量合计输入 768,386 / 输出 17,711 Token，
+`verify-maas` 退出 0；同时报告 `skipped_other_session_requests=25` 和
+`skipped_incomplete_requests=13`，其他会话与失败尝试不进入样本。样本位于
+`router_v2/records/chiptrace-samples/maas-01a1589a-full/`。
+
+## 2026-10-20 15:55（Asia/Shanghai）采集修复上线与实时复核
+
+提交 `8dbd12c4b206b61065b7e24807174a3f0b6fdd44` 已构建并滚动到本机三者：Runtime 镜像
+`sha256:10b1a4b23980ab1064f0f2c8a9e02639b1929ca5cd18e0b5760a229889b3807e`，Platform 镜像
+`sha256:f478c0d1cec6f2152f9f1b3691211bcf28fae32e157e078fabbcea3d7b9f1646`；部署 preflight
+实际退出 0，三个服务的 revision、非 root、资源上限与只读根均一致。Collector/Relay 的 WAL、
+inbox、outbox 和持久质量账本未清理。
+
+滚动后的短 Session `01a15846-a82c-74a2-bc6f-10c6b73283ea`（patched 生产者、真实 18084）
+实测 6 条 Wire、17 个 OTLP 日志批次、11 个 OTLP Trace 批次、8 个 Hook、5 条工具执行；四源
+均观测且新鲜，`turn_capture_ready=true`，进程内成功 Turn-scoped Wire 7 条，pending/inflight/
+failed 均为 0、守恒通过。持久质量账本仍为 `8,797`，本进程新增 0；`hooks_freshness_window_ms`
+线上已为 3,600,000。Relay `/ready` 仍为 503，唯一原因是历史质量账本非零，代码和业务门禁没有
+新的失败项。使用第二次审计基线 `ceab1cf5...`（8,797 条，含 5 条空/合成 Hook 探针和 1 条
+unsupported OTLP log，均非 Stock Codex 业务记录）运行的 `runtime-health-gate` 实际退出 0：
+`coverage_status=complete`、`turn_capture_ready=true`、`new_quality_errors=0`，Wire/OTLP
+logs/OTLP traces/Hook 四源均在窗口内。`/ready` 的 503 与这个基线门禁是两套契约：前者坚持
+持久账本为零，后者按已审计增量判断。
+
+本轮同时修复网关可用性：客户端被杀死时会在 outbox 留下 open transaction，旧实现只在进程启动
+时恢复，导致 `/health` 长期 degraded。现在启动后每 5 分钟只恢复超过 30 分钟的 open 事务，
+不会与在途 Capture 竞争；重启后 `openTransactions=0`、`currentDeliveryHealthy=true`。
+Platform 镜像构建还暴露了 NFS 源文件 `0600` 导致非 10001 运行用户无法读取 `server.js` 的问题，
+Dockerfile 已显式 `chmod 0755 /opt/chiptrace/*.js`。
+
+严格 `inspect-session` 仍为 `delivery_ready=false`：该 Session 的 1 个 Turn 已闭合、四源完整、
+5/5 工具调用/执行/结果配对，但 source-context 审计仍列出启动/辅助 OTLP span（`fs.*`、
+config/auth、plugin、app-server RPC 等）没有 producer 声明的 Session/process 作用域。业务
+Turn 的 Wire、工具和 SSE 记录不在缺口内；这属于 `session-scope-audit` 仍需上游化的生产者
+作用域补丁，不能用名称豁免或默认归属绕过。
+
+## 2026-10-20 12:26（Asia/Shanghai）上游恢复、真实 Turn 采集与 MaaS 导出修复
+
+18084 的 Sub2API GPT pro 上游账户 1 和 12 实际返回
+`403 INSUFFICIENT_BALANCE`，这是此前“无成功 Wire”的直接原因。新增 kxyai 供应商账户
+（id 27、group 3、`https://api.kxyai.top`）作为低优先级故障转移，并将失效账户降为
+priority 50；`/v1/responses` 实测恢复 HTTP 200。共享 `~/.codex` Provider 已改为
+`http://172.28.11.121:18084/`，认证使用用户自己的 Sub2API Key，原 kxyai Provider Key
+仅保留在备份中。该变更适用于共享该 NFS 配置的所有节点；不能访问 18084 的节点会 fail-closed。
+
+真实未修改 Stock Codex `0.163.0-alpha.11` 交互 canary（Session
+`01a1575c-1aaf-7111-b569-c59263abd6d0`，两轮人工输入）产生了 59 条 Wire、349 个 OTLP
+日志批次、82 个 OTLP Trace 批次、10 个 Hook 和 26 条工具执行。会话级四源覆盖完整，Relay
+`turn_capture_ready=true`，当前进程累计成功 Turn-scoped Wire 279 条、全部 pending/failed 为 0、
+守恒通过。该 canary 不是交付证据：0.163 的 `codex.tool_result` 与 SSE 日志没有
+`turn.id`/`root_turn_id`，`inspect-session` 按设计 fail-closed；本次 TUI 又被驱动脚本强制退出，
+缺少 `SessionEnd`。要得到逐 Turn 可交付数据，必须使用仓库 `docs/upstream-*.patch` 描述的
+patched 生产者。
+
+真实数据同时暴露并修复了 `export-maas` 两个缺陷：
+
+- `turn_id` 与 `root_turn_id` 被错误当作同一别名，导致合法的原生/root Turn（子代理、
+  window）差异被拒绝；现在优先原生 Turn，仅在缺失时回退 root，并分别检查别名冲突。
+- Responses SSE 的 `tool_usage.image_gen.input_tokens/output_tokens=0` 早于 canonical
+  `usage`，旧逻辑先写入 0 后不再覆盖，导致所有请求导出为零 Token；现在 canonical
+  usage/usageMetadata 优先，并跳过 `tool_usage` 子树。
+
+修复后 `cargo test -p chiptrace --lib` 的 353 个测试和完整 `make cloud-test` 实际退出 0。
+
+本轮还修复了一个采集可用性缺陷：Hooks 是稀疏的生命周期事件，一个 Turn 可能连续十几分钟
+只有模型和工具流量而没有新 Hook；旧的 5 分钟窗口会把健康的活跃会话判为 `hooks` stale，进而
+把 `turn_capture_ready` 翻成 false。现在 Wire/OTLP 仍使用 5 分钟窗口，Hooks 单独使用 60 分钟
+窗口，并在健康快照中输出 `hooks_freshness_window_ms`。外部 MaaS 导出新增
+`--skip-incomplete`：显式跳过没有完整 input/output 用量的失败或中断 Wire 并在报告中计数，
+默认行为仍是整体 fail-closed。
+
+本机同时部署了受管 requirements Hook 和用户 `hooks.json`，每个 SessionStart/SessionEnd 会被
+投递两次（相差几毫秒）。旧视图把第二个连续边界记为 invalid，导致会话永远显示未闭合；现在
+同类型边界在 2 秒内去重，重复投递不再产生额外 epoch。使用 patched 生产者和
+`OTEL_EXPORTER_OTLP_HEADERS` 的短 Session `01a15829-acf8-7d31-bbfe-38ae1b6d976a` 实测：
+1 个 native Turn 闭合、1 个 Session epoch 闭合、四源齐全（Wire 24、OTLP logs 41、OTLP traces
+31、Hook 8）、7/7 工具调用/执行/结果配对、4 种工具。`inspect-session` 仍为
+`delivery_ready=false` 的唯一原因是 source-context 审计记录了 1,051 条启动/辅助 OTLP span
+（`fs.*`、`config/read`、`auth`、app-server RPC 等）没有生产者声明的 Session/process 作用域；
+业务 Turn 的 Wire、工具和 SSE 记录不在缺口列表中。该缺口属于
+[session-scope-audit](session-scope-audit.md) 仍需上游化的生产者作用域补丁，不能用名称豁免或
+默认归属绕过。
+从上述 canary 的 27 条协议完成请求导出外部 MaaS 包：`batch_00001.tar.gz` 为
+`3,989,724` bytes（低于 100 MB）、27 个 request、11 个 metadata 字段、真实 Token 统计，
+`verify-maas` 退出 0；32 条失败/中断请求保留在 Raw，但因没有协议终态用量而不进入外部包。
+
+业务 `/ready` 仍为 503：持久质量账本约 8,77x（历史 OTLP 标签为主），平台后端仍是 `fs`，
+真实 OSS/S3 与 SFTP 参数未提供。当前结论是：采集、恢复、投递和外部 request 级打包已能用真实
+业务流量验证；严格逐 Turn 交付仍需 patched 生产者 canary、质量基线审计和真实对象存储验收。
+
+## 2026-10-20 06:02（Asia/Shanghai）当前 revision 滚动更新与复核
+
+已将本机 Collector、Relay 和 Platform 受控更新到维护分支完整 revision
+`00f4080a3ca74329da74220720a3c51fcbab559b`。Runtime 镜像为
+`sha256:fda6b455bd223cc581cd4b1e72b255794d49be1e1d221a87ed338b9cb02f3a3d`，Platform 镜像为
+`sha256:9aa192edb2fe8ef01094763550f2fc0a052a5c5f5a772ee9bdd6aaa93ca0702c`；三个容器均通过
+Docker healthcheck，仍使用非 root、只读根、资源上限和原有持久目录。滚动过程没有清理 WAL、Relay
+outbox 或对象目录。
+
+同一镜像在临时 Compose 环境的 deployment smoke 实际退出 0，覆盖模板不可变镜像、revision 绑定、
+Collector/Relay 精确 Raw 投递和去重、重启恢复、Platform 归档/恢复/导出以及重启后重新要求来源证据。
+Action pin、部署 preflight、quality baseline、quality reason 和 runtime/platform 门禁合同测试也全部通过。
+512 条、4 KiB 负载、8 并发、双 shard 的 release 回环基准达到约 `4,304 records/s`、`16.8 MiB/s`
+端到端吞吐，512/512 投递、0 重试、守恒通过；该数字是本机基线，不替代目标 NFS/OSS 的长期 SLO。
+
+更新后的在线健康快照为：Collector `ready=true`、`captures=1,346,750`、队列 0、875 个 sealed
+Segment、`128,116,855,008` bytes；Relay `delivered=1,346,750`、`pending=0`、`inflight=0`、
+`failed=0`、`conservation_ok=true`。质量账本仍保留 `8,766`，没有被清零。由于进程重启后尚未产生新的
+业务来源，Relay 当前 `missing_sources=["wire","hooks"]`、`successful_turn_scoped_captures=0`、
+`turn_capture_ready=false`，`/ready` 仍为 503；runtime gate 真实退出 1。重启导致当前进程覆盖窗口重新
+等待新证据是预期的 fail-closed 行为，不能用历史成功计数代替新的 Wire Canary。
+
+18084 Gateway 的 full-trace body capture 和 payload sanitization 均开启，20 条历史捕获已 durable，
+当前 pending/failed 均为 0；独立 trace exporter 仍关闭。18086 Platform 已运行新 revision，但后端仍是
+`fs`，没有真实 OSS/S3 上传、恢复和远端 SHA-256 证据。因此本轮解决了远端启动和部署 revision 漂移，
+但业务交付仍需有效 Provider 凭据、成功的多轮 Wire、质量错误修复以及 OSS/S3 和 SFTP 实际验收。
+
+## 2026-10-20 03:21（Asia/Shanghai）当前服务与仓库复核
+
+当前维护基线为 `bde52f454d19a386e56d2288132587ef937e750d`，维护分支与远端 SHA 一致；工作区另有
+三份未跟踪的外部 DOCX 需求原件。当前本地 `make check`、`make test`、CI/部署/质量契约测试、
+Relay 基准和 `make m0-test` 的实际检查均通过。该结果不能替代
+真实 Provider、未修改 Stock Codex、目标 NFS/OSS 或同 SHA 的 GitHub Actions 运行证据。
+
+线上只读采样中 Gateway、Collector、Relay 和 Platform `/health` 均为 HTTP 200。Collector、Relay 和
+Platform revision 为 `b2f6f6d454da29f41e4529789c901d14a47c45b6`，Collector 队列深度为 0 且 ready；
+Relay `delivered=1,338,902`、`pending=0`、
+`inflight=0`、`failed=0`、`conservation_ok=true`。这组证据证明 Raw/WAL、恢复和投递守恒正常，
+不等同于业务 Session/Turn 已就绪。
+
+业务就绪仍然失败：Relay `/ready` 返回 HTTP 503；持久质量账本为 `8,684`，其中
+`identity_conflict=184`、`invalid_lifecycle=6,529`、`legacy_unclassified=1,965`，另有 Hook
+`conversion_error=6`。Wire `requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，
+缺失且过期来源为 `wire`。当前 `/etc/codex/config.toml` 与实际 `CODEX_HOME/config.toml` 的静态
+路由预检均对同一 18084 网关退出 0，但尚未产生可验收的真实 Wire；18086 `/health` 实际报告
+`backend=fs`；18084 的 `traceExporter` 未配置且 payload sanitization 关闭。因此当前可证明传输层和本地 Raw/恢复工作，尚未达到完整 Session/Turn、真实
+OSS/S3 导出或对外生产承诺的标准。
+
+## 2026-10-19 12:44（Asia/Shanghai）当前 HEAD 与线上复核
+
+本轮复核使用的维护代码基线为 `a9b900d`；随后仅继续提交了文档标记更新，均已推送到
+`origin/fix/oss-disk-session-platform`，工作区干净。
+本轮 `make cloud-test` 实际退出 0；Rust 单元测试 `343 passed, 0 failed, 3 ignored`，平台/OSS
+集成测试 `100/100`，路由预检 `8/8`，并覆盖标签、生命周期、Session/Turn、部署隔离、受限堆
+读取和 MinIO/S3 协议合同。GitHub CLI 未认证（退出 4），因此同一 SHA 的 GitHub Actions 远端
+结果仍不可观测，不能把本地通过替代远端 Run 证据。
+
+线上只读采样显示 Gateway、Collector、Relay 和 Platform `/health` 均为 HTTP 200；Collector 队列
+为 0 且 ready，Relay `delivered=1,305,705`、`pending=0`、`inflight=0`、`failed=0`、
+`delivery_retries=85`、`conservation_ok=true`。Gateway outbox 当前无待处理或最近失败文件，历史
+失败原件和 recovery receipt 仍保留且未解决数为 0。该组数据证明 Raw/WAL、重启恢复和投递守恒正常，
+不等同于业务 Session/Turn 已就绪。
+
+业务门禁仍真实失败：Relay `/ready=503`，持久质量错误 `7,338`（`identity_conflict=184`、
+`invalid_lifecycle=5,189`、`legacy_unclassified=1,965`），`missing_sources=["wire"]`、
+`wire.requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`。18084
+独立 trace exporter 当前关闭；实际 `CODEX_HOME=/var/tmp/zhangyuxin/codex-home/by-node/open21`
+的路由预检退出 1，用户 `OpenAI.base_url` 绕过 18084。18086 `/health` 为 HTTP 200 但实际
+`backend=fs`，所以真实 OSS 上传/恢复/远端 SHA-256、未修改 Stock Codex 多轮四源 Canary 和
+同 SHA 远端 CI 尚未验收，当前只能用于内部 Raw/恢复验证。
+
+## 2026-10-19 11:04（Asia/Shanghai）当前服务与 CI 复核
+
+本次复核只读取本机健康端点、容器元数据和 Git 远端状态，未重启服务、修改运行配置或清理
+Raw。Gateway、Collector、Relay 和 Platform 的 `/health` 均返回 HTTP 200；Collector 队列为 0
+且 ready，Relay 投递 `delivered=1,299,997`、`pending=0`、`inflight=0`、`failed=0`、
+`conservation_ok=true`，累计 `delivery_retries=85`。Gateway full-trace outbox 当前
+`pending=0`、`processing=0`、`recentFailures=0`，293 个历史失败原件均有 recovery receipt，
+`unresolvedHistoricalFailedFiles=0`；独立 trace exporter 仍关闭，watchdog 最近一次上游探测为
+HTTP 403。
+
+业务就绪仍未通过：Relay `/ready` 返回 HTTP 503，持久质量账本为 `7,079`，其中
+`identity_conflict=184`、`invalid_lifecycle=4,930`、`legacy_unclassified=1,965`，本进程新增
+318；`missing_sources=["wire"]`、`wire.requests=0`、`turn_capture_ready=false`。对最新活动
+WAL 的有界只读抽样确认，新增 `invalid_lifecycle` 均是同一 Span 同时声明
+`outcome=interrupted` 和 `outcome=completed`。Relay 保留原始批次并拒绝解释冲突终态，标签和计数
+因此没有被清零或伪造为成功。Platform `/health` 返回 `backend=fs`、revision
+`f5a4a9c1e1b389c1bb85e1067968f91942b15304`，当前无排队任务；真实 OSS 账号验收仍未完成。
+
+本轮将 Hook 契约测试在共享 NFS runner 上的固定 30 秒超时调整为有界 120 秒，保留 ACK、重试、
+重复计数和真实 Relay WAL 断言；完整 `make cloud-test` 以退出码 0 完成后，修复已推送到维护分支
+提交 [`1728f94`](https://github.com/XS-MLVP/ChipTrace/commit/1728f94)。GitHub Actions API 在本机
+请求超时，因此同一 SHA 的远端 Run 尚不能据此声明通过。
+
+## 2026-10-19 11:23（Asia/Shanghai）平台大文件读取优化
+
+将平台共享 JSON 证据读取器的固定缓冲从 64 KiB 调整为 1 MiB，降低大 Turn/Projection
+sidecar 在 NFS 或对象存储恢复目录上的读取调用次数；SHA-256、UTF-8、长度、inode 和变更检测
+保持不变，缓冲仍是每个引擎进程的固定上限。`make turn-memory-test`、平台/OSS 集成测试
+（100/100）和 `cargo clippy --workspace --all-targets --locked -- -D warnings` 均实际退出 0。
+该优化改善读取路径的系统调用开销，尚未替代目标 NFS/OSS 上的长期吞吐与 P99 容量验收。
+
+## 2026-10-19 12:09（Asia/Shanghai）平台读取路径与容器烟测复核
+
+平台 Node 适配器的完整 Turn/Projection 摘要读取也统一使用固定 1 MiB 缓冲，减少恢复目录
+在 NFS 或对象存储挂载上的读取调用；读取仍逐字节校验 UTF-8、长度、SHA-256、inode 和
+变更时间，不把完整 sidecar 放入内存。平台/OSS 集成测试实际通过 100/100，三项内存门禁
+分别为 Turn writer `78,336/131,072 KiB`、Projection reader `27,128/49,152 KiB`、
+Turn page reader `25,080/49,152 KiB`。
+
+最新提交的 runtime 镜像通过 `make m0-test` 本地容器烟测：镜像以当前完整 revision 启动，
+Raw/WAL、四源 Session/Turn、Buyer v7、发布幂等和篡改检测均通过，退出码为 0。当前 release
+在 4 shard、16 并发、64 KiB、`fsync` 的 Relay 回环基准中入口吞吐为 `4,188 records/s`，
+端到端吞吐为 `1,239 records/s`，P95 批延迟 `308 ms`，`10,000/10,000` 投递、零重试、
+计数守恒，排空约 `5.69 s`。该结果仍是本机回环基准，不替代目标 NFS/OSS、多租户和长期
+容量 SLO 验收。
+
+## 2026-10-19 09:54（Asia/Shanghai）部署配置持久化复核
+
+为避免宿主自动重启回滚，已将 `/nfs/home/zhangyuxin/router_v2/deploy/.env` 中的
+`CHIPTRACE_IMAGE`、`CHIPTRACE_PLATFORM_IMAGE` 和 `CHIPTRACE_REVISION` 同步到本轮已验证镜像与
+`f5a4a9c1e1b389c1bb85e1067968f91942b15304`；后端仍为 `fs`，其余路径、端口和凭据未改动。
+使用该 env 文件直接运行 `scripts/deploy/preflight.js` 实际退出 0，三个运行容器的镜像 ID、
+期望 revision 和 health 均与预检一致。该配置持久化只保证重启继续运行当前版本，不改变真实 OSS
+和四源业务门禁仍未通过的事实。
+
+## 2026-10-19 09:51（Asia/Shanghai）ChipTrace 组件滚动更新后的复核
+
+使用部署预检通过的不可变镜像完成 Collector、Relay、Platform 的受控滚动更新，未修改宿主
+`.env`：Collector/Relay 使用 `sha256:2029a5d927f53c8a1eaf2cb39972963006f8c3f670b924d4dbce6360d52d177e`，
+Platform 使用 `sha256:2a8ff89dbf4d094077c09858730100710a9e76a0886879a8bd6b594cd55b8335`，三者
+容器均运行 revision `f5a4a9c1e1b389c1bb85e1067968f91942b15304` 且 Docker health 为 healthy。
+Collector 队列为 0、ready；Relay 投递计数守恒，Platform `/health` 返回 `backend=fs` 和对应
+revision，`platform-health-gate --expected-backend fs` 实际退出 0。
+
+更新后运行 runtime gate 仍真实退出 1：持久质量账本为 `6,764`（`identity_conflict=182`、
+`invalid_lifecycle=4,617`、`legacy_unclassified=1,965`），本进程新增仅 3，`missing_sources=["wire"]`、
+`turn_capture_ready=false`。这证明重启和换镜像没有清空历史标签或把 OTLP/Hook 流量伪造成 Wire；
+真实 Provider 路由和四源 Canary 仍是业务就绪的阻断项。最新维护分支还包含文档提交
+`414af71`，该 docs-only 提交未重新构建镜像，当前运行 revision 明确记录为上面的 `f5a4a9c`。
+
+## 2026-10-19 09:28（Asia/Shanghai）线上只读复核（维护分支 `6db26f8`）
+
+本轮只读取健康端点、容器元数据和 Git 状态，未重启服务、修改配置或清理 Raw。18084 Gateway、
+3011 Collector、3012 Relay 和 18086 Platform 的 `/health` 均返回 HTTP 200；Relay `/ready` 返回
+HTTP 503。Collector 与 Relay 实际运行 revision `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，
+Collector `captures=1,293,154`，Relay `delivered=1,293,154`、`delivery_records=1,293,155`、
+`pending=0`、`failed=0`、`conservation_ok=true`，但仍有 1 条 inflight 和 83 次 delivery retry。
+
+业务交付门禁仍真实失败：Relay 持久质量账本为 `6,668`，全部来自 `otlp_traces`，其中
+`identity_conflict=182`、`invalid_lifecycle=4,521`、`legacy_unclassified=1,965`；本进程新增
+`1,146`。Wire `requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，
+缺失且过期来源为 `wire`。同一时刻运行 runtime gate 观察到质量计数 `6,670`，退出码为 1，阻断
+原因包含质量、新鲜度、来源覆盖、Turn 就绪和部署 revision 不匹配；OTLP/Hook 流量不能替代
+缺失的 Wire。
+
+Platform `/health` 返回 HTTP 200，但没有 `backend` 字段；只读容器环境为
+`CHIPTRACE_BUILD_REVISION=db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`、`CHIPTRACE_BACKEND=fs`。
+以维护分支 revision 和 `--expected-backend oss` 执行 Platform 健康门禁实际退出 1。因此当前运行
+只证明 Raw/WAL、投递守恒和恢复基础仍在工作，尚未达到对外提供完整 Session/Turn 与真实 OSS 导出的
+生产标准。
+
+本轮维护分支已推送 `6db26f8`；本地 `make cloud-test` 以退出码 0 完成，覆盖 343 个 Rust 通过、
+OSS 签名/恢复、受限堆内存平台路径、质量标签和 GitHub Actions 合同门禁。GitHub Actions 新提交
+Run 仍因本环境未认证 `gh` CLI 无法取得真实运行证据，不能把本地绿色替代远端同 SHA 检查。
+
+## 2026-10-19 09:35（Asia/Shanghai）CI 启动输入收敛
+
+维护分支提交 `881f6aa` 将 `stock-managed-route` 作业使用的 `node:22-bookworm-slim` 固定为
+`node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392`，
+并把同一 digest 通过 `CHIPTRACE_CONFIG_TEST_IMAGE` 传给实际 Docker 测试；合同测试会拒绝退回可变标签。
+当前节点用非 root、只读根、无网络参数启动该 digest，实际输出 Node `v22.23.3` 并退出 0。该修复
+降低远程 CI 因基础镜像漂移产生的启动差异，但仍需要 GitHub Actions 对同一 SHA 的真实 Run 作为最终证据。
+
+## 2026-10-20 Platform Dockerfile 基镜像锁定
+
+维护提交将 Platform Dockerfile 的默认 `CHIPTRACE_PLATFORM_BASE` 与上述已验证 digest 对齐，
+并在镜像构建阶段强制 `node --version` 为 `v22.23.3`。因此 managed-route 测试、CI Platform
+镜像和本地部署候选不会因 `node:22-bookworm-slim` 标签漂移而产生不同启动运行时；这仍需由同一
+提交的 GitHub Actions Run 复核远端 runner 结果。
+
+## 2026-10-19 09:42（Asia/Shanghai）最新 Platform 镜像临时启动验证
+
+从维护分支 `f5a4a9c1e1b389c1bb85e1067968f91942b15304` 构建 Platform target，镜像 ID 为
+`sha256:2a8ff89dbf4d094077c09858730100710a9e76a0886879a8bd6b594cd55b8335`。在独立临时端口和
+tmpfs 目录以 UID `10001:10001`、只读根、`cap_drop=ALL`、`no-new-privileges` 启动，健康响应实际为
+`ok=true`、`backend=fs`、对应完整 revision，`queued=0`、`running=0`、`jobs=0`、`failure=null`。
+该 smoke 只验证新版 Platform 进程和健康契约，使用 FS 临时存储；没有修改 18086 热服务，也不能替代
+真实 OSS 账号的提交、恢复、远端哈希和租户鉴权验收。
+
+## 2026-10-19 09:01:42（Asia/Shanghai）线上只读复核
+
+本次复核只读取健康端点、Docker 容器元数据和 Git 状态，未重启服务、修改配置或清理 Raw。18084
+Gateway、3011 Collector、3012 Relay 和 18086 Platform 的 `/health` 均返回 HTTP 200；Relay `/ready`
+返回 HTTP 503。Collector/Relay 实际运行 revision
+`db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，Collector 与 Relay 的 Capture/Delivered 均为
+`1,291,300`，`pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`，Collector 队列为 0
+且 ready。Relay delivery attempts 为 `1,291,383`，其中 `83` 次为重试；Gateway outbox 的
+pending/processing/最近失败均为 0，293 个历史失败原件均有 recovery receipt，未解决数为 0。
+
+业务交付门禁仍失败：Relay 持久质量账本在本次健康采样为 `6,506`，全部来自 `otlp_traces`，其中
+`identity_conflict=182`、`invalid_lifecycle=4,359`、`legacy_unclassified=1,965`；本进程新增 984，
+Raw 未被改写。Wire `requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，
+`wire` 同时缺失且过期。随后以同一 revision 运行 runtime gate，实际观察到质量计数 `6,515`，退出码为
+1，阻断原因包含质量、新鲜度、Wire 覆盖和 Turn 就绪；持续增长的 OTLP 不能替代缺失的 Wire。
+
+Platform `/health` 返回 HTTP 200 且无排队任务，但响应没有 `backend` 字段；只读容器元数据显示
+`CHIPTRACE_BACKEND=fs`，运行 revision 仍为 `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`。对同一
+端点执行 `platform-health-gate --expected-backend oss` 实际退出 1。维护分支当前已推送提交
+`59790ac`，线上尚未部署它，因此真实 OSS 提交、恢复、远端 SHA-256、同 SHA GitHub Actions 和
+新鲜多轮 Wire Canary 仍未验收。服务目前只适合内部 Raw/恢复验证，不能向外部使用者承诺完整
+Session/Turn 和远端持久导出。
+
+## 2026-10-19 09:13（Asia/Shanghai）当前 release 性能复测
+
+在当前工作树的 release binary 上使用 4 shard、16 并发、64 KiB、批量 64、`fsync` 和
+`--max-delivery-retries 0` 连续复测两次。入口确认吞吐为 `3,969–4,071 records/s`，端到端
+吞吐为 `1,230–1,235 records/s`，P95 批请求延迟约 `319–335 ms`，两次均为 `10,000/10,000`
+delivered、`failed=0`、`delivery_retries=0`、`conservation_ok=true`；排空耗时约 `5.58–5.68 s`。
+复测主机 load average 约 `27`，根文件系统使用率约 `91%`，因此不能把历史的 `1,384 records/s`
+直接判定为代码回退。下一轮容量结论必须在隔离主机或明确的目标 NFS/OSS 上重复相同参数，并同时记录
+P95/P99、磁盘余量、`pending/inflight/retries/failed` 和对象上传耗时；当前结果只证明本版本在受限
+环境下仍保持零重试和投递守恒。
+
+## 2026-10-19 08:30（Asia/Shanghai）线上只读复核
+
+本次复核仅读取健康端点和容器元数据，未重启服务、修改配置或清理 Raw。18084 Gateway、3011
+Collector、3012 Relay 和 18086 Platform 的 `/health` 均返回 HTTP 200；Relay `/ready` 仍返回
+HTTP 503。Collector 与 Relay 实际运行 revision `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，
+Collector `captures=1,289,122`、队列深度为 0 且 ready，单 shard 已封存 849 个 Segment、
+`119,280,003,319` bytes；Relay `delivered=1,289,122`、`pending=0`、`failed=0`、
+`conservation_ok=true`。Gateway outbox pending、processing 和最近失败均为 0，未解决历史失败为
+0；该瞬间 Rust relay 有 1 条 inflight，故不能把单次快照写成完全排空。
+
+业务交付门禁仍真实失败：Relay 持久质量账本为 `6,325`，全部来自 `otlp_traces`，其中
+`identity_conflict=182`、`invalid_lifecycle=4,178`、`legacy_unclassified=1,965`；原因分解完整，
+Raw 未被改写。Wire `requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，
+`wire` 同时缺失且过期。使用同一 revision 的 runtime gate 实际退出 1，阻断原因包括质量错误、
+缺少/过期 Wire 和未准备好 Turn 交付；这不是传输进程健康就绪的误报。
+
+Platform 健康响应为 HTTP 200 且当前无排队任务，但未提供新版 `backend` 字段；只读容器环境为
+`CHIPTRACE_BACKEND=fs`，运行 revision 仍为 `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`。对该
+端点执行 `platform-health-gate --expected-backend oss` 实际退出 1。因此真实 OSS 提交、恢复、
+远端 SHA-256、同 SHA GitHub Actions 和新鲜多轮 Wire Canary 仍未验收，服务目前只适合内部
+Raw/恢复验证，不能向外部使用者承诺完整 Session/Turn 和远端持久导出。
+
+## 2026-10-19 08:17:11（Asia/Shanghai）线上只读复核
+
+本次复核未重启容器、未修改配置或清理 Raw。18084 Gateway、3011 Collector、3012 Relay 和
+18086 Platform 的 `/health` 均返回 HTTP 200；Relay `/ready` 返回 HTTP 503。Collector 与
+Relay 实际运行 revision `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，Capture/Delivered
+均为 `1,287,967`，`pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`；Collector
+队列深度为 0 且 ready，单 shard 已封存 849 个 Segment、`119,280,003,319` bytes。Gateway
+outbox 当前 pending、processing 和最近失败均为 0，293 个历史失败原件仍有恢复凭据，未解决数
+为 0；独立 trace exporter 关闭。
+
+业务交付门禁仍失败：Relay 持久质量账本为 `6,243`，其中 `identity_conflict=182`、
+`invalid_lifecycle=4,096`、`legacy_unclassified=1,965`；当前进程新增 721。错误全部来自
+OTLP traces，原因分解完整且 Raw 未被改写。Wire `requests=0`、
+`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，`wire` 同时缺失且过期；
+runtime gate 在质量、新鲜度和来源覆盖门禁下真实退出 1。新增 `invalid_lifecycle` 仍对应上游
+重复 `outcome` 属性，必须修复 Producer 或采用已验收的补丁版本，不能在 Relay 中择一终态来掩盖冲突。
+
+Platform 健康响应仍没有新版 `backend` 字段，实际容器环境为 `CHIPTRACE_BACKEND=fs`，运行 revision
+为 `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`；维护分支最新提交尚未部署，真实 OSS 提交、恢复、
+远端 SHA-256、同 SHA GitHub Actions 和新鲜多轮 Wire Canary 仍未验收。因此当前只能用于内部
+Raw/恢复验证，不能向外部使用者承诺完整 Session/Turn 和远端持久导出。
+
+## 2026-10-19 07:52（Asia/Shanghai）线上只读复核
+
+本次复核未重启容器、未改动配置或清理 Raw。18084 Gateway、3011 Collector、3012 Relay 和
+18086 Platform 的 `/health` 均返回 HTTP 200；Relay `/ready` 返回 HTTP 503。Collector 与
+Relay 实际运行 revision `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，Capture/Delivered
+均为 `1,286,211`，`pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`；Collector
+队列深度为 0、ready，单 shard 已封存 `848` 个 Segment、`118,743,161,277` bytes。Gateway
+outbox 当前 pending/processing/recent failure 均为 0，293 个历史失败原件及 293 个恢复凭据
+仍保留，未解决数为 0。
+
+业务交付门禁仍失败：Relay 持久质量账本为 `6,105`，其中 `identity_conflict=182`、
+`invalid_lifecycle=3,958`、`legacy_unclassified=1,965`；当前进程新增 583。错误全部来自
+OTLP traces，原因分解完整且 Raw 未被改写。Wire `requests=0`、
+`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，缺失且过期来源为 `wire`；
+runtime gate 因质量、新鲜度和四源覆盖硬门禁真实退出 1。新增 `invalid_lifecycle` 仍对应
+上游重复 `outcome` 生命周期属性，必须修复 Producer 或采用已验收的补丁版本，不能在 Relay
+中择一终态来掩盖冲突。
+
+Platform 进程仍运行旧 revision，HTTP 健康响应尚未包含新版 `backend` 字段；只读容器环境明确
+为 `CHIPTRACE_BACKEND=fs`，对象目录挂载在本地磁盘。维护分支已把后端字段加入健康契约，并让
+受保护 live preflight 只接受 `oss` 或 `s3`，但提交 `d55e26f` 尚未部署。真实 OSS 提交、恢复、
+远端 SHA-256、同 SHA GitHub Actions 和新鲜多轮 Wire Canary 仍未验收，因此当前服务只能用于
+内部 Raw/恢复验证，不能向外部使用者承诺完整 Session/Turn 和远端持久导出。
+
+## 2026-10-19 07:23（Asia/Shanghai）线上只读复核与生产结论
+
+本次只读复核没有重启容器、修改配置或清理证据。18084 Gateway、3011 Collector、3012 Relay 和
+18086 Platform 的 `/health` 均返回 HTTP 200；Collector/Relay 实际运行 revision
+`db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，Collector Capture 与 Relay Delivered 均为
+`1,284,184`，`pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`，Collector
+ready 且队列深度为 0。Gateway full-trace outbox 当前 `pending=0`、`processing=0`、最近失败为 0，
+293 个历史失败文件和 293 个 recovery receipt 仍保留，未解决数为 0。上述证据证明 Raw/WAL、
+durable receipt、重试和守恒链路在运行。
+
+业务交付门禁仍真实失败：runtime gate 退出 1，Relay `/ready` 返回 503。该快照的持久质量账本为
+`quality_errors=5,944`（`identity_conflict=182`、`invalid_lifecycle=3,797`、
+`legacy_unclassified=1,965`），本进程新增 422；Wire `requests=0`、
+`successful_turn_scoped_captures=0`，因此 `turn_capture_ready=false`，缺失且过期来源为 `wire`。
+对最新 3.76 GB WAL 片段的流式只读复核发现新增错误均为固定的
+`conflicting duplicate lifecycle attribute "outcome"`；这与
+`docs/upstream-otlp-outcome.patch` 描述的生产者修复一致。Relay 正确保留 Raw 并标记
+`invalid_lifecycle`，不能通过选择一个终态或重启清零。
+
+当前实际运行的 Stock Codex 用户配置把 Provider 指向外部地址，受管 `/etc/codex` 虽指向
+18084；这解释了 OTLP/Hook 持续增长而 Wire 为零。没有把该配置静默改写，因为它属于用户级运行时
+授权。要达到发布标准，必须先用受管配置和已应用生产者补丁的新进程产生至少两个新鲜、带 Session/Turn
+身份的 HTTP 2xx Wire，再通过四源 runtime gate、真实 Alibaba OSS 提交/恢复/哈希校验、目标租户
+Platform 导出和同一发布 SHA 的 GitHub Actions。
+
+本仓库的优势已经由本地 `make cloud-test` 的真实退出码 0 覆盖：磁盘 Raw/WAL 和 redb 账本可恢复，
+质量原因码有界且守恒，Session/Turn 分页不把大正文装入内存，FS/私有 S3/OSS 协议有重启与哈希回归，
+容器和 CI 使用不可变 revision、只读根、非 root 及资源上限。它们是可靠性基础，不等同于当前线上
+生产就绪。
+
+后续迭代按以下顺序执行：
+
+1. **P0 来源与交付**：修正实际用户 Provider/OTLP 路由，部署包含 outcome/context 补丁的受管
+   Producer，观察新错误增量为零并完成真实多轮四源 Canary；任何质量错误、缺 Wire 或 stale Wire
+   都继续阻断发布。
+2. **P0 远端与对象存储**：用待发布 SHA 核验 GitHub Actions；将 Platform 从 FS 切到目标 OSS，
+   完成提交、恢复、远端 SHA-256 和鉴权导出，保留 FS 作为回滚验证而不是生产后端。
+3. **P1 性能与容量**：在目标 NFS/OSS 上按现有目录拓扑做迁移前压测，比较 1/4 shard、16/32
+   delivery concurrency、批量和 P95/P99；用 `pending/inflight/retries/failed`、磁盘余量和
+   `conservation_ok` 建立持续 SLO，再决定是否新建四 shard 数据目录。
+4. **P1 GitHub 维护**：合并维护分支前完成同 SHA 远端 run、保护分支和必需检查；本地绿色测试、
+   公开 ref 或历史 run 均不能替代新提交的远端证据。
+
+## 2026-10-19 质量账本基线机制（代码变更）
+
+维护分支新增 `chiptrace.quality-baseline.v1`：基线保存完整端点/原因计数、源报告 SHA-256、
+审批元数据和自身内容摘要；runtime gate 只有显式传入基线与 `--max-new-quality-errors` 时才按
+基线后的增量门禁。计数回退、未知原因、篡改或缺少审批信息均失败，原始质量账本和 Raw 不会被
+清零。默认 live preflight 仍使用 `--max-quality-errors 0`，因此本机制没有放宽当前线上门槛。
+新增质量基线测试已纳入本地 Makefile 和 GitHub CI；它解决的是历史账本治理，不能替代实际
+Producer 路由、四源 Turn、真实 OSS 或目标租户验收。
+
+## 2026-10-19 06:41（Asia/Shanghai）最新只读复核
+
+本次复核未重启服务、未改动主机配置。18084 Gateway、3011 Collector、3012 Relay 和 18086
+Platform 的 `/health` 均返回 HTTP 200；Collector 与 Relay 使用 revision
+`db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，两者的累计 Capture/Delivered 均为
+`1,281,084`，队列、pending、inflight 和 failed 均为 0，Collector ready 且无错误。Collector
+当前 sealed Segment 为 846 个、`117,669,720,704` bytes，仍落在 NFS，不能当作远端归档证据。
+
+业务门禁仍未通过：runtime gate 真实退出 1；Relay 持久 `quality_errors=5,714`，全部来自
+`otlp_traces`，原因分解为 `identity_conflict=182`、`invalid_lifecycle=3,567`、
+`legacy_unclassified=1,965`。`wire` 同时缺失且过期，`successful_turn_scoped_captures=0`、
+`turn_capture_ready=false`。其中 `invalid_lifecycle` 继续对应上游同一 Span 重复声明终态；
+Raw 和质量账本均保留，不能通过选择某一个终态来清零。Gateway outbox 当前 pending、processing
+和 recent failure 均为 0，293 个历史失败文件均有 recovery receipt 且未解决数为 0；独立 trace
+exporter 仍关闭。Platform health gate 以同一 revision 退出 0，但当前后端仍为本地 FS。
+
+路由预检以实际运行 Codex 的 user 配置执行时真实退出 1：受管 `/etc/codex` 指向 18084，user
+配置覆盖为外部 Provider，因此只能观察到 OTLP/Hook 流量，不能把当前线上状态解释为完整 Wire
+采集。真实 Alibaba OSS、未修改 Stock Codex 新鲜多轮 Canary、主平台鉴权导出和远端 Actions
+结论仍未验收。
+
+本轮还修复了 GitHub live preflight 的启动阻断：工作流的“Verify the actual Codex configuration”
+步骤现在显式注入 `CHIPTRACE_CODEX_USER_CONFIG`，并由契约测试锁定同一步的变量作用域；此前该变量
+只存在于前一步，在 `set -u` 下会在路由检查前直接失败。当前工作树的 `make cloud-test` 已真实
+退出 0；该本地结果仍不替代对应提交的远端 Actions 证据。
+
+同轮还为 runtime gate 增加了受限排空重试：受控 live preflight 使用 4 次、每次 250 ms，
+只对 Gateway/Relay 的 pending/inflight 和 Collector 短暂队列进行重采样；质量错误、缺失或过期
+Wire、版本不一致和存储失败不会被重试掩盖。新增回归实际验证了首个快照 inflight 后第二次稳定
+快照可以通过，持续业务质量缺口仍保持真实非零退出。
+
+## 2026-10-19 06:53（Asia/Shanghai）当前 release 性能复核
+
+在当前工作树的 release binary 上串行执行了相同 10,000 条、64 KiB、`fsync` 对照，避免并行
+构建竞争。Collector WAL 单 shard 为 `3,282.2 records/s`、`205.1 MiB/s`，四 shard 为
+`4,676.4 records/s`、`292.3 MiB/s`；loopback HTTP 入口单 shard 为 `3,640.9 records/s`
+（P95 `287.6 ms`、P99 `360.6 ms`），四 shard 为 `5,083.7 records/s`（P95 `251.3 ms`、
+P99 `275.1 ms`）。
+
+Relay 四 shard、批量 64、并发 16 的端到端吞吐为 `1,384.0 records/s`，入口确认吞吐为
+`3,923.4 records/s`，10,000/10,000 delivered、零重试，排空耗时 `4.68 s`；排空期间有
+`265/347` 次健康轮询处于背压 503。结果再次说明 Relay 交付和背压是热路径瓶颈，四 shard
+有明显收益，但不包含真实 Session/Turn、OSS 上传、多租户竞争或长期 NFS 负载，因此没有把
+Compose 默认从单 shard 直接改成四 shard。已初始化的数据目录拓扑不能在线修改，生产切换仍需
+独立归档、恢复和目标 OSS 压测证据。
+
+评估日期：2026-10-19。最新线上只读快照为 06:07:26（Asia/Shanghai）；文内较早实验保留各自时间与验证范围。
 结论：具备可靠 Raw 采集、持久账本和离线验收的基础，可开展受控试用；当前部署尚未达到向他人承诺
 原生 Turn 全量采集、远端持久保存和在线导出的发布条件。
 
-最新快照中 Collector 与 Relay 的传输计数仍守恒：03:50 健康观测到两者均为
-`1,267,147`，`pending=0`、`failed=0`、`inflight=0`，Collector ready；18084、3011、3012、
+最新快照中 Collector 与 Relay 的传输计数仍守恒：06:07:26 健康观测到两者均为
+`1,278,543`，`pending=0`、`failed=0`、`inflight=0`，Collector ready；18084、3011、3012、
 18086 的 `/health` 均返回 HTTP 200，但 Relay `/ready` 为 HTTP 503。Collector/Relay/Platform
-实际 build revision 均为本次部署的代码基线 `bd2bf5cb54fe5fab4161f37bff5294eff0ebcffb`，版本已完成受控滚动更新。
-业务覆盖仍拒绝：`ingest_coverage.status=degraded`，持久 `quality_errors=4658`
-（全部来自 `otlp_traces`，其中 `identity_conflict=182`、`invalid_lifecycle=2511`、
-`legacy_unclassified=1965`），重启后的本次进程质量错误为 12。原因标签按固定分类计数并保留 Raw；
-新进程尚未观察到 Wire 或 Hook，`successful_turn_scoped_captures=0`、
+实际 build revision 均为 `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，已完成受控滚动更新。
+业务覆盖仍拒绝：`ingest_coverage.status=degraded`，持久 `quality_errors=5525`
+（全部来自 `otlp_traces`，其中 `identity_conflict=182`、`invalid_lifecycle=3378`、
+`legacy_unclassified=1965`），本次进程质量错误为 3。原因标签按固定分类计数并保留 Raw；
+当前缺少且过期的来源为 `wire`（同一时刻 Hook 也尚未观察到），`successful_turn_scoped_captures=0`、
 `turn_capture_ready=false`，runtime gate 仍以质量、新鲜度、来源和 revision 门禁真实退出 1。
 18086 的平台后端仍为 `fs`；Gateway outbox 当前 pending/processing/recent failure 均为 0，
-293 个历史失败原件和 recovery receipt 保留且未解决数为 0，但 watchdog 最近仍报告上游 403，
+历史失败原件和 recovery receipt 保留且未解决数为 0，但 trace exporter 仍关闭。
 真实 Alibaba OSS 提交、恢复、远端对象哈希、未修改 Stock Codex 新鲜多轮 Canary 和目标租户导出
 仍未完成。GitHub API/CLI 当前无法核验远端 Actions 结论；维护分支与 `main` 的远端 ref 已更新，
 当前仅以 `git ls-remote` 证明远端 ref 存在。
 
-本次升级后复核显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
+较早的 03:50 快照显示 Gateway/Collector/Relay 的传输闭环健康：Gateway outbox 的 pending/processing/recent
 failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留，Collector/Relay 队列为空且
 `conservation_ok=true`。Collector/Relay/Platform 实际 revision 均为本次部署的代码基线
 `bd2bf5cb54fe5fab4161f37bff5294eff0ebcffb`；Gateway 入口仍是独立发布组件，需在 live preflight
@@ -35,6 +560,13 @@ failure 均为 0，293 个历史失败原件与 293 个 recovery receipt 保留�
 `1,085.1 records/s`、`6.10 s`。两次均为 10,000/10,000 delivered、零重试、计数守恒；4 shard
 使端到端吞吐提升约 13.6%，说明交付链路仍是主要瓶颈。该基准不含真实 Session/Turn、OSS 上传或
 多租户竞争，不能替代目标硬件上的容量和 SLO 验收。
+
+04:59（Asia/Shanghai）在同一 10,000 条、64 KiB、`fsync`、Relay 回环条件下补测了配置敏感性：
+`batch=128`、并发 16、1 shard 的端到端吞吐为 `1,572.3 records/s`，4 shard 为
+`1,893.1 records/s`（约提升 20.4%），两次均为 10,000/10,000 delivered、零交付重试；
+并发 32、4 shard 可达到 `2,530.6 records/s`，但 P99 批延迟升至约 `1.29 s`，并发 16 的
+P99 约为 `0.52 s`。这支持在真实 NFS/OSS 压测后优先评估四 shard，不能据此直接把并发 32
+作为生产默认值；测试仍不包含对象上传、跨租户竞争和长期负载。
 
 较早快照的 Relay `ingest_coverage.status=degraded`，`quality_errors=848`（全部来自 `otlp_traces`），
 Wire 已约 96 分钟未刷新，`required_sources_fresh=false`、`turn_capture_ready=false`，

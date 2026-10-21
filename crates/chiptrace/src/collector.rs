@@ -78,7 +78,7 @@ fn router(state: AppState, max_connections: usize, max_envelope_bytes: usize) ->
             std::time::Duration::from_secs(120),
         ))
         .layer(CatchPanicLayer::new())
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().on_failure(crate::http_trace::on_failure))
         .with_state(state)
 }
 

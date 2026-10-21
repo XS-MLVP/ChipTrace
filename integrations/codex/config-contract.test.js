@@ -10,6 +10,7 @@ const { spawn } = require('node:child_process');
 const integrationRoot = __dirname;
 const configPath = path.join(integrationRoot, 'config.toml.example');
 const requirementsPath = path.join(integrationRoot, 'requirements.toml.example');
+const hookPath = path.join(integrationRoot, 'chiptrace-codex-hook.sh');
 const readmePath = path.join(integrationRoot, 'README.md');
 const collectorComposePath = path.join(integrationRoot, '..', '..', 'deploy', 'collector-relay.yml');
 const platformComposePath = path.join(integrationRoot, '..', '..', 'deploy', 'cloud-platform.yml');
@@ -39,12 +40,16 @@ test('Stock Codex uses the current system configuration contract', () => {
 
 test('Responses and OTLP routes are complete without embedded credentials', () => {
   assert.match(config, /^wire_api = "responses"$/m);
+  assert.match(config, /^base_url = "http:\/\/127\.0\.0\.1:18084\/"$/m);
   assert.match(config, /^request_max_retries = 25$/m);
   assert.match(config, /^stream_max_retries = 25$/m);
   assert.match(config, /^requires_openai_auth = false$/m);
   assert.match(config, /^auth\s*=.*CHIPTRACE_API_KEY/m);
   assert.match(config, /18084\/otel\/v1\/logs/);
   assert.match(config, /18084\/otel\/v1\/traces/);
+  assert.doesNotMatch(config, /172\.28\.11\.121/);
+  assert.match(requirements, /^base_url = "http:\/\/127\.0\.0\.1:18084\/"$/m);
+  assert.doesNotMatch(requirements, /172\.28\.11\.121/);
   assert.match(config, /^log_user_prompt = true$/m);
   assert.match(config, /^\[otel\.tool_result\]$/m);
   assert.match(config, /^max_bytes = 268435456$/m);
@@ -68,6 +73,13 @@ test('model catalog keeps fields required by legacy and current Stock Codex', ()
 });
 
 test('required Hooks contain lifecycle only and fail closed at SessionStart', () => {
+  assert.equal(fs.existsSync(hookPath), true);
+  assert.notEqual(fs.statSync(hookPath).mode & 0o111, 0);
+  const hook = fs.readFileSync(hookPath, 'utf8');
+  assert.match(hook, /CHIPTRACE_INGEST_TOKEN_FILE/);
+  assert.match(hook, /127\.0\.0\.1:18084/);
+  assert.match(hook, /\/etc\/chiptrace\/ingest-token/);
+  assert.match(hook, /invalid_durable_receipt/);
   assert.doesNotMatch(requirements, /^allow_managed_hooks_only\s*=\s*true$/m);
   const events = [...requirements.matchAll(/^\[\[hooks\.([A-Za-z]+)\]\]$/gm)]
     .map((match) => match[1])
@@ -88,23 +100,30 @@ test('required Hooks contain lifecycle only and fail closed at SessionStart', ()
 
   const commands = requirements.match(/^command = .*$/gm) ?? [];
   assert.equal(commands.length, events.length);
-  assert.equal(commands.every((command) => command.includes('$CHIPTRACE_INGEST_TOKEN')), true);
+  assert.equal(commands.every((command) => command.includes('CHIPTRACE_HOOK_EVENT=')), true);
+  assert.equal(commands.every((command) => command.includes('CHIPTRACE_HOOK_BIN')), true);
 
   const sessionStart = requirements.split('[[hooks.SessionEnd]]', 1)[0];
   const sessionStartCommandLine = sessionStart.match(/^command = (.*)$/m);
   assert.notEqual(sessionStartCommandLine, null);
   const sessionStartCommand = JSON.parse(sessionStartCommandLine[1]);
-  assert.match(sessionStart, /\$CHIPTRACE_API_KEY/);
-  assert.match(sessionStart, /\$OTEL_EXPORTER_OTLP_HEADERS/);
-  assert.match(sessionStartCommand, /"continue":false/);
-  assert.match(sessionStartCommand, /cloud ingest unavailable or configuration incomplete/);
+  assert.doesNotMatch(sessionStartCommand, /CHIPTRACE_API_KEY|OTEL_EXPORTER_OTLP_HEADERS/);
+  assert.match(sessionStart, /CHIPTRACE_GATEWAY_URL/);
+  assert.match(sessionStart, /CHIPTRACE_INGEST_TOKEN_FILE/);
+  assert.match(sessionStartCommand, /CHIPTRACE_HOOK_EVENT=SessionStart/);
 
   const timeouts = [...requirements.matchAll(/^timeout = (\d+)$/gm)]
     .map((match) => Number(match[1]));
   assert.equal(timeouts.length, events.length);
   assert.equal(timeouts.every((timeout) => timeout <= 3), true);
-  assert.equal(commands.every((command) => command.includes('--max-time 1')), true);
   assert.doesNotMatch(requirements, /--max-time 8|timeout = 10/);
+});
+
+test('README SessionStart preflight includes the native fields required by the converter', () => {
+  assert.match(readme, /"hook_event_name":"SessionStart","session_id":"preflight"/);
+  assert.match(readme, /"model":"preflight"/);
+  assert.match(readme, /"permission_mode":"default"/);
+  assert.match(readme, /"source":"startup"/);
 });
 
 test('configuration has no ChipTrace client or plugin dependency', () => {
@@ -167,7 +186,7 @@ test('production deployment templates require an immutable image revision', () =
 
 test('standalone platform server refuses an implicit or invalid storage backend', async () => {
   for (const backend of [undefined, 'local']) {
-    const env = { ...process.env };
+    const env = { ...process.env, CHIPTRACE_BUILD_REVISION: 'f'.repeat(40) };
     if (backend === undefined) delete env.CHIPTRACE_BACKEND;
     else env.CHIPTRACE_BACKEND = backend;
     const child = spawn(process.execPath, [platformServerPath], {
@@ -211,11 +230,13 @@ test('separate native hook invocations survive while HTTP retries deduplicate', 
   try {
     const block = requirements.split('[[hooks.SessionEnd]]')[1].split('[[hooks.Interrupt]]')[0];
     const native = JSON.parse(block.match(/^command = (.*)$/m)[1]);
-    const command = native.replace('http://172.28.11.121:18084', `http://127.0.0.1:${server.address().port}`);
+    const command = native;
     const event = { hook_event_name: 'SessionEnd', session_id: 'resume-contract-session', reason: 'other' };
     async function invoke(input) {
       const child = spawn('/bin/sh', ['-c', command], {
-        env: { ...process.env, CHIPTRACE_INGEST_TOKEN: 'synthetic-hook-test-credential' },
+        env: { ...process.env, CHIPTRACE_HOOK_BIN: hookPath,
+          CHIPTRACE_GATEWAY_URL: `http://127.0.0.1:${server.address().port}`,
+          CHIPTRACE_INGEST_TOKEN: 'synthetic-hook-test-credential' },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       const stderr = [];
@@ -257,9 +278,8 @@ test('SessionStart stops before forwarding when credentials or hook JSON are inv
     { input: '{invalid', token: 'synthetic-hook-test-credential' },
   ]) {
     const child = spawn('/bin/sh', ['-c', command], {
-      env: { ...process.env, CHIPTRACE_API_KEY: 'synthetic-provider-credential',
-        CHIPTRACE_INGEST_TOKEN: scenario.token,
-        OTEL_EXPORTER_OTLP_HEADERS: `Authorization=Bearer%20${scenario.token}` },
+      env: { ...process.env, CHIPTRACE_HOOK_BIN: hookPath,
+        CHIPTRACE_INGEST_TOKEN: scenario.token },
       stdio: ['pipe', 'pipe', 'ignore'],
     });
     let stdout = '';
@@ -272,6 +292,6 @@ test('SessionStart stops before forwarding when credentials or hook JSON are inv
     await finished;
     const response = JSON.parse(stdout);
     assert.equal(response.continue, false);
-    assert.match(response.stopReason, /cloud ingest unavailable or configuration incomplete/);
+    assert.match(response.stopReason, /ChipTrace cloud ingest unavailable:/);
   }
 });

@@ -27,6 +27,12 @@ into a new namespace. Switching storage backends, project IDs or capture paths
 also requires a new root and verified migration. The binding guards accidental
 state reuse; host authentication and tenant authorization remain required.
 
+`GET /health` reports the selected `backend` as `fs`, `oss`, or `s3` without
+exposing endpoint, bucket, prefix, or credentials. A production deployment gate
+should pass `--expected-backend oss` (or an approved `s3`) to
+`scripts/ci/platform-health-gate.js`; this makes a local FS scratch service fail
+closed before it is presented as a remote durable export service.
+
 The plugin persists job acknowledgements before returning, uses the Rust
 engine's OS lock for a single writer, resumes queued/running jobs after a
 restart, and stores native Session/Turn records in a checksummed JSONL sidecar.

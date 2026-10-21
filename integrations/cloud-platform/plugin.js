@@ -15,6 +15,11 @@ const PROJECTION_PARTS = Object.freeze({
   links: { file: 'links/interaction-links.jsonl.zst', contentType: 'application/zstd' },
 });
 
+// These readers hash and validate complete evidence files. A fixed MiB buffer
+// reduces NFS/object-restore read calls without making memory usage depend on
+// the size of a Session or Projection.
+const EVIDENCE_READ_BUFFER_BYTES = 1024 * 1024;
+
 class PlatformError extends Error {
   constructor(message, status = 400, code = 'INVALID_REQUEST') {
     super(message);
@@ -194,7 +199,7 @@ async function fileDigest(file) {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new PlatformError('engine artifact is not a regular file', 502, 'ENGINE_PROTOCOL');
     const digest = crypto.createHash('sha256');
-    const buffer = Buffer.alloc(64 * 1024);
+    const buffer = Buffer.alloc(EVIDENCE_READ_BUFFER_BYTES);
     let bytes = 0;
     for (;;) {
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, bytes);
@@ -905,7 +910,7 @@ class ChipTracePlugin {
       }
       if (!stat.isFile() || stat.size !== job.turns.bytes) throw new Error('invalid Turn file');
       const digest = crypto.createHash('sha256');
-      const buffer = Buffer.alloc(64 * 1024);
+      const buffer = Buffer.alloc(EVIDENCE_READ_BUFFER_BYTES);
       const turns = [];
       let records = 0;
       let position = 0;
@@ -1105,6 +1110,10 @@ class ChipTracePlugin {
   }
 
   health() { return { ok: this.started && !this.closing && !this.failure, version: 'chiptrace.platform.v1',
+    // Keep endpoint, bucket, prefix and credentials private while exposing
+    // the selected backend to deployment gates. This prevents a local FS
+    // scratch deployment from being mistaken for an OSS/S3 production one.
+    backend: this.backend,
     build: { revision: process.env.CHIPTRACE_BUILD_REVISION || null },
     queued: this.queue.length, running: this.running.size, active_reads: this.activeReads,
     jobs: this.jobs.size, failure: this.failure || null }; }

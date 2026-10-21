@@ -28,6 +28,8 @@ export CHIPTRACE_CAPTURE_ROOT='/srv/chiptrace/capture'
 export CHIPTRACE_COLLECTOR_STATE_ROOT='/srv/chiptrace/collector-state'
 export CHIPTRACE_RELAY_ROOT='/srv/chiptrace/relay'
 export CHIPTRACE_INGEST_TOKEN='<at-least-32-bytes>'
+# Stock Codex lifecycle Hooks may read the same token from a root-owned file:
+# export CHIPTRACE_INGEST_TOKEN_FILE='/etc/chiptrace/ingest-token'
 sudo install -d -o 10001 -g 10001 -m 0700 \
   /srv/chiptrace/capture /srv/chiptrace/collector-state /srv/chiptrace/relay
 node scripts/deploy/preflight.js --file deploy/collector-relay.yml
@@ -39,6 +41,15 @@ docker compose -f deploy/collector-relay.yml up -d --no-build --pull never --wai
 完整 Git SHA 不一致的 OCI revision；不会启动或更新服务。跨主机发布时使用仓库 digest。
 构建参数写入 Collector/Relay 的健康响应；启动后还需核对实际编译 revision 和业务门禁。
 预检通过不替代真实 Stock Codex、OSS 账号或目标 Session 验收。
+
+平台生产发布还必须显式加上 `--require-cloud-backend`；该选项只接受 `oss` 或 `s3`，本地
+`fs` 继续保留给隔离测试：
+
+```bash
+node scripts/deploy/preflight.js \
+  --file deploy/cloud-platform.yml \
+  --require-cloud-backend
+```
 
 模板默认 Collector 8 GiB、Relay 12 GiB、平台 4 GiB 内存上限，均为 2 CPU、256 PID。
 可通过 `CHIPTRACE_COLLECTOR_MEMORY_LIMIT`、`CHIPTRACE_RELAY_MEMORY_LIMIT`、
@@ -59,9 +70,25 @@ Collector 与 Relay 的存储拓扑可通过 `CHIPTRACE_STORE_SHARDS` 配置，�
 release Relay 对照（10,000 条、64 KiB、批量 64、并发 16、带 `fsync`）中，4 个 shard 的入口确认
 吞吐为 `4,242.2 records/s`、端到端为 `1,232.8 records/s`，1 个 shard 分别为 `3,211.4`
 和 `1,085.1 records/s`。这不是生产 SLO，且端到端提升有限，仍需在目标硬件和对象存储链路上
-单独测量。已初始化的
+单独测量。2026-10-19 08:03 的当前 release、1,000 条 64 KiB、批量 128、并发 16、带
+`fsync` 的同机对照为：1 shard 入口 `3,057`、端到端 `1,518 records/s`，4 shard 入口
+`3,692`、端到端 `1,961 records/s`，两次均 1,000/1,000 投递、零重试、守恒通过；这只是
+约 29% 的 loopback 提升，不能替代 NFS/OSS 压测。已初始化的
 数据目录会在 `sharding.json` 中固定拓扑，运行中改变 shard 数会被拒绝；迁移必须先
 完成独立的数据归档、恢复和字节校验，不能只修改环境变量。
+
+2026-10-19 13:06（Asia/Shanghai）的当前 release 复测使用 4 shard、16 并发、64 KiB、批量
+64、`fsync` 和 10,000 条记录：入口 `4,351.4 records/s`，端到端 `1,244.1 records/s`，P95
+`316.8 ms`、P99 `338.8 ms`，排空 `5.74 s`，`10,000/10,000` delivered、`failed=0`、
+`delivery_retries=0`、计数守恒。排空期间有 360/435 次健康轮询观察到背压；这仍是本机回环
+基线，不包含目标 NFS/OSS 上传、多租户竞争或长期 SLO。
+
+2026-10-19 14:22（Asia/Shanghai）在同一 release binary 上复测 4 shard、16 并发、64 KiB、
+批量 64、`fsync`、10,000 条并设置 `--max-delivery-retries 0`：入口 `4,311.6 records/s`，
+端到端 `1,234.6 records/s`，P95 `336.0 ms`、P99 `350.1 ms`，排空 `5.78 s`；
+`10,000/10,000` delivered、`failed=0`、`delivery_retries=0`、`conservation_ok=true`。
+排空期间有 386/471 次健康轮询处于背压 503。结果与前一轮在误差范围内一致，继续说明
+Relay 是回环热路径；它仍不替代目标 NFS/OSS、多租户或长期压测。
 
 Relay 的 `--delivery-concurrency` 同时决定正文读取的受限并行度，可通过
 `CHIPTRACE_DELIVERY_CONCURRENCY` 在部署时调整，默认值为 16，预检允许 1 到 128。最近同一
@@ -80,7 +107,8 @@ Relay `/health` 的 `delivery_retries` 是持久账本中的 `delivery_attempts 
 
 Relay 的 `/health` 只表示进程、WAL 和传输层存活，即使四路来源缺失也可能返回 200。发布门禁
 和需要业务采集就绪语义的编排系统应使用 `/ready`：它要求四路来源已观察且新鲜、持久质量错误为
-零、存在新的有归属 HTTP 2xx Turn Wire，并在 503 响应中返回固定 `blocking_reasons`。`/ready=200`
+零、质量账本作用域为 `durable_relay_state` 且三路原因分解总数守恒、存在新的有归属 HTTP 2xx
+Turn Wire，并在 503 响应中返回固定 `blocking_reasons`。`/ready=200`
 仍不代表某个具体 Session 已完整，Session/Turn 交付必须继续运行 runtime gate 和 cloud acceptance。
 
 `benchmark-http --relay` 会在入口压测结束后轮询 Relay `/health`，直到 `delivered` 与入口
@@ -88,6 +116,10 @@ Relay 的 `/health` 只表示进程、WAL 和传输层存活，即使四路来�
 503；这类响应现在单独计入 `drain_health_degraded_polls`，不会被误报为入口拒绝。压测结果同时
 输出 `delivery_attempts`、`delivery_retries` 和 `delivery_retry_rate`；需要把可恢复背压纳入
 门禁时可传 `--max-delivery-retries N`，超过上限会返回非零，未传时只报告不阻断。
+
+Collector 和 Relay 的 HTTP TraceLayer 将 429/503 作为可恢复背压以 `DEBUG` 记录，并附带
+`backpressure=true`；真正的 5xx 和传输错误仍为 `ERROR`。因此生产日志不会因正常排空产生
+错误洪泛，但监控仍应以 `delivery_retries`、`pending`、`failed` 和 `conservation_ok` 判定交付状态。
 
 18084 网关也必须通过容器级隔离预检。它拥有原始 Wire 的 durable outbox，不能继续使用
 可变镜像 tag、可写根文件系统或无资源上限的容器：
@@ -141,9 +173,24 @@ trace exporter 未启用，watchdog 最近报告重试失败；18086 没有监�
 
 读取到的系统和用户配置存在同名 Provider 的不同 `base_url`。离线原生客户端回归确认，
 系统 `config.toml` 的默认路由可以被用户配置覆盖；仅有 OTLP/Hook 流量不能证明 Wire
-经过 18084。新 requirements 模板通过原生 exact Provider 约束修复这个接入风险，但本次
-没有改动线上 `/etc/codex` 或用户配置。更新受管配置后必须从新客户端进程获取真实 Wire，
-再复验 runtime gate 和目标 Session 的四源关联；不能用合成 Capture 把线上计数补成通过。
+经过 18084。部署前必须同时检查系统配置和实际运行进程的用户配置：
+
+```bash
+node scripts/deploy/codex-route-preflight.js \
+  --config /etc/codex/config.toml \
+  --user-config /path/to/actual/CODEX_HOME/config.toml \
+  --expected-base-url http://127.0.0.1:18084/
+```
+
+如果省略 `--user-config`，预检会自动读取当前进程 `CODEX_HOME/config.toml`；`CODEX_HOME`
+必须是绝对路径。这样可以检查实际运行 Codex 的用户覆盖层，避免只验证 `/etc/codex` 而漏掉
+绕过 Gateway 的用户 Provider。未设置 `CODEX_HOME` 时只校验系统配置；无法读取自动发现的用户
+配置或发现 Provider/OTLP 覆盖时会 fail-closed，且不会输出配置正文、凭据或请求内容。
+
+预检会拒绝用户 Provider 绕过 Gateway、关闭 OTLP 或覆盖受管鉴权。新 requirements 模板
+通过原生 exact Provider 约束进一步修复这个接入风险，但本次没有改动线上 `/etc/codex`
+或用户配置。更新受管配置后必须从新客户端进程获取真实 Wire，再复验 runtime gate 和目标
+Session 的四源关联；不能用合成 Capture 把线上计数补成通过。
 
 隔离 patched Canary 已通过仓库门禁，但不证明线上未修改客户端已经通过。提交
 `13164883972a33634e4c420d532e612c666edfad` 的
@@ -156,6 +203,14 @@ trace exporter 未启用，watchdog 最近报告重试失败；18086 没有监�
 
 管理员按 [Stock Codex 接入](../integrations/codex/README.md) 下发原生配置。用户主机没有
 ChipTrace 程序或服务，用户仍直接运行：
+
+安装前必须同时部署 `integrations/codex/requirements.toml.example` 和
+`integrations/codex/chiptrace-codex-hook.sh`；后者安装为
+`/usr/local/libexec/chiptrace-codex-hook` 并设置为 `0755`。Hook 使用
+`CHIPTRACE_GATEWAY_URL` 选择入口，使用 `CHIPTRACE_INGEST_TOKEN` 或
+`CHIPTRACE_INGEST_TOKEN_FILE` 认证。`CHIPTRACE_API_KEY` 和
+`OTEL_EXPORTER_OTLP_HEADERS` 分别属于 Provider/OTLP 路由，不是 SessionStart Hook 的
+前置条件。安装后先执行 README 中的无业务预检，再启动 Codex。
 
 ```bash
 codex
@@ -197,8 +252,9 @@ Session 交付证据。
 GitHub CI 的 `live-provider-runtime-preflight` 只在手工 `workflow_dispatch`、
 `live_preflight=true`、受保护分支/规则集、受保护的 `production-canary` Environment 和标签为
 `self-hosted, linux, chiptrace-canary` 的内网 Runner 上执行。Environment Secret 必须提供
-`CHIPTRACE_API_KEY`；Environment Variables 必须提供实际 Canary 配置文件路径
-`CHIPTRACE_CODEX_CONFIG`、对应网关地址 `CHIPTRACE_CODEX_BASE_URL`，以及
+`CHIPTRACE_API_KEY`；Environment Variables 必须提供实际 Canary 的系统配置文件路径
+`CHIPTRACE_CODEX_CONFIG`、实际运行用户覆盖文件路径 `CHIPTRACE_CODEX_USER_CONFIG`、对应网关地址
+`CHIPTRACE_CODEX_BASE_URL`，以及
 `CHIPTRACE_RESPONSES_URL`、`CHIPTRACE_GATEWAY_HEALTH_URL`、`CHIPTRACE_RELAY_HEALTH_URL`、
 `CHIPTRACE_COLLECTOR_HEALTH_URL` 和 `CHIPTRACE_PLATFORM_HEALTH_URL`。启用真实预检时，手工输入的
 `expected_revision` 必须是 Collector/Relay 实际构建的完整 Git SHA；普通手工 CI 可以留空。
@@ -214,9 +270,42 @@ Delivery ledger 恢复，`quality_errors_scope` 必须为 `durable_relay_state`�
 重启不能把历史错误静默归零；
 若历史错误已存在，应先保留其报告并修复生产者或采集配置，再开始新的 Canary。
 
+### 已审计质量基线
+
+历史质量错误需要保留，但长期运行的账本不能因为历史计数永久阻断所有后续检查。仓库提供
+`scripts/ci/quality-baseline.js` 生成一次性、内容寻址的基线工件。基线只能从已经人工审计的
+runtime gate 报告创建，并且必须写入审批人、审批时间、原因说明和源报告 SHA-256：
+
+```bash
+node scripts/ci/quality-baseline.js \
+  --input /var/tmp/chiptrace-runtime-health.json \
+  --output /srv/chiptrace/relay-state/quality-baseline.json \
+  --approved-by '<operator-or-change-id>' \
+  --approved-at '<ISO-8601 timestamp>' \
+  --approval-note 'Historical ledger audited; producer repair starts after this point.'
+```
+
+运行门禁显式传入基线和基线后的新增错误上限，才会按每个端点、每个原因码计算增量：
+
+```bash
+node scripts/ci/runtime-health-gate.js \
+  --gateway-url http://127.0.0.1:18084/health \
+  --relay-url http://127.0.0.1:3012/health \
+  --collector-url http://127.0.0.1:3011/health \
+  --quality-baseline /srv/chiptrace/relay-state/quality-baseline.json \
+  --max-new-quality-errors 0
+```
+
+基线文件大小、类型、schema、原因守恒和自身 SHA-256 都会校验；输出使用独占创建，不能被
+覆盖。当前任一端点或原因计数低于基线都会失败，防止重启、换账本或手工清零伪造“新增为零”。
+`--max-quality-errors` 仍可同时使用，继续提供绝对上限。基线不会删除 Raw、修改 Relay 账本，
+也不能替代四源 Turn、Producer、OSS 或 Buyer 验收；生产者缺陷修复后应重新人工审计并创建新基线。
+
 Live preflight 同时调用 `scripts/ci/platform-health-gate.js` 检查 18086 的平台版本、运行
-revision、持久任务计数和存储失败状态。平台健康只证明导出服务进程可用；它不替代目标 Session 的
-`cloud-acceptance`、真实 OSS 上传/下载和 SHA-256 复验。
+revision、实际存储后端、持久任务计数和存储失败状态。受保护环境必须设置
+`CHIPTRACE_PLATFORM_BACKEND=oss`（或明确批准的 `s3`）；门禁会拒绝服务实际使用 `fs` 的情况。
+平台健康只证明导出服务进程和后端配置可用；它不替代目标 Session 的 `cloud-acceptance`、真实
+OSS 上传/下载和 SHA-256 复验。
 
 受保护的 runtime gate 还要求 Gateway outbox 报告至少 `10 GiB` 可用磁盘和 `10,000` 个可用 inode：
 
@@ -225,6 +314,8 @@ node scripts/ci/runtime-health-gate.js \
   --gateway-url http://127.0.0.1:18084/health \
   --relay-url http://127.0.0.1:3012/health \
   --collector-url http://127.0.0.1:3011/health \
+  --transient-retries 4 \
+  --transient-retry-delay-ms 250 \
   --min-gateway-free-bytes 10737418240 \
   --min-gateway-free-files 10000
 ```
@@ -335,6 +426,7 @@ export OSS_ACCESS_KEY_ID='<service-key>'
 export OSS_ACCESS_KEY_SECRET='<service-secret>'
 sudo install -d -o 10001 -g 10001 -m 0700 \
   /srv/chiptrace/platform-oss-project-001
+node scripts/deploy/preflight.js --file deploy/cloud-platform.yml --require-cloud-backend
 ```
 
 CI 使用隔离 MinIO 验证 S3 协议、对象长度和 SHA-256；真实 Alibaba OSS 账号、区域 endpoint
@@ -374,10 +466,12 @@ Relay/Collector 的精确 Raw、重复确认、平台归档/恢复、Turn 和采
   `unsupported_event`、`invalid_structure`、`invalid_attributes`、`identity_conflict`、
   `missing_identity`、`invalid_tool`、`invalid_lifecycle`、`invalid_timestamp`、
   `conversion_error` 或历史迁移专用的 `legacy_unclassified`，每个端点的原因计数必须和
-  端点总数一致，总数必须和持久化的 `quality_errors` 对账。`quality_errors_current_process`
+  端点总数一致，总数必须和持久化的 `quality_errors` 对账，并且
+  `quality_reason_breakdown_complete=true`。`quality_errors_current_process`
   仅表示本次进程增量，运行门禁还必须拒绝缺少原因分解的旧 Relay。旧 ledger 无法回溯原因时
   只能归入 `legacy_unclassified`，不能按正文或时间猜测更具体标签。先保留失败快照，再
-  修正生产者或采集配置。
+  修正生产者或采集配置。`scripts/ci/quality-reason-contract.test.js` 会在 CI 中对照 Rust
+  ingest、Relay seed 和 runtime gate 的标签集合，防止新增原因码只在单一路径生效。
 - Session start/end、模型调用/结果/执行、内部父引用的完整率；以及每个 Turn 的 Wire、
   OTLP logs、OTLP traces、required Hook 覆盖和 `incomplete_turns`。
 - Buyer v7 失败原因、合格 Session 数和四种 Token 口径。
@@ -407,6 +501,8 @@ node scripts/ci/runtime-health-gate.js \
   --expected-revision <git-revision> \
   --max-quality-errors 0 \
   --max-historical-failed-files 0 \
+  --transient-retries 4 \
+  --transient-retry-delay-ms 250 \
   --report /var/tmp/chiptrace-runtime-health.json
 ```
 
@@ -416,6 +512,11 @@ node scripts/ci/runtime-health-gate.js \
 `--expected-revision` 时两者均须匹配待发布版本。Collector 持久 Capture 总数不得低于
 Relay delivered；额外的私有评估或其他 Relay 数据不要求计数相等。计数下界不证明 Raw
 逐对象完整性，仍须对目标 Session 独立验收。预检的 OCI label 不能替代运行版本探测。
+
+持续流量可能使一次健康采样短暂看到 Gateway/Relay 的 `pending` 或 `inflight`，或者
+Collector 仍有少量队列。受控发布预检可以用 `--transient-retries` 和
+`--transient-retry-delay-ms` 做有限排空重试；只有这些固定的短暂原因会重试，质量错误、
+缺失或过期 Wire、版本不一致和存储失败仍立即失败。重试耗尽后报告保留最后一次真实快照。
 
 门禁继续要求网关 `openCaptureHealthy`、Relay `freshness_applicable`、四路来源新鲜、
 队列排空和 attempt 守恒。保留 v2 的 `wire_turn_coverage` 要求：明确原生 Session/Turn、无

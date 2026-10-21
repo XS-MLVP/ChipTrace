@@ -16,23 +16,53 @@
 Codex 的 Responses Wire、原生 OTLP 和生命周期 Hook，组装完整 Session，并只交付通过
 Buyer v7 硬门槛的 UTF-8 JSONL `tar.gz`。
 
-最新线上只读复核（2026-10-19 03:50，Asia/Shanghai）确认 18084、3011、3012、18086 的 `/health` 均返回
-HTTP 200，但 Relay `/ready` 返回 HTTP 503；Collector、Relay 和平台实际已运行
-`bd2bf5cb54fe5fab4161f37bff5294eff0ebcffb`，与本次部署的可执行代码基线一致，使用内容寻址镜像、非 root、只读根和持久目录。
-Relay 与 Collector 均为 `1,267,147` 条，`pending=0`、`inflight=0`、`failed=0`、`conservation_ok=true`；
-Collector 队列深度为 0、ready。Gateway outbox 当前 pending/processing/recent failure 均为 0，293 个历史失败原件
-和 recovery receipt 仍保留且未解决数为 0。
+最新维护状态（2026-10-20 03:21，Asia/Shanghai）的代码基线为 [`bde52f4`](https://github.com/XS-MLVP/ChipTrace/commit/bde52f454d19a386e56d2288132587ef937e750d)。
+维护分支与 `origin/fix/oss-disk-session-platform` 的 SHA 一致；工作区只保留三份外部 DOCX
+作为未跟踪的需求原件，没有改写或纳入仓库。`make check`、`make test`、Codex 配置契约和
+质量/部署门禁契约均在本机通过。GitHub CLI 未认证且 Actions API 当前超时，远端运行结果仍
+不可观测，不能用本地通过替代 GitHub 证据。
+
+最新线上只读采样中 18084、3011、3012、18086 的 `/health` 均返回 HTTP 200；Collector
+队列为 0 且 ready，Relay `delivered=1,338,902`、`pending=0`、`inflight=0`、`failed=0`、
+`conservation_ok=true`。这些证据说明 Raw/WAL 接收、恢复和投递守恒正常，不能据此宣称业务
+Session/Turn 已就绪。
+
+业务门禁仍未通过：Relay `/ready` 返回 HTTP 503，持久 `quality_errors=8,684`
+（`otlp_traces.identity_conflict=184`、`invalid_lifecycle=6,529`、
+`legacy_unclassified=1,965`，另有 Hook `conversion_error=6`），`missing_sources=["wire"]`、
+`wire.requests=0`、`successful_turn_scoped_captures=0`、`turn_capture_ready=false`。
+当前 `/etc/codex/config.toml` 与实际 `CODEX_HOME/config.toml` 的静态路由预检已对同一网关退出 0，
+但尚未由真实新进程产生可验收的 Wire。18084 的 payload 脱敏仍关闭并保留 293 个历史失败文件；Platform 健康虽为 200，实际后端仍是
+`fs`。真实 OSS 上传/恢复/远端哈希、未修改 Stock Codex 多轮四源 Canary 和同 SHA 远端 CI
+尚未验收，当前只能用于内部 Raw/恢复验证，不能作为外部 MaaS 交付服务。
+
+历史线上只读快照（2026-10-19 09:01:42，Asia/Shanghai）确认 18084、3011、3012、18086 的
+`/health` 均返回 HTTP 200，但 Relay `/ready` 返回 HTTP 503。Collector/Relay
+revision 为 `db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，Collector Capture 与 Relay Delivered
+均为 `1,291,300`，`pending=0`、`inflight=0`、`failed=0` 且计数守恒；Collector 队列为 0 且 ready。
+Gateway full-trace outbox 的 pending/processing/最近失败均为 0，293 个历史失败原件仍有恢复凭据且
+未解决数为 0。Relay delivery retries 累计为 83，持久质量账本为 `6,506`（182 个身份冲突、4,359
+个生命周期冲突、1,965 个旧账本未分类），本进程新增 984；Wire 请求和成功的逐 Turn Wire 均为 0，
+缺失且过期来源为 `wire`，`turn_capture_ready=false`。Platform 运行 revision 仍为旧版本，健康响应
+没有 `backend` 字段，容器环境实际为本地 `fs`；要求 `oss` 的 platform health gate 真实退出 1。
+随后 runtime gate 采样到质量计数 `6,515` 并真实退出 1。当前适合内部 Raw/恢复验证，尚未达到对外
+承诺完整 Session/Turn 采集、真实 OSS 和在线导出的生产标准。
+
+历史线上只读快照（2026-10-19 06:07:26，Asia/Shanghai）确认 18084、3011、3012、18086 的 `/health` 均返回
+HTTP 200，但 Relay `/ready` 返回 HTTP 503；Collector、Relay 和平台实际已运行维护提交
+`db0294ecb4e5bb9e4d5877ebf659e53926c3a13d`，使用内容寻址镜像、非 root、只读根和持久目录。
+该时刻 Collector 与 Relay 均为 `1,278,543` 条，`pending=0`、`failed=0`、`conservation_ok=true`，
+Collector 队列深度为 0、ready；`inflight` 随持续流量瞬时变化。Gateway outbox 当前 pending/processing/recent
+failure 均为 0，历史失败原件和 recovery receipt 仍保留且未解决数为 0。
 
 业务门禁仍未通过：Relay `/ready` 返回 HTTP 503，`ingest_coverage.status=degraded`，持久
-`quality_errors=4658`，全部来自 `otlp_traces`，其中 `identity_conflict=182`、`invalid_lifecycle=2511`、
-旧账本无法回溯的 `legacy_unclassified=1965`；重启后本次进程质量错误为 12，Raw 仍保留。新进程尚未观察到 Wire 或 Hook，
-`successful_turn_scoped_captures=0`、`turn_capture_ready=false`，带质量、新鲜度
-和来源门禁的 runtime gate 真实退出 1。平台 health gate 以该 revision 真实通过，但平台后端
-仍是本地 FS；18084 trace exporter 关闭，Gateway 的 `fullTraceCapture.stats.acceptedCount=2`，其
-OCI revision 仍为 `e57480eca4fe11769c5fcb8787266ab6b77ce4d5`，本机用户级 Codex 配置仍指向外部
-Provider，尚未经过 18084；18084 `/v1/models` 返回 HTTP 401；真实 Alibaba OSS 提交/恢复/远端对象哈希及未修改 Stock Codex 多轮
-Canary 尚未完成。因此可用于内部传输与恢复验证，不能对外承诺完整 Session/Turn 采集或生产 OSS
-导出。详见[生产就绪评估](docs/production-readiness.md)。
+`quality_errors=5525`，全部来自 `otlp_traces`，其中 `identity_conflict=182`、`invalid_lifecycle=3378`、
+旧账本无法回溯的 `legacy_unclassified=1965`；本次进程质量错误为 3，Raw 仍保留。当前仍未观察到 Wire，
+`missing_sources=["wire","hooks"]`、`stale_sources=["wire"]`、`successful_turn_scoped_captures=0`、
+`turn_capture_ready=false`，带质量、新鲜度和来源门禁的 runtime gate 真实退出 1。Platform health gate
+以该 revision 真实通过，但平台后端仍是本地 FS；18084 trace exporter 关闭，Gateway full-trace outbox 已接受 2 条。
+真实 Alibaba OSS 提交/恢复/远端对象哈希及未修改 Stock Codex 多轮 Canary 尚未完成。因此当前可用于内部传输与恢复验证，
+不能对外承诺完整 Session/Turn 采集或生产 OSS 导出。详见[生产就绪评估](docs/production-readiness.md)。
 
 维护分支的原生启动护栏已在 `266bded` 加强：CI 在长时 Producer Canary 前会实际进入 Bubblewrap
 namespace，并验证只读根、私有 `/etc` 与私有可写 `/tmp`。本机探针和 21 项原生上下文/沙箱测试已通过；
@@ -148,7 +178,9 @@ OTLP 单根且内部父引用全部可解析。
 - [数据契约](docs/data-contract.md)
 - [验收矩阵](docs/acceptance-matrix.md)
 - [生产就绪评估](docs/production-readiness.md)
+- [业务采集数据符合性评估](docs/business-data-assessment.md)
 - [交付格式](docs/delivery.md)
+- [外部 MaaS request 级交付](docs/maas-delivery.md)
 - [OpenAPI](schemas/openapi.yaml)
 - [云平台嵌入插件](integrations/cloud-platform/README.md)
 - [生产者支持策略](integrations/codex/producer-support.json)

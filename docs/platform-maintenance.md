@@ -4,12 +4,31 @@
 一次请求只确认磁盘中已保存的任务，随后由独立 CLI 子进程执行归档、恢复、检查或采购验收。
 业务采集入口仍是网关、Relay 和 Collector；平台插件提供异步管理与交付 API。
 
+## 2026-10-19 06:06 维护提交滚动更新
+
+维护分支 `fix/oss-disk-session-platform` 的提交
+`db0294ecb4e5bb9e4d5877ebf659e53926c3a13d` 已在本机受控部署。Runtime 镜像摘要为
+`sha256:73e70606961dbe287738412029a48fee35b21a7ed441c1e3d8c48289fa6206fb`，Platform
+镜像摘要为 `sha256:e63a06a78415cebc0cb6008584e6c02c0cd1e85159d23d6ee26d219707bd86b5`；
+三容器实际报告相同 revision，运行用户为 `1267:1001`，只读根、资源限制和持久挂载均保留。
+Collector、Relay、Platform 的健康检查均为 HTTP 200，队列无积压且传输计数守恒；Relay `/ready`
+按业务门禁返回 503，因为线上 Wire 尚未出现且持久质量错误仍存在。部署预检和镜像 self-test
+均通过，平台项目更新时显式使用 `router-v2-platform`，避免 Compose 默认项目名造成
+`18086` 端口冲突。部署环境文件已同步到上述镜像摘要和 revision，后续重启不会回退到旧版本。
+
+该更新只证明维护代码已进入运行实例，不等于完整生产交付：06:07:26 的真实快照仍为
+`quality_errors=5525`、`missing_sources=["wire","hooks"]`、`successful_turn_scoped_captures=0`、
+`turn_capture_ready=false`。必须先修复受管 Stock Codex Provider 路由并完成真实多轮四源 Canary，
+再验收目标 Alibaba OSS、租户授权和对应 SHA 的远程 Actions。
+
 生产部署必须把同一个完整 Git SHA 同时写入三类证据：运行镜像的
 `org.opencontainers.image.revision`、Compose 服务的
 `io.chiptrace.expected-revision`，以及平台服务的 `CHIPTRACE_BUILD_REVISION`。
 部署预检和平台健康门禁都会拒绝缺失或不匹配的 revision，避免平台进程虽然返回
 `200` 却导出另一份源码的结果。运行时升级必须先构建并核对该 SHA 的镜像摘要，再
 执行健康、归档/恢复、分页和重启验收。
+独立 Platform 入口也在绑定端口前拒绝缺失、短或非十六进制 40 位的
+`CHIPTRACE_BUILD_REVISION`；不能通过只返回健康响应的旧进程绕过版本门禁。
 
 已发现并修复的具体故障是 OpenDAL 0.58 在显式 `rustls-no-provider` feature 下未注册
 HTTP transport：原先 FS 自测可通过，而 OSS/S3 在发送前返回 ConfigInvalid。网络存储

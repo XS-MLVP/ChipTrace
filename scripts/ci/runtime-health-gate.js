@@ -1,24 +1,26 @@
 'use strict';
 
 const fs = require('node:fs');
+const {
+  QUALITY_REASON_CODES,
+  compareQualityBaseline,
+  readQualityBaseline,
+} = require('./quality-baseline');
 
 const DEFAULT_TIMEOUT_MS = 5000;
+const DEFAULT_TRANSIENT_RETRIES = 0;
+const DEFAULT_TRANSIENT_RETRY_DELAY_MS = 250;
 const REQUIRED_SOURCES = ['wire', 'otlp_logs', 'otlp_traces', 'hooks'];
 const QUALITY_ENDPOINTS = ['otlp_logs', 'otlp_traces', 'hooks'];
-const QUALITY_REASON_CODES = [
-  'unsupported_event',
-  'invalid_structure',
-  'invalid_attributes',
-  'identity_conflict',
-  'missing_identity',
-  'invalid_tool',
-  'invalid_lifecycle',
-  'invalid_timestamp',
-  'conversion_error',
-  'legacy_unclassified',
-];
 const QUALITY_ERRORS_SCOPE = 'durable_relay_state';
 const REVISION_PATTERN = /^[a-f0-9]{40}$/;
+const TRANSIENT_BLOCKING_REASONS = new Set([
+  'gateway_pending_records',
+  'gateway_inflight_records',
+  'relay_pending_records',
+  'relay_inflight_records',
+  'collector_queue_not_empty',
+]);
 
 function fail(message) {
   throw new Error(`runtime health gate: ${message}`);
@@ -76,17 +78,18 @@ function observedMissingSources(coverage) {
   return [...new Set([...listed, ...derived])];
 }
 
-function routeObservation(route) {
+function routeObservation(route, qualityErrors) {
   if (!route || typeof route !== 'object' || Array.isArray(route)) return null;
+  const quality = qualityErrorObservation(qualityErrors) || qualityErrorObservation(route.quality);
   return {
     requests: safeInteger(route.requests),
     source_records: safeInteger(route.source_records),
     durable_captures: safeInteger(route.durable_captures),
     duplicates: safeInteger(route.duplicates),
     quality: {
-      unknown_events: safeInteger(route.quality?.unknown_events),
-      conversion_errors: safeInteger(route.quality?.conversion_errors),
-      total: safeInteger(route.quality?.total),
+      unknown_events: quality?.unknown_events ?? null,
+      conversion_errors: quality?.conversion_errors ?? null,
+      total: quality?.total ?? null,
     },
     last_at: safeTimestamp(route.last_at),
   };
@@ -110,11 +113,49 @@ function qualityErrorObservation(value) {
   };
 }
 
+function hasCompleteQualityBreakdown(coverage, qualityErrors) {
+  if (!Number.isSafeInteger(qualityErrors) || qualityErrors < 0) return false;
+  const breakdown = coverage?.quality_errors_by_endpoint;
+  if (!breakdown || typeof breakdown !== 'object' || Array.isArray(breakdown)) return false;
+  let total = 0;
+  for (const endpoint of QUALITY_ENDPOINTS) {
+    const value = breakdown[endpoint];
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const unknown = value.unknown_events;
+    const conversion = value.conversion_errors;
+    const endpointTotal = value.total;
+    if (![unknown, conversion, endpointTotal].every(number => (
+      Number.isSafeInteger(number) && number >= 0
+    ))) return false;
+    if (unknown > Number.MAX_SAFE_INTEGER - conversion || endpointTotal !== unknown + conversion) {
+      return false;
+    }
+    const reasons = value.reasons;
+    if (!reasons || typeof reasons !== 'object' || Array.isArray(reasons)) return false;
+    let reasonTotal = 0;
+    for (const [code, count] of Object.entries(reasons)) {
+      if (!QUALITY_REASON_CODES.includes(code)
+        || !Number.isSafeInteger(count) || count < 0
+        || reasonTotal > Number.MAX_SAFE_INTEGER - count) {
+        return false;
+      }
+      reasonTotal += count;
+    }
+    if (reasonTotal !== endpointTotal || total > Number.MAX_SAFE_INTEGER - endpointTotal) {
+      return false;
+    }
+    total += endpointTotal;
+  }
+  return total === qualityErrors;
+}
+
 function blockingReasons(
   observation,
   {
     expectedRevision,
     maxQualityErrors,
+    maxNewQualityErrors,
+    qualityBaseline,
     maxHistoricalFailedFiles,
     minGatewayFreeBytes,
     minGatewayFreeFiles,
@@ -173,6 +214,14 @@ function blockingReasons(
     && coverage.quality_errors > maxQualityErrors) {
     add('relay_quality_errors_exceed_max');
   }
+  if (qualityBaseline && coverage.quality_baseline?.invalid === true) {
+    add('relay_quality_baseline_invalid');
+  }
+  if (maxNewQualityErrors !== undefined
+    && Number.isSafeInteger(coverage.quality_baseline?.new_quality_errors)
+    && coverage.quality_baseline.new_quality_errors > maxNewQualityErrors) {
+    add('relay_new_quality_errors_exceed_max');
+  }
   if (coverage.turn_capture_ready !== true) add('relay_turn_capture_not_ready');
   if (coverage.quality_errors_scope !== QUALITY_ERRORS_SCOPE) {
     add('relay_quality_history_not_durable');
@@ -212,6 +261,10 @@ function blockingReasons(
   return [...reasons].slice(0, 32);
 }
 
+function onlyTransientBlockingReasons(reasons) {
+  return reasons.length > 0 && reasons.every(reason => TRANSIENT_BLOCKING_REASONS.has(reason));
+}
+
 function healthObservation(
   gateway,
   relay,
@@ -219,6 +272,8 @@ function healthObservation(
   {
     expectedRevision,
     maxQualityErrors,
+    maxNewQualityErrors,
+    qualityBaseline,
     maxHistoricalFailedFiles,
     minGatewayFreeBytes,
     minGatewayFreeFiles,
@@ -229,6 +284,17 @@ function healthObservation(
   const coverage = relay?.ingest_coverage;
   const turnCoverage = coverage?.wire_turn_coverage;
   const collectorStore = collector?.collector;
+  let qualityBaselineObservation = null;
+  if (qualityBaseline) {
+    try {
+      qualityBaselineObservation = compareQualityBaseline(coverage, qualityBaseline);
+    } catch {
+      qualityBaselineObservation = {
+        baseline_id: qualityBaseline.baseline_id || null,
+        invalid: true,
+      };
+    }
+  }
   const observation = {
     schema_version: 'chiptrace.runtime-health-observation.v1',
     observed_at: new Date().toISOString(),
@@ -275,9 +341,15 @@ function healthObservation(
           hooks: safeInteger(coverage?.source_lag_ms?.hooks),
         },
         wire: routeObservation(coverage?.wire),
-        otlp_logs: routeObservation(coverage?.otlp_logs),
-        otlp_traces: routeObservation(coverage?.otlp_traces),
-        hooks: routeObservation(coverage?.hooks),
+        otlp_logs: routeObservation(
+          coverage?.otlp_logs,
+          coverage?.quality_errors_by_endpoint?.otlp_logs,
+        ),
+        otlp_traces: routeObservation(
+          coverage?.otlp_traces,
+          coverage?.quality_errors_by_endpoint?.otlp_traces,
+        ),
+        hooks: routeObservation(coverage?.hooks, coverage?.quality_errors_by_endpoint?.hooks),
         quality_errors: safeInteger(coverage?.quality_errors),
         quality_errors_current_process: safeInteger(coverage?.quality_errors_current_process),
         quality_errors_scope: typeof coverage?.quality_errors_scope === 'string'
@@ -287,11 +359,11 @@ function healthObservation(
           otlp_traces: qualityErrorObservation(coverage?.quality_errors_by_endpoint?.otlp_traces),
           hooks: qualityErrorObservation(coverage?.quality_errors_by_endpoint?.hooks),
         },
-        quality_reason_breakdown_complete: QUALITY_ENDPOINTS.every(endpoint => (
-          coverage?.quality_errors_by_endpoint?.[endpoint]?.reasons
-          && typeof coverage.quality_errors_by_endpoint[endpoint].reasons === 'object'
-          && !Array.isArray(coverage.quality_errors_by_endpoint[endpoint].reasons)
-        )),
+        quality_reason_breakdown_complete: hasCompleteQualityBreakdown(
+          coverage,
+          safeInteger(coverage?.quality_errors),
+        ),
+        quality_baseline: qualityBaselineObservation,
         wire_turn_coverage: {
           turn_scoped_captures: safeInteger(turnCoverage?.turn_scoped_captures),
           successful_turn_scoped_captures: safeInteger(turnCoverage?.successful_turn_scoped_captures),
@@ -316,6 +388,8 @@ function healthObservation(
   observation.blocking_reasons = blockingReasons(observation, {
     expectedRevision,
     maxQualityErrors,
+    maxNewQualityErrors,
+    qualityBaseline,
     maxHistoricalFailedFiles,
     minGatewayFreeBytes,
     minGatewayFreeFiles,
@@ -564,7 +638,10 @@ function verifyQualityBreakdown(coverage, qualityErrors) {
   return result;
 }
 
-function verifyRelayHealth(health, { maxQualityErrors } = {}) {
+function verifyRelayHealth(
+  health,
+  { maxQualityErrors, maxNewQualityErrors, qualityBaseline } = {},
+) {
   object(health, 'relay health');
   if (health.status !== 'healthy') fail('relay status must be healthy');
   requireTrue(health.ok, 'relay.ok');
@@ -578,6 +655,10 @@ function verifyRelayHealth(health, { maxQualityErrors } = {}) {
   if (coverage.quality_errors_scope !== QUALITY_ERRORS_SCOPE) {
     fail('relay.ingest_coverage.quality_errors_scope must be durable_relay_state');
   }
+  requireTrue(
+    coverage.quality_reason_breakdown_complete,
+    'relay.ingest_coverage.quality_reason_breakdown_complete',
+  );
   nonNegativeInteger(
     coverage.quality_errors_current_process,
     'relay.ingest_coverage.quality_errors_current_process',
@@ -596,6 +677,22 @@ function verifyRelayHealth(health, { maxQualityErrors } = {}) {
     }
   }
   const qualityBreakdown = verifyQualityBreakdown(coverage, qualityErrors);
+  let qualityBaselineObservation = null;
+  if (maxNewQualityErrors !== undefined && !qualityBaseline) {
+    fail('max new quality errors requires an approved quality baseline');
+  }
+  if (qualityBaseline) {
+    qualityBaselineObservation = compareQualityBaseline(coverage, qualityBaseline);
+  }
+  if (maxNewQualityErrors !== undefined) {
+    if (!Number.isSafeInteger(maxNewQualityErrors) || maxNewQualityErrors < 0) {
+      fail('max new quality errors must be a non-negative integer');
+    }
+    if (qualityBaselineObservation.new_quality_errors > maxNewQualityErrors) {
+      fail('new quality errors exceed the configured maximum '
+        + `(observed=${qualityBaselineObservation.new_quality_errors}; maximum=${maxNewQualityErrors})`);
+    }
+  }
   if (coverage.status !== 'complete') {
     // Keep failure diagnostics bounded and free of arbitrary health response
     // text. Older Relays omitted Wire from missing_sources even at count zero.
@@ -642,6 +739,7 @@ function verifyRelayHealth(health, { maxQualityErrors } = {}) {
     quality_errors_current_process: coverage.quality_errors_current_process,
     quality_errors_scope: coverage.quality_errors_scope,
     quality_errors_by_endpoint: qualityBreakdown,
+    quality_baseline: qualityBaselineObservation,
     wire_turn_coverage: wireTurnCoverage,
     sources: REQUIRED_SOURCES.reduce((result, source) => {
       result[source] = coverage[source].source_records;
@@ -657,6 +755,8 @@ function verifyRuntimeHealth(
     expectedRevision,
     collectorHealth,
     maxQualityErrors,
+    maxNewQualityErrors,
+    qualityBaseline,
     maxHistoricalFailedFiles,
     minGatewayFreeBytes,
     minGatewayFreeFiles,
@@ -667,7 +767,11 @@ function verifyRuntimeHealth(
     minGatewayFreeBytes,
     minGatewayFreeFiles,
   });
-  const relay = verifyRelayHealth(relayHealth, { maxQualityErrors });
+  const relay = verifyRelayHealth(relayHealth, {
+    maxQualityErrors,
+    maxNewQualityErrors,
+    qualityBaseline,
+  });
   const buildRevision = verifyBuildRevision(relayHealth, expectedRevision, 'relay health');
   if (gateway.delivered !== relay.delivered) {
     fail(
@@ -723,58 +827,82 @@ async function runRemoteHealthGate(
   maxHistoricalFailedFiles,
   minGatewayFreeBytes,
   minGatewayFreeFiles,
+  transientRetries = DEFAULT_TRANSIENT_RETRIES,
+  transientRetryDelayMs = DEFAULT_TRANSIENT_RETRY_DELAY_MS,
+  qualityBaseline,
+  maxNewQualityErrors,
 ) {
   if (!gatewayUrl || !relayUrl || !collectorUrl) fail('gateway, relay and collector health URLs are required');
-  let health;
-  try {
-    health = await Promise.all([
-      fetchJson(gatewayUrl, timeoutMs),
-      fetchJson(relayUrl, timeoutMs),
-      fetchJson(collectorUrl, timeoutMs),
-    ]);
-  } catch (error) {
-    writeReport(reportPath, {
-      ok: false,
-      schema_version: 'chiptrace.runtime-health-observation.v1',
-      observed_at: new Date().toISOString(),
-      session_delivery_claimed: false,
-      blocking_reasons: ['health_fetch_failed'],
-      failure_kind: 'fetch_failed',
-    });
-    throw error;
+  if (!Number.isSafeInteger(transientRetries) || transientRetries < 0) {
+    fail('transient retries must be a non-negative integer');
   }
-  const [gateway, relay, collector] = health;
-  let result;
-  try {
-    result = verifyRuntimeHealth(gateway, relay, {
-      expectedRevision,
-      collectorHealth: collector,
-      maxQualityErrors,
-      maxHistoricalFailedFiles,
-      minGatewayFreeBytes,
-      minGatewayFreeFiles,
-    });
-  } catch (error) {
-    const observed = healthObservation(gateway, relay, collector, {
-      expectedRevision,
-      maxQualityErrors,
-      maxHistoricalFailedFiles,
-      minGatewayFreeBytes,
-      minGatewayFreeFiles,
-    });
-    writeReport(reportPath, {
-      ok: false,
-      ...observed,
-      failure_kind: 'validation_failed',
-    });
-    const reasons = observed.blocking_reasons.join(',');
-    if (reasons) {
-      throw new Error(`${error.message}; blocking_reasons=${reasons}`);
+  if (!Number.isSafeInteger(transientRetryDelayMs) || transientRetryDelayMs < 0) {
+    fail('transient retry delay must be a non-negative integer');
+  }
+
+  for (let attempt = 0; ; attempt += 1) {
+    let health;
+    try {
+      health = await Promise.all([
+        fetchJson(gatewayUrl, timeoutMs),
+        fetchJson(relayUrl, timeoutMs),
+        fetchJson(collectorUrl, timeoutMs),
+      ]);
+    } catch (error) {
+      writeReport(reportPath, {
+        ok: false,
+        schema_version: 'chiptrace.runtime-health-observation.v1',
+        observed_at: new Date().toISOString(),
+        session_delivery_claimed: false,
+        blocking_reasons: ['health_fetch_failed'],
+        failure_kind: 'fetch_failed',
+      });
+      throw error;
     }
-    throw error;
+    const [gateway, relay, collector] = health;
+    let result;
+    try {
+      result = verifyRuntimeHealth(gateway, relay, {
+        expectedRevision,
+        collectorHealth: collector,
+        maxQualityErrors,
+        maxNewQualityErrors,
+        qualityBaseline,
+        maxHistoricalFailedFiles,
+        minGatewayFreeBytes,
+        minGatewayFreeFiles,
+      });
+    } catch (error) {
+      const observed = healthObservation(gateway, relay, collector, {
+        expectedRevision,
+        maxQualityErrors,
+        maxNewQualityErrors,
+        qualityBaseline,
+        maxHistoricalFailedFiles,
+        minGatewayFreeBytes,
+        minGatewayFreeFiles,
+      });
+      const reasons = observed.blocking_reasons;
+      if (attempt < transientRetries && onlyTransientBlockingReasons(reasons)) {
+        if (transientRetryDelayMs > 0) {
+          await new Promise(resolve => setTimeout(resolve, transientRetryDelayMs));
+        }
+        continue;
+      }
+      writeReport(reportPath, {
+        ok: false,
+        ...observed,
+        failure_kind: 'validation_failed',
+      });
+      const reasonText = reasons.join(',');
+      if (reasonText) {
+        throw new Error(`${error.message}; blocking_reasons=${reasonText}`);
+      }
+      throw error;
+    }
+    writeReport(reportPath, { ok: true, ...result });
+    return result;
   }
-  writeReport(reportPath, { ok: true, ...result });
-  return result;
 }
 
 function parseArgs(argv) {
@@ -785,9 +913,13 @@ function parseArgs(argv) {
   let expectedRevision;
   let report;
   let maxQualityErrors;
+  let maxNewQualityErrors;
+  let qualityBaselinePath;
   let maxHistoricalFailedFiles;
   let minGatewayFreeBytes;
   let minGatewayFreeFiles;
+  let transientRetries = DEFAULT_TRANSIENT_RETRIES;
+  let transientRetryDelayMs = DEFAULT_TRANSIENT_RETRY_DELAY_MS;
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     const value = argv[index + 1];
@@ -797,6 +929,14 @@ function parseArgs(argv) {
     else if (flag === '--timeout-ms' && value) { timeout = Number(value); index += 1; }
     else if (flag === '--expected-revision' && value) { expectedRevision = value; index += 1; }
     else if (flag === '--max-quality-errors' && value) { maxQualityErrors = Number(value); index += 1; }
+    else if (flag === '--max-new-quality-errors' && value) {
+      maxNewQualityErrors = Number(value);
+      index += 1;
+    }
+    else if (flag === '--quality-baseline' && value) {
+      qualityBaselinePath = value;
+      index += 1;
+    }
     else if (flag === '--max-historical-failed-files' && value) {
       maxHistoricalFailedFiles = Number(value);
       index += 1;
@@ -809,22 +949,41 @@ function parseArgs(argv) {
       minGatewayFreeFiles = Number(value);
       index += 1;
     }
+    else if (flag === '--transient-retries' && value) {
+      transientRetries = Number(value);
+      index += 1;
+    }
+    else if (flag === '--transient-retry-delay-ms' && value) {
+      transientRetryDelayMs = Number(value);
+      index += 1;
+    }
     else if (flag === '--report' && value) { report = value; index += 1; }
-    else fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--max-quality-errors N] [--max-historical-failed-files N] [--min-gateway-free-bytes N] [--min-gateway-free-files N] [--report PATH]');
+    else fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--max-quality-errors N] [--quality-baseline PATH --max-new-quality-errors N] [--max-historical-failed-files N] [--min-gateway-free-bytes N] [--min-gateway-free-files N] [--transient-retries N] [--transient-retry-delay-ms N] [--report PATH]');
   }
   if (!gateway || !relay || !collector || !Number.isSafeInteger(timeout) || timeout < 100
     || (maxQualityErrors !== undefined
       && (!Number.isSafeInteger(maxQualityErrors) || maxQualityErrors < 0))
+    || (maxNewQualityErrors !== undefined
+      && (!Number.isSafeInteger(maxNewQualityErrors) || maxNewQualityErrors < 0))
     || (minGatewayFreeBytes !== undefined
       && (!Number.isSafeInteger(minGatewayFreeBytes) || minGatewayFreeBytes < 0))
     || (minGatewayFreeFiles !== undefined
-      && (!Number.isSafeInteger(minGatewayFreeFiles) || minGatewayFreeFiles < 0))) {
-    fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--max-quality-errors N] [--max-historical-failed-files N] [--min-gateway-free-bytes N] [--min-gateway-free-files N] [--report PATH]');
+      && (!Number.isSafeInteger(minGatewayFreeFiles) || minGatewayFreeFiles < 0))
+    || !Number.isSafeInteger(transientRetries) || transientRetries < 0
+    || !Number.isSafeInteger(transientRetryDelayMs) || transientRetryDelayMs < 0) {
+    fail('usage: runtime-health-gate.js --gateway-url URL --relay-url URL --collector-url URL [--timeout-ms N] [--expected-revision REVISION] [--max-quality-errors N] [--quality-baseline PATH --max-new-quality-errors N] [--max-historical-failed-files N] [--min-gateway-free-bytes N] [--min-gateway-free-files N] [--transient-retries N] [--transient-retry-delay-ms N] [--report PATH]');
   }
   if (maxHistoricalFailedFiles !== undefined
     && (!Number.isSafeInteger(maxHistoricalFailedFiles) || maxHistoricalFailedFiles < 0)) {
     fail('usage: runtime-health-gate.js --max-historical-failed-files N requires a non-negative integer');
   }
+  if (maxNewQualityErrors !== undefined && !qualityBaselinePath) {
+    fail('usage: --max-new-quality-errors N requires --quality-baseline PATH');
+  }
+  if (qualityBaselinePath && maxNewQualityErrors === undefined) {
+    fail('usage: --quality-baseline PATH requires --max-new-quality-errors N');
+  }
+  const qualityBaseline = qualityBaselinePath ? readQualityBaseline(qualityBaselinePath) : undefined;
   return {
     gateway,
     relay,
@@ -832,9 +991,13 @@ function parseArgs(argv) {
     timeout,
     expectedRevision,
     maxQualityErrors,
+    maxNewQualityErrors,
+    qualityBaseline,
     maxHistoricalFailedFiles,
     minGatewayFreeBytes,
     minGatewayFreeFiles,
+    transientRetries,
+    transientRetryDelayMs,
     report,
   };
 }
@@ -847,7 +1010,11 @@ if (require.main === module) {
     args.maxQualityErrors,
     args.maxHistoricalFailedFiles,
     args.minGatewayFreeBytes,
-    args.minGatewayFreeFiles)
+    args.minGatewayFreeFiles,
+    args.transientRetries,
+    args.transientRetryDelayMs,
+    args.qualityBaseline,
+    args.maxNewQualityErrors)
     .then(result => process.stdout.write(`${JSON.stringify(result, null, 2)}\n`))
     .catch(error => {
       process.stderr.write(`${error.message || String(error)}\n`);
@@ -857,6 +1024,8 @@ if (require.main === module) {
 
 module.exports = {
   DEFAULT_TIMEOUT_MS,
+  DEFAULT_TRANSIENT_RETRIES,
+  DEFAULT_TRANSIENT_RETRY_DELAY_MS,
   REQUIRED_SOURCES,
   QUALITY_REASON_CODES,
   verifyGatewayHealth,
@@ -865,5 +1034,6 @@ module.exports = {
   verifyRuntimeHealth,
   healthObservation,
   blockingReasons,
+  onlyTransientBlockingReasons,
   runRemoteHealthGate,
 };

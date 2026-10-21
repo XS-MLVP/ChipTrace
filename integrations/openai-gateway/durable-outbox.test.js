@@ -726,6 +726,29 @@ test('open streamed captures expose age and stale transaction count', async t =>
   }
 });
 
+test('periodic recovery finalizes only stale open captures', async t => {
+  const root = temporaryRoot();
+  const outbox = new DurableCaptureOutbox({ root, relayUrl: '', maxOpenAgeMs: 1000 });
+  try {
+    await outbox.start();
+    await outbox.beginCapture({
+      captureId: 'cap-periodic-open',
+      sourceNamespace: 'gateway-test',
+      method: 'POST',
+      proxiedPath: '/v1/responses',
+    });
+    await outbox.recoverOpenCaptures({ staleOnly: true });
+    assert.equal(outbox.snapshot().openTransactions, 1, 'a live capture must not be recovered');
+    const originalNow = Date.now;
+    t.mock.method(Date, 'now', () => originalNow() + 5000);
+    await outbox.recoverOpenCaptures({ staleOnly: true });
+    assert.equal(outbox.snapshot().openTransactions, 0, 'a stale capture must be recovered');
+  } finally {
+    await outbox.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('restart preserves open Wire when the same Capture ID has conflicting stored evidence', async t => {
   for (const directory of ['pending', 'failed']) await t.test(directory, async t => {
     const root = temporaryRoot();

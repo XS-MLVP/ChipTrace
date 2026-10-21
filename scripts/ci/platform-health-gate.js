@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const DEFAULT_TIMEOUT_MS = 5000;
 const PLATFORM_VERSION = 'chiptrace.platform.v1';
 const REVISION_PATTERN = /^[a-f0-9]{40}$/;
+const STORAGE_BACKENDS = Object.freeze(['fs', 'oss', 's3']);
 
 function fail(message) {
   throw new Error(`platform health gate: ${message}`);
@@ -24,11 +25,20 @@ function nonNegativeInteger(value, label) {
   return value;
 }
 
-function verifyPlatformHealth(health, { expectedRevision } = {}) {
+function verifyPlatformHealth(health, { expectedRevision, expectedBackend } = {}) {
   object(health, 'platform health');
   if (health.ok !== true) fail('platform health.ok must be true');
   if (health.version !== PLATFORM_VERSION) {
     fail(`platform health.version must be ${PLATFORM_VERSION}`);
+  }
+  if (typeof health.backend !== 'string' || !STORAGE_BACKENDS.includes(health.backend)) {
+    fail('platform health.backend must be one of fs, oss, or s3');
+  }
+  if (expectedBackend !== undefined && !STORAGE_BACKENDS.includes(expectedBackend)) {
+    fail('expected platform backend must be one of fs, oss, or s3');
+  }
+  if (expectedBackend !== undefined && health.backend !== expectedBackend) {
+    fail(`platform health.backend must equal ${expectedBackend}`);
   }
   if (expectedRevision !== undefined && !REVISION_PATTERN.test(expectedRevision)) {
     fail('expected platform revision must be a full Git SHA');
@@ -55,8 +65,10 @@ function verifyPlatformHealth(health, { expectedRevision } = {}) {
     schema_version: 'chiptrace.platform-health-gate.v1',
     ok: true,
     version: health.version,
+    backend: health.backend,
     build_revision: buildRevision,
     expected_revision: expectedRevision ?? null,
+    expected_backend: expectedBackend ?? null,
     ...counters,
   };
 }
@@ -73,6 +85,7 @@ async function runPlatformHealthGate({
   timeoutMs = DEFAULT_TIMEOUT_MS,
   reportPath,
   expectedRevision,
+  expectedBackend,
   fetchImpl = fetch,
 } = {}) {
   if (typeof url !== 'string' || url.trim() === '') fail('platform health URL is required');
@@ -94,7 +107,7 @@ async function runPlatformHealthGate({
     fail(`cannot fetch platform health: ${error.message}`);
   }
   try {
-    const result = verifyPlatformHealth(health, { expectedRevision });
+    const result = verifyPlatformHealth(health, { expectedRevision, expectedBackend });
     writeReport(reportPath, result);
     return result;
   } catch (error) {
@@ -112,19 +125,21 @@ function parseArgs(argv) {
   let timeout = DEFAULT_TIMEOUT_MS;
   let report;
   let expectedRevision;
+  let expectedBackend;
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     const value = argv[index + 1];
     if (flag === '--platform-url' && value) { url = value; index += 1; }
     else if (flag === '--timeout-ms' && value) { timeout = Number(value); index += 1; }
     else if (flag === '--expected-revision' && value) { expectedRevision = value; index += 1; }
+    else if (flag === '--expected-backend' && value) { expectedBackend = value; index += 1; }
     else if (flag === '--report' && value) { report = value; index += 1; }
-    else fail('usage: platform-health-gate.js --platform-url URL [--expected-revision SHA] [--timeout-ms N] [--report PATH]');
+    else fail('usage: platform-health-gate.js --platform-url URL [--expected-revision SHA] [--expected-backend fs|oss|s3] [--timeout-ms N] [--report PATH]');
   }
   if (!url || !Number.isSafeInteger(timeout) || timeout < 100 || timeout > 120000) {
-    fail('usage: platform-health-gate.js --platform-url URL [--expected-revision SHA] [--timeout-ms N] [--report PATH]');
+    fail('usage: platform-health-gate.js --platform-url URL [--expected-revision SHA] [--expected-backend fs|oss|s3] [--timeout-ms N] [--report PATH]');
   }
-  return { url, timeout, report, expectedRevision };
+  return { url, timeout, report, expectedRevision, expectedBackend };
 }
 
 if (require.main === module) {
@@ -133,7 +148,7 @@ if (require.main === module) {
     args = parseArgs(process.argv.slice(2));
     const result = await runPlatformHealthGate({
       url: args.url, timeoutMs: args.timeout, reportPath: args.report,
-      expectedRevision: args.expectedRevision,
+      expectedRevision: args.expectedRevision, expectedBackend: args.expectedBackend,
     });
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   }).catch(error => {
@@ -145,6 +160,7 @@ if (require.main === module) {
 module.exports = {
   DEFAULT_TIMEOUT_MS,
   PLATFORM_VERSION,
+  STORAGE_BACKENDS,
   parseArgs,
   runPlatformHealthGate,
   verifyPlatformHealth,

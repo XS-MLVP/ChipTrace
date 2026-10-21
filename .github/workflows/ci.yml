@@ -45,36 +45,44 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "22"
+          node-version: "22.23.3"
           package-manager-cache: false
       - name: Require protected live preflight configuration
         env:
           CHIPTRACE_API_KEY: ${{ secrets.CHIPTRACE_API_KEY }}
           CHIPTRACE_CODEX_CONFIG: ${{ vars.CHIPTRACE_CODEX_CONFIG }}
+          CHIPTRACE_CODEX_USER_CONFIG: ${{ vars.CHIPTRACE_CODEX_USER_CONFIG }}
           CHIPTRACE_CODEX_BASE_URL: ${{ vars.CHIPTRACE_CODEX_BASE_URL }}
           CHIPTRACE_RESPONSES_URL: ${{ vars.CHIPTRACE_RESPONSES_URL }}
           CHIPTRACE_GATEWAY_HEALTH_URL: ${{ vars.CHIPTRACE_GATEWAY_HEALTH_URL }}
           CHIPTRACE_RELAY_HEALTH_URL: ${{ vars.CHIPTRACE_RELAY_HEALTH_URL }}
           CHIPTRACE_COLLECTOR_HEALTH_URL: ${{ vars.CHIPTRACE_COLLECTOR_HEALTH_URL }}
           CHIPTRACE_PLATFORM_HEALTH_URL: ${{ vars.CHIPTRACE_PLATFORM_HEALTH_URL }}
+          CHIPTRACE_PLATFORM_BACKEND: ${{ vars.CHIPTRACE_PLATFORM_BACKEND }}
           CHIPTRACE_GATEWAY_CONTAINER: ${{ vars.CHIPTRACE_GATEWAY_CONTAINER }}
           CHIPTRACE_EXPECTED_REVISION: ${{ inputs.expected_revision }}
           CHIPTRACE_GATEWAY_EXPECTED_REVISION: ${{ inputs.gateway_revision }}
         run: |
           set -euo pipefail
           test -n "${CHIPTRACE_API_KEY:-}" || { echo 'CHIPTRACE_API_KEY is missing from the protected environment' >&2; exit 1; }
-          for name in CHIPTRACE_CODEX_CONFIG CHIPTRACE_CODEX_BASE_URL CHIPTRACE_RESPONSES_URL CHIPTRACE_GATEWAY_HEALTH_URL CHIPTRACE_RELAY_HEALTH_URL CHIPTRACE_COLLECTOR_HEALTH_URL CHIPTRACE_PLATFORM_HEALTH_URL CHIPTRACE_GATEWAY_CONTAINER CHIPTRACE_EXPECTED_REVISION CHIPTRACE_GATEWAY_EXPECTED_REVISION; do
+          for name in CHIPTRACE_CODEX_CONFIG CHIPTRACE_CODEX_USER_CONFIG CHIPTRACE_CODEX_BASE_URL CHIPTRACE_RESPONSES_URL CHIPTRACE_GATEWAY_HEALTH_URL CHIPTRACE_RELAY_HEALTH_URL CHIPTRACE_COLLECTOR_HEALTH_URL CHIPTRACE_PLATFORM_HEALTH_URL CHIPTRACE_PLATFORM_BACKEND CHIPTRACE_GATEWAY_CONTAINER CHIPTRACE_EXPECTED_REVISION CHIPTRACE_GATEWAY_EXPECTED_REVISION; do
             test -n "${!name:-}" || { echo "$name is missing from the protected environment or dispatch input" >&2; exit 1; }
           done
+          case "$CHIPTRACE_PLATFORM_BACKEND" in
+            oss|s3) ;;
+            *) echo 'CHIPTRACE_PLATFORM_BACKEND must be oss or s3 for protected live preflight' >&2; exit 1 ;;
+          esac
           echo 'protected live preflight configuration is present'
       - name: Verify the actual Codex configuration targets the managed Gateway
         env:
           CHIPTRACE_CODEX_CONFIG: ${{ vars.CHIPTRACE_CODEX_CONFIG }}
+          CHIPTRACE_CODEX_USER_CONFIG: ${{ vars.CHIPTRACE_CODEX_USER_CONFIG }}
           CHIPTRACE_CODEX_BASE_URL: ${{ vars.CHIPTRACE_CODEX_BASE_URL }}
         run: |
           set -euo pipefail
           node scripts/deploy/codex-route-preflight.js \
             --config "$CHIPTRACE_CODEX_CONFIG" \
+            --user-config "$CHIPTRACE_CODEX_USER_CONFIG" \
             --expected-base-url "$CHIPTRACE_CODEX_BASE_URL" \
             | tee "$RUNNER_TEMP/codex-route-preflight.json"
       - name: Probe the real Provider Responses endpoint
@@ -107,6 +115,8 @@ jobs:
             --max-historical-failed-files 0 \
             --min-gateway-free-bytes 10737418240 \
             --min-gateway-free-files 10000 \
+            --transient-retries 4 \
+            --transient-retry-delay-ms 250 \
             --report "$RUNNER_TEMP/runtime-health.json" \
             | tee "$RUNNER_TEMP/runtime-health.stdout.json"
       - name: Verify live Gateway container isolation and capture contract
@@ -124,12 +134,14 @@ jobs:
         if: ${{ always() }}
         env:
           CHIPTRACE_PLATFORM_HEALTH_URL: ${{ vars.CHIPTRACE_PLATFORM_HEALTH_URL }}
+          CHIPTRACE_PLATFORM_BACKEND: ${{ vars.CHIPTRACE_PLATFORM_BACKEND }}
           CHIPTRACE_EXPECTED_REVISION: ${{ inputs.expected_revision }}
         run: |
           set -euo pipefail
           node scripts/ci/platform-health-gate.js \
             --platform-url "$CHIPTRACE_PLATFORM_HEALTH_URL" \
             --expected-revision "$CHIPTRACE_EXPECTED_REVISION" \
+            --expected-backend "$CHIPTRACE_PLATFORM_BACKEND" \
             --report "$RUNNER_TEMP/platform-health.json" \
             | tee "$RUNNER_TEMP/platform-health.stdout.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -153,15 +165,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "22"
+          node-version: "22.23.3"
           package-manager-cache: false
       - name: Install the pinned unmodified client in the runner temporary directory
         run: |
           stock_spec=$(node -p 'require("./integrations/codex/stock-release.json").npm_spec')
           npm install --prefix "$RUNNER_TEMP/chiptrace-stock-client" \
             --ignore-scripts --no-audit --no-fund "$stock_spec"
-          docker pull node:22-bookworm-slim
+          docker pull node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
       - name: Verify managed Wire routing against real user and session overrides
+        env:
+          CHIPTRACE_CONFIG_TEST_IMAGE: node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
         run: |
           set -euo pipefail
           CHIPTRACE_STOCK_CODEX_MODULES="$RUNNER_TEMP/chiptrace-stock-client/node_modules" \
@@ -188,7 +202,7 @@ jobs:
           fetch-depth: 1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "22"
+          node-version: "22.23.3"
           package-manager-cache: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable action revision
         with:
@@ -295,7 +309,7 @@ jobs:
           toolchain: "1.95.0"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "22"
+          node-version: "22.23.3"
           package-manager-cache: false
       - name: Install the system Bubblewrap required by the debug producer sandbox
         run: |
@@ -533,7 +547,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "22"
+          node-version: "22.23.3"
           package-manager-cache: false
       - name: Verify immutable GitHub Action pins
         run: node scripts/ci/action-pin-gate.js
@@ -555,6 +569,8 @@ jobs:
           bash scripts/ci/run-producer-check.sh workspace-tests rust-tests.log \
             timeout --signal=TERM --kill-after=30s 5m \
             cargo test --workspace --all-targets --locked
+      - name: Verify external MaaS delivery contract
+        run: make maas-contract-test
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -679,6 +695,20 @@ jobs:
         with:
           name: runtime-health-gate-report
           path: runtime-health-gate.tap
+      - name: Verify the approved quality-baseline contract
+        run: node --test scripts/ci/quality-baseline.test.js | tee quality-baseline.tap
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: quality-baseline-report
+          path: quality-baseline.tap
+      - name: Verify the cross-language quality reason taxonomy contract
+        run: node --test scripts/ci/quality-reason-contract.test.js | tee quality-reason-contract.tap
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: quality-reason-contract-report
+          path: quality-reason-contract.tap
       - name: Verify Platform export health gate fails closed
         run: node --test scripts/ci/platform-health-gate.test.js | tee platform-health-gate.tap
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -772,7 +802,7 @@ jobs:
         run: |
           cargo run --locked --bin chiptrace -- benchmark-http \
             --records 32 --payload-kib 4 --batch-records 8 \
-            --concurrency 4 --store-shards 2 --relay \
+            --concurrency 4 --store-shards 2 --relay --max-delivery-retries 0 \
           | python3 -c '
           import json, sys
           result = json.load(sys.stdin)
@@ -785,6 +815,7 @@ jobs:
           assert result["drain_health_polls"] >= result["drain_health_degraded_polls"]
           assert result["delivery_attempts"] == result["relay_health"]["delivery_attempts"]
           assert result["delivery_retries"] == result["relay_health"]["delivery_retries"]
+          assert result["delivery_retries"] == 0
           '
       - run: cargo build --release --locked --bin chiptrace
       - run: target/release/chiptrace --help
@@ -802,7 +833,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "22"
+          node-version: "22.23.3"
           package-manager-cache: false
       - run: docker build --build-arg CHIPTRACE_REVISION="$GITHUB_SHA" -t chiptrace:ci .
       - run: docker run --rm chiptrace:ci --help
@@ -865,6 +896,29 @@ jobs:
           '
       - name: Build cloud platform image
         run: docker build --target platform --build-arg CHIPTRACE_REVISION="$GITHUB_SHA" -t chiptrace-platform:ci .
+      - name: Prepare read-only test mounts for the non-root container
+        run: |
+          set -euo pipefail
+          # The image runs as UID 10001.  A self-hosted checkout can inherit a
+          # private umask (0700), which would make a read-only bind mount
+          # unreadable and look like a container startup failure.  These paths
+          # contain tests and redacted fixtures only; make their permissions
+          # traversable without changing file contents or tracked modes.
+          chmod -R a+rX integrations/openai-gateway integrations/cloud-platform integrations/codex fixtures
+      - name: Verify non-root container mounts before test runners
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --read-only \
+            --user 10001:10001 \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --tmpfs /tmp:size=32m,mode=1777 \
+            --entrypoint node \
+            -v "$PWD/integrations/openai-gateway:/tests/gateway:ro" \
+            -v "$PWD/integrations/cloud-platform:/tests/platform:ro" \
+            -v "$PWD/integrations/codex:/tests/codex:ro" \
+            -v "$PWD/fixtures:/tests/fixtures:ro" \
+            chiptrace-platform:ci \
+            -e 'const fs = require("node:fs"); for (const file of ["/tests/gateway/relay-receipt.test.js", "/tests/platform/platform.test.js", "/tests/codex/native-context.test.js", "/tests/fixtures/native-context-0163.json"]) fs.readFileSync(file); process.stdout.write("NON_ROOT_TEST_MOUNTS_READABLE\\n");'
       - name: Verify actual deployment templates reject mutable images and missing limits
         run: |
           set -euo pipefail
@@ -912,7 +966,7 @@ jobs:
             --cap-drop ALL --security-opt no-new-privileges \
             --tmpfs /tmp:size=1g,mode=1777 \
             -v "$PWD/integrations/cloud-platform:/tests:ro" \
-            chiptrace-platform:ci --test /tests/platform.test.js /tests/storage-oss.test.js \
+            chiptrace-platform:ci --test /tests/platform.test.js /tests/server.test.js /tests/storage-oss.test.js \
             2>&1 | tee container-platform.tap
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
@@ -945,7 +999,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "22"
+          node-version: "22.23.3"
           package-manager-cache: false
       - name: Check out pinned MinIO source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -1,4 +1,8 @@
-ARG CHIPTRACE_PLATFORM_BASE=node:22-bookworm-slim
+# Keep the production platform base identical to the image used by the
+# managed-route CI contract.  A floating Node tag can change the runtime
+# between two GitHub runs and turn an otherwise valid image into a startup
+# failure.  The digest has been verified to provide Node v22.23.3.
+ARG CHIPTRACE_PLATFORM_BASE=node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
 FROM rust:1.91-bookworm AS builder
 
 WORKDIR /src
@@ -35,7 +39,12 @@ LABEL org.opencontainers.image.source="https://github.com/XS-MLVP/ChipTrace" \
 COPY --from=builder /out/chiptrace /usr/local/bin/chiptrace
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY integrations/cloud-platform/plugin.js integrations/cloud-platform/server.js integrations/cloud-platform/client.js /opt/chiptrace/
-RUN mkdir -p /data/platform /data/capture /data/objects \
+RUN test "$(node --version)" = "v22.23.3" \
+    # The build context may carry 0600 source files on NFS.  The runtime user
+    # is configurable (CHIPTRACE_RUN_AS), so the copied scripts must be
+    # readable independently of the source mode.
+    && chmod 0755 /opt/chiptrace/*.js \
+    && mkdir -p /data/platform /data/capture /data/objects \
     && chown -R 10001:10001 /data /opt/chiptrace
 ENV CHIPTRACE_BIN=/usr/local/bin/chiptrace \
     CHIPTRACE_BUILD_REVISION=${CHIPTRACE_REVISION} \

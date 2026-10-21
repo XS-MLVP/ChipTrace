@@ -18,7 +18,7 @@ const stockRelease = require('./stock-release.json');
 const stockVersion = stockRelease.version;
 const stockBinary = '@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex';
 const image = process.env.CHIPTRACE_CONFIG_TEST_IMAGE || 'node:22-bookworm-slim';
-const gatewayUrl = 'http://172.28.11.121:18084/';
+const gatewayUrl = 'http://127.0.0.1:18084/';
 const userConfig = `model_provider = "Bypass"
 [model_providers.OpenAI]
 name = "User override"

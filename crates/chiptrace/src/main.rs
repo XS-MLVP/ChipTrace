@@ -8,6 +8,10 @@ use chiptrace::cloud_acceptance::{
 use chiptrace::collector::{CollectorConfig, serve};
 use chiptrace::enrich::{EnrichConfig, enrich_captures, verify_enrichment};
 use chiptrace::jsonl::absolute_path;
+use chiptrace::maas_export::{
+    DEFAULT_MAX_BATCH_BYTES, DEFAULT_TIMEZONE_OFFSET_MINUTES, MaasExportConfig, export_maas,
+    verify_maas,
+};
 use chiptrace::model_interaction::{
     InteractionProjectConfig, audit_session_context, inspect_session, project_interactions,
     verify_interaction_projection,
@@ -101,6 +105,10 @@ enum Command {
     PackageBuyer(PackageBuyerArgs),
     /// 只读验证采购方交付包、归档内容与全部 SHA-256。
     VerifyBuyerPackage(VerifyBuyerPackageArgs),
+    /// 将真实 Wire Capture 导出为外部 MaaS request 级 tar.gz 包。
+    ExportMaas(ExportMaasArgs),
+    /// 只读验证外部 MaaS request 级目录、字段和压缩包上限。
+    VerifyMaas(VerifyMaasArgs),
     /// 将已验收的内部 Release 或采购包原子发布到对象存储。
     Publish(PublishArgs),
     /// 从远端 COMMIT 只读复验已发布对象及完整 SHA-256。
@@ -469,6 +477,47 @@ struct PackageBuyerArgs {
 struct VerifyBuyerPackageArgs {
     #[arg(long)]
     package: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ExportMaasArgs {
+    /// 已封存 Capture JSONL/NDJSON，可重复指定；open WAL 会被拒绝。
+    #[arg(long = "input", required = true)]
+    input: Vec<PathBuf>,
+    /// `/maasData/archive` 根目录。
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long)]
+    provider_code: String,
+    #[arg(long)]
+    platform: String,
+    /// 可选协议覆盖；缺省时从 Wire 路由严格推导。
+    #[arg(long)]
+    protocol: Option<String>,
+    /// 外部 requestTime 和日期目录使用的固定时区偏移（分钟），默认北京时间 UTC+08:00。
+    #[arg(long, default_value_t = DEFAULT_TIMEZONE_OFFSET_MINUTES)]
+    timezone_offset_minutes: i32,
+    /// 压缩后单包上限，默认 100 MB；不得超过外部合同上限。
+    #[arg(long, default_value_t = DEFAULT_MAX_BATCH_BYTES)]
+    max_batch_bytes: u64,
+    #[arg(long)]
+    replace: bool,
+    /// 跳过没有完整 input/output Token 用量的失败或中断 Wire，而不是让整批导出失败。
+    #[arg(long)]
+    skip_incomplete: bool,
+    /// 只导出指定 native Session；可重复。用于从共享 Raw 中生成指定进程的数据样本。
+    #[arg(long = "session-id")]
+    session_id: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct VerifyMaasArgs {
+    /// `/maasData/archive` 根目录。
+    #[arg(long)]
+    input: PathBuf,
+    /// 压缩后单包上限，默认 100 MB。
+    #[arg(long, default_value_t = DEFAULT_MAX_BATCH_BYTES)]
+    max_batch_bytes: u64,
 }
 
 #[derive(Debug, Args)]
@@ -1009,6 +1058,21 @@ async fn main() -> Result<()> {
         }
         Command::VerifyBuyerPackage(args) => {
             serde_json::to_value(verify_buyer_package(&args.package)?)?
+        }
+        Command::ExportMaas(args) => serde_json::to_value(export_maas(MaasExportConfig {
+            inputs: args.input,
+            output: args.output,
+            provider_code: args.provider_code,
+            platform: args.platform,
+            protocol: args.protocol,
+            timezone_offset_minutes: args.timezone_offset_minutes,
+            max_batch_bytes: args.max_batch_bytes,
+            replace: args.replace,
+            skip_incomplete: args.skip_incomplete,
+            session_ids: args.session_id,
+        })?)?,
+        Command::VerifyMaas(args) => {
+            serde_json::to_value(verify_maas(&args.input, args.max_batch_bytes)?)?
         }
         Command::Publish(args) => {
             let source = match (args.release, args.buyer_package) {
@@ -3028,6 +3092,7 @@ mod cli_tests {
             "cloud-acceptance",
             "collector",
             "enrich",
+            "export-maas",
             "export-otlp",
             "inspect-session",
             "package-buyer",
@@ -3048,6 +3113,7 @@ mod cli_tests {
             "verify-cloud-acceptance",
             "verify-enrichment",
             "verify-interactions",
+            "verify-maas",
             "verify-otlp",
             "verify-published",
             "verify-raw-archive",

@@ -2106,6 +2106,58 @@ mod tests {
     }
 
     #[test]
+    fn known_code_mode_outcome_updates_remain_raw_without_false_quality_errors() {
+        for terminal in ["completed", "failed"] {
+            let raw = serde_json::to_vec(&json!({
+                "resourceSpans":[{"scopeSpans":[{"spans":[{
+                    "name":"code_mode.handler.execute",
+                    "traceId":"0123456789abcdef0123456789abcdef",
+                    "spanId":"0123456789abcdef",
+                    "attributes":[
+                        {"key":"outcome","value":{"stringValue":"interrupted"}},
+                        {"key":"outcome","value":{"stringValue":terminal}}
+                    ]
+                }]}]}]
+            }))
+            .unwrap();
+            let batch = prepare_cloud_ingest(CloudEndpoint::OtlpTraces, &raw, 1024 * 1024).unwrap();
+            assert_eq!(batch.summary.source_records, 1);
+            assert_eq!(batch.summary.derived_captures, 0);
+            assert!(batch.summary.conversion_errors.is_empty());
+            assert_eq!(quality_error_reasons(&batch.summary), BTreeMap::new());
+            let captured = values(&batch).remove(0);
+            assert_eq!(captured["telemetryBatch"]["endpoint"], "otlp_traces");
+            assert_eq!(
+                captured["telemetryBatch"]["raw_json"],
+                String::from_utf8(raw).unwrap()
+            );
+            assert!(revalidate_telemetry_batch(&captured).is_ok());
+        }
+    }
+
+    #[test]
+    fn duplicate_outcomes_on_other_trace_spans_remain_lifecycle_errors() {
+        let raw = br#"{
+            "resourceSpans":[{"scopeSpans":[{"spans":[{
+                "name":"other.handler.execute",
+                "traceId":"0123456789abcdef0123456789abcdef",
+                "spanId":"0123456789abcdef",
+                "attributes":[
+                    {"key":"outcome","value":{"stringValue":"interrupted"}},
+                    {"key":"outcome","value":{"stringValue":"completed"}}
+                ]
+            }]}]}]
+        }"#;
+        let batch = prepare_cloud_ingest(CloudEndpoint::OtlpTraces, raw, 1024 * 1024).unwrap();
+        assert_eq!(batch.summary.source_records, 1);
+        assert_eq!(batch.summary.derived_captures, 0);
+        assert_eq!(
+            quality_error_reasons(&batch.summary),
+            BTreeMap::from([(String::from("invalid_lifecycle"), 1)])
+        );
+    }
+
+    #[test]
     fn telemetry_reason_labels_are_revalidated_against_the_raw_batch() {
         let raw = br#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"01"}]}]}]}"#;
         let batch = prepare_cloud_ingest(CloudEndpoint::OtlpTraces, raw, 1024 * 1024).unwrap();
