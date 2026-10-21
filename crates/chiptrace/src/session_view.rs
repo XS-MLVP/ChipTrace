@@ -247,8 +247,10 @@ fn duplicate_boundary(
     };
     if let Some((previous, previous_at)) = *last
         && previous == event
-        && at >= previous_at
-        && at - previous_at <= DUPLICATE_WINDOW_MS
+        // Duplicate deliveries can arrive out of order (the two Hook sources
+        // run concurrently), so compare the absolute distance instead of
+        // requiring monotonically increasing timestamps.
+        && at.abs_diff(previous_at) <= DUPLICATE_WINDOW_MS as u64
     {
         return true;
     }
@@ -691,6 +693,29 @@ mod tests {
             ),
             boundary_at("end-1", "SessionEnd", "2026-10-20T07:19:47.570448+00:00"),
             boundary_at("end-2", "SessionEnd", "2026-10-20T07:19:47.571474+00:00"),
+        ];
+        let view = summarize_session(&captures, "s").unwrap();
+        assert_eq!(view.session_epochs, 1);
+        assert_eq!(view.closed_session_epochs, 1);
+        assert_eq!(view.invalid_session_boundaries, 0);
+        assert!(view.latest_epoch_closed);
+    }
+
+    #[test]
+    fn out_of_order_duplicate_boundaries_do_not_open_extra_epochs() {
+        let captures = vec![
+            boundary_at(
+                "start-1",
+                "SessionStart",
+                "2026-10-20T09:17:43.077118+00:00",
+            ),
+            boundary_at(
+                "start-2",
+                "SessionStart",
+                "2026-10-20T09:17:43.074130+00:00",
+            ),
+            boundary_at("end-1", "SessionEnd", "2026-10-20T09:49:45.633820+00:00"),
+            boundary_at("end-2", "SessionEnd", "2026-10-20T09:49:45.634484+00:00"),
         ];
         let view = summarize_session(&captures, "s").unwrap();
         assert_eq!(view.session_epochs, 1);

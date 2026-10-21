@@ -1,5 +1,46 @@
 # 生产就绪评估
 
+## 2026-10-20 17:00（Asia/Shanghai）严格 Session 验收首次通过
+
+固定 `0.163.0` + 七补丁之外，本轮又补齐了辅助作用域，patched 生产者现在能产生
+`inspect-session delivery_ready=true` 的真实 Session：
+
+- `app-server`：`account/read`、`collaborationMode/list`、`hooks/list`、`plugin/list`、
+  `skills/list`、`fs/getMetadata` 等无 Thread 目标的方法显式标记 `process`；
+  `thread/name/set`、`thread/attachment/list` 从参数记录 `conversation.id` 和 `session`。
+- `config_manager::load_with_cli_overrides` 显式 `process`，让 `fs.*` 等子 span 继承。
+- `exec-server` 的 `http_request`、`fs.read_file`、`fs.get_metadata` 显式 `process`。
+- `rmcp` 依赖的 `transport_worker`、`serve_inner`、`streamable_http_session` 在源码
+  checkout 中显式 `process`；使用 `RUSTUP_TOOLCHAIN=1.95.0` 重建，避免其
+  `rust-toolchain.toml` 触发 1.96 同步。
+
+Session `01a15887-9581-7983-b317-619400bc1f56`（真实 18084、patched 生产者、短任务）实测：
+
+| 项 | 结果 |
+| --- | --- |
+| `delivery_ready` | **true** |
+| Session epoch | 1 个，已闭合，`invalid=0` |
+| Native Turn | 1 个，已闭合，`incomplete=0` |
+| 四源 | Wire 5、OTLP logs 15、OTLP traces 9、Hook 8，`missing=[]` |
+| 工具 | 4 次调用/执行，0 缺失 |
+| Source-context 审计 | 0 gap groups、0 unknown_session、0 unscoped_turn |
+
+这证明采集链路和 patched 生产者已经可以为单 Session 生成严格可交付数据。下一层门槛是
+Buyer v7 的规模（≥10 有效轮、≥2 真人交互、≥5 工具）和 `cloud-acceptance` 全阶段；
+短 Session 只证明严格结构与身份闭合，不冒充采购规模。
+
+随后用两轮真实任务 Session `01a1589a-2fac-75d1-b2e4-eaec831ac564` 验证规模：2 个 native
+Turn 全部闭合、1 个 Session epoch 闭合、四源完整（Wire 43、OTLP logs 239、OTLP traces 55、
+Hook 12）、43 次模型交互、6 种工具（`create_goal`、`exec_command`、`get_goal`、
+`update_goal`、`view_image`、`write_stdin`）、29/29 调用/执行/结果配对、0 个 source-context
+缺口，`inspect-session delivery_ready=true`。这满足 Buyer v7 的有效轮次、真人交互和工具
+数量前置条件；canonical `assemble` 仍受共享进程混合 OTLP 批次阻塞，生产者侧已加入按
+Session 拆分的 exporter，待新的隔离 canary 复验后才能声明 `score` 和 `cloud-acceptance`
+通过。
+
+必须用完整的连续 Segment 作为 `inspect-session --input`，不能只抽取包含 Session ID 的行：
+按 Session 拆分后，无 Session 的 process 批次是解析父链和作用域所需的上下文。
+
 ## 2026-10-20 15:55（Asia/Shanghai）采集修复上线与实时复核
 
 提交 `8dbd12c4b206b61065b7e24807174a3f0b6fdd44` 已构建并滚动到本机三者：Runtime 镜像
