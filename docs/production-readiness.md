@@ -41,6 +41,15 @@ Session 拆分的 exporter，待新的隔离 canary 复验后才能声明 `score
 必须用完整的连续 Segment 作为 `inspect-session --input`，不能只抽取包含 Session ID 的行：
 按 Session 拆分后，无 Session 的 process 批次是解析父链和作用域所需的上下文。
 
+为“只抓取指定进程”生成对外样本，`export-maas` 新增可重复的 `--session-id` 和
+`--skip-incomplete`。直接用共享 Collector 的连续 sealed Segment 过滤上述 Session 实测：
+30 个协议完成请求、`batch_00001.tar.gz` 3,866,469 bytes、SHA-256
+`96f87bedc77f58d4651ebfbeb6bfad79d436c8a759494b06fa8879ee08c7bda6`，30 个请求的
+`sessionId` 全部为 `01a1589a-...`，真实用量合计输入 768,386 / 输出 17,711 Token，
+`verify-maas` 退出 0；同时报告 `skipped_other_session_requests=25` 和
+`skipped_incomplete_requests=13`，其他会话与失败尝试不进入样本。样本位于
+`router_v2/records/chiptrace-samples/maas-01a1589a-full/`。
+
 ## 2026-10-20 15:55（Asia/Shanghai）采集修复上线与实时复核
 
 提交 `8dbd12c4b206b61065b7e24807174a3f0b6fdd44` 已构建并滚动到本机三者：Runtime 镜像

@@ -505,6 +505,9 @@ struct ExportMaasArgs {
     /// 跳过没有完整 input/output Token 用量的失败或中断 Wire，而不是让整批导出失败。
     #[arg(long)]
     skip_incomplete: bool,
+    /// 只导出指定 native Session；可重复。用于从共享 Raw 中生成指定进程的数据样本。
+    #[arg(long = "session-id")]
+    session_id: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1066,6 +1069,7 @@ async fn main() -> Result<()> {
             max_batch_bytes: args.max_batch_bytes,
             replace: args.replace,
             skip_incomplete: args.skip_incomplete,
+            session_ids: args.session_id,
         })?)?,
         Command::VerifyMaas(args) => {
             serde_json::to_value(verify_maas(&args.input, args.max_batch_bytes)?)?

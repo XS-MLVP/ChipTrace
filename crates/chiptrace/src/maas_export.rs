@@ -111,6 +111,8 @@ pub struct MaasExportConfig {
     /// failing the whole export. Failed or client-aborted attempts are kept in
     /// Raw but cannot satisfy the external 11-field contract.
     pub skip_incomplete: bool,
+    /// Export only these native Session IDs. Empty exports every Session.
+    pub session_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -147,6 +149,7 @@ pub struct MaasExportReport {
     pub requests: u64,
     pub skipped_non_wire_records: u64,
     pub skipped_incomplete_requests: u64,
+    pub skipped_other_session_requests: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -206,6 +209,7 @@ pub fn export_maas(config: MaasExportConfig) -> Result<MaasExportReport> {
     let mut seen_request_ids = BTreeSet::new();
     let mut skipped_non_wire_records = 0_u64;
     let mut skipped_incomplete_requests = 0_u64;
+    let mut skipped_other_session_requests = 0_u64;
     for input in inputs {
         let mut reader = open_jsonl_reader(&input)?;
         let mut line = Vec::new();
@@ -232,6 +236,15 @@ pub fn export_maas(config: MaasExportConfig) -> Result<MaasExportReport> {
             if value.get("recordType").and_then(Value::as_str) != Some("api_snapshot") {
                 skipped_non_wire_records = skipped_non_wire_records.saturating_add(1);
                 continue;
+            }
+            if !config.session_ids.is_empty() {
+                let selected = capture_session_id(&value)
+                    .is_some_and(|session| config.session_ids.iter().any(|id| id == &session));
+                if !selected {
+                    skipped_other_session_requests =
+                        skipped_other_session_requests.saturating_add(1);
+                    continue;
+                }
             }
             if config.skip_incomplete && !has_complete_usage(&value) {
                 skipped_incomplete_requests = skipped_incomplete_requests.saturating_add(1);
@@ -327,6 +340,7 @@ pub fn export_maas(config: MaasExportConfig) -> Result<MaasExportReport> {
         batches,
         skipped_non_wire_records,
         skipped_incomplete_requests,
+        skipped_other_session_requests,
     })
 }
 
@@ -703,6 +717,21 @@ fn trace_string(value: &Value, keys: &[&str]) -> Option<String> {
             .filter(|text| !text.trim().is_empty())
             .map(str::to_owned)
     })
+}
+
+fn capture_session_id(value: &Value) -> Option<String> {
+    trace_string(
+        value,
+        &[
+            "session_id",
+            "sessionId",
+            "source_session_id",
+            "sourceSessionId",
+            "conversation_id",
+            "conversationId",
+        ],
+    )
+    .or_else(|| header_string(value, "requestHeaders", "session-id"))
 }
 
 fn reject_identity_conflicts(capture: &Value, request_id: &str) -> Result<()> {
@@ -1588,6 +1617,7 @@ mod tests {
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             replace: false,
             skip_incomplete: false,
+            session_ids: Vec::new(),
         }
     }
 
@@ -1933,6 +1963,39 @@ mod tests {
         assert_eq!(report.requests, 1);
         assert_eq!(report.skipped_incomplete_requests, 1);
         verify_maas(&root.path().join("skip"), DEFAULT_MAX_BATCH_BYTES).unwrap();
+    }
+
+    #[test]
+    fn exports_only_selected_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("sessions.ndjson");
+        let mut first = capture(
+            "req-session-a",
+            false,
+            json!({"model":"gpt-5.6-sol","input":[]}),
+        );
+        first["traceContext"]["session_id"] = json!("session-a");
+        let mut second = capture(
+            "req-session-b",
+            false,
+            json!({"model":"gpt-5.6-sol","input":[]}),
+        );
+        second["traceContext"]["session_id"] = json!("session-b");
+        fs::write(
+            &input,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&first).unwrap(),
+                serde_json::to_string(&second).unwrap()
+            ),
+        )
+        .unwrap();
+        let mut selected = config(input, root.path().join("selected"));
+        selected.session_ids = vec!["session-a".to_owned()];
+        let report = export_maas(selected).unwrap();
+        assert_eq!(report.requests, 1);
+        assert_eq!(report.skipped_other_session_requests, 1);
+        verify_maas(&root.path().join("selected"), DEFAULT_MAX_BATCH_BYTES).unwrap();
     }
 
     #[test]

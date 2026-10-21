@@ -30,6 +30,19 @@ Token 用量。缺少或冲突的身份、协议、用量和正文会使命令�
 短横线和 camelCase 归一化后匹配，验证器会拒绝仍含未掩码敏感字段的 JSON。导出器不会伪造缺失
 事实，也不会把 OTLP、Hook 或旧的未分类记录当作 Wire 请求。
 
+从共享 Raw 生成“指定进程”的样本时，用可重复的 `--session-id` 只导出给定 native
+Session，其他会话的请求计入 `skipped_other_session_requests`；`--skip-incomplete`
+把没有完整用量的失败/中断 Wire 计入 `skipped_incomplete_requests`，默认仍整体失败。
+两个过滤条件都不改写 Raw。
+
+```bash
+chiptrace export-maas \
+  --input /var/lib/chiptrace/capture/segments/segment-*.sealed.ndjson \
+  --output /maasData/archive \
+  --provider-code providerX --platform openai \
+  --session-id <native-session-id> --skip-incomplete
+```
+
 ## 命令
 
 ```bash
