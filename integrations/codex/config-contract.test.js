@@ -273,12 +273,16 @@ test('separate native hook invocations survive while HTTP retries deduplicate', 
 test('SessionStart stops before forwarding when credentials or hook JSON are invalid', async () => {
   const block = requirements.split('[[hooks.SessionEnd]]', 1)[0];
   const command = JSON.parse(block.match(/^command = (.*)$/m)[1]);
+  // Point the token lookup at a path that cannot exist so the test never reads
+  // a real host credential from the default location.
+  const missingTokenFile = path.join(integrationRoot, 'does-not-exist-ingest-token');
   for (const scenario of [
     { input: '{}', token: '' },
     { input: '{invalid', token: 'synthetic-hook-test-credential' },
   ]) {
     const child = spawn('/bin/sh', ['-c', command], {
       env: { ...process.env, CHIPTRACE_HOOK_BIN: hookPath,
+        CHIPTRACE_INGEST_TOKEN_FILE: missingTokenFile,
         CHIPTRACE_INGEST_TOKEN: scenario.token },
       stdio: ['pipe', 'pipe', 'ignore'],
     });
@@ -293,5 +297,37 @@ test('SessionStart stops before forwarding when credentials or hook JSON are inv
     const response = JSON.parse(stdout);
     assert.equal(response.continue, false);
     assert.match(response.stopReason, /ChipTrace cloud ingest unavailable:/);
+  }
+});
+
+test('an empty Hook probe is acknowledged locally without posting a bad event', async () => {
+  const block = requirements.split('[[hooks.SessionEnd]]', 1)[0];
+  const command = JSON.parse(block.match(/^command = (.*)$/m)[1]);
+  let requested = 0;
+  const server = http.createServer((request, response) => {
+    requested += 1;
+    response.end(JSON.stringify({ ok: true, durable: true }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    const child = spawn('/bin/sh', ['-c', command], {
+      env: { ...process.env, CHIPTRACE_HOOK_BIN: hookPath,
+        CHIPTRACE_GATEWAY_URL: `http://127.0.0.1:${port}`,
+        CHIPTRACE_INGEST_TOKEN: 'synthetic-hook-test-credential' },
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    let stdout = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    const finished = new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', code => code === 0 ? resolve() : reject(new Error(`Unexpected hook exit ${code}`)));
+    });
+    child.stdin.end('{}');
+    await finished;
+    assert.equal(stdout, '', 'an empty probe must not emit a stop reason');
+    assert.equal(requested, 0, 'an empty probe must not reach the gateway');
+  } finally {
+    await new Promise(resolve => server.close(resolve));
   }
 });
