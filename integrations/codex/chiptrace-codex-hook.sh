@@ -46,9 +46,10 @@ case "$token" in
   *[![:print:]]*) fail ingest_token_invalid ;;
 esac
 
-event=$(/usr/bin/python3 -c '
+event=$(CHIPTRACE_EVENT_HINT="${CHIPTRACE_HOOK_EVENT:-}" /usr/bin/python3 -c '
 import datetime
 import json
+import os
 import sys
 import uuid
 
@@ -59,12 +60,30 @@ try:
     value = json.loads(raw.decode("utf-8"))
     if not isinstance(value, dict):
         raise ValueError("object required")
+    # An empty invocation carries no Session, Turn or payload. Codex emits a
+    # bare "{}" when it probes the Hook; posting it only creates an
+    # unattributable quality error, so acknowledge locally and send nothing.
+    if not value:
+        raise SystemExit(0)
     value.setdefault("event_id", str(uuid.uuid4()))
     value.setdefault("occurred_at", datetime.datetime.now(datetime.timezone.utc).isoformat())
+    # Codex can invoke a required Hook with an event name but no payload. The
+    # managed requirements.toml already names the event in
+    # CHIPTRACE_HOOK_EVENT, so carry it explicitly instead of letting ingest
+    # reject a valid boundary.
+    if not str(value.get("hook_event_name") or "").strip():
+        hint = str(os.environ.get("CHIPTRACE_EVENT_HINT") or "").strip()
+        if hint:
+            value["hook_event_name"] = hint
+            value["hook_event_name_source"] = "requirements_env"
     print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
     raise SystemExit(2)
-' 2>/dev/null) || fail invalid_hook_json
+' 2>/dev/null)
+status=$?
+# An empty payload exits 0 with no output: local acknowledgement only.
+[ "$status" -eq 0 ] && [ -z "$event" ] && exit 0
+[ "$status" -eq 0 ] || fail invalid_hook_json
 
 for attempt in 1 2; do
   if wire=$(
