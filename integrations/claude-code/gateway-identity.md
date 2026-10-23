@@ -19,18 +19,30 @@ CHIPTRACE_CLAUDE_TURN_STATE_DIR=/monitor-state/claude-turns
 核心函数：
 
 ```js
+const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function sessionFromUserId(userId) {
+  if (typeof userId !== 'string') return null;
+  try {
+    const session = JSON.parse(userId)?.session_id;
+    return typeof session === 'string' && SESSION_UUID_RE.test(session) ? session : null;
+  } catch {
+    return null;
+  }
+}
+
 function anthropicSessionFromBody(requestBodyText) {
   if (typeof requestBodyText !== 'string' || requestBodyText.trim() === '') return null;
   try {
-    const body = JSON.parse(requestBodyText);
-    const userId = body?.metadata?.user_id;
-    if (typeof userId !== 'string') return null;
-    const parsed = JSON.parse(userId);
-    const session = parsed?.session_id;
-    if (typeof session !== 'string') return null;
-    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(session)
-      ? session
-      : null;
+    const session = sessionFromUserId(JSON.parse(requestBodyText)?.metadata?.user_id);
+    if (session) return session;
+  } catch {
+    // Large interactive requests are sampled at head and tail; fall through.
+  }
+  const match = requestBodyText.match(/"user_id"\s*:\s*("(?:\\.|[^"\\])*")/);
+  if (!match) return null;
+  try {
+    return sessionFromUserId(JSON.parse(match[1]));
   } catch {
     return null;
   }
@@ -72,3 +84,23 @@ if (anthropicSession) {
 `requestIdentityCapture` 在 `appendCaptureChunk` 中对 request 侧始终追加
 （上限 1 MiB），并随 `scheduleFullTraceSubmit` 传入；不要使用未填充的
 `requestCapture`，它在事务模式下为空。
+
+## 大请求体：头部 + 尾部
+
+交互式 Claude Code 的 `/v1/messages` 请求在真实会话中会超过 1 MiB（实测
+1.67–2.60 MB），而 `metadata.user_id` 位于 JSON 末尾。只缓存前 1 MiB 会让这类
+Wire 没有 session 标签，`inspect-session` 也无法归属。
+
+网关因此同时保留：
+
+- `requestIdentityCapture`：前 1 MiB；
+- `requestIdentityTail`：最后 256 KiB（滚动窗口）。
+
+`scheduleFullTraceSubmit` 用 `head + "\n" + tail` 组成
+`requestIdentityText`，先尝试完整 `JSON.parse`，失败时用
+`"user_id"\s*:\s*("(?:\\.|[^"\\])*")` 取出转义字符串，再解析两次。这样既覆盖
+小请求，也能从大请求尾部取到身份，且不会为每个请求复制整个正文。
+
+实测：重启后本机会话 `f4302b69-…`（1.72 MB）和另一会话 `839b4b0d-…`
+（2.62 MB）的 Wire 都带上了 `session_id`；未重启前的同类记录仍保持为空，Raw
+不重写。

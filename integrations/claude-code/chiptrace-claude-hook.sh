@@ -160,6 +160,12 @@ else:
                 value["status"] = "error"
             else:
                 value["status"] = "success"
+    # Claude Code emits SubagentStop with an empty agent_type for generic
+    # subagents. The ingest contract requires a non-empty type, so label the
+    # producer gap explicitly instead of inventing a concrete agent type.
+    if hook == "SubagentStop" and not str(value.get("agent_type") or "").strip():
+        value["agent_type"] = "unspecified"
+        value["agent_type_source"] = "claude_payload_empty"
 print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 ' 2>/dev/null) || fail invalid_hook_json
 

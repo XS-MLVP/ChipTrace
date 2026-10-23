@@ -1,5 +1,36 @@
 # 生产就绪评估
 
+## 2026-10-23 16:50（Asia/Shanghai）Codex 与 Claude Code 单入口客户端落地
+
+客户端已统一到唯一业务入口 `http://172.28.11.121:18084`：
+
+- Codex：`~/.codex/config.toml` 的 `OpenAI` Provider 保持该入口，认证为 Sub2API 业务 Key；
+  `/etc/codex` 仍是 `127.0.0.1:18084`（同一 Gateway，但字面地址不同，需 root 统一）。
+- Claude Code：`~/.claude/settings.json` 的 `ANTHROPIC_BASE_URL` 改为该入口，认证改为
+  Sub2API 业务 Key；`~/.local/libexec/chiptrace-claude-hook` 已安装，9 个生命周期 Hook
+  全部指向该入口，状态目录与网关的 `/monitor-state/claude-turns` 一致。
+- GPT 上游：本机可用的 `https://api.kxyai.top` Key 与 Sub2API 账户 27 的 Key 完全一致；
+  账户 27 位于 `GPT pro` 分组（id 3），优先级 1；`/v1/messages` 实测
+  `account_id=27`、HTTP 200。`gpt-6-astra` 的 Responses 直探针也返回 200。
+
+修复的采集缺陷：交互式 Claude Code 请求体实测 1.67–2.60 MB，`metadata.user_id` 在末尾，
+而网关原本身份缓存只取前 1 MiB，导致这些 Wire 没有 session。网关现在保留前 1 MiB 和
+最后 256 KiB，并在完整 JSON 解析失败时用 `user_id` 字符串回退解析。重启后本机会话
+`f4302b69-…`（1.72 MB）和 `839b4b0d-…`（2.62 MB）的 Wire 都已带 `session_id`。
+
+`SubagentStop` 的空 `agent_type` 由 helper 写成 `unspecified` 并记录
+`agent_type_source=claude_payload_empty`，避免把真实事件变成质量错误，也不伪造具体类型。
+
+单入口复验：使用真实 `~/.claude/settings.json`（不改环境变量）跑一个新的 `claude -p`
+会话 `ad0095c2-3d34-4a70-b8df-544529e3ab8f`，实际产生 2 条 Wire、8 个 Hook 批次
+（SessionStart/UserPromptSubmit/PreToolUse×2/PostToolUse×2/Stop/SessionEnd），Bash
+工具 1/1 配对；`inspect-session` 返回 `delivery_ready=true`，profile=`claude-code`，
+1 个 epoch 闭合、1 个 Turn、0 source-context 缺口。
+
+当前仍存在的边界：`/etc/codex` 需要 root 统一字面地址；Sub2API 的 GPT 上游仍主要依赖
+账户 27（单点）；持久质量账本仍为 8,819 条历史记录；Platform 仍为 `fs`，未接真实
+OSS/S3 与 SFTP。
+
 ## 2026-10-21 12:00（Asia/Shanghai）Claude Code + DeepSeek 采集支持
 
 采集器已从 Codex Responses 扩展到 Claude Code 的 Anthropic Messages（DeepSeek 模型）。

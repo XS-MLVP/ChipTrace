@@ -4,6 +4,12 @@
 的 Hook helper 和配置样例。Claude Code 通过 `ANTHROPIC_BASE_URL` 指向 18084，模型可用
 DeepSeek 的 Anthropic 兼容端点或上游聚合网关。
 
+本机已按“单一入口”落地：`~/.claude/settings.json` 的
+`ANTHROPIC_BASE_URL=http://172.28.11.121:18084`，认证使用 Sub2API 业务 Key；
+`~/.local/libexec/chiptrace-claude-hook` 已安装，9 个生命周期 Hook 全部指向同一入口，
+状态目录为 `/nfs/home/zhangyuxin/router_v2-data/monitor/claude-turns`。Codex 也使用
+同一个 `172.28.11.121:18084`。
+
 ## 数据源与标签
 
 | 数据 | 来源 | 关键标签 |
@@ -23,8 +29,12 @@ helper 用它作为 `turn_id`/`root_turn_id`，并写入
 ```bash
 install -d -m 0755 ~/.local/libexec
 install -m 0755 chiptrace-claude-hook.sh ~/.local/libexec/chiptrace-claude-hook
-install -d -m 0755 /var/lib/chiptrace/claude-turn-state
+install -d -m 0755 /nfs/home/zhangyuxin/router_v2-data/monitor/claude-turns
 ```
+
+`SubagentStop` 在 Claude Code 中可能给出空 `agent_type`。helper 会写成
+`agent_type=unspecified` 并标记 `agent_type_source=claude_payload_empty`，保留事件、
+不伪造具体类型。
 
 在 Claude Code 的 `settings.json` 中把 [settings.hooks.example.json](settings.hooks.example.json)
 的 `hooks` 合并进去，并按实际路径修改：
