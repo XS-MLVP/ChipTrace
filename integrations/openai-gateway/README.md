@@ -1,3 +1,17 @@
+# 网关源码
+
+`server.js` 是 18084 业务网关的正式源码，与主机 `/nfs/home/zhangyuxin/router_v2/relay_shell`
+运行的是同一份文件（Compose 用 bind mount 覆盖）。`durable-outbox.js` 是它唯一的本地依赖。
+
+变更网关必须：
+
+1. 修改本目录的 `server.js`；
+2. 运行 `make gateway-source-test`（`server-capture.test.js` + `server-identity.test.js`）；
+3. 重建 `router-v2-relay-shell` 容器并确认 `/health` 的 `status=healthy`。
+
+`server-identity.test.js` 覆盖大于 1 MiB 的 Anthropic 请求体：`metadata.user_id` 位于 JSON
+末尾，网关需要头部 + 尾部采样才能回填 native Session 和 Hook 派生的 Turn。
+
 # OpenAI 网关接入
 
 该目录只提供 OpenAI-compatible 网关旁路采集所需的本地可靠投递模块，不包含业务代理、

@@ -1,4 +1,4 @@
-.PHONY: check test gateway-test gateway-receipt-test gateway-host-test failed-outbox-replay-test codex-config-test claude-config-test codex-route-preflight-test managed-route-test protocol-collection-test protocol-sandbox-contract-test native-context-test native-canary-gate-test native-canary-evidence-test stock-release-gate-test producer-support-gate-test producer-report-gate-test provider-response-gate-test live-preflight-contract-test action-pin-gate-test runtime-health-gate-test quality-baseline-test quality-reason-contract-test platform-health-gate-test relay-quality-seed-test deployment-smoke-contract-test audit-memory-test turn-memory-test platform-test deployment-config-test gateway-preflight-test maas-contract-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
+.PHONY: check test gateway-test gateway-receipt-test gateway-host-test gateway-source-test failed-outbox-replay-test codex-config-test claude-config-test codex-route-preflight-test managed-route-test protocol-collection-test protocol-sandbox-contract-test native-context-test native-canary-gate-test native-canary-evidence-test stock-release-gate-test producer-support-gate-test producer-report-gate-test provider-response-gate-test live-preflight-contract-test action-pin-gate-test runtime-health-gate-test quality-baseline-test quality-reason-contract-test platform-health-gate-test relay-quality-seed-test deployment-smoke-contract-test audit-memory-test turn-memory-test platform-test deployment-config-test gateway-preflight-test maas-contract-test self-test cloud-test m0-test build benchmark benchmark-store benchmark-http benchmark-compression
 
 CHIPTRACE_VERSION ?= 0.6.0
 CHIPTRACE_REVISION ?= $(shell git rev-parse HEAD)
@@ -25,6 +25,9 @@ gateway-receipt-test:
 
 gateway-host-test:
 	node --test integrations/openai-gateway/host-health.test.js
+
+gateway-source-test:
+	node --test integrations/openai-gateway/server-capture.test.js integrations/openai-gateway/server-identity.test.js
 
 failed-outbox-replay-test:
 	node --test scripts/ops/replay-failed-outbox.test.js
