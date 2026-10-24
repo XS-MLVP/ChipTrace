@@ -1,5 +1,5 @@
 --- /nfs/home/zhangyuxin/.local/bin/codex.bak-20261024T154913	2026-10-20 13:47:07.034031000 +0800
-+++ /nfs/home/zhangyuxin/.local/bin/codex	2026-10-24 15:46:30.088430000 +0800
++++ /nfs/home/zhangyuxin/.local/bin/codex	2026-10-24 16:23:32.960603000 +0800
 @@ -226,6 +226,13 @@
    local system_token=/etc/chiptrace/ingest-token
    local user_helper=/nfs/home/zhangyuxin/.local/libexec/chiptrace-codex-hook
@@ -14,7 +14,33 @@
    local temporary
  
    if [ -x "$system_helper" ] && [ -d "$(dirname "$user_helper")" ]; then
-@@ -343,7 +350,13 @@
+@@ -238,8 +245,8 @@
+     fi
+   fi
+ 
+-  if [ -r "$system_token" ] && [ -d "$(dirname "$user_token")" ]; then
+-    if [ ! -f "$user_token" ] || ! cmp -s "$system_token" "$user_token"; then
++  if [ -r "$system_token" ] && [ -d "$(dirname "$user_token")" ] && [ ! -s "$user_token" ]; then
++    if true; then
+       temporary="$user_token.tmp.$$"
+       if cp -f "$system_token" "$temporary" 2>/dev/null; then
+         chmod 0600 "$temporary" 2>/dev/null || true
+@@ -311,7 +318,13 @@
+ requirements_template=/nfs/home/zhangyuxin/router_v2/ChipTrace/integrations/codex/requirements.toml.example
+ requirements_overlay="$SHARED_CODEX_HOME/requirements.chiptrace-managed.toml"
+ host_requirements_managed=0
+-if [ "$node_name" = "open21" ] && [ -f "$requirements_system_file" ]; then
++# This host runs a locally installed Codex. When the repository ships a
++# requirements template, use it as a user-owned overlay inside a private mount
++# namespace so collection never depends on the root-owned /etc/codex files.
++if [ -r "$requirements_template" ]; then
++  requirements_overlay_needed=1
++fi
++if [ "$requirements_overlay_needed" = "0" ] && [ "$node_name" = "open21" ] && [ -f "$requirements_system_file" ]; then
+   if grep -Fq 'ChipTrace cloud ingest unavailable or configuration incomplete' "$requirements_system_file" \
+     || grep -Eq 'CHIPTRACE_INGEST_TOKEN[[:space:]]*=' "$requirements_system_file" \
+     || grep -Fq '172.28.11.121:18084/hooks/codex' "$requirements_system_file" \
+@@ -343,7 +356,13 @@
      requirements_force_no_daemon=1
      requirements_force_reason="inherited inline CHIPTRACE_INGEST_TOKEN must not override the managed token file"
    fi
@@ -29,3 +55,64 @@
    export CHIPTRACE_GATEWAY_URL=http://127.0.0.1:18084
    export CHIPTRACE_INGEST_TOKEN_FILE=/etc/chiptrace/ingest-token
    unset CHIPTRACE_INGEST_TOKEN
+@@ -367,7 +386,7 @@
+ # newly launched CLI to a daemon that predates the host requirements file;
+ # leave that daemon and its active sessions untouched and run this invocation
+ # in its own process instead.
+-if [ -f "$requirements_system_file" ] && command -v pgrep >/dev/null 2>&1 \
++if [ "$requirements_overlay_needed" = "0" ] && [ -f "$requirements_system_file" ] && command -v pgrep >/dev/null 2>&1 \
+   && command -v ps >/dev/null 2>&1; then
+   requirements_mtime="$(stat -c '%Y' "$requirements_system_file" 2>/dev/null || true)"
+   requirements_now="$(date +%s)"
+@@ -409,10 +428,17 @@
+   fi
+ fi
+ 
++# Downstream gates read the effective requirements file: the user-owned
++# overlay when it exists, otherwise the host file on a root-managed install.
++requirements_effective="$requirements_system_file"
++if [ -r "$requirements_overlay" ]; then
++  requirements_effective="$requirements_overlay"
++fi
++
+ # The managed host provider reads its key from CHIPTRACE_API_KEY.  Reuse the
+ # protected Codex auth file when the host requirements declare that contract;
+ # never copy the key into a TOML file or the requirements overlay.
+-if [ -f "$requirements_system_file" ] && grep -Fq 'CHIPTRACE_API_KEY' "$requirements_system_file" \
++if [ -r "$requirements_effective" ] && grep -Fq 'CHIPTRACE_API_KEY' "$requirements_effective" \
+   && [ -z "${CHIPTRACE_API_KEY:-}" ] && [ -r "$CODEX_HOME/auth.json" ] \
+   && [ -x /nfs/home/zhangyuxin/bin/jq ]; then
+   chiptrace_api_key="$(/nfs/home/zhangyuxin/bin/jq -r '.OPENAI_API_KEY // empty' "$CODEX_HOME/auth.json" 2>/dev/null || true)"
+@@ -426,11 +452,11 @@
+ # OTEL_EXPORTER_OTLP_HEADERS variable.  Codex reads it from the process
+ # environment (including the managed app-server), so set it before every
+ # launch; keep the token out of config files and process arguments.
+-if [ -f "$requirements_system_file" ] && [ -z "${OTEL_EXPORTER_OTLP_HEADERS:-}" ]; then
++if [ -r "$requirements_effective" ] && [ -z "${OTEL_EXPORTER_OTLP_HEADERS:-}" ]; then
+   otel_ingest_token="${CHIPTRACE_INGEST_TOKEN:-}"
+   if [ -z "$otel_ingest_token" ]; then
+-    for otel_token_file in "${CHIPTRACE_INGEST_TOKEN_FILE:-/etc/chiptrace/ingest-token}" \
+-      /nfs/home/zhangyuxin/.config/chiptrace/ingest-token; do
++    for otel_token_file in "${CHIPTRACE_INGEST_TOKEN_FILE:-/nfs/home/zhangyuxin/.config/chiptrace/ingest-token}" \
++      /etc/chiptrace/ingest-token; do
+       [ -r "$otel_token_file" ] || continue
+       otel_ingest_token="$(/usr/bin/head -c 4097 -- "$otel_token_file" 2>/dev/null | /usr/bin/tr -d '\r\n')"
+       [ -n "$otel_ingest_token" ] && break
+@@ -722,7 +748,16 @@
+   # user namespace rather than bubblewrap: Codex must be able to spawn its
+   # external auth command, and bubblewrap's no-new-privileges mode blocks it.
+   exec unshare --user --map-root-user --mount --fork /bin/sh -c '
+-    mount --bind "$1" /etc/codex/requirements.toml
++    # The target may be absent on a host without root-owned Codex assets.
++    # Inside this private namespace we are root, so create it only when the
++    # directory is writable there; never require the host file to exist.
++    if [ ! -e /etc/codex/requirements.toml ]; then
++      : > /etc/codex/requirements.toml 2>/dev/null || true
++    fi
++    mount --bind "$1" /etc/codex/requirements.toml || {
++      echo "codex-wrapper: cannot activate the user requirements overlay" >&2
++      exit 126
++    }
+     shift
+     exec "$@"
+   ' codex-requirements-overlay "$requirements_overlay" "$upstream" "$@"

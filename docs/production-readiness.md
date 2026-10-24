@@ -1,5 +1,37 @@
 # 生产就绪评估
 
+## 2026-10-24 16:25（Asia/Shanghai）本地 Codex 采集不再依赖 root
+
+本机 Codex 是本地安装（`~/.local/openai-codex` + `~/.local/bin/codex`），但 launcher
+原先从 root 所有的 `/usr/local/libexec/chiptrace-codex-hook`、`/etc/codex/*.toml`
+和 `/etc/chiptrace/ingest-token` 加载采集资产。没有 sudo 时这些文件无法更新，空 `{}`
+Hook 探针会持续产生 `Codex hook requires hook_event_name` 质量错误。
+
+现在采集路径全部改为用户所有：
+
+| 资产 | 本地路径 |
+| --- | --- |
+| Hook helper | `~/.local/libexec/chiptrace-codex-hook`（由仓库 helper 安装） |
+| requirements | `~/.codex/requirements.chiptrace-managed.toml`（由仓库模板生成） |
+| ingest token | `~/.config/chiptrace/ingest-token` |
+| 网关/OTLP | `http://127.0.0.1:18084`（本机入口） |
+
+requirements 在私有 mount namespace 内通过
+`unshare --user --map-root-user --mount` bind 覆盖到 `/etc/codex/requirements.toml`，
+不需要真实 root。目标文件不存在时在命名空间内自建；挂载失败则 fail-closed（exit 126），
+不会静默丢失必需 Hook。
+
+验证：
+
+- 正常启动：launcher 使用 overlay，采集到 1 条 Wire、8 个 Hook 批次、OTLP logs/traces，
+  质量账本零新增。
+- 用 `mount -t tmpfs none /etc/codex` 把 `/etc/codex` 完全屏蔽后再启动：Codex 正常回复，
+  overlay 自建目标并生效，仍采集到完整 8 个 Hook，质量账本零新增（8829 → 8829）。
+- `make codex-config-test` 通过（30 + 20 项）。
+
+因此 `/etc/codex` 的 root 文件不再是采集前置条件；它们只是无仓库模板时的回退。
+启动器补丁存档在 `integrations/codex/patches/local-helper-loading.patch`，Codex 升级后需重新应用。
+
 ## 2026-10-23 16:50（Asia/Shanghai）Codex 与 Claude Code 单入口客户端落地
 
 客户端已统一到唯一业务入口 `http://172.28.11.121:18084`：
