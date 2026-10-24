@@ -1,0 +1,31 @@
+--- /nfs/home/zhangyuxin/.local/bin/codex.bak-20261024T154913	2026-10-20 13:47:07.034031000 +0800
++++ /nfs/home/zhangyuxin/.local/bin/codex	2026-10-24 15:46:30.088430000 +0800
+@@ -226,6 +226,13 @@
+   local system_token=/etc/chiptrace/ingest-token
+   local user_helper=/nfs/home/zhangyuxin/.local/libexec/chiptrace-codex-hook
+   local user_token=/nfs/home/zhangyuxin/.config/chiptrace/ingest-token
++  # The maintained helper lives in the ChipTrace repository. Prefer it so a
++  # locally installed Codex loads the current capture contract; the root-owned
++  # copy is only a fallback and cannot be refreshed without root.
++  local repo_helper=/nfs/home/zhangyuxin/router_v2/ChipTrace/integrations/codex/chiptrace-codex-hook.sh
++  if [ -x "$repo_helper" ]; then
++    system_helper="$repo_helper"
++  fi
+   local temporary
+ 
+   if [ -x "$system_helper" ] && [ -d "$(dirname "$user_helper")" ]; then
+@@ -343,7 +350,13 @@
+     requirements_force_no_daemon=1
+     requirements_force_reason="inherited inline CHIPTRACE_INGEST_TOKEN must not override the managed token file"
+   fi
+-  export CHIPTRACE_HOOK_BIN=/usr/local/libexec/chiptrace-codex-hook
++  # Required Hooks must run the same helper as the user hooks. Use the local
++  # installation maintained from the repository when it exists.
++  if [ -x /nfs/home/zhangyuxin/.local/libexec/chiptrace-codex-hook ]; then
++    export CHIPTRACE_HOOK_BIN=/nfs/home/zhangyuxin/.local/libexec/chiptrace-codex-hook
++  else
++    export CHIPTRACE_HOOK_BIN=/usr/local/libexec/chiptrace-codex-hook
++  fi
+   export CHIPTRACE_GATEWAY_URL=http://127.0.0.1:18084
+   export CHIPTRACE_INGEST_TOKEN_FILE=/etc/chiptrace/ingest-token
+   unset CHIPTRACE_INGEST_TOKEN
