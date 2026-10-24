@@ -38,4 +38,29 @@ install -m 0755 /nfs/home/zhangyuxin/router_v2/ChipTrace/integrations/codex/chip
   /nfs/home/zhangyuxin/.local/libexec/chiptrace-codex-hook
 ```
 
-`codex-single-install-maintainer` 的更新脚本可能重写 launcher，升级后需重新应用。
+`codex-single-install-maintainer` 的更新脚本可能重写 launcher，升级后需重新应用本目录下的两个补丁。
+
+## 统一使用 patched Codex（严格交付）
+
+`patched-upstream.patch` 让 launcher 在
+`/nfs/home/zhangyuxin/.local/openai-codex/patched/0.163.0-alpha.11-chiptrace/codex`
+存在时优先使用它，否则回退到官方 package。
+
+该二进制是 `codex-producer-0.163.0` 的 **release** 构建（已 strip debug 信息），
+包含 Turn 级 SSE 标签与辅助 Span 的 process 作用域，因此日常会话可直接达到
+`delivery_ready=true`，无需在“日常版/采集版”之间切换。
+
+重建步骤：
+
+```bash
+cd /nfs/home/zhangyuxin/router_v2/codex-producer-0.163.0/src/codex-rs
+RUSTUP_TOOLCHAIN=1.95.0-x86_64-unknown-linux-gnu \
+  cargo build --release -p codex-cli --bin codex --locked
+strip --strip-debug target/release/codex
+install -D -m 0755 target/release/codex \
+  /nfs/home/zhangyuxin/.local/openai-codex/patched/0.163.0-alpha.11-chiptrace/codex
+```
+
+回退：删除上述文件，launcher 自动使用官方版本；或用
+`CODEX_PATCHED_UPSTREAM=<path>` 覆盖。
+

@@ -1,0 +1,17 @@
+--- /nfs/home/zhangyuxin/.local/bin/codex.bak-patched-20261024T232142	2026-10-24 16:23:32.960603000 +0800
++++ /nfs/home/zhangyuxin/.local/bin/codex	2026-10-24 23:18:48.428584000 +0800
+@@ -568,6 +568,14 @@
+ export PATH="$clean_path"
+ 
+ upstream="$CANONICAL_CODEX_UPSTREAM"
++# This host maintains a locally built Codex that adds native Turn identity to
++# SSE telemetry and process scope to auxiliary spans. Prefer it when present so
++# collection produces strict, delivery-ready data; other nodes without the
++# build keep the canonical package.
++PATCHED_CODEX_UPSTREAM="${CODEX_PATCHED_UPSTREAM:-/nfs/home/zhangyuxin/.local/openai-codex/patched/0.163.0-alpha.11-chiptrace/codex}"
++if [ -x "$PATCHED_CODEX_UPSTREAM" ]; then
++  upstream="$PATCHED_CODEX_UPSTREAM"
++fi
+ if [ ! -x "$upstream" ]; then
+   echo "ERROR: cannot find canonical Codex binary: $upstream" >&2
+   exit 127
