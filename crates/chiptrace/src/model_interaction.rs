@@ -2694,17 +2694,20 @@ fn interaction_integrity(
     let response_bytes_at_close = capture
         .get("responseBytesForwardedAtClientClose")
         .and_then(Value::as_u64);
-    let boundary_offsets_consistent = response_bytes_forwarded
-        .zip(response_bytes_captured)
-        .is_none_or(|(forwarded, captured)| forwarded <= captured)
-        && response_bytes_at_close
-            .zip(response_bytes_forwarded)
-            .is_none_or(|(at_close, forwarded)| at_close <= forwarded)
-        && (!matches!(response_closed, Some(true))
-            || (response_bytes_at_close.is_some()
-                && capture
-                    .get("responseProtocolTerminalObservedAtClientClose")
-                    .is_some_and(Value::is_boolean)));
+    // Production captures redact credentials before delivery, so the stored
+    // body can be shorter than the byte count the client received. The gateway
+    // records the original digest in that case; without that explicit evidence
+    // a larger forwarded count still means we lost bytes.
+    let boundary_offsets_consistent =
+        boundary_bytes_consistent(capture, response_bytes_forwarded, response_bytes_captured)
+            && response_bytes_at_close
+                .zip(response_bytes_forwarded)
+                .is_none_or(|(at_close, forwarded)| at_close <= forwarded)
+            && (!matches!(response_closed, Some(true))
+                || (response_bytes_at_close.is_some()
+                    && capture
+                        .get("responseProtocolTerminalObservedAtClientClose")
+                        .is_some_and(Value::is_boolean)));
     let client_delivery_evidence_consistent = !matches!(
         (response_finished, response_closed),
         (Some(true), Some(true))
@@ -4396,11 +4399,43 @@ fn contains_object_key(value: &Value, expected: &str) -> bool {
     }
 }
 
+/// Opaque fields whose exact bytes are not required to be stable between a
+/// streamed item and the terminal snapshot. Some OpenAI-compatible gateways
+/// re-encrypt reasoning payloads per event; the ciphertext is not semantic
+/// content, while its presence and all other fields still must match.
+fn is_repackable_opaque_field(key: &str) -> bool {
+    key == "encrypted_content"
+}
+
+/// The stored response body must not be shorter than what the client received,
+/// unless the capture explicitly declares that the body was redacted and keeps
+/// the original digest as evidence.
+fn boundary_bytes_consistent(
+    capture: &Value,
+    forwarded: Option<u64>,
+    captured: Option<u64>,
+) -> bool {
+    let body_redacted_with_original_evidence = capture
+        .pointer("/captureSanitization/bodyRedacted")
+        .and_then(Value::as_bool)
+        == Some(true)
+        && capture
+            .get("responseBodyTextOriginalSha256")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+    forwarded.zip(captured).is_none_or(|(forwarded, captured)| {
+        forwarded <= captured || body_redacted_with_original_evidence
+    })
+}
+
 fn response_item_retains_observation(observed: &Value, terminal: &Value) -> bool {
     match (observed, terminal) {
         (Value::Object(observed), Value::Object(terminal)) => {
             observed.iter().all(|(key, value)| {
                 terminal.get(key).is_some_and(|final_value| {
+                    if is_repackable_opaque_field(key) {
+                        return value.is_string() && final_value.is_string();
+                    }
                     response_item_retains_observation(value, final_value)
                 })
             })
@@ -10119,5 +10154,78 @@ mod tests {
                 "declares tool execution records but has no canonical tool_execution span"
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod opaque_reasoning_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn encrypted_reasoning_ciphertext_may_be_repacked() {
+        let observed =
+            json!({"type":"reasoning","id":"rs_1","encrypted_content":"AAA","summary":[]});
+        let terminal =
+            json!({"type":"reasoning","id":"rs_1","encrypted_content":"BBB","summary":[]});
+        assert!(response_item_retains_observation(&observed, &terminal));
+    }
+
+    #[test]
+    fn encrypted_reasoning_still_requires_structural_identity() {
+        let observed =
+            json!({"type":"reasoning","id":"rs_1","encrypted_content":"AAA","summary":[]});
+        let terminal =
+            json!({"type":"reasoning","id":"rs_2","encrypted_content":"BBB","summary":[]});
+        assert!(!response_item_retains_observation(&observed, &terminal));
+        let missing = json!({"type":"reasoning","id":"rs_1","summary":[]});
+        assert!(!response_item_retains_observation(&observed, &missing));
+    }
+}
+
+#[cfg(test)]
+mod redacted_boundary_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn capture(redacted: bool) -> Value {
+        let mut value = json!({"captureId":"cap-1","recordType":"api_snapshot"});
+        if redacted {
+            value["captureSanitization"] =
+                json!({"bodyRedacted":true,"fields":["body.token_like"]});
+            value["responseBodyTextOriginalSha256"] = json!("a".repeat(64));
+        }
+        value
+    }
+
+    #[test]
+    fn redacted_body_with_original_digest_allows_shorter_stored_bytes() {
+        assert!(boundary_bytes_consistent(
+            &capture(true),
+            Some(140),
+            Some(100)
+        ));
+    }
+
+    #[test]
+    fn missing_or_unmarked_redaction_keeps_the_strict_bound() {
+        assert!(!boundary_bytes_consistent(
+            &capture(false),
+            Some(140),
+            Some(100)
+        ));
+        let mut marked = capture(true);
+        marked["responseBodyTextOriginalSha256"] = Value::Null;
+        assert!(!boundary_bytes_consistent(&marked, Some(140), Some(100)));
+    }
+
+    #[test]
+    fn unredacted_capture_with_smaller_forward_count_stays_valid() {
+        assert!(boundary_bytes_consistent(
+            &capture(false),
+            Some(100),
+            Some(100)
+        ));
+        assert!(boundary_bytes_consistent(&capture(false), None, Some(100)));
     }
 }

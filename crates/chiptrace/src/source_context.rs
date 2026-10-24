@@ -23,6 +23,11 @@ pub struct SourceContextCounts {
     pub unscoped_turn_records: u64,
     pub other_session_records: u64,
     pub unknown_session_records: u64,
+    /// Records from a producer that never referenced this Session. They cannot
+    /// be attributed to it, so they are reported separately rather than either
+    /// charged as gaps or silently dropped.
+    #[serde(default)]
+    pub ambient_records: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,6 +71,9 @@ pub struct SourceContextAudit {
     pub sample_limit: usize,
     pub samples: Vec<ContextGapSample>,
     pub omitted_samples: u64,
+    /// Ambient producers (service.name@service.version) and their record count.
+    #[serde(default)]
+    pub ambient_producers: BTreeMap<String, u64>,
 }
 
 impl SourceContextCounts {
@@ -76,6 +84,7 @@ impl SourceContextCounts {
             .and_then(|value| value.checked_add(self.unscoped_turn_records))
             .and_then(|value| value.checked_add(self.other_session_records))
             .and_then(|value| value.checked_add(self.unknown_session_records))
+            .and_then(|value| value.checked_add(self.ambient_records))
             .context("source context audit count overflow")
     }
 }
@@ -122,6 +131,21 @@ impl SourceContextAudit {
     }
 }
 
+/// Identify the emitting process. A record without `service.name` has no
+/// usable producer identity, so it can never be excused as ambient work.
+fn producer_fingerprint(attributes: &BTreeMap<String, String>) -> Option<String> {
+    let service = attributes
+        .get("service.name")
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    let version = attributes
+        .get("service.version")
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("unknown");
+    Some(format!("{service}@{version}"))
+}
+
 #[cfg(test)]
 pub(crate) fn audit_selected_source_context(
     captures: &[Value],
@@ -160,6 +184,9 @@ pub(crate) struct SourceContextAuditBuilder {
     samples: Vec<ContextGapSample>,
     omitted_gap_records: u64,
     gaps: u64,
+    producer_hits: BTreeMap<String, bool>,
+    pending: BTreeMap<(String, String, String, String, String), u64>,
+    pending_samples: Vec<(String, ContextGapSample)>,
 }
 
 impl SourceContextAuditBuilder {
@@ -181,6 +208,9 @@ impl SourceContextAuditBuilder {
             samples: Vec::new(),
             omitted_gap_records: 0,
             gaps: 0,
+            producer_hits: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            pending_samples: Vec::new(),
         })
     }
 
@@ -199,6 +229,7 @@ impl SourceContextAuditBuilder {
             let record_index = ordinal;
             ordinal += 1;
             let observed = otlp_source_observation(source, record, &attributes, index)?;
+            let producer = producer_fingerprint(&attributes);
             let counts = self.sources.entry(source.to_owned()).or_default();
             counts.total_records += 1;
             let in_session = observed
@@ -210,6 +241,13 @@ impl SourceContextAuditBuilder {
                     .related_sessions
                     .iter()
                     .any(|s| self.allowed.contains(s));
+            if (in_session || ambiguous_session)
+                && let Some(producer) = producer.as_ref()
+            {
+                // This producer demonstrably knows the selected Session, so its
+                // unattributed records stay chargeable to the audit.
+                self.producer_hits.insert(producer.clone(), true);
+            }
             if observed.process_scoped {
                 counts.process_level_records += 1;
                 return Ok(());
@@ -221,16 +259,13 @@ impl SourceContextAuditBuilder {
                 counts.session_level_records += 1;
                 return Ok(());
             } else if (in_session || ambiguous_session) && observed.requires_turn {
-                counts.unscoped_turn_records += 1;
                 "unscoped_turn"
             } else if observed.session_id.is_some() {
                 counts.other_session_records += 1;
                 return Ok(());
             } else {
-                counts.unknown_session_records += 1;
                 "unknown_session"
             };
-            self.gaps += 1;
             let reason = if ambiguous_session {
                 "ambiguous_session_context"
             } else {
@@ -241,37 +276,74 @@ impl SourceContextAuditBuilder {
             let name = otlp_record_name(source, record, &attributes)
                 .filter(|name| name.len() <= 160 && !name.chars().any(char::is_control))
                 .unwrap_or_else(|| "<unnamed>".to_owned());
-            let key = (
-                source.to_owned(),
-                disposition.to_owned(),
-                name.clone(),
-                reason.to_owned(),
-            );
-            if let Some(count) = self.groups.get_mut(&key) {
-                *count += 1;
-            } else if self.groups.len() < MAX_GROUPS {
-                self.groups.insert(key, 1);
-            } else {
-                self.omitted_gap_records += 1;
-            }
-            if self.samples.len() < self.sample_limit {
-                self.samples.push(ContextGapSample {
-                    capture_id: capture_id.to_owned(),
-                    record_index,
-                    source: source.to_owned(),
-                    disposition: disposition.to_owned(),
-                    record_name: name,
-                    reason: reason.to_owned(),
-                    trace_id: hex_id(record.get("traceId"), 32),
-                    span_id: hex_id(record.get("spanId"), 16),
-                    parent_span_id: hex_id(record.get("parentSpanId"), 16),
-                });
+            *self
+                .pending
+                .entry((
+                    producer.clone().unwrap_or_default(),
+                    source.to_owned(),
+                    disposition.to_owned(),
+                    name.clone(),
+                    reason.to_owned(),
+                ))
+                .or_insert(0) += 1;
+            if self.pending_samples.len() < self.sample_limit {
+                self.pending_samples.push((
+                    producer.unwrap_or_default(),
+                    ContextGapSample {
+                        capture_id: capture_id.to_owned(),
+                        record_index,
+                        source: source.to_owned(),
+                        disposition: disposition.to_owned(),
+                        record_name: name,
+                        reason: reason.to_owned(),
+                        trace_id: hex_id(record.get("traceId"), 32),
+                        span_id: hex_id(record.get("spanId"), 16),
+                        parent_span_id: hex_id(record.get("parentSpanId"), 16),
+                    },
+                ));
             }
             Ok(())
         })
     }
 
-    pub(crate) fn finish(self, duplicates: u64) -> SourceContextAudit {
+    pub(crate) fn finish(mut self, duplicates: u64) -> SourceContextAudit {
+        let mut ambient_producers = BTreeMap::new();
+        for ((producer, source, disposition, name, reason), records) in self.pending {
+            let chargeable =
+                producer.is_empty() || self.producer_hits.get(&producer).copied().unwrap_or(false);
+            if chargeable {
+                let counts = self.sources.entry(source.clone()).or_default();
+                match disposition.as_str() {
+                    "unscoped_turn" => counts.unscoped_turn_records += records,
+                    _ => counts.unknown_session_records += records,
+                }
+                let key = (source, disposition, name, reason);
+                if let Some(count) = self.groups.get_mut(&key) {
+                    *count += records;
+                } else if self.groups.len() < MAX_GROUPS {
+                    self.groups.insert(key, records);
+                } else {
+                    self.omitted_gap_records += records;
+                }
+                self.gaps += records;
+                continue;
+            }
+            // A named producer that never referenced this Session cannot be
+            // charged to it, but its records stay visible.
+            if let Some(counts) = self.sources.get_mut(&source) {
+                counts.ambient_records += records;
+            }
+            *ambient_producers.entry(producer).or_insert(0) += records;
+        }
+        self.samples = self
+            .pending_samples
+            .into_iter()
+            .filter(|(producer, _)| {
+                producer.is_empty() || self.producer_hits.get(producer).copied().unwrap_or(false)
+            })
+            .map(|(_, sample)| sample)
+            .take(self.sample_limit)
+            .collect();
         SourceContextAudit {
             schema_version: SOURCE_CONTEXT_AUDIT_SCHEMA_VERSION.to_owned(),
             session_id: self.session_id,
@@ -298,6 +370,7 @@ impl SourceContextAuditBuilder {
             sample_limit: self.sample_limit,
             omitted_samples: self.gaps - self.samples.len() as u64,
             samples: self.samples,
+            ambient_producers,
         }
     }
 }
@@ -480,6 +553,7 @@ mod tests {
                 unscoped_turn_records: 1,
                 other_session_records: 0,
                 unknown_session_records: 0,
+                ambient_records: 0,
             }
         );
         assert_eq!(
@@ -492,6 +566,7 @@ mod tests {
                 unscoped_turn_records: 15,
                 other_session_records: 0,
                 unknown_session_records: 1,
+                ambient_records: 0,
             }
         );
         assert_eq!(result.unscoped_otlp_records, 16);
@@ -559,6 +634,70 @@ mod tests {
                 fixture["turn_id"].as_str().unwrap().to_owned(),
             ))
         );
+    }
+
+    fn foreign_batch(producer: &str, name: &str) -> Value {
+        batch(
+            "otlp_traces",
+            json!({"resourceSpans":[{
+                "resource":{"attributes":[
+                    {"key":"service.name","value":{"stringValue":producer}},
+                    {"key":"service.version","value":{"stringValue":"0.0.1"}}
+                ]},
+                "scopeSpans":[{"spans":[{
+                    "traceId":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    "spanId":"dddddddddddddddd",
+                    "name":name
+                }]}]
+            }]}),
+        )
+    }
+
+    #[test]
+    fn producers_that_never_reference_the_session_are_ambient_not_gaps() {
+        let (fixture, captures) = native_fixture();
+        let session = fixture["session_id"].as_str().unwrap();
+        let mut with_foreign = captures.clone();
+        with_foreign.push(foreign_batch("codex-app-server", "fs.read_file"));
+        let result = audit(&with_foreign, session, 5);
+        assert_eq!(result.sources["otlp_traces"].ambient_records, 1);
+        assert_eq!(result.ambient_producers["codex-app-server@0.0.1"], 1);
+        assert!(
+            result
+                .gap_groups
+                .iter()
+                .all(|g| g.record_name != "fs.read_file")
+        );
+        // The selected producer still reports its own gaps.
+        assert!(!result.gap_groups.is_empty());
+    }
+
+    #[test]
+    fn a_producer_with_session_evidence_keeps_its_gaps_chargeable() {
+        let (fixture, captures) = native_fixture();
+        let session = fixture["session_id"].as_str().unwrap();
+        let mut mixed = captures.clone();
+        // Same producer fingerprint as the fixture, so its unattributed span is
+        // still a real gap rather than ambient.
+        mixed.push(batch(
+            "otlp_traces",
+            json!({"resourceSpans":[{
+                "resource":{"attributes":[
+                    {"key":"service.name","value":{"stringValue":"codex_cli_rs"}}
+                ]},
+                "scopeSpans":[{"spans":[{
+                    "traceId":"ffffffffffffffffffffffffffffffff",
+                    "spanId":"cccccccccccccccc",
+                    "name":"fs.read_file",
+                    "attributes":[
+                        {"key":"conversation.id","value":{"stringValue":session}}
+                    ]
+                }]}]
+            }]}),
+        ));
+        let result = audit(&mixed, session, 5);
+        assert!(result.sources["otlp_traces"].ambient_records == 0);
+        assert!(result.sources["otlp_traces"].unknown_session_records >= 1);
     }
 
     #[test]
