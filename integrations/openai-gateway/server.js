@@ -202,6 +202,9 @@ const fullTraceCaptureStatus = {
   // gateway unhealthy for the rest of the process lifetime. Health looks at
   // drops inside a bounded window; the lifetime total stays for operators.
   recentDropTimestamps: [],
+  // Whether the most recent drop left a durable record on disk.
+  dropEvidencePersisted: null,
+  dropEvidenceError: null,
   lastError: null,
 };
 let fullTraceSubmitterStartupError = null;
@@ -994,7 +997,10 @@ function appendBoundedBuffer(state, chunk, maxBytes) {
   state.bytes += buffer.length;
 }
 
-function captureDrop(reason, error = null) {
+const DROP_EVIDENCE = require('./drop-evidence');
+const DROP_EVIDENCE_DIR = DROP_EVIDENCE.evidenceDirectory(FULL_TRACE_CAPTURE_OUTBOX_DIR);
+
+function captureDrop(reason, error = null, context = {}) {
   const droppedAt = Date.now();
   fullTraceCaptureStatus.droppedCount += 1;
   fullTraceCaptureStatus.lastDroppedAt = new Date(droppedAt).toISOString();
@@ -1004,6 +1010,15 @@ function captureDrop(reason, error = null) {
   fullTraceCaptureStatus.recentDropTimestamps =
     fullTraceCaptureStatus.recentDropTimestamps.filter((at) => at > cutoff);
   fullTraceCaptureStatus.lastError = error ? (error.message || String(error)).slice(0, 500) : fullTraceCaptureStatus.lastError;
+  const evidence = DROP_EVIDENCE.recordDrop(FULL_TRACE_CAPTURE_OUTBOX_DIR, {
+    reason,
+    error,
+    context,
+    at: droppedAt,
+  });
+  fullTraceCaptureStatus.dropEvidencePersisted = evidence.persisted;
+  fullTraceCaptureStatus.dropEvidenceError = evidence.persistError;
+  fullTraceCaptureStatus.dropEvidenceWithinBudget = evidence.withinBudget;
 }
 
 async function probeFullTraceRelay() {
@@ -1059,7 +1074,14 @@ async function submitFullTraceCapture(record) {
           : error.code === 'OUTBOX_INODE_PRESSURE'
             ? 'capture_outbox_inode_pressure'
             : 'capture_outbox_write_failed';
-    captureDrop(reason, error);
+    captureDrop(reason, error, {
+      captureId: record?.captureId,
+      clientRequestId: record?.clientRequestId,
+      proxiedPath: record?.proxiedPath,
+      method: record?.method,
+      requestBytesCaptured: record?.requestBytesCaptured,
+      responseBytesCaptured: record?.responseBytesCaptured,
+    });
     return null;
   }
 }
@@ -1084,7 +1106,14 @@ async function finalizeFullTraceCapture(transaction, record) {
           : error.code === 'OUTBOX_INODE_PRESSURE'
             ? 'capture_outbox_inode_pressure'
             : 'capture_finalize_failed';
-    captureDrop(reason, error);
+    captureDrop(reason, error, {
+      captureId: record?.captureId,
+      clientRequestId: record?.clientRequestId,
+      proxiedPath: record?.proxiedPath,
+      method: record?.method,
+      requestBytesCaptured: record?.requestBytesCaptured,
+      responseBytesCaptured: record?.responseBytesCaptured,
+    });
     throw error;
   }
 }
@@ -3823,7 +3852,13 @@ async function proxyWithFullTrace(req, res, proxiedPath) {
       maxResponseBytes: FULL_TRACE_CAPTURE_MAX_RESPONSE_BYTES,
     });
   } catch (error) {
-    captureDrop('capture_start_failed', error);
+    captureDrop('capture_start_failed', error, {
+      captureId,
+      clientRequestId,
+      proxiedPath,
+      method: req?.method,
+      requestBytesCaptured: requestCapture?.bytes,
+    });
   }
 
   let clientRequestAborted = false;
@@ -3881,7 +3916,13 @@ async function proxyWithFullTrace(req, res, proxiedPath) {
   ));
   req.on('error', (error) => {
     requestTee.destroy(error);
-    captureDrop('request_stream_error', error);
+    captureDrop('request_stream_error', error, {
+      captureId,
+      clientRequestId,
+      proxiedPath,
+      method: req.method,
+      requestBytesCaptured: requestCapture.bytes,
+    });
   });
   req.pipe(requestTee);
 
@@ -3956,7 +3997,14 @@ async function proxyWithFullTrace(req, res, proxiedPath) {
         captureTransaction,
         captureWritePromises,
       }))
-        .catch((error) => captureDrop('post_response_capture_failed', error));
+        .catch((error) => captureDrop('post_response_capture_failed', error, {
+          captureId,
+          clientRequestId,
+          proxiedPath,
+          method: req.method,
+          requestBytesCaptured: requestCapture.bytes,
+          responseBytesCaptured: responseCapture.bytes,
+        }));
     };
     if (res.writableFinished || res.destroyed) {
       setImmediate(submitAfterFinish);
@@ -4080,6 +4128,10 @@ const server = http.createServer(async (req, res) => {
           recentDropTimestamps: undefined,
           recentDroppedCount: fullTraceCaptureStatus.recentDropTimestamps.length,
           dropHealthWindowMs: CAPTURE_DROP_HEALTH_WINDOW_MS,
+          dropEvidenceDir: DROP_EVIDENCE_DIR,
+          dropEvidencePersisted: fullTraceCaptureStatus.dropEvidencePersisted,
+          dropEvidenceError: fullTraceCaptureStatus.dropEvidenceError,
+          dropEvidenceWithinBudget: fullTraceCaptureStatus.dropEvidenceWithinBudget ?? true,
         },
         submitter: {
           ...fullTraceSubmitterStatus,

@@ -162,4 +162,70 @@ test('a dropped capture ages out of capture health after the window', async (t) 
   assert.equal(initial.fullTraceCapture.stats.recentDroppedCount, 0);
   assert.equal(initial.fullTraceCapture.stats.dropHealthWindowMs, WINDOW_MS);
   assert.equal(initial.fullTraceCapture.outbox.rejected, 0);
+  assert.equal(initial.fullTraceCapture.stats.dropEvidencePersisted, null);
+  assert.equal(initial.fullTraceCapture.stats.dropEvidenceWithinBudget, true);
+  assert.ok(
+    initial.fullTraceCapture.stats.dropEvidenceDir.endsWith('/dropped'),
+    'drop evidence must live in a dedicated directory',
+  );
+});
+
+test('a dropped capture leaves a durable evidence record on disk', () => {
+  // The in-memory counter is not an audit trail: the evidence file must name
+  // the reason and the identifiers of the request that was lost.
+  const evidence = require('./drop-evidence');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'drop-evidence-'));
+  try {
+    const error = Object.assign(new Error('boom'), { code: 'E_TEST' });
+    const written = evidence.recordDrop(root, {
+      reason: 'request_stream_error',
+      error,
+      context: {
+        captureId: 'cap-1',
+        clientRequestId: 'req-1',
+        proxiedPath: '/v1/messages?beta=true',
+        method: 'POST',
+        requestBytesCaptured: 10,
+        responseBytesCaptured: 20,
+      },
+      at: Date.parse('2026-10-26T00:00:00Z'),
+    });
+    assert.equal(written.persisted, true);
+    assert.equal(written.persistError, null);
+    assert.equal(written.withinBudget, true);
+    const drops = evidence.readDrops(root);
+    assert.equal(drops.length, 1);
+    assert.deepEqual(drops[0], {
+      droppedAt: '2026-10-26T00:00:00.000Z',
+      reason: 'request_stream_error',
+      captureId: 'cap-1',
+      clientRequestId: 'req-1',
+      proxiedPath: '/v1/messages?beta=true',
+      method: 'POST',
+      requestBytesCaptured: 10,
+      responseBytesCaptured: 20,
+      errorCode: 'E_TEST',
+      errorMessage: 'boom',
+    });
+    const stat = fs.statSync(path.join(evidence.evidenceDirectory(root), 'drops.ndjson'));
+    assert.equal(stat.mode & 0o777, 0o600, 'evidence must not be world readable');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('drop evidence stays bounded and records an unwritable directory', () => {
+  const evidence = require('./drop-evidence');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'drop-evidence-budget-'));
+  try {
+    // A path that cannot be created: a regular file stands where the directory
+    // must go, so the append fails and the failure is reported, not swallowed.
+    fs.writeFileSync(path.join(root, 'dropped'), 'not a directory');
+    const written = evidence.recordDrop(root, { reason: 'test', error: null, context: {} });
+    assert.equal(written.persisted, false);
+    assert.ok(written.persistError);
+    assert.equal(evidence.readDrops(root).length, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
