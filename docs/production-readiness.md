@@ -1,5 +1,36 @@
 # 生产就绪评估
 
+## 2026-10-26 00:35（Asia/Shanghai）外部合同 P0 修复完成
+
+调研 B 指出的两个"现有样本已实际违约"项已修复并验证：
+
+1. **modelName 取上游真名**：改为 `response.model` → SSE 事件内 `response.model`
+   → `gatewayEvidence.upstream_model` → 请求别名（最后兜底）。实测同一样本
+   `modelName` 从 `gpt-6-astra` 变为 `gpt-6.1-sol`。
+2. **停止把工具名当人名脱敏**：移除泛化的 `name` 敏感键；中文人名规则改为必须有
+   冒号分隔（或"我叫"前缀），避免把 `姓名/工号/部门` 这类枚举整句遮蔽。实测同一样本
+   掩码数从 7 降到 0，工具名完整保留。
+
+新增 3 个回归测试（别名被上游改写、证据兜底、工具名不被掩码），`make cloud-test`
+退出 0，`verify-maas` 仍退出 0。
+
+同时按调研 A/C 记录了对象存储与质量账本方案，按调研 D 明确了上游补丁的合入边界。
+
+### 上游补丁边界（调研 D 结论）
+
+- **真正应提上游**：`upstream-sse-context(.patch/-test)`（SSE 遥测丢失请求 Span）与
+  `upstream-otlp-outcome`（code_mode 重复 outcome）。这两个是上游行为缺陷，且证据独立。
+- **先走设计 issue**：`session-scope`、`extension`。`codex.context_scope` 在上游
+  源码中出现 0 次，属于新增协议词汇，必须先与维护者对齐语义再提代码。
+- **不应提上游**：`config-read-scope`、`session-scope-process`、`SessionSplittingExporter`、
+  以及 repair-round 的大部分 `process` 标注——它们是本地审计词汇与共享进程适配，
+  不是上游缺陷。
+- **未闭环风险**：本地 producer 源码树比七个托管补丁多出 19 个文件改动（含关键的
+  `turn.rs` SSE Turn scope、`models-manager`、`exec-server` 等），`producer-support.json`
+  只登记 7 个哈希。当前"通过严格验收的 patched 二进制"因此**不等价于**仓库补丁集。
+  必须二选一：把这些改动正式补丁化并更新策略文件，或明确标注本地构建为实验产物、
+  不作为生产证据。
+
 ## 2026-10-26 00:05（Asia/Shanghai）网关健康纠正：丢弃计数不再永久降级
 
 23:59 的 5 分钟检查发现网关 `status=degraded`、`currentDeliveryHealthy=false`，
