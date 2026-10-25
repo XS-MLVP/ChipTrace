@@ -726,12 +726,12 @@ test('open streamed captures expose age and stale transaction count', async t =>
   }
 });
 
-test('periodic recovery finalizes only stale open captures', async t => {
+test('periodic recovery finalizes only stale orphaned open captures', async t => {
   const root = temporaryRoot();
   const outbox = new DurableCaptureOutbox({ root, relayUrl: '', maxOpenAgeMs: 1000 });
   try {
     await outbox.start();
-    await outbox.beginCapture({
+    const transaction = await outbox.beginCapture({
       captureId: 'cap-periodic-open',
       sourceNamespace: 'gateway-test',
       method: 'POST',
@@ -739,10 +739,52 @@ test('periodic recovery finalizes only stale open captures', async t => {
     });
     await outbox.recoverOpenCaptures({ staleOnly: true });
     assert.equal(outbox.snapshot().openTransactions, 1, 'a live capture must not be recovered');
-    const originalNow = Date.now;
-    t.mock.method(Date, 'now', () => originalNow() + 5000);
+    // Simulate an orphan left by a previous process: this process no longer
+    // owns the transaction and every piece of activity evidence is old.
+    outbox.openCaptures.delete('cap-periodic-open');
+    const old = new Date(Date.now() - 60_000);
+    for (const file of [transaction.files.metadata, transaction.files.request, transaction.files.response]) {
+      try { fs.utimesSync(file, old, old); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
     await outbox.recoverOpenCaptures({ staleOnly: true });
-    assert.equal(outbox.snapshot().openTransactions, 0, 'a stale capture must be recovered');
+    assert.equal(outbox.snapshot().openTransactions, 0, 'a stale orphan must be recovered');
+  } finally {
+    await outbox.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a long streaming capture is not recovered while it keeps writing', async t => {
+  // Age alone would recover this capture: the start time is far in the past.
+  // The live transaction and recent spool writes are the real liveness signal.
+  const root = temporaryRoot();
+  const outbox = new DurableCaptureOutbox({ root, relayUrl: '', maxOpenAgeMs: 50 });
+  try {
+    await outbox.start();
+    const transaction = await outbox.beginCapture({
+      captureId: 'cap-long-stream',
+      sourceNamespace: 'gateway-test',
+      method: 'POST',
+      proxiedPath: '/v1/messages',
+    });
+    // Age the on-disk evidence past maxOpenAgeMs while the transaction is live.
+    const old = new Date(Date.now() - 60_000);
+    for (const file of [transaction.files.metadata, transaction.files.request, transaction.files.response]) {
+      try { fs.utimesSync(file, old, old); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    await outbox.recoverOpenCaptures({ staleOnly: true });
+    assert.equal(outbox.snapshot().openTransactions, 1, 'an active transaction is live by definition');
+    // A fresh spool write refreshes the activity evidence for orphan recovery.
+    await transaction.appendRequest(Buffer.from('data: {"type":"ping"}\n\n'));
+    const open = [...outbox.openCaptures.values()][0];
+    const activity = await outbox.openCaptureLastActivityMs(
+      open.files.metadata,
+      open.files.request,
+      open.files.response,
+      open.baseRecord,
+    );
+    assert.ok(activity > 0, 'spool writes must count as activity');
+    assert.ok(Date.now() - activity <= 50, 'recent activity keeps the capture fresh');
   } finally {
     await outbox.close();
     fs.rmSync(root, { recursive: true, force: true });

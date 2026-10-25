@@ -1076,6 +1076,28 @@ class DurableCaptureOutbox {
     }
   }
 
+
+  /**
+   * Most recent evidence that an open Capture is still making progress.
+   * The metadata start time alone is a poor liveness signal for long streams,
+   * so the request/response spool mtimes and an explicit heartbeat win.
+   */
+  async openCaptureLastActivityMs(metadataFile, requestFile, responseFile, baseRecord) {
+    const candidates = [];
+    const heartbeat = Number(baseRecord?.captureTransaction?.heartbeatAtMs);
+    if (Number.isFinite(heartbeat)) candidates.push(heartbeat);
+    const startedAtMs = Date.parse(baseRecord?.startedAt || '');
+    if (Number.isFinite(startedAtMs)) candidates.push(startedAtMs);
+    for (const file of [metadataFile, requestFile, responseFile]) {
+      try {
+        candidates.push((await fsp.stat(file)).mtimeMs);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+    }
+    return candidates.length ? Math.max(...candidates) : 0;
+  }
+
   async recoverOpenCaptures({ staleOnly = false } = {}) {
     return this.withQueueMutation(() => this.recoverOpenCapturesInternal({ staleOnly }));
   }
@@ -1102,10 +1124,19 @@ class DurableCaptureOutbox {
         // Periodic recovery must never race an in-flight capture.  Startup
         // recovery (staleOnly=false) still finalizes every orphan because the
         // previous process cannot own any live transaction.
-        const startedAtMs = Date.parse(baseRecord.startedAt || '');
-        const observedAtMs = Number.isFinite(startedAtMs)
-          ? startedAtMs
-          : (await fsp.stat(metadataFile)).mtimeMs;
+        //
+        // Age alone is not enough: a long streaming request can legitimately
+        // exceed maxOpenAgeMs. A transaction this process still owns is live by
+        // definition, so it is never recovered. For orphaned files, use the
+        // most recent evidence of progress (start, spool mtime, heartbeat)
+        // instead of only the start time.
+        if (this.openCaptures.has(captureId)) continue;
+        const observedAtMs = await this.openCaptureLastActivityMs(
+          metadataFile,
+          files.request,
+          files.response,
+          baseRecord,
+        );
         if (Date.now() - observedAtMs <= this.maxOpenAgeMs) continue;
       }
       const spoolStats = await Promise.all([files.request, files.response].map(async file => {
