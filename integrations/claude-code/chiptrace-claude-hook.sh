@@ -146,11 +146,22 @@ else:
             "started_at": value["occurred_at"],
         }
         write_state(state)
+    open_tools = dict(state.get("open_tools") or {})
+    if hook == "PreToolUse":
+        tool_call = str(value.get("tool_use_id") or "").strip()
+        if tool_call:
+            open_tools[tool_call] = str(value.get("tool_name") or "")
+    elif hook == "PostToolUse":
+        open_tools.pop(str(value.get("tool_use_id") or "").strip(), None)
     if turn_scoped:
         value["turn_id"] = turn_id
         value["root_turn_id"] = turn_id
         value["turn_identity_source"] = "claude_prompt_id"
         value["turn_index"] = turn_index
+    if open_tools != dict(state.get("open_tools") or {}):
+        state = dict(state)
+        state["open_tools"] = open_tools
+        write_state(state)
     if hook == "PostToolUse" and not value.get("status"):
         response = value.get("tool_response")
         if isinstance(response, dict):
@@ -166,20 +177,76 @@ else:
     if hook == "SubagentStop" and not str(value.get("agent_type") or "").strip():
         value["agent_type"] = "unspecified"
         value["agent_type_source"] = "claude_payload_empty"
-print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+extra = []
+if hook == "SessionEnd":
+    # A PreToolUse with no PostToolUse when the Session closes means the tool
+    # never reported a result. Record that explicitly as cancelled so the
+    # runtime span is terminal; the evidence is the closed Session boundary.
+    background = {
+        str(task.get("id"))
+        for task in (state.get("open_tools_background") or [])
+        if isinstance(task, dict)
+    }
+    last_turn = str(state.get("turn_id") or "").strip()
+    for tool_call, tool_name in (state.get("open_tools") or {}).items():
+        if tool_call in background:
+            continue
+        extra.append({
+            "hook_event_name": "PostToolUse",
+            "session_id": session,
+            "turn_id": last_turn or None,
+            "root_turn_id": last_turn or None,
+            "turn_identity_source": "claude_prompt_id",
+            "tool_use_id": tool_call,
+            "tool_name": tool_name or "unknown",
+            # The tool never returned, so there is no argument echo to carry;
+            # an empty object keeps the record structurally valid while the
+            # explicit evidence field records why it is cancelled.
+            "tool_input": {},
+            "tool_response": {"interrupted": True},
+            "status": "cancelled",
+            "cancel_evidence": "session_ended_without_post_tool_use",
+            "event_id": str(uuid.uuid4()),
+            "occurred_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "model": value.get("model"),
+            "permission_mode": value.get("permission_mode"),
+        })
+print(json.dumps({"event": value, "extra": extra}, ensure_ascii=False, separators=(",", ":")))
 ' 2>/dev/null) || fail invalid_hook_json
 
-for attempt in 1 2; do
-  if wire=$(
-    /usr/bin/printf '%s' "$event" |
-      /usr/bin/curl --disable --fail --silent --show-error \
-        --connect-timeout 0.5 --max-time 1 --max-filesize 65536 \
-        --write-out '\n%{http_code}' \
-        -H "Authorization: Bearer $token" \
-        -H 'Content-Type: application/json' \
-        --data-binary @- "$gateway/hooks/codex"
-  ); then
-    if /usr/bin/printf '%s' "$wire" | /usr/bin/python3 -c '
+# One HTTP request per event keeps the durable receipt contract exact: every
+# payload yields source_records=1 and captures=2. SessionEnd may carry extra
+# derived cancellations, so fan them out instead of merging.
+payloads=$(/usr/bin/printf '%s' "$event" | /usr/bin/python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+items = [value["event"]] + list(value.get("extra") or [])
+for item in items:
+    print(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
+' 2>/dev/null) || fail invalid_hook_json
+[ -n "$payloads" ] || fail invalid_hook_json
+
+session_id=$(/usr/bin/printf '%s' "$event" | /usr/bin/python3 -c '
+import json,sys
+try: print(json.load(sys.stdin)["event"].get("session_id") or "")
+except Exception: print("")' 2>/dev/null)
+
+# A here-document keeps the loop in this shell, so `exit 0` and `fail` keep
+# their fail-closed meaning instead of only ending a pipeline subshell.
+while IFS= read -r payload; do
+  [ -n "$payload" ] || continue
+  sent=0
+  for attempt in 1 2; do
+    if wire=$(
+      /usr/bin/printf '%s' "$payload" |
+        /usr/bin/curl --disable --fail --silent --show-error \
+          --connect-timeout 0.5 --max-time 1 --max-filesize 65536 \
+          --write-out '\n%{http_code}' \
+          -H "Authorization: Bearer $token" \
+          -H 'Content-Type: application/json' \
+          --data-binary @- "$gateway/hooks/codex"
+    ); then
+      if /usr/bin/printf '%s' "$wire" | /usr/bin/python3 -c '
 import json
 import sys
 
@@ -209,20 +276,19 @@ except (ValueError, TypeError, KeyError, AttributeError):
     valid = False
 sys.exit(0 if valid else 1)
 '; then
-      if [ "$event_name" = "SessionEnd" ] || [ "$event_name" = "SessionStart" ]; then
-        # Session gaps are terminal for this Hook; drop stale turn state.
-        if [ "$event_name" = "SessionEnd" ]; then
-          session=$(/usr/bin/printf '%s' "$event" | /usr/bin/python3 -c '
-import json,sys
-try: print(json.load(sys.stdin).get("session_id") or "")
-except ValueError: print("")' 2>/dev/null)
-          [ -n "$session" ] && /usr/bin/rm -f -- "$state_dir/$session.json"
-        fi
+        sent=1
+        break
       fi
-      exit 0
+      fail invalid_durable_receipt
     fi
-    fail invalid_durable_receipt
-  fi
-done
+  done
+  [ "$sent" = "1" ] || fail gateway_unavailable
+done <<EOF
+$payloads
+EOF
 
-fail gateway_unavailable
+if [ "$event_name" = "SessionEnd" ] && [ -n "$session_id" ]; then
+  # Session end is terminal for this Hook; drop stale turn state.
+  /usr/bin/rm -f -- "$state_dir/$session_id.json"
+fi
+exit 0
