@@ -1548,3 +1548,61 @@ sealed Segment；宿主根分区约 91% 使用率，NFS 约 58%。当前没有�
 新 runtime gate 的 HTTP 2xx 只证明有归属的请求获得 HTTP 成功状态，仍输出
 `session_delivery_claimed=false`。完整规范与命令见[验收矩阵](acceptance-matrix.md)、
 [运维说明](operations.md)和[平台维护流程](platform-maintenance.md)。
+## 2026-10-26 00:10（Asia/Shanghai）三方向调研结论与排期
+
+本轮并行完成三份只读调研，结论汇总如下（详细证据见各自报告与后续专门文档）。
+
+### A. 真实对象存储（S3/OSS）
+
+- 代码路径可用：真实 MinIO 跑通 6 MiB multipart 归档、幂等、恢复、篡改拒绝；
+  用前两个 sealed 段（295 MB）实测归档 3.49s（≈84.5 MB/s）、恢复 1.46s，
+  源文件/Manifest/恢复文件三方 SHA 一致。
+- **阻断项**：① NAMESPACE 绑定含 backend/endpoint/bucket/region/prefix，原地从 `fs`
+  切 `s3` 实测返回 `NAMESPACE_CONFLICT`，必须新建平台 root；② 平台容器当前与
+  MinIO 不在同一 Docker 网络，容器内不可达；③ `/health` 不探测对象存储，配置错误
+  要到第一个 job 才暴露；④ 平台 `kind:archive` 会因持续写入的 `.open.ndjson` 失败。
+- 关键数字：capture 精确 142.79 GB / 1,046 文件（`du` 低估为 103G，容量规划必须用
+  精确字节）；当前 `fs` 后端**没有任何已提交 Raw Archive**，对象根为空，因此不存在
+  需要搬迁的历史对象。
+- 建议：先起独立 pilot 平台（18087、独立 root、独立 bucket），用 CLI 显式传 sealed
+  文件归档试点；生产切换优先真实 OSS 或独立 MinIO，共享 Langfuse MinIO 仅适合试点。
+
+### B. 对外交付规范差距
+
+- 格式层（目录、`batch_*.tar.gz`、≤100 MB、三件文件、11 字段、时间格式、枚举、
+  Token）**基本满足**，8 个历史样本 `verify-maas` 全部退出 0。
+- **实际违约项**：
+  1. `modelName` 取请求别名 `gpt-6-astra`，而规范要求"官方模型名，禁止自定义"；
+     上游响应实际为 `gpt-6.1-sol`。
+  2. 脱敏**双向偏差**：`name` 键被当作人名掩码，样本中 26/27、18/19 个掩码是工具/
+     函数名，破坏 agent 工具轨迹；同时 `safety_identifier`、安装 ID 等稳定标识未清除。
+  3. 当天**全部**请求需交付，而当前失败/缺用量请求只能整批失败或被丢弃。
+  4. 历史/断档数据需并入最新日期，当前只能 `--replace` 整体重写。
+  5. 无 SFTP/FTP 发布与 T+1 02:00 调度。
+- 建议优先级：先修 `modelName` 与 `name` 过度脱敏（现有样本已实际违约），
+  再补 `--append`、健全量交付模式，最后做 SFTP 发布与定时编排。
+
+### C. 质量账本治理
+
+- 契约确认：`/ready` 要求**持久累计字面为零**（`relay.rs:2688`），与审计基线无关；
+  基线只作用于 CI 门禁。
+- 当前 8,834 条全部为历史；本进程新增 0。`hooks.invalid_tool` 5 条中 3 条可在 Raw
+  定位为合成探测，2 条为同一载荷重投去重后仍计数（计数按请求而非按新行）。
+- 方案对比：保持严格（`/ready` 永久 503）、代际分段（改 Rust 大、且
+  `deny_unknown_fields` 会让旧镜像拒绝启动）、可审计归档（计数迁到归档键）。
+- 推荐**可审计归档**：新增 `relay-quality-archive`（含 `--dry-run`/`--restore`），
+  归档工件内容寻址、记录对账与审批，`/ready` 才可能恢复 200；并要求先完成账本与
+  Raw 的逐条对账，禁止用时间或正文猜测归因。
+- 附带发现：`/ready` 在持续流量下还会因 `relay_inflight_records` 抖动，属独立缺陷。
+
+### 下一步排期
+
+| 优先级 | 工作 | 依据 |
+| --- | --- | --- |
+| P0 | `modelName` 取上游真名 | 现有样本已违约 |
+| P0 | 取消 `name` 泛化脱敏，补稳定标识清除 | 现有样本已违约 |
+| P1 | `--append` 与全量交付模式 | 规范第 8、9 条 |
+| P1 | 质量账本可审计归档 | 恢复 `/ready` 语义 |
+| P2 | 对象存储 pilot → 生产切换 | 规范与持久化要求 |
+| P2 | SFTP 发布 + T+1 调度 | 规范第 11、12 条 |
+
