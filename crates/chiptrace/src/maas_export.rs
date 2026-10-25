@@ -118,6 +118,10 @@ pub struct MaasExportConfig {
     pub skip_incomplete: bool,
     /// Export only these native Session IDs. Empty exports every Session.
     pub session_ids: Vec<String>,
+    /// Append to an existing date directory instead of failing or replacing it.
+    /// New batch numbers continue after the highest existing one, which is what
+    /// the external contract expects for backfilled or partial days.
+    pub append: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -290,7 +294,31 @@ pub fn export_maas(config: MaasExportConfig) -> Result<MaasExportReport> {
     for (date, mut requests) in requests_by_date {
         requests.sort_by(|left, right| left.request_id.cmp(&right.request_id));
         let date_root = staged_root.join(&date);
-        let batch_infos = pack_date(&date_root, &date, &requests, config.max_batch_bytes)?;
+        let published_target = config.output.join(&config.provider_code).join(&date);
+        let first_batch_number = if config.append {
+            // Refuse duplicates here so a refused run never publishes a
+            // partially appended date directory.
+            let published = published_request_ids(&published_target)?;
+            for request in &requests {
+                if published.contains(&request.request_id) {
+                    bail!(
+                        "append would duplicate requestId {} already published in {}",
+                        request.request_id,
+                        published_target.display()
+                    );
+                }
+            }
+            next_batch_number(&published_target)?
+        } else {
+            1
+        };
+        let batch_infos = pack_date(
+            &date_root,
+            &date,
+            &requests,
+            config.max_batch_bytes,
+            first_batch_number,
+        )?;
         batches.extend(batch_infos);
         // Request directories are staging inputs for the tar writer only.  The
         // published date directory is an external contract surface and must
@@ -310,17 +338,42 @@ pub fn export_maas(config: MaasExportConfig) -> Result<MaasExportReport> {
         .collect::<BTreeSet<_>>()
     {
         let target = output_provider.join(date);
+        let source = staged_root.join(date);
         if target.exists() {
+            if config.append {
+                // Backfill or top-up: keep the existing batches and add the new
+                // ones after the highest number already published.
+                fs::create_dir_all(&target)?;
+                for entry in fs::read_dir(&source)? {
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    let to = target.join(&name);
+                    if to.exists() {
+                        bail!(
+                            "MaaS append would overwrite an existing batch: {}",
+                            to.display()
+                        );
+                    }
+                    fs::rename(entry.path(), &to).with_context(|| {
+                        format!(
+                            "append MaaS batch {} -> {}",
+                            entry.path().display(),
+                            to.display()
+                        )
+                    })?;
+                }
+                fs::remove_dir_all(&source).ok();
+                continue;
+            }
             if !config.replace {
                 bail!(
-                    "MaaS output date already exists: {}; pass --replace to replace it",
+                    "MaaS output date already exists: {}; pass --replace or --append",
                     target.display()
                 );
             }
             fs::remove_dir_all(&target)
                 .with_context(|| format!("replace MaaS output {}", target.display()))?;
         }
-        let source = staged_root.join(date);
         fs::create_dir_all(&output_provider)?;
         fs::rename(&source, &target).with_context(|| {
             format!(
@@ -1361,15 +1414,87 @@ fn remove_request_staging(date_root: &Path, requests: &[StagedRequest]) -> Resul
     Ok(())
 }
 
+/// Request IDs already published in a date directory. Append must reject a
+/// duplicate before publishing, not after: a half-written date is worse than a
+/// refused run.
+fn published_request_ids(directory: &Path) -> Result<BTreeSet<String>> {
+    let mut ids = BTreeSet::new();
+    if !directory.exists() {
+        return Ok(ids);
+    }
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !BATCH_FILENAME.is_match(&name) {
+            bail!(
+                "MaaS append target contains a non-batch file: {}",
+                entry.path().display()
+            );
+        }
+        for request_id in batch_request_ids(&entry.path())? {
+            if !ids.insert(request_id.clone()) {
+                bail!("existing MaaS batch already duplicates requestId {request_id}");
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn batch_request_ids(path: &Path) -> Result<BTreeSet<String>> {
+    let file = File::open(path)?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut ids = BTreeSet::new();
+    for entry in archive.entries()? {
+        let entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            bail!("MaaS batch contains a non-file entry: {}", path.display());
+        }
+        let name = entry.path()?.to_string_lossy().into_owned();
+        let parts = Path::new(&name).components().collect::<Vec<_>>();
+        if parts.len() != 2 {
+            bail!("MaaS entry must be request/file: {name}");
+        }
+        ids.insert(component_text(parts[0])?);
+    }
+    Ok(ids)
+}
+
+/// Highest published batch number in a date directory, plus one.
+fn next_batch_number(directory: &Path) -> Result<u64> {
+    if !directory.exists() {
+        return Ok(1);
+    }
+    let mut highest = 0_u64;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !BATCH_FILENAME.is_match(&name) {
+            bail!(
+                "MaaS append target contains a non-batch file: {}",
+                entry.path().display()
+            );
+        }
+        let digits = name
+            .trim_start_matches("batch_")
+            .trim_end_matches(".tar.gz");
+        highest = highest.max(digits.parse::<u64>().with_context(|| {
+            format!("MaaS append target has an unparseable batch number: {name}")
+        })?);
+    }
+    Ok(highest.saturating_add(1))
+}
+
 fn pack_date(
     date_root: &Path,
     date: &str,
     requests: &[StagedRequest],
     max_batch_bytes: u64,
+    first_batch_number: u64,
 ) -> Result<Vec<MaasBatchInfo>> {
     let mut batches = Vec::new();
     let mut start = 0_usize;
-    let mut batch_number = 1_u64;
+    let mut batch_number = first_batch_number;
     let rough_limit = max_batch_bytes.saturating_mul(9) / 10;
     while start < requests.len() {
         let mut end = start;
@@ -1671,6 +1796,7 @@ mod tests {
             replace: false,
             skip_incomplete: false,
             session_ids: Vec::new(),
+            append: false,
         }
     }
 
@@ -2119,6 +2245,102 @@ mod tests {
         assert_eq!(report.requests, 1);
         assert_eq!(report.skipped_incomplete_requests, 1);
         verify_maas(&root.path().join("skip"), DEFAULT_MAX_BATCH_BYTES).unwrap();
+    }
+
+    #[test]
+    fn append_keeps_existing_batches_and_continues_numbering() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("archive");
+        // First export publishes batch_00001.
+        let first = root.path().join("first.ndjson");
+        let mut one = capture(
+            "req-first",
+            false,
+            json!({"model":"gpt-5.6-sol","input":[]}),
+        );
+        one["traceContext"]["session_id"] = json!("session-a");
+        fs::write(
+            &first,
+            format!("{}\n", serde_json::to_string(&one).unwrap()),
+        )
+        .unwrap();
+        export_maas(config(first, output.clone())).unwrap();
+
+        // Second export appends a different request to the same date.
+        let second = root.path().join("second.ndjson");
+        let mut two = capture(
+            "req-second",
+            false,
+            json!({"model":"gpt-5.6-sol","input":[]}),
+        );
+        two["traceContext"]["session_id"] = json!("session-b");
+        fs::write(
+            &second,
+            format!("{}\n", serde_json::to_string(&two).unwrap()),
+        )
+        .unwrap();
+        let mut append_config = config(second, output.clone());
+        append_config.append = true;
+        export_maas(append_config).unwrap();
+
+        let date_dir = output.join("providerX").join("2026-08-17");
+        let mut names: Vec<String> = fs::read_dir(&date_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["batch_00001.tar.gz", "batch_00002.tar.gz"]);
+        verify_maas(&output, DEFAULT_MAX_BATCH_BYTES).unwrap();
+    }
+
+    #[test]
+    fn append_refuses_a_duplicate_request_before_publishing() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("archive");
+        let input = root.path().join("capture.ndjson");
+        let mut value = capture("req-dup", false, json!({"model":"gpt-5.6-sol","input":[]}));
+        value["traceContext"]["session_id"] = json!("session-a");
+        fs::write(
+            &input,
+            format!("{}\n", serde_json::to_string(&value).unwrap()),
+        )
+        .unwrap();
+        export_maas(config(input.clone(), output.clone())).unwrap();
+        let date_dir = output.join("providerX").join("2026-08-17");
+        let before: Vec<String> = fs::read_dir(&date_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let mut append_config = config(input, output.clone());
+        append_config.append = true;
+        let error = export_maas(append_config).unwrap_err().to_string();
+        assert!(error.contains("would duplicate requestId"), "{error}");
+        let after: Vec<String> = fs::read_dir(&date_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(before, after, "a refused append must not publish anything");
+        verify_maas(&output, DEFAULT_MAX_BATCH_BYTES).unwrap();
+    }
+
+    #[test]
+    fn append_refuses_to_overwrite_an_existing_batch_number() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("archive");
+        let date_dir = output.join("providerX").join("2026-08-17");
+        fs::create_dir_all(&date_dir).unwrap();
+        fs::write(date_dir.join("README.txt"), b"unexpected").unwrap();
+        let input = root.path().join("capture.ndjson");
+        let value = capture("req-x", false, json!({"model":"gpt-5.6-sol","input":[]}));
+        fs::write(
+            &input,
+            format!("{}\n", serde_json::to_string(&value).unwrap()),
+        )
+        .unwrap();
+        let mut append_config = config(input, output.clone());
+        append_config.append = true;
+        let error = export_maas(append_config).unwrap_err().to_string();
+        assert!(error.contains("non-batch file"), "{error}");
     }
 
     #[test]

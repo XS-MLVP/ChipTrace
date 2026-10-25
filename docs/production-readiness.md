@@ -1,5 +1,42 @@
 # 生产就绪评估
 
+## 2026-10-26 00:45（Asia/Shanghai）新增 `--append` 追加导出
+
+外部规范第 9 条要求"历史或断档数据可以并入最新日期路径"，而此前导出器在目标日期
+目录已存在时只能整体 `--replace` 或报错。现在新增 `--append`：
+
+- 保留已发布的 `batch_*.tar.gz`，新批次从已有最大号 +1 继续；
+- **发布前**读取已有包并逐条比对 requestId，重复即拒绝，绝不产生半追加的目录；
+- 目标目录出现非 `batch_*.tar.gz` 文件时拒绝，避免污染交付面。
+
+实测：首次导出生成 `batch_00001.tar.gz`；再次 `--append` 同一数据被正确拒绝
+（`append would duplicate requestId …`），目录内容不变；不同请求追加时生成
+`batch_00002.tar.gz` 且 `verify-maas` 通过。新增 3 个回归测试。
+
+## 2026-10-26 00:50（Asia/Shanghai）容量与成本调研结论
+
+**实测**：Collector sealed 148.46 GB / 1,055 段（`du` 107 GB 是 NFS 在线压缩，
+计费与预算必须用逻辑字节）；Relay outbox 是**同一逻辑流的第二份完整副本**
+（1,032 段、字节总数完全相同）；三本 redb 账本约 4.3 GB；`/nfs/home` 余量 2.0 TB，
+inode 仅用 1%。增长约 3.6 GB/天。
+
+**分来源**：OTLP traces 55–59%、OTLP logs 24–25%、Wire 16–20%、tool_execution 0.7%、
+Hook 0.01%。**79% 的落盘是 OTLP 观测包络**，压缩杠杆在 OTLP 而非 prompt。
+
+**字节/Token**：实测 20.6 B/上报 token（区间 15–23）。1B 上报 token ≈ 20.6 GB；
+但缓存命中 94.3%，折算到"新 token"是 **360 GB/1B**。缓存只降计费，不降 Raw 体积。
+
+**成本**（阿里云 OSS 中国内地 LRS 按量，单价需在下单前按地域复核）：
+标准 0.12 / 低频 0.08 / 归档 0.033 元/GB/月。1 TB 分别约 123 / 82 / 34 元/月；
+混合 10/20/70 策略下 10 TB 约 523 元/月，较全标准省 57%。
+**关键**：全量回读一次约 8.9 元，会抵消归档存储费，因此归档后只做 Manifest 抽查。
+
+**分层建议**：14 天内热存（约 439 段/85 GB）；15–90 天转低频；>90 天转归档。
+**当前禁止删除任何数据**：`backend=fs`、对象存储为空，本地是唯一证据副本。
+删除的前置条件是 `archive-raw` + `verify-raw-archive --verify-records` 成功。
+绝不删：Raw sealed 与 Manifest/Checkpoint、三本 redb、质量账本与基线、
+Relay failed/quarantine/recovery-receipts、已交付 MaaS 包、任何 `.open.ndjson`。
+
 ## 2026-10-26 00:35（Asia/Shanghai）外部合同 P0 修复完成
 
 调研 B 指出的两个"现有样本已实际违约"项已修复并验证：

@@ -508,6 +508,9 @@ struct ExportMaasArgs {
     /// 只导出指定 native Session；可重复。用于从共享 Raw 中生成指定进程的数据样本。
     #[arg(long = "session-id")]
     session_id: Vec<String>,
+    /// 追加到已存在的日期目录：保留旧包，新包号从已有最大号 +1 继续。
+    #[arg(long)]
+    append: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1070,6 +1073,7 @@ async fn main() -> Result<()> {
             replace: args.replace,
             skip_incomplete: args.skip_incomplete,
             session_ids: args.session_id,
+            append: args.append,
         })?)?,
         Command::VerifyMaas(args) => {
             serde_json::to_value(verify_maas(&args.input, args.max_batch_bytes)?)?
