@@ -1,5 +1,57 @@
 # 生产就绪评估
 
+## 2026-10-26 01:20（Asia/Shanghai）生产补丁集正式化与故障模式审查
+
+### 补丁集正式化（解决生产证据链缺口）
+
+此前"通过严格验收的 patched 二进制"来自一棵比托管补丁多 19 个文件改动的源码树，
+而 `producer-support.json` 只登记 7 个补丁，无法从固定 commit 复现。
+
+现在：
+
+- 新增 `docs/upstream-auxiliary-scope.patch`（569 行），是从
+  `83086188…` + 七个补丁到生产源码树的**精确 diff**；
+- 登记为第八个内容寻址补丁，应用顺序在七个上游补丁之后（上下文依赖 scope 字段）；
+- 门禁从"恰好七个"改为"至少七个 + 必需集合 + 完整有序清单"；
+- 实测：从固定 commit 检出、按序应用八个补丁，产物与生产源码树**逐文件一致**
+  （仅 `Cargo.lock` 因构建期 workspace 版本归一化不同）。
+
+`producer-support-gate` 通过（`patch_digests_verified=true`，8 个补丁）。
+
+### 采集链路故障模式审查（只读代码分析 + 只读健康采样）
+
+审查覆盖 Gateway → Relay → Collector → Platform 全链路，识别出 18 项缺失保护，
+按风险排序的前四项：
+
+1. **Gateway 丢弃无持久证据**：`captureDrop` 只增内存计数，30 分钟窗口滑出后
+   无法离线审计"丢了哪条"。且 `request_stream_error` 与 enqueue 失败混用同一计数。
+2. **长流与超龄恢复竞争**：周期恢复只看 `startedAt`，无心跳/活跃集合；超过
+   `maxOpenAgeMs` 的仍在进行的流式请求可能被提前 enqueue 为
+   `recovered_incomplete` 并删除 spool，造成尾部丢失。
+3. **outbox 启动恢复全有或全无**：任意坏 `.open.json` 会让 `start()` 抛错，
+   此后所有新 Capture 都被丢弃，无隔离坏文件继续服务的降级模式。
+4. **`failed`/`conflict` 无重放入口**：批量 400 会把整批标 `failed`，Gateway 已删除
+   本地副本，这些记录实际不可再交付，且 Relay `/health` 永久 503。
+
+另有：Relay 积压阈值按生命周期总量计算（140 万条历史下需 14 万积压才降级）、
+Collector 写入器死亡后进程不退、无 redb 修复工具、健康面存在"绿但没采集"盲区、
+failed/receipt 无 GC、idle 时不主动 drain 手工重放文件、`open/*.tmp` 孤儿不清、
+部署模块哈希未入门禁等。
+
+已确认**现有保护是充分的**：outbox 的 `link` 原子入队 + fsync 目录、open receipt 绑定
+SHA、Relay 先写 WAL 再 ACK、Collector 先 `sync_data` 再提交 ledger、sealed 段启动
+校验 fail-closed、Platform 原子写入与作业重排。
+
+### 建议的修复顺序
+
+| 优先级 | 修复 |
+| --- | --- |
+| P0 | 长流心跳 + 活跃事务集合，避免超龄恢复误删在途 spool |
+| P0 | 丢弃落盘证据（`failed/` 或独立 drop 日志），使丢失可审计 |
+| P1 | Relay/Collector 永久失败的重放入口 |
+| P1 | outbox 启动坏文件隔离而非整体失败 |
+| P2 | Relay 积压年龄指标、Collector 写入器死亡后自退、redb 修复工具 |
+
 ## 2026-10-26 01:00（Asia/Shanghai）外部合同"当天全量交付"存在需确认的冲突
 
 规范第 8 条要求"供应商侧一次性把当天所有请求/响应打包"，但 11 个 metadata 字段中
