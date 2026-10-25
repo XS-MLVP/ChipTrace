@@ -758,6 +758,69 @@ impl DeliveryLedger {
         Ok(())
     }
 
+    /// Failed deliveries are terminal: nothing retries them and the Gateway has
+    /// already released its copy. Without an explicit operator action they are
+    /// undeliverable forever, so expose a bounded, auditable requeue.
+    fn failed_ids(&self, limit: usize) -> Result<Vec<String>> {
+        let transaction = self.database.begin_read()?;
+        let table = transaction.open_table(DELIVERIES)?;
+        let mut output = Vec::new();
+        for row in table.iter()? {
+            let (_, value) = row?;
+            let record: DeliveryRecord = serde_json::from_slice(value.value())?;
+            if record.state != "failed" {
+                continue;
+            }
+            output.push(record.capture_id.clone());
+            if output.len() >= limit {
+                break;
+            }
+        }
+        Ok(output)
+    }
+
+    /// Move the named failed deliveries back to pending with an explicit
+    /// reason. Only records currently in `failed` are touched, so a concurrent
+    /// delivery cannot be reset underneath a worker.
+    fn requeue_failed(&self, capture_ids: &[String], reason: &str) -> Result<Vec<String>> {
+        if capture_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let transaction = self.database.begin_write()?;
+        let mut requeued = Vec::new();
+        {
+            let mut table = transaction.open_table(DELIVERIES)?;
+            let mut pending = transaction.open_table(PENDING_DELIVERIES)?;
+            let mut meta = transaction.open_table(META)?;
+            let mut counters = read_delivery_counters(&meta)?;
+            let now = unix_millis();
+            for capture_id in capture_ids {
+                let Some(value) = table.get(capture_id.as_str())? else {
+                    continue;
+                };
+                let mut record: DeliveryRecord = serde_json::from_slice(value.value())?;
+                drop(value);
+                if record.state != "failed" {
+                    continue;
+                }
+                decrement_delivery_state(&mut counters, &record.state);
+                record.state = "pending".to_owned();
+                record.attempts = 0;
+                record.next_attempt_unix_ms = now;
+                record.lease_until_unix_ms = 0;
+                record.last_error = Some(reason.chars().take(500).collect());
+                let key = delivery_index_key(record.next_attempt_unix_ms, &record.capture_id);
+                pending.insert(key.as_str(), record.capture_id.as_bytes())?;
+                table.insert(capture_id.as_str(), serde_json::to_vec(&record)?.as_slice())?;
+                increment_delivery_state(&mut counters, "pending");
+                requeued.push(capture_id.clone());
+            }
+            write_delivery_counters(&mut meta, &counters)?;
+        }
+        transaction.commit()?;
+        Ok(requeued)
+    }
+
     fn pending_ids(&self, limit: usize) -> Result<Vec<String>> {
         let transaction = self.database.begin_read()?;
         let table = transaction.open_table(PENDING_DELIVERIES)?;
@@ -2161,6 +2224,7 @@ pub async fn serve_relay(
         .route("/health", get(relay_health))
         .route("/ready", get(relay_ready))
         .route("/flush", post(relay_flush))
+        .route("/admin/requeue-failed", post(relay_requeue_failed))
         .fallback(relay_not_found)
         .layer(DefaultBodyLimit::max(max_envelope_bytes))
         .layer(ConcurrencyLimitLayer::new(max_connections.max(1)))
@@ -2762,6 +2826,86 @@ async fn relay_ready(State(state): State<RelayAppState>) -> Response {
             "ingest_coverage": coverage,
         }),
     )
+}
+
+/// Operator-only recovery for terminal delivery failures.
+///
+/// Body: {"limit": N} to requeue the oldest N failed records, or
+/// {"capture_ids": ["cap-…"]} to requeue specific ones. Authentication uses the
+/// ingest bearer token; an unset token leaves the relay open like every other
+/// ingest route, so deployments that need this closed must set it.
+async fn relay_requeue_failed(State(state): State<RelayAppState>, request: Request) -> Response {
+    if !ingest_authorized(&state, &request) {
+        return relay_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"ok":false,"reason":"ingest_auth_required"}),
+        );
+    }
+    let body = match state.body_budget.read_json(request).await {
+        Ok(body) => body,
+        Err(error) => return relay_body_error_response(error),
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&body.bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            return relay_response(
+                StatusCode::BAD_REQUEST,
+                json!({"ok":false,"reason":"invalid_body","detail":error.to_string()}),
+            );
+        }
+    };
+    let requested: Vec<String> = match value.get("capture_ids").and_then(|v| v.as_array()) {
+        Some(items) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(str::to_owned)
+            .collect(),
+        None => {
+            let limit = value
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100)
+                .min(10_000) as usize;
+            let listed = state
+                .relay
+                .inner
+                .ledger
+                .lock()
+                .expect("delivery ledger poisoned")
+                .failed_ids(limit);
+            match listed {
+                Ok(ids) => ids,
+                Err(error) => {
+                    return relay_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"ok":false,"reason":"ledger_unavailable","detail":error.to_string()}),
+                    );
+                }
+            }
+        }
+    };
+    let result = state
+        .relay
+        .inner
+        .ledger
+        .lock()
+        .expect("delivery ledger poisoned")
+        .requeue_failed(&requested, "operator_requeue_failed");
+    match result {
+        Ok(requeued) => relay_response(
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "requested": requested.len(),
+                "requeued": requeued.len(),
+                "capture_ids": requeued,
+            }),
+        ),
+        Err(error) => relay_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"ok":false,"reason":"requeue_failed","detail":error.to_string()}),
+        ),
+    }
 }
 
 async fn relay_flush(State(state): State<RelayAppState>, request: Request) -> Response {
@@ -4206,6 +4350,73 @@ mod tests {
             assert_eq!(crate::jsonl::sha256_bytes(&restored), record.raw_sha256);
         }
         collector.close().await.unwrap();
+    }
+
+    fn locator(capture_id: &str) -> CaptureLocator {
+        CaptureLocator {
+            capture_id: capture_id.to_owned(),
+            raw_sha256: "0".repeat(64),
+            segment_id: 1,
+            offset: 0,
+            length: 128,
+            received_at: None,
+            model: None,
+        }
+    }
+
+    #[test]
+    fn failed_deliveries_can_be_listed_and_requeued() {
+        let temporary = tempfile::tempdir().unwrap();
+        let ledger = DeliveryLedger::open(&temporary.path().join("delivery.redb")).unwrap();
+        for id in ["cap-failed-a", "cap-failed-b", "cap-ok"] {
+            ledger.ensure(&locator(id)).unwrap();
+        }
+        // Mark two records failed the way the delivery worker does.
+        let record = |id: &str| DeliveryRecord {
+            capture_id: id.to_owned(),
+            raw_sha256: "0".repeat(64),
+            bytes: 128,
+            state: "pending".to_owned(),
+            attempts: 1,
+            next_attempt_unix_ms: 0,
+            lease_until_unix_ms: 0,
+            last_attempt_at: None,
+            delivered_at: None,
+            last_error: None,
+        };
+        ledger
+            .finish_many(&[
+                failed_update(&record("cap-failed-a"), "http_400".to_owned()),
+                failed_update(&record("cap-failed-b"), "http_400".to_owned()),
+            ])
+            .unwrap();
+        assert_eq!(ledger.failed_ids(10).unwrap().len(), 2);
+        assert_eq!(ledger.health().unwrap().0, 3);
+
+        let requeued = ledger
+            .requeue_failed(
+                &["cap-failed-a".to_owned(), "cap-ok".to_owned()],
+                "operator",
+            )
+            .unwrap();
+        // Only a record that is actually failed is touched.
+        assert_eq!(requeued, vec!["cap-failed-a".to_owned()]);
+        let remaining: Vec<String> = ledger.failed_ids(10).unwrap();
+        assert_eq!(remaining, vec!["cap-failed-b".to_owned()]);
+        // Counters move failed -> pending and stay conserved.
+        let (total, pending_count, _inflight, _delivered, _conflicts, failed, _attempts) =
+            ledger.health().unwrap();
+        assert_eq!(failed, 1, "only the untouched failed record remains");
+        // cap-ok was pending before the requeue, so pending goes 1 -> 2.
+        assert_eq!(pending_count, 2);
+        assert_eq!(total, 3, "requeue must not change the total");
+        // The requeued record is immediately due alongside the untouched pending one.
+        let mut pending = ledger.pending_ids(10).unwrap();
+        pending.sort();
+        assert_eq!(
+            pending,
+            vec!["cap-failed-a".to_owned(), "cap-ok".to_owned()]
+        );
     }
 
     #[test]
