@@ -230,6 +230,10 @@ struct ResponsesStreamView {
     malformed_events: u64,
     framing_recovered_events: u64,
     error_event: Option<Value>,
+    /// Calls whose item was announced but never completed because the upstream
+    /// response itself ended incomplete (for example max_output_tokens). The
+    /// truncation is explicit, so these are evidenced, not silent gaps.
+    truncated_call_ids: BTreeSet<String>,
 }
 
 struct CanonicalValidators {
@@ -3109,12 +3113,83 @@ fn runtime_integrity(
         .filter(|node| !calls_with_execution.contains(node.as_str()))
         .cloned()
         .collect();
+    // A response that the upstream itself ended as incomplete can stop
+    // mid-item. The truncation is explicit in the terminal, so those calls are
+    // reported separately instead of failing the pairing gate.
+    let truncated_delivery_call_candidates: BTreeSet<String> = interactions
+        .iter()
+        .flat_map(|interaction| {
+            interaction
+                .pointer("/extensions/wire/truncated_model_call_ids")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|call_id| !call_id.trim().is_empty())
+                .filter_map(|call_id| {
+                    Some(format!(
+                        "model-call:{}:{call_id}",
+                        string_field(interaction, "interaction_id")?
+                    ))
+                })
+        })
+        .collect();
+    // A model response the upstream itself ended as failed never produced a
+    // usable tool call: the client is correct not to execute it. The explicit
+    // failure terminal is the evidence, so report these as unevaluated rather
+    // than as a missing execution.
+    let failed_terminal_call_candidates: BTreeSet<String> = interactions
+        .iter()
+        .filter(|interaction| {
+            interaction
+                .pointer("/response/status")
+                .and_then(Value::as_str)
+                == Some("failed")
+                && interaction
+                    .pointer("/integrity/protocol_complete")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
+        .flat_map(|interaction| {
+            interaction
+                .get("model_tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|call| {
+                    let call_id = call
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())?;
+                    Some(format!(
+                        "model-call:{}:{call_id}",
+                        string_field(interaction, "interaction_id")?
+                    ))
+                })
+        })
+        .collect();
+    let truncated_model_call_nodes: BTreeSet<String> = truncated_delivery_call_candidates
+        .union(&failed_terminal_call_candidates)
+        .filter(|node| {
+            !calls_with_results.contains(node.as_str())
+                && !calls_with_execution.contains(node.as_str())
+        })
+        .cloned()
+        .collect();
+    let truncated_model_call_ids: BTreeSet<String> = truncated_model_call_nodes
+        .iter()
+        .filter_map(|node| node.rsplit_once(':').map(|(_, call_id)| call_id.to_owned()))
+        .collect();
     let abandoned_model_call_ids: BTreeSet<String> = abandoned_model_call_nodes
         .iter()
         .filter_map(|node| node.rsplit_once(':').map(|(_, call_id)| call_id.to_owned()))
         .collect();
+    let evidenced_exclusions: BTreeSet<String> = abandoned_model_call_nodes
+        .union(&truncated_model_call_nodes)
+        .cloned()
+        .collect();
     let required_model_call_nodes: BTreeSet<String> = model_call_nodes
-        .difference(&abandoned_model_call_nodes)
+        .difference(&evidenced_exclusions)
         .cloned()
         .collect();
     let calls_without_results: BTreeSet<&String> = required_model_call_nodes
@@ -3188,6 +3263,9 @@ fn runtime_integrity(
             "abandoned_model_tool_calls":abandoned_model_call_nodes.len(),
             "abandoned_model_call_nodes":abandoned_model_call_nodes,
             "abandoned_model_call_ids":abandoned_model_call_ids,
+            "truncated_model_tool_calls":truncated_model_call_nodes.len(),
+            "truncated_model_call_nodes":truncated_model_call_nodes,
+            "truncated_model_call_ids":truncated_model_call_ids,
             "model_tool_calls_with_results":model_call_nodes.intersection(&calls_with_results).count(),
             "model_tool_calls_with_execution":model_call_nodes.intersection(&calls_with_execution).count(),
             "calls_without_results":calls_without_results,
@@ -3508,6 +3586,7 @@ fn adapt_responses(
                 "client_delivery_boundary":client_delivery_boundary(capture),
                 "malformed_sse_events":stream_view.malformed_events,
                 "framing_recovered_events":stream_view.framing_recovered_events,
+                "truncated_model_call_ids":stream_view.truncated_call_ids.iter().collect::<Vec<_>>(),
                 "stream_state":stream_state_value(&state),
             },
             "routing":routing_extension(capture),
@@ -4462,6 +4541,7 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
             malformed_events: 0,
             framing_recovered_events: 0,
             error_event: None,
+            truncated_call_ids: BTreeSet::new(),
         };
     }
     let Some(raw) = body.raw_utf8.as_deref() else {
@@ -4475,6 +4555,7 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
             malformed_events: 0,
             framing_recovered_events: 0,
             error_event: None,
+            truncated_call_ids: BTreeSet::new(),
         };
     };
     let parsed_sse = parse_sse(raw);
@@ -4490,6 +4571,8 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
     let mut item_call_ids: BTreeMap<String, String> = BTreeMap::new();
     let mut terminal_outcome = None;
     let mut error_event = None;
+    let mut added_items: BTreeMap<u64, Option<String>> = BTreeMap::new();
+    let mut explicit_incomplete = false;
     for event in &events {
         let Some(value) = event.data.as_ref() else {
             continue;
@@ -4550,6 +4633,13 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
         if kind == "response.created" {
             created = value.get("response").cloned();
         }
+        if kind == "response.incomplete"
+            && value
+                .pointer("/response/incomplete_details")
+                .is_some_and(|details| details.is_object() || details.is_string())
+        {
+            explicit_incomplete = true;
+        }
         if matches!(
             kind,
             "response.output_item.done" | "response.output_item.added"
@@ -4566,6 +4656,14 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
                     malformed = malformed.saturating_add(1);
                 }
                 completed_output.insert(index);
+            } else {
+                added_items.entry(index).or_insert_with(|| {
+                    item.get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(str::to_owned)
+                });
             }
             if kind.ends_with("done") || !output.contains_key(&index) {
                 output.insert(index, item.clone());
@@ -4656,9 +4754,24 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
         .as_ref()
         .and_then(|response| response.get("output"));
     let terminal_has_output = terminal_output.is_some();
+    let mut truncated_call_ids: BTreeSet<String> = BTreeSet::new();
     if let Some(terminal_output) = terminal_output {
         if let Some(items) = terminal_output.as_array() {
             for (index, observed) in &output {
+                // An upstream that ends with an explicit incomplete reason can
+                // stop mid-item: the item was announced, never completed, and
+                // is absent from the terminal snapshot. That truncation is
+                // evidenced by the terminal itself, so record it rather than
+                // counting a malformed event or inventing a completed item.
+                if explicit_incomplete
+                    && !completed_output.contains(index)
+                    && usize::try_from(*index).is_ok_and(|index| index >= items.len())
+                {
+                    if let Some(call_id) = added_items.get(index).cloned().flatten() {
+                        truncated_call_ids.insert(call_id);
+                    }
+                    continue;
+                }
                 let consistent = usize::try_from(*index)
                     .ok()
                     .and_then(|index| items.get(index))
@@ -4704,6 +4817,7 @@ fn responses_response_view(body: &WireBody, shape: &ProtocolShape) -> ResponsesS
         malformed_events: malformed,
         framing_recovered_events,
         error_event,
+        truncated_call_ids,
     }
 }
 
@@ -7718,6 +7832,80 @@ mod tests {
                 response
             );
         }
+    }
+
+    #[test]
+    fn explicitly_incomplete_stream_records_a_truncated_tail_call() {
+        // The upstream stopped on max_output_tokens after announcing a tool
+        // call but before completing it. The terminal carries the reason, so
+        // the tail is recorded as truncated instead of a malformed event.
+        let added = json!({"type":"function_call","id":"item-partial","call_id":"call-partial",
+            "name":"run_query","arguments":""});
+        let reasoning = json!({"type":"reasoning","id":"rs-1","summary":[]});
+        let response = [
+            json!({"type":"response.created","response":{"id":"r-1"}}),
+            json!({"type":"response.output_item.added","output_index":0,"item":reasoning}),
+            json!({"type":"response.output_item.done","output_index":0,"item":reasoning}),
+            json!({"type":"response.output_item.added","output_index":1,"item":added}),
+            json!({"type":"response.function_call_arguments.delta","output_index":1,
+                "delta":"{\"sql\":"}),
+            json!({"type":"response.incomplete","response":{"id":"r-1","status":"incomplete",
+                "incomplete_details":{"reason":"max_output_tokens"},
+                "output":[reasoning]}}),
+        ]
+        .iter()
+        .map(|value| format!("data: {value}\n\n"))
+        .collect::<String>();
+        let capture = fixture_capture(
+            "incomplete-tail",
+            "/v1/responses",
+            true,
+            RESPONSES_STREAM_REQUEST,
+            &response,
+        );
+        let interaction = model_interaction_from_capture(&capture).unwrap();
+        assert_eq!(interaction["integrity"]["protocol_complete"], true);
+        assert_eq!(
+            interaction["extensions"]["wire"]["malformed_sse_events"],
+            json!(0)
+        );
+        assert_eq!(
+            interaction["extensions"]["wire"]["truncated_model_call_ids"],
+            json!(["call-partial"])
+        );
+        assert_eq!(interaction["response"]["status"], "incomplete");
+    }
+
+    #[test]
+    fn a_completed_stream_still_rejects_an_absent_tail_item() {
+        // Without an explicit incomplete reason a missing tail item stays a
+        // protocol error; truncation must never be inferred.
+        let added = json!({"type":"function_call","id":"item-partial","call_id":"call-partial",
+            "name":"run_query","arguments":""});
+        let reasoning = json!({"type":"reasoning","id":"rs-1","summary":[]});
+        let response = [
+            json!({"type":"response.created","response":{"id":"r-1"}}),
+            json!({"type":"response.output_item.done","output_index":0,"item":reasoning}),
+            json!({"type":"response.output_item.added","output_index":1,"item":added}),
+            json!({"type":"response.completed","response":{"id":"r-1","status":"completed",
+                "output":[reasoning]}}),
+        ]
+        .iter()
+        .map(|value| format!("data: {value}\n\n"))
+        .collect::<String>();
+        let capture = fixture_capture(
+            "completed-with-gap",
+            "/v1/responses",
+            true,
+            RESPONSES_STREAM_REQUEST,
+            &response,
+        );
+        let interaction = model_interaction_from_capture(&capture).unwrap();
+        assert_eq!(interaction["integrity"]["protocol_complete"], false);
+        assert_eq!(
+            interaction["extensions"]["wire"]["truncated_model_call_ids"],
+            json!([])
+        );
     }
 
     #[test]
