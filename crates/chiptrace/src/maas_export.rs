@@ -61,8 +61,13 @@ static ACCESS_KEY: LazyLock<Regex> =
 // Generic Han-character NER would over-mask ordinary model content; callers
 // still get complete masking for structured keys below.
 static CN_PERSON_CONTEXT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?u)(?:姓名|名字|本人|我叫|联系人|收件人|客户|患者)\s*[:：]?\s*\p{Han}{2,4}")
-        .unwrap()
+    // Require an explicit delimiter (or the first-person prefix). Without one,
+    // a label enumeration such as "姓名/工号/部门" would be masked, which
+    // corrupts the sentence instead of protecting a person.
+    Regex::new(
+        r"(?u)(?:(?:姓名|名字|联系人|收件人|客户|患者)\s*[:：]\s*\p{Han}{2,4}|我叫\s*\p{Han}{2,4})",
+    )
+    .unwrap()
 });
 static CN_ADDRESS_CONTEXT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?u)(?:地址|住址|收货地址|家庭住址|工作地址)\s*[:：]?\s*[^,，;；。\n]{4,80}")
@@ -659,13 +664,13 @@ fn build_payload(capture: &Value, config: &MaasExportConfig) -> Result<RequestPa
     let output_tokens = usage
         .output
         .ok_or_else(|| anyhow::anyhow!("api_snapshot {request_id} has no output token count"))?;
-    let model_name = request
-        .get("model")
-        .and_then(Value::as_str)
-        .or_else(|| response.get("model").and_then(Value::as_str))
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("api_snapshot {request_id} has no modelName"))?
-        .to_owned();
+    // The external contract requires the official upstream model name and
+    // forbids self-defined aliases. A gateway can rewrite the requested alias
+    // (for example `gpt-6-astra` to `gpt-6.1-sol`), so the response model is the
+    // authoritative one; the request alias is only a last-resort fallback and
+    // is never silently substituted for a real upstream name.
+    let model_name = upstream_model_name(capture, &request, &response, &response_text)
+        .ok_or_else(|| anyhow::anyhow!("api_snapshot {request_id} has no modelName"))?;
     let protocol = config
         .protocol
         .clone()
@@ -732,6 +737,48 @@ fn capture_session_id(value: &Value) -> Option<String> {
         ],
     )
     .or_else(|| header_string(value, "requestHeaders", "session-id"))
+}
+
+/// Resolve the model name reported to the external receiver.
+///
+/// Order: the upstream response model, then gateway evidence captured on the
+/// Wire, then the request alias. The request value can be a self-defined
+/// gateway alias, which the contract explicitly forbids.
+fn upstream_model_name(
+    capture: &Value,
+    request: &Value,
+    response: &Value,
+    response_text: &str,
+) -> Option<String> {
+    let non_empty = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    // A streaming Responses body is SSE text, so the model only appears on the
+    // individual events. Take the last non-empty one: the terminal event owns
+    // the authoritative model, and earlier events may repeat a default.
+    let from_stream = response_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+        .filter_map(|event| {
+            event
+                .pointer("/response/model")
+                .or_else(|| event.get("model"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+        .next_back();
+    non_empty(response.get("model"))
+        .or(from_stream)
+        .or_else(|| non_empty(capture.pointer("/gatewayEvidence/response_model")))
+        .or_else(|| non_empty(capture.pointer("/gatewayEvidence/upstream_model")))
+        .or_else(|| non_empty(request.get("model")))
 }
 
 fn reject_identity_conflicts(capture: &Value, request_id: &str) -> Result<()> {
@@ -1231,7 +1278,9 @@ fn sensitive_key(key: &str) -> bool {
         || key == "bankcard"
         || key == "creditcard"
         || key == "ssn"
-        || key == "name"
+        // A bare `name` is a tool, function, file or field name in agent
+        // traffic far more often than a person. Masking it destroys the
+        // tool-call trajectory, so only explicit person-name keys match.
         || key == "fullname"
         || key == "firstname"
         || key == "lastname"
@@ -1625,6 +1674,68 @@ mod tests {
         }
     }
 
+    fn read_metadata(output: &Path) -> Value {
+        let mut found = None;
+        for provider in fs::read_dir(output).unwrap() {
+            let provider = provider.unwrap().path();
+            for date in fs::read_dir(&provider).unwrap() {
+                let date = date.unwrap().path();
+                for batch in fs::read_dir(&date).unwrap() {
+                    let mut archive = Vec::new();
+                    let file = fs::File::open(batch.unwrap().path()).unwrap();
+                    let mut decoder = flate2::read::GzDecoder::new(file);
+                    std::io::Read::read_to_end(&mut decoder, &mut archive).unwrap();
+                    let mut tar = tar::Archive::new(&archive[..]);
+                    for entry in tar.entries().unwrap() {
+                        let mut entry = entry.unwrap();
+                        if entry
+                            .path()
+                            .unwrap()
+                            .to_string_lossy()
+                            .ends_with("metadata.json")
+                        {
+                            let mut text = String::new();
+                            std::io::Read::read_to_string(&mut entry, &mut text).unwrap();
+                            found = Some(serde_json::from_str(&text).unwrap());
+                        }
+                    }
+                }
+            }
+        }
+        found.expect("metadata.json")
+    }
+
+    fn read_request(output: &Path) -> Value {
+        let mut found = None;
+        for provider in fs::read_dir(output).unwrap() {
+            let provider = provider.unwrap().path();
+            for date in fs::read_dir(&provider).unwrap() {
+                let date = date.unwrap().path();
+                for batch in fs::read_dir(&date).unwrap() {
+                    let mut archive = Vec::new();
+                    let file = fs::File::open(batch.unwrap().path()).unwrap();
+                    let mut decoder = flate2::read::GzDecoder::new(file);
+                    std::io::Read::read_to_end(&mut decoder, &mut archive).unwrap();
+                    let mut tar = tar::Archive::new(&archive[..]);
+                    for entry in tar.entries().unwrap() {
+                        let mut entry = entry.unwrap();
+                        if entry
+                            .path()
+                            .unwrap()
+                            .to_string_lossy()
+                            .ends_with("biz_request.json")
+                        {
+                            let mut text = String::new();
+                            std::io::Read::read_to_string(&mut entry, &mut text).unwrap();
+                            found = Some(serde_json::from_str(&text).unwrap());
+                        }
+                    }
+                }
+            }
+        }
+        found.expect("biz_request.json")
+    }
+
     fn capture(id: &str, stream: bool, body: Value) -> Value {
         let response = if stream {
             json!({"kind":"sse","value":"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":7}}}\n\ndata: [DONE]\n\n"})
@@ -2008,6 +2119,92 @@ mod tests {
         assert_eq!(report.requests, 1);
         assert_eq!(report.skipped_incomplete_requests, 1);
         verify_maas(&root.path().join("skip"), DEFAULT_MAX_BATCH_BYTES).unwrap();
+    }
+
+    #[test]
+    fn model_name_prefers_the_upstream_response_over_a_gateway_alias() {
+        // A gateway may rewrite the requested alias; the external contract
+        // requires the official upstream name, so the response wins.
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("alias.ndjson");
+        let mut value = capture("req-alias", true, json!({"model":"gpt-6-astra","input":[]}));
+        value["responseBody"] = json!({
+            "kind":"sse",
+            "value":"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-6.1-sol\",\"usage\":{\"input_tokens\":12,\"output_tokens\":7}}}\n\ndata: [DONE]\n\n",
+        });
+        fs::write(
+            &input,
+            format!("{}\n", serde_json::to_string(&value).unwrap()),
+        )
+        .unwrap();
+        let output = root.path().join("alias-archive");
+        export_maas(config(input, output.clone())).unwrap();
+        let metadata = read_metadata(&output);
+        assert_eq!(metadata["modelName"], "gpt-6.1-sol");
+    }
+
+    #[test]
+    fn model_name_falls_back_to_gateway_evidence_then_the_alias() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("fallback.ndjson");
+        let mut with_evidence = capture(
+            "req-evidence",
+            true,
+            json!({"model":"gpt-6-astra","input":[]}),
+        );
+        with_evidence["gatewayEvidence"] = json!({"upstream_model":"gpt-6.1-sol"});
+        let mut alias_only = capture(
+            "req-alias-only",
+            true,
+            json!({"model":"gpt-6-astra","input":[]}),
+        );
+        alias_only["responseBody"] = json!({
+            "kind":"sse",
+            "value":"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":7}}}\n\ndata: [DONE]\n\n",
+        });
+        fs::write(
+            &input,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&with_evidence).unwrap(),
+                serde_json::to_string(&alias_only).unwrap()
+            ),
+        )
+        .unwrap();
+        let output = root.path().join("fallback-archive");
+        export_maas(config(input, output.clone())).unwrap();
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&output).unwrap() {
+            let date = entry.unwrap().path();
+            for batch in fs::read_dir(&date).unwrap() {
+                let path = batch.unwrap().path();
+                names.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+        assert_eq!(names.len(), 1);
+        let metadata = read_metadata(&output);
+        assert_eq!(metadata["modelName"], "gpt-6.1-sol");
+    }
+
+    #[test]
+    fn a_tool_name_is_not_treated_as_a_person_name() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("tools.ndjson");
+        let value = capture(
+            "req-tool",
+            false,
+            json!({"model":"gpt-5.6-sol","input":[],
+                "tools":[{"type":"function","name":"exec_command","parameters":{"type":"object"}}]}),
+        );
+        fs::write(
+            &input,
+            format!("{}\n", serde_json::to_string(&value).unwrap()),
+        )
+        .unwrap();
+        let output = root.path().join("tool-archive");
+        export_maas(config(input, output.clone())).unwrap();
+        let request = read_request(&output);
+        assert_eq!(request["tools"][0]["name"], "exec_command");
     }
 
     #[test]
