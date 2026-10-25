@@ -27,7 +27,7 @@ gateway-host-test:
 	node --test integrations/openai-gateway/host-health.test.js
 
 gateway-source-test:
-	node --test integrations/openai-gateway/server-capture.test.js integrations/openai-gateway/server-identity.test.js
+	node --test integrations/openai-gateway/server-capture.test.js integrations/openai-gateway/server-identity.test.js integrations/openai-gateway/server-drop-health.test.js
 
 failed-outbox-replay-test:
 	node --test scripts/ops/replay-failed-outbox.test.js

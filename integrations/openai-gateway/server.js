@@ -146,6 +146,13 @@ const FULL_TRACE_CAPTURE_HEALTH_MAX_OLDEST_PENDING_MS = boundedNumber(
   0,
   24 * 60 * 60 * 1000,
 );
+// How far back a dropped capture keeps the gateway unhealthy.
+const CAPTURE_DROP_HEALTH_WINDOW_MS = boundedNumber(
+  process.env.FULL_TRACE_CAPTURE_DROP_HEALTH_WINDOW_MS,
+  30 * 60 * 1000,
+  1000,
+  24 * 60 * 60 * 1000,
+);
 const FULL_TRACE_CAPTURE_HEALTH_MAX_OPEN_MS = boundedNumber(
   process.env.FULL_TRACE_CAPTURE_HEALTH_MAX_OPEN_MS,
   30 * 60 * 1000,
@@ -191,6 +198,10 @@ const fullTraceCaptureStatus = {
   lastFilterReason: null,
   lastDroppedAt: null,
   lastDropReason: null,
+  // A dropped capture is permanent audit evidence, but it must not keep the
+  // gateway unhealthy for the rest of the process lifetime. Health looks at
+  // drops inside a bounded window; the lifetime total stays for operators.
+  recentDropTimestamps: [],
   lastError: null,
 };
 let fullTraceSubmitterStartupError = null;
@@ -984,9 +995,14 @@ function appendBoundedBuffer(state, chunk, maxBytes) {
 }
 
 function captureDrop(reason, error = null) {
+  const droppedAt = Date.now();
   fullTraceCaptureStatus.droppedCount += 1;
-  fullTraceCaptureStatus.lastDroppedAt = new Date().toISOString();
+  fullTraceCaptureStatus.lastDroppedAt = new Date(droppedAt).toISOString();
   fullTraceCaptureStatus.lastDropReason = reason;
+  fullTraceCaptureStatus.recentDropTimestamps.push(droppedAt);
+  const cutoff = droppedAt - CAPTURE_DROP_HEALTH_WINDOW_MS;
+  fullTraceCaptureStatus.recentDropTimestamps =
+    fullTraceCaptureStatus.recentDropTimestamps.filter((at) => at > cutoff);
   fullTraceCaptureStatus.lastError = error ? (error.message || String(error)).slice(0, 500) : fullTraceCaptureStatus.lastError;
 }
 
@@ -3988,7 +4004,7 @@ const server = http.createServer(async (req, res) => {
         && outboxHealth.currentFailureCount === 0
         && outboxHealth.stalledFiles === 0
         && outboxHealth.openCaptureHealthy === true
-        && fullTraceCaptureStatus.droppedCount === 0
+        && fullTraceCaptureStatus.recentDropTimestamps.length === 0
         && fullTraceCaptureStatus.truncatedRequestCount === 0
         && fullTraceCaptureStatus.truncatedResponseCount === 0
         && !fullTraceSubmitterStatus.lastError
@@ -4059,7 +4075,12 @@ const server = http.createServer(async (req, res) => {
         },
         pendingLocalWrites: fullTracePendingLocalWrites.size,
         skippedResponseStatuses: [],
-        stats: { ...fullTraceCaptureStatus },
+        stats: {
+          ...fullTraceCaptureStatus,
+          recentDropTimestamps: undefined,
+          recentDroppedCount: fullTraceCaptureStatus.recentDropTimestamps.length,
+          dropHealthWindowMs: CAPTURE_DROP_HEALTH_WINDOW_MS,
+        },
         submitter: {
           ...fullTraceSubmitterStatus,
           inFlight: outboxHealth.processing,

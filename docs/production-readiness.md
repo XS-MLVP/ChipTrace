@@ -1,5 +1,33 @@
 # 生产就绪评估
 
+## 2026-10-26 00:05（Asia/Shanghai）网关健康纠正：丢弃计数不再永久降级
+
+23:59 的 5 分钟检查发现网关 `status=degraded`、`currentDeliveryHealthy=false`，
+但 `pending=0`、`failed=0`、`rejected=0`、`stale=0`、`openCaptureHealthy=true`。
+逐项核对 `captureHealthy` 的全部条件后定位到唯一失败项：
+`fullTraceCaptureStatus.droppedCount === 0`。
+
+该计数器是**进程生命周期累计**。14:51Z 有一次客户端流错误
+（`lastDropReason=request_stream_error`）导致一次 capture 被丢弃，此后网关永久
+degraded，即使后续 5,000+ 条全部成功投递。这是可观测性设计缺陷：瞬时事件被当成
+永久状态。
+
+修复：健康只看**有界窗口内**的丢弃，lifetime 总数仍完整保留给运维审计。
+
+- 新增 `FULL_TRACE_CAPTURE_DROP_HEALTH_WINDOW_MS`（默认 30 分钟，范围 1 秒–24 小时）。
+- `captureDrop()` 记录时间戳并裁剪窗口外的项。
+- `captureHealthy` 改为 `recentDropTimestamps.length === 0`。
+- 健康响应新增 `recentDroppedCount` 与 `dropHealthWindowMs`；`droppedCount`、
+  `lastDroppedAt`、`lastDropReason` 保持不变，仍可追溯。
+- 新增 `integrations/openai-gateway/server-drop-health.test.js`，已接入
+  `make gateway-source-test`（3 项通过）。
+
+这**不是**放宽：窗口内仍有一次丢弃就 degraded，且丢弃记录与时间戳永久可见。它只
+纠正"一次瞬时失败让服务永久不可用"的错误语义。
+
+滚动后实测：`status=healthy`、`currentDeliveryHealthy=true`、`open=3`（正在传输的
+正常会话）、`droppedCount=0`（重启后进程内无丢弃）。
+
 ## 2026-10-24 16:25（Asia/Shanghai）本地 Codex 采集不再依赖 root
 
 本机 Codex 是本地安装（`~/.local/openai-codex` + `~/.local/bin/codex`），但 launcher
