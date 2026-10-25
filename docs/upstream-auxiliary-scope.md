@@ -58,3 +58,15 @@ The Session view also treats duplicate Hook boundaries as duplicates when the
 two deliveries arrive out of order (absolute timestamp distance within two
 seconds), because the managed requirements and user `hooks.json` run
 concurrently.
+
+## 补丁文件
+
+本文件描述的额外改动已正式化为
+[`upstream-auxiliary-scope.patch`](upstream-auxiliary-scope.patch)，并登记到
+`integrations/codex/producer-support.json` 的第八个补丁；应用顺序在七个上游补丁之后，
+因为其上下文依赖 `session-scope` 系列已引入的字段。
+
+复现验证：从固定 commit `83086188ae0614bd882818ff1aa23f3194962012` 检出后按顺序应用
+八个补丁，产物与本机生产源码树**逐文件一致**（仅 `Cargo.lock` 因构建时的 workspace
+版本归一化不同，属预期）。
+

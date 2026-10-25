@@ -52,7 +52,20 @@ function verifyProducerSupport(policy, stock, { patchRoot = PATCH_ROOT } = {}) {
   assert.match(producer.upstream_commit, SHA1, 'producer.upstream_commit must be a full lowercase SHA-1');
   assert.match(producer.source_sha256, SHA256, 'producer.source_sha256 must be a SHA-256');
   assert.match(producer.official_binary_sha256, SHA256, 'producer.official_binary_sha256 must be a SHA-256');
-  assert.ok(Array.isArray(producer.patches) && producer.patches.length === 7, 'exactly seven producer patches are required');
+  // Seven upstream-defect patches plus the auxiliary scope patch that is
+  // required for exact four-source attribution on a shared app-server host.
+  assert.ok(
+    Array.isArray(producer.patches) && producer.patches.length >= 7,
+    'at least the seven producer patches are required',
+  );
+  const patchFiles = producer.patches.map(patch => patch && patch.file);
+  for (const required of [
+    'upstream-sse-context.patch',
+    'upstream-otlp-outcome.patch',
+    'upstream-auxiliary-scope.patch',
+  ]) {
+    assert.ok(patchFiles.includes(required), `producer.patches must include ${required}`);
+  }
 
   const files = producer.patches.map((patch, index) => {
     assert.ok(patch && typeof patch === 'object' && !Array.isArray(patch), `producer.patches[${index}] must be an object`);
@@ -65,6 +78,8 @@ function verifyProducerSupport(policy, stock, { patchRoot = PATCH_ROOT } = {}) {
     assert.ok(fs.statSync(absolute).isFile(), `patch is not a regular file: ${file}`);
     return file;
   });
+  // Order is the application order: upstream-defect patches first, then the
+  // auxiliary scope patch, whose context depends on the scope patches above.
   assert.deepEqual(files, [
     'upstream-sse-context.patch',
     'upstream-sse-context-test.patch',
@@ -73,6 +88,7 @@ function verifyProducerSupport(policy, stock, { patchRoot = PATCH_ROOT } = {}) {
     'upstream-session-scope-process.patch',
     'upstream-config-read-scope.patch',
     'upstream-otlp-outcome.patch',
+    'upstream-auxiliary-scope.patch',
   ]);
 
   return {

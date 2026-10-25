@@ -1,0 +1,569 @@
+--- a/codex-rs/app-server/src/app_server_tracing.rs
++++ b/codex-rs/app-server/src/app_server_tracing.rs
+@@ -129,7 +129,30 @@
+ fn record_process_scope_for_method(span: &Span, method: &str) {
+     if matches!(
+         method,
+-        "initialize" | "model/list" | "config/read" | "configRequirements/read"
++        "initialize"
++            | "model/list"
++            | "model/read"
++            | "config/read"
++            | "configRequirements/read"
++            | "account/read"
++            | "account/login"
++            | "account/logout"
++            | "getAuthStatus"
++            | "collaborationMode/list"
++            | "experimentalFeature/list"
++            | "hooks/list"
++            | "plugin/list"
++            | "plugin/read"
++            | "plugin/install"
++            | "plugin/uninstall"
++            | "skills/list"
++            | "skills/read"
++            | "fs/getMetadata"
++            | "fs/watch"
++            | "fs/unwatch"
++            | "feedback/upload"
++            | "app/list"
++            | "list_models"
+     ) {
+         span.record("codex.context_scope", "process");
+     }
+--- a/codex-rs/app-server/src/config_manager.rs
++++ b/codex-rs/app-server/src/config_manager.rs
+@@ -447,7 +447,7 @@
+         })
+     }
+ 
+-    #[instrument(level = "trace", skip_all)]
++    #[instrument(level = "trace", skip_all, fields(codex.context_scope = "process"))]
+     pub(crate) async fn load_with_cli_overrides(
+         &self,
+         cli_overrides: &[(String, TomlValue)],
+--- a/codex-rs/app-server/src/model_catalog.rs
++++ b/codex-rs/app-server/src/model_catalog.rs
+@@ -29,7 +29,12 @@
+         }
+     }
+ 
+-    #[tracing::instrument(name = "model_catalog.list_models", level = "trace", skip_all)]
++    #[tracing::instrument(
++        name = "model_catalog.list_models",
++        level = "trace",
++        skip_all,
++        fields(codex.context_scope = "process")
++    )]
+     pub(crate) async fn list_models(
+         &self,
+         refresh_strategy: RefreshStrategy,
+--- a/codex-rs/app-server/src/request_processors/thread_attachments.rs
++++ b/codex-rs/app-server/src/request_processors/thread_attachments.rs
+@@ -108,6 +108,9 @@
+         const OPERATION: &str = "thread/attachment/list";
+         self.ensure_thread_attachments_supported(OPERATION)?;
+         let thread_id = parse_attachment_thread_id(&params.thread_id)?;
++        let span = tracing::Span::current();
++        span.record("conversation.id", tracing::field::display(&thread_id));
++        span.record("codex.context_scope", "session");
+         let limit = params
+             .limit
+             .map(|limit| limit as usize)
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -1870,6 +1870,9 @@
+         let ThreadSetNameParams { thread_id, name } = params;
+         let thread_id = ThreadId::from_string(&thread_id)
+             .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
++        let span = tracing::Span::current();
++        span.record("conversation.id", tracing::field::display(&thread_id));
++        span.record("codex.context_scope", "session");
+         let Some(name) = codex_core::util::normalize_thread_name(&name) else {
+             return Err(invalid_request("thread name must not be empty"));
+         };
+--- a/codex-rs/codex-api/src/endpoint/session.rs
++++ b/codex-rs/codex-api/src/endpoint/session.rs
+@@ -75,7 +75,13 @@
+         name = "endpoint_session.execute_with",
+         level = "info",
+         skip_all,
+-        fields(http.method = %method, api.path = path)
++        fields(
++            http.method = %method,
++            api.path = path,
++            // This client is also used by detached catalog/auth work, so the
++            // span cannot claim a Turn on its own.
++            codex.context_scope = "process"
++        )
+     )]
+     pub(crate) async fn execute_with<C>(
+         &self,
+--- a/codex-rs/core-plugins/src/loader.rs
++++ b/codex-rs/core-plugins/src/loader.rs
+@@ -132,7 +132,7 @@
+ }
+ 
+ /// Load configured plugins without applying auth-dependent runtime policies.
+-#[instrument(level = "trace", skip_all)]
++#[instrument(level = "trace", skip_all, fields(codex.context_scope = "process"))]
+ // Keep validated policy with the existing snapshot inputs instead of reparsing layers.
+ #[allow(clippy::too_many_arguments)]
+ pub(crate) async fn load_plugins_from_layer_stack(
+--- a/codex-rs/core-plugins/src/manager.rs
++++ b/codex-rs/core-plugins/src/manager.rs
+@@ -816,7 +816,8 @@
+         skip_all,
+         fields(
+             otel.name = "plugins_for_config",
+-            plugins_enabled = config.plugins_enabled
++            plugins_enabled = config.plugins_enabled,
++            codex.context_scope = "process"
+         )
+     )]
+     pub async fn plugins_for_config(&self, config: &PluginsConfigInput) -> PluginLoadOutcome {
+@@ -1914,7 +1915,8 @@
+         skip_all,
+         fields(
+             plugins_enabled = config.plugins_enabled,
+-            remote_plugin_enabled = config.remote_plugin_enabled
++            remote_plugin_enabled = config.remote_plugin_enabled,
++            codex.context_scope = "process"
+         )
+     )]
+     pub async fn recommended_plugins_mode_for_config(
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -815,6 +815,7 @@
+             client_setup.redirect_policy,
+         )?;
+         let request_telemetry = Self::build_request_telemetry(
++            self.state.thread_id,
+             session_telemetry,
+             AuthRequestTelemetryContext::new(
+                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+@@ -916,13 +917,14 @@
+ 
+     /// Builds request telemetry for unary API calls (e.g., Compact endpoint).
+     fn build_request_telemetry(
++        thread_id: ThreadId,
+         session_telemetry: &SessionTelemetry,
+         auth_context: AuthRequestTelemetryContext,
+         request_route_telemetry: RequestRouteTelemetry,
+         auth_env_telemetry: AuthEnvTelemetry,
+     ) -> Arc<dyn RequestTelemetry> {
+         let telemetry = Arc::new(ApiTelemetry::new(
+-            session_telemetry.clone(),
++            session_telemetry.clone().with_conversation_id(thread_id),
+             auth_context,
+             request_route_telemetry,
+             auth_env_telemetry,
+@@ -1303,6 +1305,8 @@
+         let mut headers = self.build_websocket_headers(responses_metadata).await;
+         headers.extend(responses_headers.clone());
+         let websocket_telemetry = ModelClientSession::build_websocket_telemetry(
++            ThreadId::from_string(&responses_metadata.session_id)
++                .unwrap_or(self.state.thread_id),
+             session_telemetry,
+             auth_context.clone(),
+             request_route_telemetry,
+@@ -1805,6 +1809,8 @@
+                 pending_retry,
+             );
+             let (request_telemetry, sse_telemetry) = ModelClientSession::build_streaming_telemetry(
++                ThreadId::from_string(&responses_metadata.session_id)
++                    .unwrap_or(self.client.state.thread_id),
+                 session_telemetry,
+                 request_auth_context,
+                 RequestRouteTelemetry::for_endpoint("/responses"),
+@@ -2249,13 +2255,14 @@
+ 
+     /// Builds request and SSE telemetry for streaming API calls.
+     fn build_streaming_telemetry(
++        thread_id: ThreadId,
+         session_telemetry: &SessionTelemetry,
+         auth_context: AuthRequestTelemetryContext,
+         request_route_telemetry: RequestRouteTelemetry,
+         auth_env_telemetry: AuthEnvTelemetry,
+     ) -> (Arc<dyn RequestTelemetry>, Arc<dyn SseTelemetry>) {
+         let telemetry = Arc::new(ApiTelemetry::new(
+-            session_telemetry.clone(),
++            session_telemetry.clone().with_conversation_id(thread_id),
+             auth_context,
+             request_route_telemetry,
+             auth_env_telemetry,
+@@ -2267,13 +2274,14 @@
+ 
+     /// Builds telemetry for the Responses API WebSocket transport.
+     fn build_websocket_telemetry(
++        thread_id: ThreadId,
+         session_telemetry: &SessionTelemetry,
+         auth_context: AuthRequestTelemetryContext,
+         request_route_telemetry: RequestRouteTelemetry,
+         auth_env_telemetry: AuthEnvTelemetry,
+     ) -> Arc<dyn WebsocketTelemetry> {
+         let telemetry = Arc::new(ApiTelemetry::new(
+-            session_telemetry.clone(),
++            session_telemetry.clone().with_conversation_id(thread_id),
+             auth_context,
+             request_route_telemetry,
+             auth_env_telemetry,
+--- a/codex-rs/core/src/environment_selection.rs
++++ b/codex-rs/core/src/environment_selection.rs
+@@ -939,6 +939,7 @@
+         fields(
+             environment_count = snapshot.environments.len(),
+             non_blocking = non_blocking_snapshots,
++            codex.context_scope = "process"
+         )
+     )]
+     fn resolve_snapshot(
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -2676,7 +2676,15 @@
+             responses_metadata,
+             &inference_trace,
+         )
+-        .instrument(trace_span!("stream_request"))
++        // The SSE polling telemetry captures this span and re-enters it for
++        // every event. Carrying the native Turn identity here is what lets
++        // codex.sse_event logs be joined to a Turn instead of only a Session.
++        .instrument(trace_span!(
++            "stream_request",
++            codex.context_scope = "turn",
++            conversation.id = %sess.thread_id,
++            turn.id = %turn_context.sub_id,
++        ))
+         .or_cancel(&cancellation_token)
+         .await??;
+     if cancellation_token.is_cancelled() {
+@@ -2710,7 +2718,15 @@
+     let defer_streamed_turn_items_for_contributors =
+         !sess.services.extensions.turn_item_contributors().is_empty();
+     let mut active_item_is_streaming_to_client = false;
+-    let receiving_span = trace_span!("receiving_stream");
++    // Response handling is entirely Turn work. Declaring the Turn scope here
++    // makes every child span (receiving, handle_responses, tool calls) carry
++    // the same native identity without repeating the fields at each site.
++    let receiving_span = trace_span!(
++        "receiving_stream",
++        codex.context_scope = "turn",
++        conversation.id = %sess.thread_id,
++        turn.id = %turn_context.sub_id,
++    );
+     let outcome: CodexResult<SamplingRequestResult> = loop {
+         let handle_responses = trace_span!(
+             parent: &receiving_span,
+--- a/codex-rs/exec-server/src/client/route_aware_http_client.rs
++++ b/codex-rs/exec-server/src/client/route_aware_http_client.rs
+@@ -187,6 +187,7 @@
+             server.port = u64::from(url.port_or_known_default().unwrap_or_default()),
+             http.response.status_code = tracing::field::Empty,
+             error.type = tracing::field::Empty,
++            codex.context_scope = "process",
+         );
+         let mut headers = Self::build_headers(params.headers)?;
+         codex_otel::inject_span_w3c_trace_headers(&request_span, &mut headers);
+--- a/codex-rs/exec-server/src/local_file_system.rs
++++ b/codex-rs/exec-server/src/local_file_system.rs
+@@ -150,7 +150,10 @@
+     #[tracing::instrument(
+         name = "fs.read_file",
+         skip_all,
+-        fields(sandboxed = sandbox.is_some_and(FileSystemSandboxContext::should_read_from_sandbox))
++        fields(
++            sandboxed = sandbox.is_some_and(FileSystemSandboxContext::should_read_from_sandbox),
++            codex.context_scope = "process"
++        )
+     )]
+     async fn read_file(
+         &self,
+@@ -197,7 +200,10 @@
+     #[tracing::instrument(
+         name = "fs.get_metadata",
+         skip_all,
+-        fields(sandboxed = sandbox.is_some_and(FileSystemSandboxContext::should_read_from_sandbox))
++        fields(
++            sandboxed = sandbox.is_some_and(FileSystemSandboxContext::should_read_from_sandbox),
++            codex.context_scope = "process"
++        )
+     )]
+     async fn get_metadata(
+         &self,
+--- a/codex-rs/ext/skills/src/host_service.rs
++++ b/codex-rs/ext/skills/src/host_service.rs
+@@ -172,7 +172,10 @@
+         name = "skills_for_config",
+         level = "info",
+         skip_all,
+-        fields(otel.name = "skills_for_config")
++        fields(
++            otel.name = "skills_for_config",
++            codex.context_scope = "process"
++        )
+     )]
+     pub async fn snapshot_for_config(
+         &self,
+--- a/codex-rs/model-provider/src/models_endpoint.rs
++++ b/codex-rs/model-provider/src/models_endpoint.rs
+@@ -327,6 +327,7 @@
+             error.message = error_message.as_deref(),
+             attempt = attempt,
+             endpoint = MODELS_ENDPOINT,
++            codex.context_scope = "process",
+             auth.header_attached = self.auth_header_attached,
+             auth.header_name = self.auth_header_name,
+             auth.env_openai_api_key_present = self.auth_env.openai_api_key_env_present,
+@@ -353,6 +354,7 @@
+             error.message = error_message.as_deref(),
+             attempt = attempt,
+             endpoint = MODELS_ENDPOINT,
++            codex.context_scope = "process",
+             auth.header_attached = self.auth_header_attached,
+             auth.header_name = self.auth_header_name,
+             auth.env_openai_api_key_present = self.auth_env.openai_api_key_env_present,
+--- a/codex-rs/models-manager/src/manager.rs
++++ b/codex-rs/models-manager/src/manager.rs
+@@ -135,7 +135,8 @@
+             }
+             .instrument(tracing::info_span!(
+                 "list_models",
+-                refresh_strategy = %refresh_strategy
++                refresh_strategy = %refresh_strategy,
++                codex.context_scope = "process"
+             )),
+         )
+     }
+@@ -222,7 +223,8 @@
+                 "get_default_model",
+                 model.provided = model.is_some(),
+                 allow_provider_model_fallback,
+-                refresh_strategy = %refresh_strategy
++                refresh_strategy = %refresh_strategy,
++                codex.context_scope = "process"
+             )),
+         )
+     }
+@@ -239,7 +241,11 @@
+                 let remote_models = self.get_remote_models().await;
+                 construct_model_info_from_candidates(model, &remote_models, config)
+             }
+-            .instrument(tracing::info_span!("get_model_info", model = model)),
++            .instrument(tracing::info_span!(
++                "get_model_info",
++                model = model,
++                codex.context_scope = "process"
++            )),
+         )
+     }
+ 
+@@ -458,7 +464,7 @@
+         self.auth_manager.as_deref()
+     }
+ 
+-    #[tracing::instrument(skip_all, fields(model))]
++    #[tracing::instrument(skip_all, fields(model, codex.context_scope = "process"))]
+     fn get_model_info<'a>(
+         &'a self,
+         model: &'a str,
+@@ -796,7 +802,8 @@
+                 "get_default_model",
+                 model.provided = model.is_some(),
+                 allow_provider_model_fallback,
+-                refresh_strategy = %refresh_strategy
++                refresh_strategy = %refresh_strategy,
++                codex.context_scope = "process"
+             )),
+         )
+     }
+--- a/codex-rs/otel/src/events/session_telemetry.rs
++++ b/codex-rs/otel/src/events/session_telemetry.rs
+@@ -583,6 +583,15 @@
+         .into_tags()
+     }
+ 
++    /// Rebind the telemetry to the native Session/thread that actually owns the
++    /// request. The TUI creates its front-end telemetry before the app-server
++    /// allocates the real thread id, so API request events must not keep the
++    /// placeholder id.
++    pub fn with_conversation_id(mut self, conversation_id: ThreadId) -> Self {
++        self.metadata.conversation_id = conversation_id;
++        self
++    }
++
+     #[allow(clippy::too_many_arguments)]
+     pub fn new(
+         conversation_id: ThreadId,
+--- a/codex-rs/otel/src/provider.rs
++++ b/codex-rs/otel/src/provider.rs
+@@ -8,8 +8,10 @@
+ use crate::targets::is_trace_safe_target;
+ use gethostname::gethostname;
+ use opentelemetry::Context;
++use opentelemetry::InstrumentationScope;
+ use opentelemetry::KeyValue;
+ use opentelemetry::global;
++use opentelemetry::logs::AnyValue;
+ use opentelemetry::trace::Span as _;
+ use opentelemetry::trace::SpanBuilder;
+ use opentelemetry::trace::TracerProvider as _;
+@@ -26,6 +28,9 @@
+ use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+ use opentelemetry_sdk::Resource;
+ use opentelemetry_sdk::error::OTelSdkResult;
++use opentelemetry_sdk::logs::LogBatch;
++use opentelemetry_sdk::logs::LogExporter as LogExporterTrait;
++use opentelemetry_sdk::logs::SdkLogRecord;
+ use opentelemetry_sdk::logs::SdkLoggerProvider;
+ use opentelemetry_sdk::propagation::TraceContextPropagator;
+ use opentelemetry_sdk::runtime;
+@@ -33,6 +38,7 @@
+ use opentelemetry_sdk::trace::SdkTracerProvider;
+ use opentelemetry_sdk::trace::Span;
+ use opentelemetry_sdk::trace::SpanData;
++use opentelemetry_sdk::trace::SpanExporter as SpanExporterTrait;
+ use opentelemetry_sdk::trace::SpanProcessor;
+ use opentelemetry_sdk::trace::Tracer;
+ use opentelemetry_sdk::trace::TracerProviderBuilder;
+@@ -442,6 +448,84 @@
+     }
+ }
+ 
++/// Splits one SDK export batch by native Session identity before it reaches the
++/// OTLP exporter.  The shared app-server/exec-server process can batch spans and
++/// logs from several Sessions; a mixed telemetry batch cannot be attributed to
++/// one Session downstream, so each Session gets its own HTTP batch.  Records
++/// without a Session identity stay together in one process batch.
++#[derive(Debug)]
++struct SessionSplittingExporter<E> {
++    exporter: E,
++}
++
++fn span_session_key(attributes: &[KeyValue]) -> Option<String> {
++    attributes.iter().find_map(|kv| {
++        matches!(kv.key.as_str(), "conversation.id" | "session.id" | "turn.id")
++            .then(|| kv.value.as_str().into_owned())
++    })
++}
++
++fn log_session_key(record: &SdkLogRecord) -> Option<String> {
++    record.attributes_iter().find_map(|(key, value)| {
++        if !matches!(key.as_str(), "conversation.id" | "session.id" | "turn.id") {
++            return None;
++        }
++        match value {
++            AnyValue::String(text) => Some(text.as_str().to_owned()),
++            _ => None,
++        }
++    })
++}
++
++impl<E: SpanExporterTrait> SpanExporterTrait for SessionSplittingExporter<E> {
++    async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
++        let mut groups: BTreeMap<String, Vec<SpanData>> = BTreeMap::new();
++        for span in batch {
++            let key = span_session_key(&span.attributes).unwrap_or_else(|| "process".to_owned());
++            groups.entry(key).or_default().push(span);
++        }
++        for group in groups.into_values() {
++            self.exporter.export(group).await?;
++        }
++        Ok(())
++    }
++
++    fn shutdown_with_timeout(&mut self, timeout: Duration) -> OTelSdkResult {
++        self.exporter.shutdown_with_timeout(timeout)
++    }
++
++    fn force_flush(&mut self) -> OTelSdkResult {
++        self.exporter.force_flush()
++    }
++
++    fn set_resource(&mut self, resource: &Resource) {
++        self.exporter.set_resource(resource);
++    }
++}
++
++impl<E: LogExporterTrait> LogExporterTrait for SessionSplittingExporter<E> {
++    async fn export(&self, batch: LogBatch<'_>) -> OTelSdkResult {
++        let mut groups: BTreeMap<String, Vec<(&SdkLogRecord, &InstrumentationScope)>> =
++            BTreeMap::new();
++        for (record, scope) in batch.iter() {
++            let key = log_session_key(record).unwrap_or_else(|| "process".to_owned());
++            groups.entry(key).or_default().push((record, scope));
++        }
++        for group in groups.into_values() {
++            self.exporter.export(LogBatch::new(&group)).await?;
++        }
++        Ok(())
++    }
++
++    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
++        self.exporter.shutdown_with_timeout(timeout)
++    }
++
++    fn set_resource(&mut self, resource: &Resource) {
++        self.exporter.set_resource(resource);
++    }
++}
++
+ fn build_logger(
+     resource: &Resource,
+     exporter: &OtelExporter,
+@@ -478,7 +562,7 @@
+                 .build()?;
+ 
+             builder = builder.with_batch_exporter(crate::network_policy::PolicyExporter {
+-                exporter,
++                exporter: SessionSplittingExporter { exporter },
+                 policy: factory.network_policy().clone(),
+             });
+         }
+@@ -516,7 +600,7 @@
+             let exporter = exporter_builder.build()?;
+ 
+             builder = builder.with_batch_exporter(crate::network_policy::PolicyExporter {
+-                exporter,
++                exporter: SessionSplittingExporter { exporter },
+                 policy: factory.network_policy().clone(),
+             });
+         }
+@@ -588,7 +672,9 @@
+ 
+                 let processor = TokioBatchSpanProcessor::builder(
+                     crate::network_policy::PolicyExporter {
+-                        exporter: exporter_builder.build()?,
++                        exporter: SessionSplittingExporter {
++                            exporter: exporter_builder.build()?,
++                        },
+                         policy: factory.network_policy().clone(),
+                     },
+                     runtime::Tokio,
+@@ -629,7 +715,9 @@
+     };
+ 
+     let processor = BatchSpanProcessor::builder(crate::network_policy::PolicyExporter {
+-        exporter: span_exporter,
++        exporter: SessionSplittingExporter {
++            exporter: span_exporter,
++        },
+         policy: factory.network_policy().clone(),
+     })
+     .build();
+--- a/codex-rs/thread-store/src/local/live_writer.rs
++++ b/codex-rs/thread-store/src/local/live_writer.rs
+@@ -138,7 +138,12 @@
+ #[tracing::instrument(
+     level = "trace",
+     skip_all,
+-    fields(item_count = params.items.len())
++    fields(
++        item_count = params.items.len(),
++        // Rollout persistence is shared infrastructure; the caller's Turn
++        // identity is not observable here.
++        codex.context_scope = "process"
++    )
+ )]
+ pub(super) async fn append_items(
+     store: &LocalThreadStore,

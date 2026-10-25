@@ -51,6 +51,10 @@
       {
         "file": "upstream-otlp-outcome.patch",
         "sha256": "63eb77eca928ec9c0b47303d6399f8b8eec2c60fbc3b793e48abcf70755fb5c2"
+      },
+      {
+        "file": "upstream-auxiliary-scope.patch",
+        "sha256": "e312d6d70a409683096650186515316810447bf1699dddfc085c092db64e0d11"
       }
     ]
   }
