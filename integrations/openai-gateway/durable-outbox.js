@@ -1098,6 +1098,72 @@ class DurableCaptureOutbox {
     return candidates.length ? Math.max(...candidates) : 0;
   }
 
+
+  /**
+   * An unreadable or unparseable open file with no other stored version of the
+   * same Capture is isolated: the alternative is a gateway that captures
+   * nothing until a human intervenes. Isolation keeps the original bytes in
+   * `failed/` with an explicit reason.
+   *
+   * If another version of the same Capture already exists in pending,
+   * processing or failed, the two cannot be compared safely, so this stays
+   * fail-closed and startup is rejected exactly as before.
+   */
+  async isolateOrFail(stem, files, error) {
+    const siblings = [
+      path.join(this.pendingDir, `${stem}.json`),
+      path.join(this.processingDir, `${stem}.json`),
+      path.join(this.failedDir, `${stem}.json`),
+    ];
+    for (const sibling of siblings) {
+      try {
+        await fsp.stat(sibling);
+      } catch (statError) {
+        if (statError.code === 'ENOENT') continue;
+        throw statError;
+      }
+      // Another stored version exists, so the open file cannot be compared
+      // safely. Keep the historical fail-closed contract.
+      this.metrics.conflicts += 1;
+      throw recoveryConflict('open metadata is not readable and another stored version exists');
+    }
+    await this.isolateUnrecoverable(files, error);
+  }
+
+  /**
+   * Move an unrecoverable open transaction's evidence into `failed/` with an
+   * error marker so it stays auditable, then continue with the remaining
+   * captures. The original bytes are never deleted.
+   */
+  async isolateUnrecoverable(files, error) {
+    this.metrics.conflicts += 1;
+    this.metrics.unrecoverableOpenFiles = (this.metrics.unrecoverableOpenFiles || 0) + 1;
+    const reason = `open_capture_unrecoverable: ${(error && error.message) || String(error)}`;
+    this.recordError(new Error(reason));
+    const stem = path.basename(files.metadata, '.open.json');
+    for (const file of [files.metadata, files.request, files.response]) {
+      let stat;
+      try {
+        stat = await fsp.stat(file);
+      } catch (statError) {
+        if (statError.code !== 'ENOENT') throw statError;
+        continue;
+      }
+      const target = path.join(this.failedDir, path.basename(file));
+      await moveOrDeduplicate(file, target);
+      const marker = `${target}.error.json`;
+      const body = `${JSON.stringify({
+        captureId: stem,
+        reason,
+        bytes: stat.size,
+        isolatedAt: new Date().toISOString(),
+      })}\n`;
+      await atomicWrite(marker, Buffer.from(body, 'utf8'));
+    }
+    this.metrics.openFiles = Math.max(0, this.metrics.openFiles - 1);
+    this.refreshOpenAgeMetrics();
+  }
+
   async recoverOpenCaptures({ staleOnly = false } = {}) {
     return this.withQueueMutation(() => this.recoverOpenCapturesInternal({ staleOnly }));
   }
@@ -1111,15 +1177,24 @@ class DurableCaptureOutbox {
         request: path.join(this.openDir, `${stem}.request.bin`),
         response: path.join(this.openDir, `${stem}.response.bin`),
       };
-      const metadataBytes = await fsp.readFile(metadataFile);
+      let metadataBytes;
+      try {
+        metadataBytes = await fsp.readFile(metadataFile);
+      } catch (error) {
+        if (error.code !== 'ENOENT') await this.isolateOrFail(stem, files, error);
+        continue;
+      }
       let baseRecord;
       try { baseRecord = JSON.parse(metadataBytes.toString('utf8')); }
-      catch {
-        this.metrics.conflicts += 1;
-        throw recoveryConflict('open metadata is not valid JSON');
+      catch (error) {
+        await this.isolateOrFail(stem, files, error);
+        continue;
       }
       const captureId = String(baseRecord.captureId || '');
-      if (!validCaptureId(captureId)) throw new Error('open Capture has invalid captureId');
+      if (!validCaptureId(captureId)) {
+        await this.isolateOrFail(stem, files, new Error('open Capture has invalid captureId'));
+        continue;
+      }
       if (staleOnly) {
         // Periodic recovery must never race an in-flight capture.  Startup
         // recovery (staleOnly=false) still finalizes every orphan because the

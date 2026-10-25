@@ -754,6 +754,43 @@ test('periodic recovery finalizes only stale orphaned open captures', async t =>
   }
 });
 
+test('an unrecoverable open file is isolated instead of blocking all capture', async t => {
+  // Before isolation a single corrupt .open.json made start() throw, so every
+  // later request failed to capture. The corrupt evidence must move to failed/
+  // with a marker and the healthy captures must still recover.
+  const root = temporaryRoot();
+  const first = new DurableCaptureOutbox({ root, relayUrl: '', minFreeBytes: 0, minFreeFiles: 0 });
+  let second;
+  try {
+    await first.start();
+    await first.beginCapture({
+      captureId: 'cap-good-open',
+      sourceNamespace: 'gateway-test',
+      method: 'POST',
+      proxiedPath: '/v1/responses',
+    });
+    await first.close();
+    // Corrupt one orphaned metadata file the way a partial write would.
+    const openDir = path.join(root, 'open');
+    fs.writeFileSync(path.join(openDir, 'cap-corrupt.open.json'), '{"captureId":', { mode: 0o600 });
+
+    second = new DurableCaptureOutbox({ root, relayUrl: '', minFreeBytes: 0, minFreeFiles: 0 });
+    await second.start();
+    const snapshot = second.snapshot();
+    assert.ok(snapshot.unrecoverableOpenFiles >= 1, 'the corrupt file must be recorded');
+    assert.equal(snapshot.openTransactions, 0, 'the healthy open capture still recovers');
+    const failedFiles = fs.readdirSync(path.join(root, 'failed'));
+    assert.ok(failedFiles.some(name => name.startsWith('cap-corrupt.open.json')), 'corrupt evidence is kept');
+    // The healthy capture is finalized into pending, not failed.
+    const pendingFiles = fs.readdirSync(path.join(root, 'pending'));
+    assert.ok(pendingFiles.some(name => name.startsWith('cap-good-open')), 'the healthy capture is still delivered');
+  } finally {
+    await second?.close();
+    await first.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a long streaming capture is not recovered while it keeps writing', async t => {
   // Age alone would recover this capture: the start time is far in the past.
   // The live transaction and recent spool writes are the real liveness signal.
