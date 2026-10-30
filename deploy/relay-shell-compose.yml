@@ -73,12 +73,13 @@ services:
       API_STATS_USAGE_CACHE_MAX: "1000"
       NODE_ENV: production
     volumes:
-      - ../relay_shell:/shell:ro
-      # The gateway source lives in the ChipTrace repository; mount the
-      # versioned file over the host copy so the running code is auditable.
-      - ../ChipTrace/integrations/openai-gateway/server.js:/shell/server.js:ro
-      - ../ChipTrace/integrations/openai-gateway/durable-outbox.js:/shell/full_trace_outbox.js:ro
-      - ../ChipTrace/integrations/openai-gateway/drop-evidence.js:/shell/drop-evidence.js:ro
+      # The gateway source is versioned in this repository, so the running code
+      # is always the reviewed code. Unpack dist/gateway-admin-ui.tar.gz into
+      # integrations/openai-gateway/public first; server.js serves it from there.
+      - ../integrations/openai-gateway:/shell:ro
+      # server.js loads the durable outbox and drop evidence under their own
+      # module names, which differ from the repository file names.
+      - ../integrations/openai-gateway/durable-outbox.js:/shell/full_trace_outbox.js:ro
       - ${ROUTER_V2_DURABLE_ROOT:?ROUTER_V2_DURABLE_ROOT must be set}/legacy-api-id-map.json:/data/legacy-api-id-map.json:ro
       - ${ROUTER_V2_DURABLE_ROOT:?ROUTER_V2_DURABLE_ROOT must be set}/monitor:/monitor-state
       - ${ROUTER_V2_DURABLE_ROOT:?ROUTER_V2_DURABLE_ROOT must be set}/relay-shell-outbox:/capture-outbox
