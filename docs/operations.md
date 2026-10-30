@@ -424,6 +424,13 @@ chiptrace verify-cloud-acceptance \
 配对率、Token、OTLP 父子关系以及每一阶段 Manifest 的 SHA-256。失败命令返回非零状态，
 且不会覆盖已有通过目录。
 
+## 生产部署编排
+
+`deploy/collector-relay.yml` 是 Collector（`3011`）与 Relay（`3012`）的编排，
+`deploy/cloud-platform.yml` 是平台（`18086`），`deploy/relay-shell-compose.yml` 是
+Gateway（`18084`，挂载 `integrations/openai-gateway/server.js`）。三个编排都以环境变量
+注入凭据，仓库内不保存明文令牌。
+
 ## 云平台插件
 
 需要把收集与验收能力嵌入已有云平台时，使用

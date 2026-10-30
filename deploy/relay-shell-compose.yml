@@ -1,0 +1,97 @@
+name: router-v2-relay-shell
+
+services:
+  relay-shell:
+    image: sha256:a284c33baabd3ec9f5fa333757bf7996d84c54b95e2c7af25f0cc43be12f5ba1
+    container_name: router-v2-relay-shell
+    restart: unless-stopped
+    user: "1267:1001"
+    read_only: true
+    cpus: ${CHIPTRACE_GATEWAY_CPU_LIMIT:-2}
+    mem_limit: ${CHIPTRACE_GATEWAY_MEMORY_LIMIT:-4g}
+    pids_limit: ${CHIPTRACE_GATEWAY_PID_LIMIT:-256}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=2g,mode=1777,uid=1267,gid=1001
+    working_dir: /shell
+    entrypoint: ["node", "/shell/server.js"]
+    ports:
+      - "0.0.0.0:18084:3000"
+    environment:
+      PORT: "3000"
+      SUB2API_BASE: http://sub2api:8080
+      PUBLIC_SUB2API_BASE: http://172.28.11.121:18080
+      PUBLIC_SELF_BASE: http://172.28.11.121:18084
+      DEFAULT_GROUP_ID: "3"
+      LEGACY_API_ID_MAP: /data/legacy-api-id-map.json
+      SUB2API_ADMIN_EMAIL: ${SUB2API_ADMIN_EMAIL}
+      SUB2API_ADMIN_PASSWORD: ${SUB2API_ADMIN_PASSWORD}
+      FULL_TRACE_CAPTURE_ENABLED: "true"
+      FULL_TRACE_CAPTURE_BODY_ENABLED: "true"
+      FULL_TRACE_CAPTURE_ALL_AUTHENTICATED_KEYS: "true"
+      FULL_TRACE_CAPTURE_EXCLUDE_API_KEY_FINGERPRINTS: 5c6213c8a3cb2fb1
+      FULL_TRACE_CAPTURE_RELAY_URL: http://router-v2-chiptrace-relay:3012
+      FULL_TRACE_CAPTURE_RELAY_TIMEOUT_MS: "30000"
+      FULL_TRACE_CAPTURE_SHUTDOWN_GRACE_MS: "20000"
+      FULL_TRACE_CAPTURE_SUBMIT_ATTEMPTS: "25"
+      FULL_TRACE_CAPTURE_RETRY_BASE_MS: "250"
+      FULL_TRACE_CAPTURE_RETRY_MAX_MS: "5000"
+      FULL_TRACE_CAPTURE_RETRY_JITTER_PERCENT: "20"
+      FULL_TRACE_CAPTURE_SUBMIT_CONCURRENCY: "8"
+      FULL_TRACE_CAPTURE_SUBMIT_MAX_INFLIGHT_BYTES: "1073741824"
+      FULL_TRACE_CAPTURE_OUTBOX_DIR: /capture-outbox
+      FULL_TRACE_CAPTURE_OUTBOX_MAX_BYTES: "10737418240"
+      FULL_TRACE_CAPTURE_OUTBOX_MAX_FILES: "100000"
+      FULL_TRACE_CAPTURE_OUTBOX_MIN_FREE_BYTES: "5368709120"
+      FULL_TRACE_CAPTURE_OUTBOX_MIN_FREE_FILES: "10000"
+      # Production captures must redact credential/token fields before they
+      # leave the host. The outbox preserves the original body digest as
+      # evidence while delivering the sanitized UTF-8 body to the Relay.
+      FULL_TRACE_CAPTURE_OUTBOX_SANITIZE: "true"
+      FULL_TRACE_CAPTURE_HEALTH_MAX_PENDING_FILES: "128"
+      FULL_TRACE_CAPTURE_HEALTH_MAX_QUEUE_BYTES: "536870912"
+      FULL_TRACE_CAPTURE_HEALTH_MAX_OLDEST_PENDING_MS: "60000"
+      CHIPTRACE_INGEST_TOKEN: ${CHIPTRACE_INGEST_TOKEN:?CHIPTRACE_INGEST_TOKEN must be set}
+      FULL_TRACE_CAPTURE_MAX_REQUEST_BYTES: "268435456"
+      FULL_TRACE_CAPTURE_MAX_RESPONSE_BYTES: "402653184"
+      FULL_TRACE_CAPTURE_SOURCE_NAMESPACE: router-v2-18084
+      WATCHDOG_ENABLED: "true"
+      WATCHDOG_USER_EMAIL: router-monitor-2786527c@bosc.cn
+      WATCHDOG_STATE_DIR: /monitor-state
+      WATCHDOG_INTERVAL_MS: "60000"
+      WATCHDOG_INITIAL_DELAY_MS: "3000"
+      WATCHDOG_RETENTION_DAYS: "7"
+      WATCHDOG_MODEL: gpt-5.5
+      WATCHDOG_TIMEOUT_MS: "30000"
+      WATCHDOG_SLOW_MS: "10000"
+      API_STATS_BATCH_MAX_IDS: "500"
+      API_STATS_BATCH_CONCURRENCY: "8"
+      API_STATS_USAGE_CACHE_TTL_MS: "2000"
+      API_STATS_USAGE_CACHE_MAX: "1000"
+      NODE_ENV: production
+    volumes:
+      - ../relay_shell:/shell:ro
+      # The gateway source lives in the ChipTrace repository; mount the
+      # versioned file over the host copy so the running code is auditable.
+      - ../ChipTrace/integrations/openai-gateway/server.js:/shell/server.js:ro
+      - ../ChipTrace/integrations/openai-gateway/durable-outbox.js:/shell/full_trace_outbox.js:ro
+      - ../ChipTrace/integrations/openai-gateway/drop-evidence.js:/shell/drop-evidence.js:ro
+      - ${ROUTER_V2_DURABLE_ROOT:?ROUTER_V2_DURABLE_ROOT must be set}/legacy-api-id-map.json:/data/legacy-api-id-map.json:ro
+      - ${ROUTER_V2_DURABLE_ROOT:?ROUTER_V2_DURABLE_ROOT must be set}/monitor:/monitor-state
+      - ${ROUTER_V2_DURABLE_ROOT:?ROUTER_V2_DURABLE_ROOT must be set}/relay-shell-outbox:/capture-outbox
+    networks:
+      - router-v2-net
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(async r=>{const j=await r.json();process.exit(r.ok&&j.status==='healthy'?0:1)}).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    stop_grace_period: 30s
+
+networks:
+  router-v2-net:
+    external: true
