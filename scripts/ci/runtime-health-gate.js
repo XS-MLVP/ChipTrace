@@ -63,6 +63,10 @@ function safeTimestamp(value) {
   return typeof value === 'string' && value.trim() !== '' ? value : null;
 }
 
+function safeHash(value) {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value) ? value : null;
+}
+
 function safeSources(value) {
   return Array.isArray(value)
     ? value.filter(source => REQUIRED_SOURCES.includes(source))
@@ -363,6 +367,16 @@ function healthObservation(
           coverage,
           safeInteger(coverage?.quality_errors),
         ),
+        quality_errors_archived_total: safeInteger(coverage?.quality_errors_archived_total),
+        quality_archive: coverage?.quality_archive
+          ? {
+            archive_id: safeHash(coverage.quality_archive.archive_id),
+            archived_at: safeTimestamp(coverage.quality_archive.archived_at),
+            approved_by: typeof coverage.quality_archive.approved_by === 'string'
+              ? coverage.quality_archive.approved_by.slice(0, 256) : null,
+            source_quality_errors: safeInteger(coverage.quality_archive.source_quality_errors),
+          }
+          : null,
         quality_baseline: qualityBaselineObservation,
         wire_turn_coverage: {
           turn_scoped_captures: safeInteger(turnCoverage?.turn_scoped_captures),

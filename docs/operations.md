@@ -298,6 +298,53 @@ node scripts/ci/runtime-health-gate.js \
 
 基线文件大小、类型、schema、原因守恒和自身 SHA-256 都会校验；输出使用独占创建，不能被
 覆盖。当前任一端点或原因计数低于基线都会失败，防止重启、换账本或手工清零伪造“新增为零”。
+
+### 历史质量计数的可审计归档
+
+`/ready` 要求 Relay 持久账本里的质量错误累计字面为零（`relay_quality_errors_nonzero`），
+基线只能让 CI 门禁通过，不能让 `/ready` 通过。账本里已存在历史计数时，只允许按下面的流程
+把它们**原样迁移**到归档记录，绝不能删除或改写原始 Raw、也不能按时间或正文猜测归因。
+
+1. 在账本所在主机上读取当前精确计数，作为审批依据：
+
+   ```bash
+   curl -fsS -X POST http://127.0.0.1:3012/admin/quality-archive \
+     -H "Authorization: Bearer $CHIPTRACE_INGEST_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"dry_run":true}'
+   ```
+
+   返回的 `source_quality_errors`、`counters`（按端点、按原因码）就是将要归档的全部数字。
+   把这份输出连同 `sha256sum` 存入变更记录。
+
+2. 人工审批后执行归档，`expected_total` 必须等于上一步的 `source_quality_errors`：
+
+   ```bash
+   curl -fsS -X POST http://127.0.0.1:3012/admin/quality-archive \
+     -H "Authorization: Bearer $CHIPTRACE_INGEST_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"expected_total":<N>,"approved_by":"<变更单号>","approval_note":"<原因与审计结论>"}'
+   ```
+
+   归档与清零在同一个 redb 事务内完成，记录含 schema、内容寻址 `archive_id`
+   （SHA-256）、审批人、审批说明与归档前总数。以下情况一律拒绝，账本不变：
+   `expected_total` 与账本现值不符、已有归档（归档只追加，不覆盖）、审批人或说明为空。
+   归档后 `/health` 的 `quality_errors` 变为 0，`quality_errors_archived_total` 与
+   `quality_errors_archived_by_endpoint` 保留全部历史数字，`/ready` 才可能返回 200。
+
+3. 回滚只在归档后**没有**新的质量错误时可行，且必须带归档 ID：
+
+   ```bash
+   curl -fsS -X POST http://127.0.0.1:3012/admin/quality-archive/restore \
+     -H "Authorization: Bearer $CHIPTRACE_INGEST_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"archive_id":"<64 位 SHA-256>"}'
+   ```
+
+   回滚要求 live 账本刚好为空；否则拒绝，避免把归档后的新错误丢掉。归档记录内容被改动
+   （`archive_id` 不匹配）时，Relay 启动与健康读取都会失败关闭，而不是接受一个被削弱的
+   审计证据。CI 基线比较使用「live + 归档」的合计值，因此归档不会让基线看起来回退，
+   也不会掩盖真实的回退。
 `--max-quality-errors` 仍可同时使用，继续提供绝对上限。基线不会删除 Raw、修改 Relay 账本，
 也不能替代四源 Turn、Producer、OSS 或 Buyer 验收；生产者缺陷修复后应重新人工审计并创建新基线。
 

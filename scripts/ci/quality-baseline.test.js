@@ -83,6 +83,36 @@ test('comparison rejects a reset or replaced ledger even when total quality erro
   assert.throws(() => compareQualityBaseline(current, value), /quality counter regressed/);
 });
 
+test('an approved quality archive keeps the comparison monotonic', () => {
+  const value = baseline();
+  const archived = coverage();
+  const live = coverage();
+  live.quality_errors = 1;
+  live.quality_errors_by_endpoint = {
+    otlp_logs: { unknown_events: 0, conversion_errors: 0, total: 0, reasons: {} },
+    otlp_traces: { unknown_events: 0, conversion_errors: 0, total: 0, reasons: {} },
+    hooks: { unknown_events: 0, conversion_errors: 1, total: 1, reasons: { invalid_tool: 1 } },
+  };
+  live.quality_errors_archived_total = archived.quality_errors;
+  live.quality_errors_archived_by_endpoint = archived.quality_errors_by_endpoint;
+
+  const result = compareQualityBaseline(live, value);
+  // The live ledger is zero for the historical reasons, yet the effective
+  // total still carries them, so only the genuinely new hook error is new.
+  assert.equal(result.current_live_quality_errors, 1);
+  assert.equal(result.archived_quality_errors, 3);
+  assert.equal(result.current_quality_errors, 4);
+  assert.equal(result.new_quality_errors, 1);
+
+  // A live ledger that loses an archived reason is still a regression.
+  const lossy = { ...live, quality_errors_archived_by_endpoint: {
+    otlp_logs: { unknown_events: 1, conversion_errors: 0, total: 1, reasons: { unsupported_event: 1 } },
+    otlp_traces: { unknown_events: 0, conversion_errors: 0, total: 0, reasons: {} },
+    hooks: { unknown_events: 0, conversion_errors: 0, total: 0, reasons: {} },
+  } };
+  assert.throws(() => compareQualityBaseline(lossy, value), /regressed/);
+});
+
 test('tampering with approval or counts invalidates the baseline hash', () => {
   const value = baseline();
   value.approval_note = 'changed';

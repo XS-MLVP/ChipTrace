@@ -45,6 +45,8 @@ const DELIVERY_SCHEMA_VERSION: &str = "chiptrace.delivery-ledger.v1";
 const DELIVERY_COUNTERS_KEY: &str = "delivery_counters_v1";
 const INGEST_QUALITY_COUNTERS_KEY: &str = "ingest_quality_counters_v1";
 const INGEST_QUALITY_SEED_SCHEMA_VERSION: &str = "chiptrace.ingest-quality-seed.v1";
+const INGEST_QUALITY_ARCHIVE_KEY: &str = "ingest_quality_archive_v1";
+const INGEST_QUALITY_ARCHIVE_SCHEMA_VERSION: &str = "chiptrace.ingest-quality-archive.v1";
 const INGEST_QUALITY_SEED_FILE: &str = "ingest-quality-seed.json";
 const MAX_INGEST_QUALITY_SEED_BYTES: u64 = 64 * 1024;
 const INGEST_COVERAGE_FRESHNESS_WINDOW_MS: u64 = 5 * 60 * 1_000;
@@ -120,7 +122,7 @@ struct DeliveryCounters {
 /// false green readiness result.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct IngestQualityCounters {
+pub struct IngestQualityCounters {
     #[serde(default)]
     otlp_logs_unknown_events: u64,
     #[serde(default)]
@@ -139,6 +141,36 @@ struct IngestQualityCounters {
     otlp_traces_quality_reasons: BTreeMap<String, u64>,
     #[serde(default)]
     codex_hook_quality_reasons: BTreeMap<String, u64>,
+}
+
+/// Audited record of historical ingest-quality counts removed from the live
+/// ledger. The archive is the only supported way to bring the live counters to
+/// zero, and it deliberately keeps the exact per-endpoint, per-reason numbers
+/// so nothing is merged, renamed or dropped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngestQualityArchive {
+    pub schema_version: String,
+    pub archive_id: String,
+    pub archived_at: String,
+    pub approved_by: String,
+    pub approval_note: String,
+    /// Total the live ledger must have reported before the archive ran.
+    pub source_quality_errors: u64,
+    pub counters: IngestQualityCounters,
+}
+
+impl IngestQualityArchive {
+    fn compute_id(&self) -> Result<String> {
+        let mut copy = self.clone();
+        copy.archive_id = String::new();
+        let bytes = serde_json::to_vec(&copy)?;
+        Ok(sha256_hex(&bytes))
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    crate::jsonl::sha256_bytes(bytes)
 }
 
 /// One-time migration evidence for a Delivery ledger created before quality
@@ -256,6 +288,23 @@ impl IngestQualityCounters {
             CloudEndpoint::OtlpLogs => &mut self.otlp_logs_quality_reasons,
             CloudEndpoint::OtlpTraces => &mut self.otlp_traces_quality_reasons,
             CloudEndpoint::CodexHook => &mut self.codex_hook_quality_reasons,
+        }
+    }
+
+    fn endpoint_counts(&self, endpoint: CloudEndpoint) -> (u64, u64) {
+        match endpoint {
+            CloudEndpoint::OtlpLogs => (
+                self.otlp_logs_unknown_events,
+                self.otlp_logs_conversion_errors,
+            ),
+            CloudEndpoint::OtlpTraces => (
+                self.otlp_traces_unknown_events,
+                self.otlp_traces_conversion_errors,
+            ),
+            CloudEndpoint::CodexHook => (
+                self.codex_hook_unknown_events,
+                self.codex_hook_conversion_errors,
+            ),
         }
     }
 
@@ -928,6 +977,132 @@ impl DeliveryLedger {
         read_ingest_quality_counters(&meta)
     }
 
+    /// Read the live counters and the archive in one read transaction, so the
+    /// health view can never mix two generations.
+    ///
+    /// The archive is content-addressed: a corrupted or hand-edited record
+    /// fails startup instead of silently weakening the audit trail.
+    fn ingest_quality_snapshot(
+        &self,
+    ) -> Result<(IngestQualityCounters, Option<IngestQualityArchive>)> {
+        let transaction = self.database.begin_read()?;
+        let meta = transaction.open_table(META)?;
+        let counters = read_ingest_quality_counters(&meta)?;
+        counters.checked_total()?;
+        let archive: Option<IngestQualityArchive> = match meta.get(INGEST_QUALITY_ARCHIVE_KEY)? {
+            Some(value) => Some(serde_json::from_slice(value.value())?),
+            None => None,
+        };
+        if let Some(archive) = &archive {
+            if archive.schema_version != INGEST_QUALITY_ARCHIVE_SCHEMA_VERSION {
+                bail!(
+                    "unsupported quality archive schema: {}",
+                    archive.schema_version
+                );
+            }
+            if archive.archive_id != archive.compute_id()? {
+                bail!("quality archive id does not match its content");
+            }
+            if archive.source_quality_errors != archive.counters.checked_total()? {
+                bail!("quality archive total does not match its counters");
+            }
+        }
+        Ok((counters, archive))
+    }
+
+    /// Move the current quality counters into an audited archive and zero the
+    /// live ledger in the same transaction.
+    ///
+    /// This is the only supported way to make `/ready` pass on a ledger that
+    /// carries historical counts. It refuses when:
+    /// - the live total differs from `expected_total` (the target moved),
+    /// - an archive already exists (archives are append-only, never rewritten),
+    /// - the operator identity or note is empty.
+    fn archive_ingest_quality(
+        &self,
+        expected_total: u64,
+        approved_by: &str,
+        approval_note: &str,
+    ) -> Result<IngestQualityArchive> {
+        if approved_by.trim().is_empty() {
+            bail!("quality archive requires a non-empty approver");
+        }
+        if approval_note.trim().is_empty() {
+            bail!("quality archive requires a non-empty approval note");
+        }
+        let transaction = self.database.begin_write()?;
+        let archive = {
+            let mut meta = transaction.open_table(META)?;
+            if meta.get(INGEST_QUALITY_ARCHIVE_KEY)?.is_some() {
+                bail!("quality archive already exists; archives are append-only");
+            }
+            let current = read_ingest_quality_counters(&meta)?;
+            let total = current.checked_total()?;
+            if total != expected_total {
+                bail!(
+                    "quality archive total mismatch: expected {expected_total}, ledger reports {total}"
+                );
+            }
+            let mut archive = IngestQualityArchive {
+                schema_version: INGEST_QUALITY_ARCHIVE_SCHEMA_VERSION.to_owned(),
+                archive_id: String::new(),
+                archived_at: crate::jsonl::utc_now(),
+                approved_by: approved_by.trim().to_owned(),
+                approval_note: approval_note.trim().to_owned(),
+                source_quality_errors: total,
+                counters: current,
+            };
+            archive.archive_id = archive.compute_id()?;
+            // Keep the counter key present with zeroed values so startup does
+            // not fall into the one-time seed migration path.
+            write_ingest_quality_counters(&mut meta, &IngestQualityCounters::default())?;
+            meta.insert(
+                INGEST_QUALITY_ARCHIVE_KEY,
+                serde_json::to_vec(&archive)?.as_slice(),
+            )?;
+            archive
+        };
+        transaction.commit()?;
+        Ok(archive)
+    }
+
+    /// Put the archived snapshot back into the live counters by exact archive
+    /// id. Refuses if the live ledger is not empty, so a restore can never
+    /// merge two histories or discard errors observed after the archive.
+    fn restore_ingest_quality(&self, archive_id: &str) -> Result<()> {
+        if archive_id.trim().is_empty() {
+            bail!("quality restore requires an archive id");
+        }
+        let transaction = self.database.begin_write()?;
+        {
+            let mut meta = transaction.open_table(META)?;
+            let archive: IngestQualityArchive = match meta.get(INGEST_QUALITY_ARCHIVE_KEY)? {
+                Some(value) => serde_json::from_slice(value.value())?,
+                None => bail!("quality restore requires a stored archive"),
+            };
+            if archive.schema_version != INGEST_QUALITY_ARCHIVE_SCHEMA_VERSION {
+                bail!(
+                    "unsupported quality archive schema: {}",
+                    archive.schema_version
+                );
+            }
+            if archive.archive_id != archive.compute_id()? {
+                bail!("quality archive id does not match its content");
+            }
+            if archive.archive_id != archive_id {
+                bail!("quality archive id does not match the requested restore");
+            }
+            let current = read_ingest_quality_counters(&meta)?;
+            if current.checked_total()? != 0 {
+                bail!("quality restore requires an empty live ledger");
+            }
+            write_ingest_quality_counters(&mut meta, &archive.counters)?;
+            meta.remove(INGEST_QUALITY_ARCHIVE_KEY)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn record_ingest_quality_with_reasons(
         &self,
         endpoint: CloudEndpoint,
@@ -1212,12 +1387,44 @@ impl DurableRelay {
         Ok(results)
     }
 
+    #[cfg(test)]
     fn ingest_quality_counters(&self) -> Result<IngestQualityCounters> {
         self.inner
             .ledger
             .lock()
             .expect("delivery ledger poisoned")
             .ingest_quality_counters()
+    }
+
+    fn ingest_quality_snapshot(
+        &self,
+    ) -> Result<(IngestQualityCounters, Option<IngestQualityArchive>)> {
+        self.inner
+            .ledger
+            .lock()
+            .expect("delivery ledger poisoned")
+            .ingest_quality_snapshot()
+    }
+
+    fn archive_ingest_quality(
+        &self,
+        expected_total: u64,
+        approved_by: &str,
+        approval_note: &str,
+    ) -> Result<IngestQualityArchive> {
+        self.inner
+            .ledger
+            .lock()
+            .expect("delivery ledger poisoned")
+            .archive_ingest_quality(expected_total, approved_by, approval_note)
+    }
+
+    fn restore_ingest_quality(&self, archive_id: &str) -> Result<()> {
+        self.inner
+            .ledger
+            .lock()
+            .expect("delivery ledger poisoned")
+            .restore_ingest_quality(archive_id)
     }
 
     fn record_ingest_quality_with_reasons(
@@ -1856,17 +2063,26 @@ struct IngestCoverageState {
     tool_executions: u64,
     quality_errors: u64,
     quality_errors_current_process: u64,
+    quality_errors_archived_total: u64,
+    quality_archive: Option<IngestQualityArchive>,
 }
 
 impl IngestCoverageState {
     #[cfg(test)]
     fn new() -> Self {
-        Self::with_quality_counters(IngestQualityCounters::default())
+        Self::with_quality_snapshot(IngestQualityCounters::default(), None)
             .expect("default quality counters must be valid")
     }
 
+    #[cfg(test)]
     fn with_quality_counters(counters: IngestQualityCounters) -> Result<Self> {
-        let quality_errors = counters.checked_total()?;
+        Self::with_quality_snapshot(counters, None)
+    }
+
+    fn with_quality_snapshot(
+        counters: IngestQualityCounters,
+        archive: Option<IngestQualityArchive>,
+    ) -> Result<Self> {
         let mut state = Self {
             started_at: utc_now(),
             wire: RouteCoverage::default(),
@@ -1876,19 +2092,39 @@ impl IngestCoverageState {
             hooks: RouteCoverage::default(),
             lifecycle_events: 0,
             tool_executions: 0,
-            quality_errors,
+            quality_errors: 0,
             quality_errors_current_process: 0,
+            quality_errors_archived_total: 0,
+            quality_archive: None,
         };
-        state.otlp_logs.quality_unknown_events = counters.otlp_logs_unknown_events;
-        state.otlp_logs.quality_conversion_errors = counters.otlp_logs_conversion_errors;
-        state.otlp_logs.quality_reasons = counters.reasons(CloudEndpoint::OtlpLogs).clone();
-        state.otlp_traces.quality_unknown_events = counters.otlp_traces_unknown_events;
-        state.otlp_traces.quality_conversion_errors = counters.otlp_traces_conversion_errors;
-        state.otlp_traces.quality_reasons = counters.reasons(CloudEndpoint::OtlpTraces).clone();
-        state.hooks.quality_unknown_events = counters.codex_hook_unknown_events;
-        state.hooks.quality_conversion_errors = counters.codex_hook_conversion_errors;
-        state.hooks.quality_reasons = counters.reasons(CloudEndpoint::CodexHook).clone();
+        state.apply_quality_snapshot(counters, archive)?;
         Ok(state)
+    }
+
+    /// Replace the durable quality view with a ledger snapshot. Used at startup
+    /// and immediately after an operator archive or restore, so the health
+    /// breakdown always mirrors the ledger it claims to describe.
+    fn apply_quality_snapshot(
+        &mut self,
+        counters: IngestQualityCounters,
+        archive: Option<IngestQualityArchive>,
+    ) -> Result<()> {
+        self.quality_errors = counters.checked_total()?;
+        self.quality_errors_archived_total = archive
+            .as_ref()
+            .map_or(0, |archive| archive.source_quality_errors);
+        self.quality_archive = archive;
+        for (route, endpoint) in [
+            (&mut self.otlp_logs, CloudEndpoint::OtlpLogs),
+            (&mut self.otlp_traces, CloudEndpoint::OtlpTraces),
+            (&mut self.hooks, CloudEndpoint::CodexHook),
+        ] {
+            let (unknown_events, conversion_errors) = counters.endpoint_counts(endpoint);
+            route.quality_unknown_events = unknown_events;
+            route.quality_conversion_errors = conversion_errors;
+            route.quality_reasons = counters.reasons(endpoint).clone();
+        }
+        Ok(())
     }
 
     fn observe_wire(&mut self, acknowledged: &[(WireCaptureEvidence, bool)]) {
@@ -2126,8 +2362,39 @@ impl IngestCoverageState {
             },
             "quality_errors":self.quality_errors,
             "quality_errors_current_process":self.quality_errors_current_process,
+            "quality_errors_archived_total":self.quality_errors_archived_total,
+            "quality_errors_archived_by_endpoint":self.quality_archive.as_ref().map(|archive| {
+                json!({
+                    "otlp_logs":archived_quality_value(&archive.counters, CloudEndpoint::OtlpLogs),
+                    "otlp_traces":archived_quality_value(&archive.counters, CloudEndpoint::OtlpTraces),
+                    "hooks":archived_quality_value(&archive.counters, CloudEndpoint::CodexHook),
+                })
+            }),
+            "quality_archive":self.quality_archive.as_ref().map(|archive| {
+                json!({
+                    "schema_version":archive.schema_version,
+                    "archive_id":archive.archive_id,
+                    "archived_at":archive.archived_at,
+                    "approved_by":archive.approved_by,
+                    "approval_note":archive.approval_note,
+                    "source_quality_errors":archive.source_quality_errors,
+                })
+            }),
         })
     }
+}
+
+/// Archived counts keep the exact per-endpoint, per-reason shape of the live
+/// breakdown so CI can compare a post-archive ledger against a pre-archive
+/// baseline without losing history.
+fn archived_quality_value(counters: &IngestQualityCounters, endpoint: CloudEndpoint) -> Value {
+    let (unknown_events, conversion_errors) = counters.endpoint_counts(endpoint);
+    json!({
+        "unknown_events":unknown_events,
+        "conversion_errors":conversion_errors,
+        "total":unknown_events.saturating_add(conversion_errors),
+        "reasons":counters.reasons(endpoint),
+    })
 }
 
 fn route_coverage_value(route: &RouteCoverage) -> Value {
@@ -2208,7 +2475,7 @@ pub async fn serve_relay(
     let max_connections = config.max_connections;
     let max_envelope_bytes = config.max_envelope_bytes;
     let relay = DurableRelay::open(config).await?;
-    let ingest_quality_counters = relay.ingest_quality_counters()?;
+    let (ingest_quality_counters, ingest_quality_archive) = relay.ingest_quality_snapshot()?;
     let body_budget = InflightBodyBudget::new(
         relay.inner.config.max_inflight_body_bytes,
         relay.inner.config.max_envelope_bytes,
@@ -2225,6 +2492,11 @@ pub async fn serve_relay(
         .route("/ready", get(relay_ready))
         .route("/flush", post(relay_flush))
         .route("/admin/requeue-failed", post(relay_requeue_failed))
+        .route("/admin/quality-archive", post(relay_quality_archive))
+        .route(
+            "/admin/quality-archive/restore",
+            post(relay_quality_archive_restore),
+        )
         .fallback(relay_not_found)
         .layer(DefaultBodyLimit::max(max_envelope_bytes))
         .layer(ConcurrencyLimitLayer::new(max_connections.max(1)))
@@ -2238,8 +2510,9 @@ pub async fn serve_relay(
             max_batch_records: relay.inner.config.max_batch_records,
             relay: relay.clone(),
             body_budget,
-            ingest_coverage: Arc::new(Mutex::new(IngestCoverageState::with_quality_counters(
+            ingest_coverage: Arc::new(Mutex::new(IngestCoverageState::with_quality_snapshot(
                 ingest_quality_counters,
+                ingest_quality_archive,
             )?)),
         });
     let listener = TcpListener::bind(bind).await?;
@@ -2904,6 +3177,210 @@ async fn relay_requeue_failed(State(state): State<RelayAppState>, request: Reque
         Err(error) => relay_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({"ok":false,"reason":"requeue_failed","detail":error.to_string()}),
+        ),
+    }
+}
+
+/// Rebuild the in-memory quality view from the ledger after an admin mutation,
+/// so `/health` and `/ready` immediately report the state the next read would
+/// see. The live total and archive total are returned for the response body.
+fn refresh_ingest_quality(state: &RelayAppState) -> Result<(u64, u64, Option<String>)> {
+    let (counters, archive) = state.relay.ingest_quality_snapshot()?;
+    let live = counters.checked_total()?;
+    let archived = archive
+        .as_ref()
+        .map_or(0, |archive| archive.source_quality_errors);
+    let archive_id = archive.as_ref().map(|archive| archive.archive_id.clone());
+    state
+        .ingest_coverage
+        .lock()
+        .expect("ingest coverage poisoned")
+        .apply_quality_snapshot(counters, archive)?;
+    Ok((live, archived, archive_id))
+}
+
+/// Operator-only, audited retirement of historical ingest-quality counts.
+///
+/// Body: {"expected_total": N, "approved_by": "…", "approval_note": "…"}.
+/// `expected_total` must equal the live durable total, so a stale plan can
+/// never archive a ledger that moved underneath it. The `{ "dry_run": true }`
+/// variant reports the exact counters that would be archived and writes
+/// nothing, so the approval can quote real numbers.
+///
+/// This is the only supported way to make `/ready` pass on a ledger carrying
+/// historical counts: the numbers move, unchanged, into a content-addressed
+/// archive record, and `quality_errors` in `/health` becomes the live-only
+/// count.
+async fn relay_quality_archive(State(state): State<RelayAppState>, request: Request) -> Response {
+    if !ingest_authorized(&state, &request) {
+        return relay_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"ok":false,"reason":"ingest_auth_required"}),
+        );
+    }
+    let body = match state.body_budget.read_json(request).await {
+        Ok(body) => body,
+        Err(error) => return relay_body_error_response(error),
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&body.bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            return relay_response(
+                StatusCode::BAD_REQUEST,
+                json!({"ok":false,"reason":"invalid_body","detail":error.to_string()}),
+            );
+        }
+    };
+    let dry_run = value
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if dry_run {
+        return match state.relay.ingest_quality_snapshot() {
+            Ok((counters, archive)) => {
+                match (counters.checked_total(), serde_json::to_value(&counters)) {
+                    (Ok(total), Ok(counters)) => relay_response(
+                        StatusCode::OK,
+                        json!({
+                            "ok": true,
+                            "dry_run": true,
+                            "source_quality_errors": total,
+                            "counters": counters,
+                            "archive_exists": archive.is_some(),
+                            "quality_archive": archive.map(|archive| json!({
+                                "archive_id": archive.archive_id,
+                                "archived_at": archive.archived_at,
+                                "source_quality_errors": archive.source_quality_errors,
+                            })),
+                        }),
+                    ),
+                    (Err(error), _) => relay_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"ok":false,"reason":"ledger_unavailable","detail":error.to_string()}),
+                    ),
+                    (_, Err(error)) => relay_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"ok":false,"reason":"ledger_unavailable","detail":error.to_string()}),
+                    ),
+                }
+            }
+            Err(error) => relay_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"ok":false,"reason":"ledger_unavailable","detail":error.to_string()}),
+            ),
+        };
+    }
+    let Some(expected_total) = value.get("expected_total").and_then(Value::as_u64) else {
+        return relay_response(
+            StatusCode::BAD_REQUEST,
+            json!({"ok":false,"reason":"missing_expected_total"}),
+        );
+    };
+    let Some(approved_by) = value.get("approved_by").and_then(Value::as_str) else {
+        return relay_response(
+            StatusCode::BAD_REQUEST,
+            json!({"ok":false,"reason":"missing_approved_by"}),
+        );
+    };
+    let Some(approval_note) = value.get("approval_note").and_then(Value::as_str) else {
+        return relay_response(
+            StatusCode::BAD_REQUEST,
+            json!({"ok":false,"reason":"missing_approval_note"}),
+        );
+    };
+    let archived = match state.relay.archive_ingest_quality(
+        expected_total,
+        approved_by,
+        approval_note,
+    ) {
+        Ok(archive) => archive,
+        Err(error) => {
+            return relay_response(
+                StatusCode::CONFLICT,
+                json!({"ok":false,"reason":"quality_archive_refused","detail":error.to_string()}),
+            );
+        }
+    };
+    let refreshed = refresh_ingest_quality(&state);
+    let serialized = serde_json::to_value(&archived);
+    match refreshed {
+        Ok((live, archived_total, archive_id)) => match serialized {
+            Ok(archive) => relay_response(
+                StatusCode::OK,
+                json!({
+                    "ok": true,
+                    "quality_errors": live,
+                    "quality_errors_archived_total": archived_total,
+                    "quality_archive_id": archive_id,
+                    "archive": archive,
+                }),
+            ),
+            Err(error) => relay_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"ok":false,"reason":"quality_archive_serialize_failed","detail":error.to_string()}),
+            ),
+        },
+        Err(error) => relay_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"ok":false,"reason":"quality_archive_refresh_failed","detail":error.to_string()}),
+        ),
+    }
+}
+
+/// Operator-only rollback of the quality archive. The live ledger must still
+/// be empty, so a restore can never merge two histories or discard errors
+/// that arrived after the archive.
+///
+/// Body: {"archive_id": "…"} naming the exact stored archive.
+async fn relay_quality_archive_restore(
+    State(state): State<RelayAppState>,
+    request: Request,
+) -> Response {
+    if !ingest_authorized(&state, &request) {
+        return relay_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"ok":false,"reason":"ingest_auth_required"}),
+        );
+    }
+    let body = match state.body_budget.read_json(request).await {
+        Ok(body) => body,
+        Err(error) => return relay_body_error_response(error),
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&body.bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            return relay_response(
+                StatusCode::BAD_REQUEST,
+                json!({"ok":false,"reason":"invalid_body","detail":error.to_string()}),
+            );
+        }
+    };
+    let Some(archive_id) = value.get("archive_id").and_then(Value::as_str) else {
+        return relay_response(
+            StatusCode::BAD_REQUEST,
+            json!({"ok":false,"reason":"missing_archive_id"}),
+        );
+    };
+    if let Err(error) = state.relay.restore_ingest_quality(archive_id) {
+        return relay_response(
+            StatusCode::CONFLICT,
+            json!({"ok":false,"reason":"quality_restore_refused","detail":error.to_string()}),
+        );
+    }
+    match refresh_ingest_quality(&state) {
+        Ok((live, archived_total, archive_id)) => relay_response(
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "restored": true,
+                "quality_errors": live,
+                "quality_errors_archived_total": archived_total,
+                "quality_archive_id": archive_id,
+            }),
+        ),
+        Err(error) => relay_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"ok":false,"reason":"quality_restore_refresh_failed","detail":error.to_string()}),
         ),
     }
 }
@@ -4527,6 +5004,155 @@ mod tests {
             coverage["quality_errors_by_endpoint"]["otlp_traces"]["total"],
             5
         );
+    }
+
+    #[test]
+    fn quality_archive_moves_counts_verbatim_and_refuses_a_second_time() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("delivery.redb");
+        let ledger = DeliveryLedger::open(&path).unwrap();
+        let reasons = BTreeMap::from([
+            ("invalid_lifecycle".to_owned(), 7),
+            ("legacy_unclassified".to_owned(), 3),
+        ]);
+        ledger
+            .record_ingest_quality_with_reasons(CloudEndpoint::OtlpTraces, 4, 6, &reasons)
+            .unwrap();
+        let hooks = BTreeMap::from([("invalid_tool".to_owned(), 2)]);
+        ledger
+            .record_ingest_quality_with_reasons(CloudEndpoint::CodexHook, 0, 2, &hooks)
+            .unwrap();
+        assert_eq!(
+            ledger.ingest_quality_counters().unwrap().total().unwrap(),
+            12
+        );
+
+        // A stale plan must not archive a ledger that moved.
+        assert!(
+            ledger
+                .archive_ingest_quality(11, "ops", "retire pre-2026-10-31 history")
+                .is_err()
+        );
+        // Approval evidence is mandatory.
+        assert!(ledger.archive_ingest_quality(12, "  ", "note").is_err());
+        assert!(ledger.archive_ingest_quality(12, "ops", "").is_err());
+        assert_eq!(
+            ledger.ingest_quality_counters().unwrap().total().unwrap(),
+            12
+        );
+
+        let archive = ledger
+            .archive_ingest_quality(12, "ops", "retire pre-2026-10-31 history")
+            .unwrap();
+        assert_eq!(archive.source_quality_errors, 12);
+        assert_eq!(archive.counters.checked_total().unwrap(), 12);
+        assert_eq!(archive.counters.otlp_traces_quality_reasons, reasons);
+        assert_eq!(archive.counters.codex_hook_quality_reasons, hooks);
+        assert_eq!(archive.archive_id.len(), 64);
+
+        // The live ledger is zeroed, and the archive keeps every number.
+        let (counters, stored) = ledger.ingest_quality_snapshot().unwrap();
+        assert_eq!(counters.checked_total().unwrap(), 0);
+        let stored = stored.expect("archive must survive a reopen");
+        assert_eq!(stored.archive_id, archive.archive_id);
+        assert_eq!(stored.counters.otlp_traces_conversion_errors, 6);
+        // Archives are append-only.
+        assert!(
+            ledger
+                .archive_ingest_quality(0, "ops", "second pass")
+                .is_err()
+        );
+        drop(ledger);
+
+        // A reopen must not resurrect the counts through the seed path.
+        let reopened = DeliveryLedger::open(&path).unwrap();
+        let (counters, stored) = reopened.ingest_quality_snapshot().unwrap();
+        assert_eq!(counters.checked_total().unwrap(), 0);
+        let stored = stored.unwrap();
+        let coverage = IngestCoverageState::with_quality_snapshot(counters, Some(stored.clone()))
+            .unwrap()
+            .snapshot();
+        assert_eq!(coverage["quality_errors"], 0);
+        assert_eq!(coverage["quality_errors_archived_total"], 12);
+        assert_eq!(
+            coverage["quality_errors_archived_by_endpoint"]["otlp_traces"]["total"],
+            10
+        );
+        assert_eq!(
+            coverage["quality_errors_archived_by_endpoint"]["hooks"]["reasons"]["invalid_tool"],
+            2
+        );
+        assert_eq!(coverage["quality_archive"]["archive_id"], stored.archive_id);
+        assert_eq!(coverage["quality_reason_breakdown_complete"], true);
+
+        // Restore requires the exact id and an empty live ledger.
+        assert!(
+            reopened
+                .restore_ingest_quality("0".repeat(64).as_str())
+                .is_err()
+        );
+        reopened.restore_ingest_quality(&stored.archive_id).unwrap();
+        let (counters, archived) = reopened.ingest_quality_snapshot().unwrap();
+        assert_eq!(counters.checked_total().unwrap(), 12);
+        assert!(archived.is_none(), "restore consumes the archive record");
+        // A second restore has nothing left to restore.
+        assert!(reopened.restore_ingest_quality(&stored.archive_id).is_err());
+    }
+
+    #[test]
+    fn quality_restore_refuses_to_merge_with_live_errors() {
+        let temporary = tempfile::tempdir().unwrap();
+        let ledger = DeliveryLedger::open(&temporary.path().join("delivery.redb")).unwrap();
+        let reasons = BTreeMap::from([("invalid_lifecycle".to_owned(), 2)]);
+        ledger
+            .record_ingest_quality_with_reasons(CloudEndpoint::OtlpTraces, 0, 2, &reasons)
+            .unwrap();
+        let archive = ledger
+            .archive_ingest_quality(2, "ops", "baseline retirement")
+            .unwrap();
+        // Errors observed after the archive must never be discarded.
+        ledger
+            .record_ingest_quality_with_reasons(
+                CloudEndpoint::OtlpLogs,
+                1,
+                0,
+                &BTreeMap::from([("unsupported_event".to_owned(), 1)]),
+            )
+            .unwrap();
+        assert!(ledger.restore_ingest_quality(&archive.archive_id).is_err());
+        let (counters, stored) = ledger.ingest_quality_snapshot().unwrap();
+        assert_eq!(counters.checked_total().unwrap(), 1);
+        assert!(stored.is_some(), "a refused restore keeps the archive");
+    }
+
+    #[test]
+    fn tampered_quality_archive_fails_the_snapshot() {
+        let temporary = tempfile::tempdir().unwrap();
+        let ledger = DeliveryLedger::open(&temporary.path().join("delivery.redb")).unwrap();
+        ledger
+            .record_ingest_quality_with_reasons(
+                CloudEndpoint::OtlpTraces,
+                0,
+                1,
+                &BTreeMap::from([("invalid_lifecycle".to_owned(), 1)]),
+            )
+            .unwrap();
+        let mut archive = ledger
+            .archive_ingest_quality(1, "ops", "baseline retirement")
+            .unwrap();
+        archive.counters.otlp_traces_conversion_errors = 0;
+        archive.counters.otlp_traces_quality_reasons.clear();
+        let transaction = ledger.database.begin_write().unwrap();
+        {
+            let mut meta = transaction.open_table(META).unwrap();
+            meta.insert(
+                INGEST_QUALITY_ARCHIVE_KEY,
+                serde_json::to_vec(&archive).unwrap().as_slice(),
+            )
+            .unwrap();
+        }
+        transaction.commit().unwrap();
+        assert!(ledger.ingest_quality_snapshot().is_err());
     }
 
     #[test]

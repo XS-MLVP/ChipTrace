@@ -130,6 +130,55 @@ function normalizeQualitySnapshot(coverage, label = 'coverage') {
   };
 }
 
+// An operator quality archive moves historical counts out of the live ledger
+// without deleting them. Comparison must stay monotonic across that boundary,
+// so the effective total is live + archived per endpoint and per reason. A
+// payload without archive fields is treated as archived = 0.
+function combineArchivedQuality(coverage) {
+  const live = normalizeQualitySnapshot(coverage);
+  const archived = coverage.quality_errors_archived_by_endpoint;
+  if (archived === undefined || archived === null) return live;
+  const archivedSnapshot = normalizeQualitySnapshot(
+    {
+      quality_errors_scope: 'durable_relay_state',
+      quality_reason_breakdown_complete: true,
+      quality_errors: Object.values(archived).reduce(
+        (sum, route) => sum + nonNegativeInteger(route?.total, 'archived.total'),
+        0,
+      ),
+      quality_errors_by_endpoint: archived,
+    },
+    'coverage.quality_errors_archived_by_endpoint',
+  );
+  const combined = {
+    quality_errors_scope: 'durable_relay_state',
+    quality_errors: 0,
+    quality_reason_breakdown_complete: true,
+    quality_errors_by_endpoint: {},
+  };
+  for (const endpoint of ENDPOINTS) {
+    const liveRoute = live.quality_errors_by_endpoint[endpoint];
+    const archivedRoute = archivedSnapshot.quality_errors_by_endpoint[endpoint];
+    const reasons = {};
+    for (const reason of new Set([
+      ...Object.keys(liveRoute.reasons),
+      ...Object.keys(archivedRoute.reasons),
+    ])) {
+      reasons[reason] = (liveRoute.reasons[reason] || 0) + (archivedRoute.reasons[reason] || 0);
+    }
+    const unknownEvents = liveRoute.unknown_events + archivedRoute.unknown_events;
+    const conversionErrors = liveRoute.conversion_errors + archivedRoute.conversion_errors;
+    combined.quality_errors_by_endpoint[endpoint] = {
+      unknown_events: unknownEvents,
+      conversion_errors: conversionErrors,
+      total: unknownEvents + conversionErrors,
+      reasons,
+    };
+    combined.quality_errors += unknownEvents + conversionErrors;
+  }
+  return combined;
+}
+
 function validateApproval(approvedBy, approvedAt, approvalNote) {
   nonEmptyString(approvedBy, 'approved_by', 256);
   nonEmptyString(approvedAt, 'approved_at', 128);
@@ -202,7 +251,7 @@ function buildBaseline(report, { sourceReportSha256, approvedBy, approvedAt, app
 }
 
 function compareQualityBaseline(coverage, baselineValue) {
-  const current = normalizeQualitySnapshot(coverage);
+  const current = combineArchivedQuality(object(coverage, 'coverage'));
   const baseline = verifyQualityBaseline(baselineValue);
   let newQualityErrors = 0;
   for (const endpoint of ENDPOINTS) {
@@ -233,15 +282,26 @@ function compareQualityBaseline(coverage, baselineValue) {
   if (current.quality_errors < baseline.quality_errors) {
     fail('quality_errors regressed below the approved baseline');
   }
+  const liveQualityErrors = safeLiveTotal(coverage);
   return {
     baseline_id: baseline.baseline_id,
     approved_by: baseline.approved_by,
     approved_at: baseline.approved_at,
     source_report_sha256: baseline.source_report_sha256,
     baseline_quality_errors: baseline.quality_errors,
+    // Effective total: live ledger plus any operator archive. This is the
+    // number that must never regress; the live-only total legitimately drops
+    // to zero when a historical archive is approved.
     current_quality_errors: current.quality_errors,
+    current_live_quality_errors: liveQualityErrors,
+    archived_quality_errors: current.quality_errors - liveQualityErrors,
     new_quality_errors: newQualityErrors,
   };
+}
+
+function safeLiveTotal(coverage) {
+  const value = coverage?.quality_errors;
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
 function readJson(inputPath, label = 'input') {

@@ -1753,3 +1753,56 @@ sealed Segment；宿主根分区约 91% 使用率，NFS 约 58%。当前没有�
 | P2 | 对象存储 pilot → 生产切换 | 规范与持久化要求 |
 | P2 | SFTP 发布 + T+1 调度 | 规范第 11、12 条 |
 
+
+## 2026-10-30 质量账本可审计归档（P1 落地）
+
+### 现状证据
+
+- 线上 Relay（`3012`，revision `0b893de`）`/health` 报告 `quality_errors=8969`、
+  `quality_errors_current_process=135`、`quality_errors_archived_total` 字段缺失，
+  `/ready` 持续因 `relay_quality_errors_nonzero` 返回非就绪。
+- 2026-10-26 记录的本进程新增为 0；本次观察到 135，说明生产者仍在产生新的质量错误，
+  **不满足归档审批前提**（先修复生产者，再迁移历史）。
+- 历史构成与 10-26 一致：`otlp_traces.invalid_lifecycle=6611`、
+  `otlp_traces.legacy_unclassified=1965`、`otlp_traces.identity_conflict=184`、
+  `otlp_logs.unsupported_event=137`、`hooks.conversion_error=61`、
+  `hooks.invalid_tool=5`、`hooks.missing_identity=6`。
+
+### 差距
+
+`/ready` 要求持久账本累计字面为零，而审计基线只作用于 CI 门禁，两者此前没有连接通道：
+要么永久 503，要么手工清零（会破坏审计证据）。缺的是「可迁移、可回滚、可验证」的归档通道。
+
+### 本次落地
+
+- Relay 新增 `POST /admin/quality-archive`（含 `{"dry_run":true}` 只读预览）与
+  `POST /admin/quality-archive/restore`，均走 ingest bearer token 鉴权。
+- 归档在一个 redb 事务内完成：写入内容寻址归档记录（schema、`archive_id`=SHA-256、
+  审批人、审批说明、归档前总数、逐端点逐原因计数），并把 live 计数清零。拒绝条件：
+  `expected_total` 与账本不符、已有归档（只追加不覆盖）、审批人或说明为空。
+- `/health` 新增 `quality_errors_archived_total`、`quality_errors_archived_by_endpoint`、
+  `quality_archive`（不含正文，仅证据字段）；`quality_errors` 变为 live-only。
+- 回滚要求 live 账本为空且携带精确 `archive_id`，避免把归档后的新错误抹掉；归档内容被
+  篡改时启动与健康读取都失败关闭。
+- CI 侧 `scripts/ci/quality-baseline.js` 改为按「live + 归档」合计值与基线比较，
+  归档不再被误判为回退，且归档中任一原因计数下降仍会失败；observation 记录
+  `current_live_quality_errors`、`archived_quality_errors` 与归档 ID。
+- 运维流程写入 `docs/operations.md`「历史质量计数的可审计归档」：dry-run 取数 → 审批
+  入档 → 带 `expected_total` 执行 → 失败的恢复路径。
+
+### 验证
+
+- `cargo test -p chiptrace --lib`：380 passed / 0 failed（新增 3 个归档用例：逐字迁移与
+  二次归档拒绝、live 非空时回滚拒绝、归档被篡改时快照失败）。
+- `node --test scripts/ci/quality-baseline.test.js scripts/ci/runtime-health-gate.test.js`：
+  37 passed / 0 failed（新增归档后基线单调性用例）。
+- `cargo clippy --all-targets`、`cargo fmt --check` 均通过。
+
+### 风险与未完成
+
+- 归档是运维动作，本次**未对线上账本执行**：`quality_errors_current_process=135` 表明
+  生产者仍在产生新错误，此时归档会把「当前回归」与「历史存量」一起清零，掩盖真实问题。
+- 需要先按原因码定位这 135 条（`invalid_lifecycle` 与 `identity_conflict` 优先）并修复，
+  稳定一个观察窗口后，再按 `docs/operations.md` 流程 dry-run → 审批 → 归档。
+- 归档后 `/ready` 才可能返回 200；`/ready` 在持续流量下仍会因 `relay_inflight_records`
+  抖动，该缺陷独立存在，需单独处理。
