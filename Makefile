@@ -35,6 +35,7 @@ failed-outbox-replay-test:
 codex-config-test:
 	cargo build --locked --bin chiptrace
 	node --test integrations/codex/config-contract.test.js integrations/codex/hook-ack.test.js
+	node --test integrations/codex/install-patched-codex.test.js
 	node --test scripts/ci/upstream-context.test.js scripts/ci/producer-source-cache.test.js scripts/ci/producer-command.test.js
 
 claude-config-test:

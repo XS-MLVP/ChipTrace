@@ -43,24 +43,50 @@ install -m 0755 /nfs/home/zhangyuxin/router_v2/ChipTrace/integrations/codex/chip
 ## 统一使用 patched Codex（严格交付）
 
 `patched-upstream.patch` 让 launcher 在
-`/nfs/home/zhangyuxin/.local/openai-codex/patched/0.163.0-alpha.11-chiptrace/codex`
-存在时优先使用它，否则回退到官方 package。
+`/nfs/home/zhangyuxin/.local/openai-codex/patched/0.163.0-alpha.11-chiptrace`
+存在时优先使用 `bin/codex`，否则回退到官方 package。
 
 该二进制是 `codex-producer-0.163.0` 的 **release** 构建（已 strip debug 信息），
 包含 Turn 级 SSE 标签与辅助 Span 的 process 作用域，因此日常会话可直接达到
 `delivery_ready=true`，无需在“日常版/采集版”之间切换。
 
-重建步骤：
+### 必须是完整 package，不能只有一个二进制
 
-```bash
-cd /nfs/home/zhangyuxin/router_v2/codex-producer-0.163.0/src/codex-rs
-RUSTUP_TOOLCHAIN=1.95.0-x86_64-unknown-linux-gnu \
-  cargo build --release -p codex-cli --bin codex --locked
-strip --strip-debug target/release/codex
-install -D -m 0755 target/release/codex \
-  /nfs/home/zhangyuxin/.local/openai-codex/patched/0.163.0-alpha.11-chiptrace/codex
+Codex 会从**二进制所在的 package layout** 解析运行时依赖：命令执行器
+`bin/codex-code-mode-host`、`codex-path/rg`、`codex-resources/bwrap`（以及
+voice 资源）。把 `codex` 单独丢进一个目录时，CLI 仍能对话，但**每一次 exec
+工具调用都会失败**：
+
+```
+failed to spawn code-mode host .../codex-code-mode-host: No such file or directory
 ```
 
-回退：删除上述文件，launcher 自动使用官方版本；或用
-`CODEX_PATCHED_UPSTREAM=<path>` 覆盖。
+搜索（`runtime.search`）同样降级。故障只在使用工具时才暴露 —— 2026-10-30 有一个
+会话就是这样全程无法执行命令。
+
+因此安装一律走脚本，它会把 CLI 摆成官方同款 layout、从同版本官方 release 包补齐
+helper/rg/bwrap、跑一次真实的"执行一条命令"冒烟测试，失败则回滚：
+
+```bash
+cd /nfs/home/zhangyuxin/router_v2/ChipTrace
+integrations/codex/install-patched-codex.sh            # 用 producer 现有 release 构建安装
+integrations/codex/install-patched-codex.sh --build    # 先重建 producer（codex + helper）
+integrations/codex/install-patched-codex.sh --verify   # 只校验现有安装
+```
+
+冒烟测试走 launcher + 一次性 `CODEX_NODE_HOME`，不会在真实会话列表里留下探针会话；
+`CODEX_PATCHED_SKIP_SMOKE=1` 可跳过。
+
+七个 producer 补丁一行都不碰 `code-mode-host` 及其依赖（`code-mode-protocol` /
+`code-mode-runtime`），所以同 commit 的官方 helper 与此构建等价，脚本直接取用：
+
+```
+<CODEX_CANONICAL_INSTALL_ROOT>/releases/<version>-*/node_modules/@openai/codex-linux-*/vendor/*/bin/
+```
+
+launcher 也会校验 package 完整性：缺任何一块时打印缺失项并回退官方 package，
+不再进入"能对话但工具全废"的状态。
+
+回退：删除 package 目录，launcher 自动使用官方版本；或用
+`CODEX_PATCHED_ROOT=<path>` 覆盖。
 

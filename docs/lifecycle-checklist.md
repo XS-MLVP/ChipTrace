@@ -7,18 +7,21 @@
 
 ```bash
 readlink ~/.local/openai-codex/current
-ls -la ~/.local/openai-codex/patched/0.163.0-alpha.11-chiptrace/codex
+integrations/codex/install-patched-codex.sh --verify        # 期望 "package ok"
 ```
 
-- `current` 指向的官方版本若发生变化，需重建 patched 二进制：
-  见 `integrations/codex/patches/README.md`。
+- `current` 指向的官方版本若发生变化，需重建/重装 patched 包：
+  `integrations/codex/install-patched-codex.sh`（见 `patches/README.md`）。
 - patched 二进制的 mtime 应不早于 `codex-producer-0.163.0` 源码最后一次修改。
+- `--verify` 只在文件齐全时通过；它不是冒烟测试。定期跑一次完整安装
+  （或手工 `codex exec "run 'echo ok'"`）确认工具真的能执行 —— 缺 helper 时
+  CLI 仍能对话，只有执行工具才暴露。
 
 ## 2. 启动器补丁漂移
 
 ```bash
-grep -c 'PATCHED_CODEX_UPSTREAM' ~/.local/bin/codex          # 期望 >= 1
-grep -c 'repo_helper='            ~/.local/bin/codex          # 期望 >= 1
+grep -c 'PATCHED_CODEX_ROOT' ~/.local/bin/codex               # 期望 >= 1
+grep -c 'repo_helper='       ~/.local/bin/codex               # 期望 >= 1
 ```
 
 - 结果不足说明 `codex-single-install-maintainer` 重写了 launcher，需要重新应用

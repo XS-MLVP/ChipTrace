@@ -1,17 +1,38 @@
---- /nfs/home/zhangyuxin/.local/bin/codex.bak-patched-20261024T232142	2026-10-24 16:23:32.960603000 +0800
-+++ /nfs/home/zhangyuxin/.local/bin/codex	2026-10-24 23:18:48.428584000 +0800
-@@ -568,6 +568,14 @@
- export PATH="$clean_path"
- 
- upstream="$CANONICAL_CODEX_UPSTREAM"
-+# This host maintains a locally built Codex that adds native Turn identity to
-+# SSE telemetry and process scope to auxiliary spans. Prefer it when present so
-+# collection produces strict, delivery-ready data; other nodes without the
-+# build keep the canonical package.
-+PATCHED_CODEX_UPSTREAM="${CODEX_PATCHED_UPSTREAM:-/nfs/home/zhangyuxin/.local/openai-codex/patched/0.163.0-alpha.11-chiptrace/codex}"
-+if [ -x "$PATCHED_CODEX_UPSTREAM" ]; then
-+  upstream="$PATCHED_CODEX_UPSTREAM"
+--- /nfs/home/zhangyuxin/.local/bin/codex	2026-10-30 14:15:38
++++ /nfs/home/zhangyuxin/.local/bin/codex	2026-10-30 14:15:38
+@@ -619,10 +619,32 @@
+ # SSE telemetry and process scope to auxiliary spans. Prefer it when present so
+ # collection produces strict, delivery-ready data; other nodes without the
+ # build keep the canonical package.
+-PATCHED_CODEX_UPSTREAM="${CODEX_PATCHED_UPSTREAM:-/nfs/home/zhangyuxin/.local/openai-codex/patched/0.163.0-alpha.11-chiptrace/codex}"
+-if [ -x "$PATCHED_CODEX_UPSTREAM" ]; then
+-  upstream="$PATCHED_CODEX_UPSTREAM"
++PATCHED_CODEX_ROOT="${CODEX_PATCHED_ROOT:-/nfs/home/zhangyuxin/.local/openai-codex/patched/0.163.0-alpha.11-chiptrace}"
++# A patched build must be a complete Codex package, not a lone binary: Codex
++# resolves its command runner, ripgrep and bubblewrap from that layout, so a
++# binary dropped in without its companions chats normally while every exec tool
++# fails to spawn -- a failure that only appears mid-session. Refuse to launch
++# such an install and say which parts are missing.
++patched_missing=""
++if [ -x "$PATCHED_CODEX_ROOT/bin/codex" ]; then
++  patched_bin="$PATCHED_CODEX_ROOT/bin/codex"
++elif [ -x "$PATCHED_CODEX_ROOT/codex" ]; then
++  patched_bin="$PATCHED_CODEX_ROOT/codex"
++else
++  patched_bin=""
+ fi
++if [ -n "$patched_bin" ]; then
++  [ -f "$PATCHED_CODEX_ROOT/codex-package.json" ] || patched_missing="$patched_missing codex-package.json"
++  [ -x "$PATCHED_CODEX_ROOT/bin/codex-code-mode-host" ] || patched_missing="$patched_missing bin/codex-code-mode-host"
++  [ -x "$PATCHED_CODEX_ROOT/codex-path/rg" ] || patched_missing="$patched_missing codex-path/rg"
++  [ -x "$PATCHED_CODEX_ROOT/codex-resources/bwrap" ] || patched_missing="$patched_missing codex-resources/bwrap"
++  if [ -z "$patched_missing" ]; then
++    upstream="$patched_bin"
++  else
++    echo "codex-wrapper: patched Codex at $PATCHED_CODEX_ROOT is incomplete (missing:$patched_missing); tools and search would fail, so the official package is used. Reinstall with integrations/codex/install-patched-codex.sh." >&2
++  fi
 +fi
++unset patched_bin patched_missing
  if [ ! -x "$upstream" ]; then
    echo "ERROR: cannot find canonical Codex binary: $upstream" >&2
    exit 127
